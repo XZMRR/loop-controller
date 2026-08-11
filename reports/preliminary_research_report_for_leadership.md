@@ -247,5 +247,4 @@ OWASP 发布的 Agentic 应用十大风险，是行业重要参考：
 | Agent 产品/架构调研（完整版） | `docs/research/02_agent_landscape_research.md`  | 附件二           |
 | Agent 安全框架简析（完整版）  | `reports/agent_security_framework_brief.md`     | 附件三           |
 | 架构概览草案             | `docs/architecture/overview.md`                 | 架构设想与关键决策     |
-| 开发日志               | `docs/process/development_log.md`               | 决策记录与过程追溯     |
 

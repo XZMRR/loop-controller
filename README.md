@@ -78,10 +78,6 @@ docs/
 ├── architecture/       # 架构设计文档
 │   ├── overview.md     # 架构概览（R0-R3 模型）
 │   └── 00_r0r3_architecture.md  # R0-R3 分层详细设计
-└── process/            # 开发流程记录
-    ├── development_log.md  # 关键决策与讨论记录
-    └── document_status_review_20260806.md  # 文档状态梳理
-
 reports/               # 汇报与研究报告
 ├── project_feasibility_report.md      # 项目可行性论证
 ├── test_conclusion_report.md          # T1/T3 测试结论
@@ -89,9 +85,8 @@ reports/               # 汇报与研究报告
 ├── agent_security_framework_brief.md  # Agent 安全框架现状
 ├── agent_security_test_plan.md        # 测试计划
 ├── preliminary_research_report_for_leadership.md  # 前期调研报告
-└── 相关文档/                           # 内控抽象与可视化
-    ├── 内控最小岗位结构抽象_v0.1.md
-    └── index.html
+└── 相关文档/                           # 内控抽象
+    └── 内控最小岗位结构抽象_v0.1.md
 
 tests/security_experiments/  # 现有 Agent 安全手段测试
 ├── README.md

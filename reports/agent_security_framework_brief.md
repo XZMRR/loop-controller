@@ -39,7 +39,7 @@ Microsoft 的 Agent Factory 也提出了类似蓝图：
 
 ## 2. OWASP Agentic Top 10（2026）：风险分类的"行业基准"
 
-OWASP 在 2025 年底发布了 **Top 10 for Agentic Applications 2026**，这是目前 Agent 安全领域最重要的风险分类框架之一，被 Microsoft、NVIDIA、Palo Alto Networks 等引用。![alt text](ScreenShot_2026-08-03_151006_915.png)
+OWASP 在 2025 年底发布了 **Top 10 for Agentic Applications 2026**，这是目前 Agent 安全领域最重要的风险分类框架之一，被 Microsoft、NVIDIA、Palo Alto Networks 等引用。![OWASP Top 10 for Agentic Applications 2026](images/ScreenShot_2026-08-03_151006_915.png)
 
 | 编号 | 风险 | 说明 |
 |------|------|------|

@@ -111,7 +111,7 @@ Loop Controller 的核心隐喻是：**把 Agent 当作数字员工来管理**�
 
 ### 4.1 结构对照分析
 
-参考 [reports/相关文档/index.html](../相关文档/index.html) 的结构对照图，将企业内控四角色与现有 Agent 治理框架对比：
+将企业内控四角色与现有 Agent 治理框架对比如下：
 
 | 内控角色 | 现有 Agent 框架对应物 | 对应关系 | 关键缺口 |
 |---------|---------------------|---------|---------|
@@ -360,7 +360,6 @@ Loop Controller 方向是**可行且有价值的**。
 - [reports/test\_conclusion\_report.md](./test_conclusion_report.md)
 - [reports/test\_methodology\_appendix.md](./test_methodology_appendix.md)
 - [reports/相关文档/内控最小岗位结构抽象\_v0.1.md](../相关文档/内控最小岗位结构抽象_v0.1.md)
-- [reports/相关文档/index.html](../相关文档/index.html)
 - [reports/preliminary\_research\_report\_for\_leadership.md](./preliminary_research_report_for_leadership.md)
 - [docs/research/01\_internal\_control\_research.md](../docs/research/01_internal_control_research.md)
 - [docs/research/02\_agent\_landscape\_research.md](../docs/research/02_agent_landscape_research.md)
