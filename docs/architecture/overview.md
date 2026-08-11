@@ -90,7 +90,7 @@ Loop Controller 借鉴企业内控的"三道防线"，把治理抽象为四个�
 
 1. **R2 专用模型边界**：哪些场景允许 R2 使用专用小模型？
 2. **R3 审计结论强制力**：R3 发现严重违规时能否触发暂停/降级？
-3. **R4 定义**：领导提到的 R0-R4 中，R4 指什么？
+3. **R4 定义**：讨论中提到的 R0-R4 中，R4 指什么？
 4. **Policy 表达形式**：Python 类 / YAML / JSON / DSL？
 5. **Audit Store 独立性**：是否需要与 R1/R2 运行时物理隔离？
 
@@ -98,7 +98,7 @@ Loop Controller 借鉴企业内控的"三道防线"，把治理抽象为四个�
 
 ## 7. 下一步
 
-1. 根据领导反馈收敛 R0-R3 架构；
+1. 根据讨论反馈收敛 R0-R3 架构；
 2. 输出核心 API 接口草案（Agent、CapabilityProfile、Policy、Checkpoint、AuditRecord）；
 3. 绘制 Loop 控制器的状态机图；
 4. 开始 Phase 1 MVP 的详细设计。

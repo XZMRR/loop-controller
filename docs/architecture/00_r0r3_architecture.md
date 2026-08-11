@@ -1,8 +1,8 @@
 # Loop Controller R0-R3 架构设计（v0.3）
 
-> **文档定位**：在前期调研、测试和 2026-08-10 会议基础上，确定 Loop Controller 的核心架构分层。本版本把旧版"治理/编排/执行"三层模型更新为 **R0-R3 四层治理模型 + 基础设施层**，与 [`reports/相关文档/内控最小岗位结构抽象_v0.1.md`](../../reports/相关文档/内控最小岗位结构抽象_v0.1.md) 中的企业内控三道防线对应。
+> **文档定位**：在前期调研、测试和 2026-08-10 会议基础上，确定 Loop Controller 的核心架构分层。本版本把旧版"治理/编排/执行"三层模型更新为 **R0-R3 四层治理模型 + 基础设施层**，与 [`docs/research/内控最小岗位结构抽象_v0.1.md`](../research/内控最小岗位结构抽象_v0.1.md) 中的企业内控三道防线对应。
 >
-> **状态**：v0.3，已吸收 2026-08-10 会议关于 R2 策略引擎、R3 脱敏审计、Open-Core 边界的要求，待领导/技术负责人评审后定稿。
+> **状态**：v0.3，已吸收 2026-08-10 会议关于 R2 策略引擎、R3 脱敏审计、Open-Core 边界的要求，待核心维护者评审后定稿。
 > **最后更新**：2026-08-11
 
 ---
@@ -235,10 +235,10 @@ R3 Audit：异步采集全流程日志（脱敏 → 掩码 → 风险偏置采�
 
 - R4 为误说法，架构保持 R0-R3 + 基础设施层。
 - R3 发现严重违规时只能向 R0 提建议，**无实操权限（不能暂停/降级/修改配置）**。
-- **MVP 决策记录（待领导/李凯最终确认）**：
+- **MVP 决策记录（待核心维护者最终确认）**：
   1. **Open-Core 边界**：MVP 先用 **R2 内 hook（方案 A）** 打桩，接口设计成可切换为云端 SaaS（B）或私有化授权服务（C）。
   2. **Policy Compiler**：MVP 用 **Rego DSL（方案 A）** 起步，竞对调研中 OPA/Rego 是成熟路径；跑通后再评估是否自研字节码 VM（方案 B）。
-  3. **Earned Authority**：MVP 先用 **任务完成后临时提升权限（方案 A）**，可解释性最强，便于向领导/审计说明。
+  3. **Earned Authority**：MVP 先用 **任务完成后临时提升权限（方案 A）**，可解释性最强，便于向治理者/审计说明。
   4. **Permission Interaction Analyzer**：MVP 用 **静态规则表（方案 A）** 覆盖常见高危组合，同时预留图分析接口（方案 B）。
   5. **用户上报数据流**：MVP 用 **默认本地沉淀 + 可选匿名上报（方案 C）**，兼顾隐私合规与数据壁垒。
   6. **MVP 范围**：先选 **最小闭环 A**，优先跑通 R0-R3 核心循环；R0-delegate 打桩；若时间和人手允许再扩展。
@@ -247,7 +247,7 @@ R3 Audit：异步采集全流程日志（脱敏 → 掩码 → 风险偏置采�
 
 ## 9. 参考文档
 
-- [`reports/相关文档/内控最小岗位结构抽象_v0.1.md`](../../reports/相关文档/内控最小岗位结构抽象_v0.1.md)：R0-R3 角色抽象的理论来源
+- [`docs/research/内控最小岗位结构抽象_v0.1.md`](../research/内控最小岗位结构抽象_v0.1.md)：R0-R3 角色抽象的理论来源
 - [`docs/research/01_internal_control_research.md`](../research/01_internal_control_research.md)：企业内控运作方式调研
 - [`reports/test_conclusion_report.md`](../../reports/test_conclusion_report.md)：T1/T3 测试证据
 - [`docs/research/03_runtime_governance_landscape.md`](../research/03_runtime_governance_landscape.md)：Zenity/Palo Alto/OPA 竞对调研

@@ -1,9 +1,8 @@
 # Loop Controller 项目可行性研究报告
 
-> **文档定位**：论证 Loop Controller 作为“Agent 制度基础设施”的方向合理性与技术可行性，为项目立项提供决策依据。
+> **文档定位**：论证 Loop Controller 作为“Agent 制度基础设施”的方向合理性与技术可行性，为开源项目立项提供参考。
 >
 > **报告日期**：2026-08-05  
-> **编写**：祝鸣  
 > **状态**：精简版 v2.2（已修正 OWASP/MCP 事实表述，已补充 Zenity/Palo Alto/OPA 竞对深调与差异化分析）
 
 ---
@@ -73,14 +72,14 @@ Agent 与传统软件的根本区别在于：**它在运行时会根据环境自
 良好的企业内控体系依靠：
 
 1. **明确的岗位职责**：谁做什么、不能做什么；
-2. **统一的制度标准**：一本全公司遵守的《内控手册》；
+2. **统一的制度标准**：一本组织统一遵守的《内控手册》；
 3. **不相容职务分离**：执行、监督、评价由不同主体承担；
 4. **默认保护机制**：在风险发生点前置控制；
 5. **独立审计闭环**：发现问题、整改、验证、追责。
 
 ### 3.2 内控最小岗位结构抽象
 
-基于 [reports/相关文档/内控最小岗位结构抽象\_v0.1.md](../相关文档/内控最小岗位结构抽象_v0.1.md)，企业内控可抽象为四个不可删减的角色：
+基于 [docs/research/内控最小岗位结构抽象\_v0.1.md](../docs/research/内控最小岗位结构抽象_v0.1.md)，企业内控可抽象为四个不可删减的角色：
 
 ```
 R0 治理者：定义风险偏好，批准制度，问责决策
@@ -359,8 +358,7 @@ Loop Controller 方向是**可行且有价值的**。
 
 - [reports/test\_conclusion\_report.md](./test_conclusion_report.md)
 - [reports/test\_methodology\_appendix.md](./test_methodology_appendix.md)
-- [reports/相关文档/内控最小岗位结构抽象\_v0.1.md](../相关文档/内控最小岗位结构抽象_v0.1.md)
-- [reports/preliminary\_research\_report\_for\_leadership.md](./preliminary_research_report_for_leadership.md)
+- [docs/research/内控最小岗位结构抽象\_v0.1.md](../docs/research/内控最小岗位结构抽象_v0.1.md)
 - [docs/research/01\_internal\_control\_research.md](../docs/research/01_internal_control_research.md)
 - [docs/research/02\_agent\_landscape\_research.md](../docs/research/02_agent_landscape_research.md)
 - [docs/research/03\_runtime\_governance\_landscape.md](../docs/research/03_runtime_governance_landscape.md)

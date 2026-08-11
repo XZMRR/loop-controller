@@ -74,7 +74,8 @@ docs/
 ├── research/           # 前期调研报告
 │   ├── 01_internal_control_research.md   # 企业内控运作方式
 │   ├── 02_agent_landscape_research.md    # Agent 产品与架构逻辑
-│   └── 03_runtime_governance_landscape.md  # 竞对调研：Zenity/Palo Alto/OPA
+│   ├── 03_runtime_governance_landscape.md  # 竞对调研：Zenity/Palo Alto/OPA
+│   └── 内控最小岗位结构抽象_v0.1.md      # 企业内控最小岗位结构抽象
 ├── architecture/       # 架构设计文档
 │   ├── overview.md     # 架构概览（R0-R3 模型）
 │   └── 00_r0r3_architecture.md  # R0-R3 分层详细设计
@@ -83,10 +84,7 @@ reports/               # 汇报与研究报告
 ├── test_conclusion_report.md          # T1/T3 测试结论
 ├── test_methodology_appendix.md       # 测试方法论附录
 ├── agent_security_framework_brief.md  # Agent 安全框架现状
-├── agent_security_test_plan.md        # 测试计划
-├── preliminary_research_report_for_leadership.md  # 前期调研报告
-└── 相关文档/                           # 内控抽象
-    └── 内控最小岗位结构抽象_v0.1.md
+└── agent_security_test_plan.md        # 测试计划
 
 tests/security_experiments/  # 现有 Agent 安全手段测试
 ├── README.md
@@ -111,7 +109,7 @@ tests/security_experiments/  # 现有 Agent 安全手段测试
 
 ### Phase 1：核心抽象设计（进行中）
 
-- [ ] 根据领导反馈收敛 R0-R3 架构
+- [ ] 根据讨论反馈收敛 R0-R3 架构
 - [ ] 设计核心抽象：Agent、CapabilityProfile、Task、Loop、Checkpoint、Policy、AuditRecord
 - [ ] 输出核心 API 接口草案
 - [ ] 绘制 Loop 控制器状态机图

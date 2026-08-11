@@ -2,6 +2,8 @@
 
 > **文档定位**：记录 T1.1 / T1.2 / T1.4c 批量重复测试的方法、环境、参数和统计方式，使结论可被复核、被质疑、被改进。
 >
+> **数据声明**：测试中使用的文档、姓名、邮箱、手机号、项目代号、密码等均为**虚构合成数据**，仅用于验证 Guardrail 对敏感信息的识别与过滤能力。
+>
 > **关联文档**：
 > - [reports/test_conclusion_report.md](./test_conclusion_report.md)
 > - [tests/security_experiments/test_results.md](../tests/security_experiments/test_results.md)
@@ -11,7 +13,7 @@
 
 ## 一、测试目标
 
-回应审查中提出的两个方法论质疑：
+为提升测试严谨性，本附录解决两个方法论问题：
 
 1. **样本量不足**：把“同一份脚本两次跑出不同结果”的轶事证据，升级为**可量化的拦截率/泄露率**；
 2. **结论过度泛化**：明确测试边界——本实验只评估 **OpenAI Agents SDK + Kimi K2.5 + LLM 判定型 Guardrail** 的稳定性，不声称所有 Guardrail 机制无效。
@@ -162,7 +164,7 @@ Agent 配置：
 要复现本测试，请执行：
 
 ```powershell
-cd "D:\Agent\tests\security_experiments\t1_openai_agents_guardrails"
+cd "tests/security_experiments/t1_openai_agents_guardrails"
 $env:T1_BATCH_N_RUNS="10"
 python t1_batch_reproducibility_test.py
 ```

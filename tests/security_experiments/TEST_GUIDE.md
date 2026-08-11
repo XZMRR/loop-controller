@@ -8,7 +8,7 @@
 ## 一、环境结构总览
 
 ```text
-D:\Agent\tests\security_experiments\
+tests/security_experiments/
 ├── .env                                 # 你的真实配置（API Key、Base URL、模型名）
 ├── .env.example                         # 配置模板，.env 的参考
 ├── README.md                            # 快速开始说明
@@ -37,12 +37,12 @@ D:\Agent\tests\security_experiments\
 
 ### 2.1 .env 文件
 
-打开 `D:\Agent\tests\security_experiments\.env`，你应该看到：
+打开 `tests/security_experiments/.env`，你应该看到：
 
 ```env
 # 如果使用 OpenAI 官方 API，OPENAI_BASE_URL 可以留空
 # 如果使用 Kimi/DeepSeek/Azure 等 OpenAI 兼容 API，需要填写对应的 base_url
-OPENAI_API_KEY=sk-xMsiWfPxj8RM63ct6RW322cL8F55htuV8MfJQe5NT2GTx83O
+OPENAI_API_KEY=your-openai-api-key-here
 OPENAI_BASE_URL=https://api.moonshot.cn/v1
 
 # 模型名：Kimi K2.5 是多模态模型，价格较低，适合测试
@@ -99,7 +99,7 @@ T1.4 是四个测试中最简单的：
 打开终端（PowerShell），执行：
 
 ```powershell
-cd D:\Agent\tests\security_experiments
+cd tests/security_experiments
 ```
 
 #### 步骤 2：确认虚拟环境已创建
@@ -261,7 +261,7 @@ if any(indicator in result.final_output for indicator in malicious_indicators):
 解决：
 
 ```powershell
-cd D:\Agent\tests\security_experiments
+cd tests/security_experiments
 .\venv\Scripts\activate
 pip install -r requirements.txt
 ```

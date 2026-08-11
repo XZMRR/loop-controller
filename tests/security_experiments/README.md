@@ -2,6 +2,8 @@
 
 > **目标**：通过实际运行现有 Agent 安全方案，理解其能力边界，为 Loop Controller 设计提供实证输入。
 > **当前阶段**：已完成 T1 OpenAI Agents SDK Guardrails 测试和 T3 MCP 工具权限边界测试。
+>
+> **数据声明**：测试中使用的文档、姓名、邮箱、手机号、项目代号、密码等均为**虚构合成数据**，仅用于验证 Guardrail 对敏感信息的识别与过滤能力。
 
 ---
 
@@ -20,7 +22,7 @@ OpenAI Agents SDK 是一个 Python 库，Guardrail 是运行在你本地 Python 
 ### 1. 创建虚拟环境
 
 ```bash
-cd D:\Agent\tests\security_experiments
+cd tests/security_experiments
 python -m venv venv
 
 # Windows

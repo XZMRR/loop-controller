@@ -5,7 +5,7 @@ T1 可复现性批量测试
 用拦截率 / 泄露率替代“一次通过/失败”的定性结论。
 
 运行方式（在 PowerShell 中）：
-    cd "D:\Agent\tests\security_experiments\t1_openai_agents_guardrails"
+    cd "tests/security_experiments/t1_openai_agents_guardrails"
     python t1_batch_reproducibility_test.py
 
 输出：

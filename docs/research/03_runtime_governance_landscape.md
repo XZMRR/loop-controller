@@ -3,7 +3,6 @@
 > **文档定位**：为开源 Agent 框架 "Loop Controller" 提供主流 Agent 运行时治理方案的竞争格局输入。本文回答的问题：Zenity、Protect AI（Palo Alto Networks）和 OPA 三家在 Agent 治理层面各是什么定位？它们的控制点、策略执行方式、企业治理对齐度有何差异？Loop Controller 可以填补哪些空白？
 >
 > **调研日期**：2026-08-06\
-> **作者**：祝鸣\
 > **状态**：初稿（v0.1），将持续迭代更新。
 
 ***
