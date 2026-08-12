@@ -96,9 +96,9 @@ Loop Controller 借鉴企业内控的"三道防线"，把治理抽象为四个�
 
 ---
 
-## 7. 下一步
+## 7. 进展更新
 
-1. 根据讨论反馈收敛 R0-R3 架构；
-2. 输出核心 API 接口草案（Agent、CapabilityProfile、Policy、Checkpoint、AuditRecord）；
-3. 绘制 Loop 控制器的状态机图；
-4. 开始 Phase 1 MVP 的详细设计。
+- [x] 根据讨论反馈收敛 R0-R3 架构
+- [x] 输出核心 API 接口草案：详见 [05_mvp_core_abstractions.md](./05_mvp_core_abstractions.md)
+- [ ] 绘制 Loop 控制器的状态机图
+- [ ] 开始 Phase 1 MVP 代码实现

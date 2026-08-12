@@ -78,7 +78,8 @@ docs/
 │   └── 内控最小岗位结构抽象_v0.1.md      # 企业内控最小岗位结构抽象
 ├── architecture/       # 架构设计文档
 │   ├── overview.md     # 架构概览（R0-R3 模型）
-│   └── 00_r0r3_architecture.md  # R0-R3 分层详细设计
+│   ├── 00_r0r3_architecture.md  # R0-R3 分层详细设计
+│   └── 05_mvp_core_abstractions.md  # MVP 核心抽象与接口设计
 reports/               # 汇报与研究报告
 ├── project_feasibility_report.md      # 项目可行性论证
 ├── test_conclusion_report.md          # T1/T3 测试结论
