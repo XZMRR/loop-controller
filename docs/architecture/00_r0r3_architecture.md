@@ -17,6 +17,7 @@
 6. **默认拒绝与最小可用权限**：任何未明确允许的动作默认拒绝；CapabilityProfile 和 Earned Authority 都遵循最小可用原则。
 7. **核心控制流程断网可用**：R1/R2 的实时判定、R3 的本地审计必须能在完全隔离/离线环境中运行。
 8. **架构与沙箱解耦**：沙箱是可选的部署增强组件，不是 Loop Controller 的强制依赖。
+9. **R1 不直接调用外部工具，R2 是工具调用的唯一授权出口**：R1 负责动作规划与申报，R2 作为 MCP Client Policy Gateway 校验并授权；任何对外部系统（MCP Server / API / 数据库等）的调用都必须由 R2 转发，R1 本身不持有可直接触发外部副作用的执行通道。
 
 ---
 
@@ -89,6 +90,11 @@ Loop Controller 采用 **Open-Core** 模式，不是完全开源。
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+**关于 Agent 交互与工具调用的分层说明**：
+
+- **Agent 交互**（R1 主责）：Agent 与 User、其他 Agent、R0/R0-delegate、R2 之间的信息交换，包括任务接收、动作申报、审批请求、结果返回等。这些交互不产生直接的外部副作用。
+- **工具调用**（R2 授权并转发）：任何对 Tool Registry / MCP Server / 外部 API / 数据库 / 文件系统的真实调用。R2 是唯一授权出口；R1 只申报，不直接执行。
+
 ---
 
 ## 4. 各层职责
@@ -110,8 +116,14 @@ Loop Controller 采用 **Open-Core** 模式，不是完全开源。
 
 | 角色 | 职责 | 人类/系统 |
 |------|------|----------|
-| **R1 Agent** | 接收任务并规划动作；依据 CapabilityProfile 自检；主动申报动作、参数、风险等级和理由；按 R2 / R0-delegate / R0 决策执行；返回结果 | 系统 |
+| **R1 Agent** | 接收任务并规划动作；依据 CapabilityProfile 自检；主动申报动作、参数、风险等级和理由；**不直接调用外部工具**；按 R2 / R0-delegate / R0 的决策执行经授权后的动作；返回结果 | 系统 |
 | **轻量分类器** | R1 自检的辅助组件；用专用小模型做敏感信息预检、意图分类等；**只输出风险信号，不做最终强制** | 系统 |
+
+**工具调用边界说明**：
+
+- R1 与 User/其他 Agent/R0/R2/R3 之间的通信属于 **Agent 交互**，归 R1 主责。
+- R1 对外部系统（Tool Registry / MCP Server / API / 数据库等）的任何调用请求都必须先封装为 **动作申报** 提交给 R2。
+- R1 本身不直接持有外部工具的执行通道，避免 Agent 绕过策略执行危险动作。
 
 **会议细化要点**：
 
@@ -124,7 +136,7 @@ R2 不再只是简单的 allow/deny 判定，而是包含以下子系统的策�
 
 | 角色/子系统 | 职责 | 人类/系统 |
 |------------|------|----------|
-| **R2 Checkpoint** | 接收 R1 申报并验证；返回 `allow / deny / modify / require_approval`；对需要审批的请求路由到 R0-delegate；记录所有判定日志 | 系统 |
+| **R2 Checkpoint** | 接收 R1 申报并验证；返回 `allow / deny / modify / require_approval`；对 `allow` 的动作代理转发到 Tool Registry / MCP Server 执行；对需要审批的请求路由到 R0-delegate；记录所有判定日志 | 系统 |
 | **Policy Compiler** | 将自然语言/声明式 Policy 编译为高效、可执行、可验证的规则表示（DSL/字节码/决策图）；支持版本控制与回滚 | 系统 |
 | **Permission Interaction Analyzer** | 检测多个独立权限/工具组合后产生的新能力（A + B > C 的权限连锁反应），输出风险信号 | 系统 |
 | **Earned Authority Manager** | 在 Agent 满足预设前提条件时动态提升其可用权限上限，但不得超过固定天花板（Fixed Ceiling） | 系统 |
@@ -193,15 +205,21 @@ R2 Checkpoint：
    ├─ Earned Authority Manager 计算当前动态权限上限
    └─ 验证 Policy
         ↓
-   ├─ allow / modify → R1 Agent 执行
+   ├─ allow / modify → R2 Checkpoint 代理转发至 Tool Registry / MCP Server 执行，结果返回 R1 Agent
    ├─ deny → R1 Agent 返回拒绝原因
    └─ require_approval → R0-delegate 审批（支付类必须到 R0）
                            ↓
                 高风险/不确定 → R0 Governance 升级
                            ↓
-                R1 Agent 按最终决策执行/拒绝
+                R2 Checkpoint 按最终决策代理转发执行 / R1 Agent 返回拒绝原因
         ↓
 R3 Audit：异步采集全流程日志（脱敏 → 掩码 → 风险偏置采样 → 审计报告）
+
+**流程中的边界说明**：
+
+- `R1 Agent → R2 Checkpoint` 的箭头是 **动作申报**，属于 Agent 交互。
+- `R2 Checkpoint → Tool Registry / MCP Server` 的箭头是 **工具调用**，是真正产生外部副作用的动作。
+- R1 与 User/其他 Agent/R0-delegate 之间的往返属于 Agent 交互，不经过工具调用通道。
 ```
 
 ---
@@ -219,6 +237,7 @@ R3 Audit：异步采集全流程日志（脱敏 → 掩码 → 风险偏置采�
 | 沙箱解耦 | 沙箱是可选组件，不强制 | 不同部署场景对隔离要求不同；核心控制流程不应依赖沙箱存在 |
 | 策略加密 | Policy 在存储层加密，运行时受信解密 | 防止恶意 Agent 通过越狱探出完整控制逻辑 |
 | 双类预算 | Token 预算与财务支付预算分开监控 | 两者性质不同，熔断/审批策略不同；支付类必须人类审批 |
+| Agent 交互与工具调用分界 | R1 只做动作规划与申报；R2 是 MCP Client Policy Gateway，唯一对外工具调用的授权出口 | 防止 R1 绕过策略直接执行危险动作；工具调用是产生外部副作用的唯一边界，必须集中管控 |
 
 ---
 
