@@ -4,7 +4,7 @@
 >
 > **MVP 场景**：制度化的研究助手（Research Assistant），可搜索公开资料、读取本地知识库、写摘要、发送研究报告邮件。
 >
-> **状态**：草案 v0.2，已吸收外部 AI 审阅意见，待评审\
+> **状态**：草案 v0.3，已确定轻量分类器位置、Agent 交互边界与单 Agent MVP 范围，待评审\
 > **最后更新**：2026-08-12
 
 ***
@@ -159,6 +159,7 @@ class ActionProposal:
     task_id: str
     call_id: str              # R1 生成的候选调用 ID，R2 会校验其唯一性
     agent_id: str
+    type: Literal["tool_call", "inter_agent"] = "tool_call"  # MVP 只处理 tool_call；inter_agent 预留
     tool_name: str
     arguments: dict
     task_context: str         # 当前任务的简短描述
@@ -167,15 +168,97 @@ class ActionProposal:
 ```
 
 **设计理由**：
-
 - `task_id` 把动作挂到一次完整任务；
 - `call_id` 用于把 R2 的判定、R3 的审计、最终工具执行结果串成一条链；
+- `type` 区分 Agent 交互（`inter_agent`）与工具调用（`tool_call`），MVP 只处理 `tool_call`，但结构已预留；
 - `risk_level` 是 R1 自检的参考，不是最终判定；
 - `reason` 给 R0-delegate 审批时看，也用于 R3 审计解释性。
 
+**MVP 范围说明**：
+- `type` 默认 `"tool_call"`，R2 只处理该类型；
+- 若 R1 产生 `type="inter_agent"`（如子任务委托），MVP 阶段由 R1 内部处理，不进入 R2；
+- 多 Agent 委托治理作为后续扩展。
+
 **安全说明**：`call_id` 由 R1 生成 UUID，R2 在判定前检查该 `call_id` 是否已处理过，防止重放。真正的权威 Decision 由 R2 签发，R1 不能伪造。
 
-### 3.5 `Decision`：R2 的判定结果
+### 3.5 `RiskSignal` 与 `LightweightClassifier`：R1 的轻量分类器
+
+**业务含义**：R1 执行层里的轻量分类器。它基于规则（MVP 阶段）或小模型（未来）对 ActionProposal 做预检，输出风险信号，**不做出最终是否执行的判定**。最终判定仍由 R2 负责。
+
+```python
+from dataclasses import dataclass, field
+from typing import Literal, Protocol
+
+@dataclass(frozen=True)
+class RiskSignal:
+    risk_level: Literal["low", "medium", "high", "critical"]
+    tags: list[str] = field(default_factory=list)   # 如 ["external_communication", "pii_involved"]
+    reason: str = ""                                 # 为什么是这个风险等级
+    suggestion: str | None = None                  # 给 R1 的缓解建议
+
+class LightweightClassifier(Protocol):
+    def classify(
+        self,
+        task: Task,
+        agent: Agent,
+        proposal: ActionProposal,
+        profile: CapabilityProfile,
+    ) -> RiskSignal: ...
+```
+
+**输入**：
+
+| 字段 | 说明 |
+|------|------|
+| `Task` | 用户原始请求、user_id、task_id |
+| `Agent` | 执行 Agent 的身份、profile_id |
+| `ActionProposal` | R1 规划出的具体动作 |
+| `CapabilityProfile` | 该 Agent 的能力边界 |
+
+**输出**：
+
+| 字段 | 说明 |
+|------|------|
+| `risk_level` | 风险等级，R2 参考 |
+| `tags` | 风险标签，便于 R2 命中规则 |
+| `reason` | 可解释性 |
+| `suggestion` | 可选缓解建议 |
+
+**MVP 实现方式：规则版打桩**
+
+```python
+class RuleBasedClassifier:
+    """基于规则的轻量分类器，MVP 先用规则打桩，未来可替换为专用小模型。"""
+
+    def classify(self, task, agent, proposal, profile):
+        if proposal.tool_name == "send_email":
+            return RiskSignal(
+                risk_level="high",
+                tags=["external_communication"],
+                reason="send_email 涉及外部通信",
+                suggestion="请确认收件人白名单",
+            )
+        if proposal.tool_name == "read_file":
+            return RiskSignal(
+                risk_level="medium",
+                tags=["data_access"],
+                reason="读取本地文件",
+                suggestion=None,
+            )
+        return RiskSignal(
+            risk_level="low",
+            tags=[],
+            reason="常规操作",
+            suggestion=None,
+        )
+```
+
+**设计理由**：
+- 领导/技术负责人要求 R1/R2 实时执行部分不用大模型，MVP 用规则实现；
+- 保留 `LightweightClassifier` 接口，未来可替换为专用小模型，不影响 R2；
+- 分类器只输出信号，不决定执行，避免把 R1 的预检变成越权决策。
+
+### 3.6 `Decision`：R2 的判定结果
 
 **业务含义**：R2 综合 Policy、CapabilityProfile、权限连锁分析后给出的最终裁决。
 
@@ -211,7 +294,7 @@ class Decision:
 - `Checkpoint.forward` 必须基于 `modified_args` 执行，并在执行前做一次轻量复核（如参数类型、目标范围）；
 - 如果改写后的参数涉及新的风险维度，应返回 `require_approval` 而非 `modify`。
 
-### 3.6 `Checkpoint`：R2 的统一入口
+### 3.7 `Checkpoint`：R2 的统一入口
 
 **业务含义**：R2 对外的门面。接收 `ActionProposal`，返回 `Decision`，对 `allow`/`modify` 的动作代理转发到 MCP Gateway。
 
@@ -489,39 +572,40 @@ Task(task_id=t1, user_id=u1, agent_id=a1)
   ▼
 R1 Agent (ResearchAssistant)
   │ 1. 解析任务，规划动作序列
+  │ 2. 轻量分类器预检（RuleBasedClassifier）生成 RiskSignal
   ▼
-ActionProposal(call_id=c1, task_id=t1, tool=web_search, args={"query":"OpenAI 合规争议"})
+ActionProposal(call_id=c1, task_id=t1, type=tool_call, tool=web_search, args={"query":"OpenAI 合规争议"}, risk_level=low)
   │
   ▼
 R2 Checkpoint.evaluate(proposal, agent, task)
-  │ 2. 查询 PolicyEngine（OPA/Rego）
-  │ 3. 检查 CapabilityProfile
-  │ 4. 咨询 BudgetLedger
-  │ 5. 检查 Permission Interaction（MVP 静态规则表）
-  │ 6. 返回 Decision(allow, decision_id=d1)
+  │ 3. 查询 PolicyEngine（OPA/Rego）
+  │ 4. 检查 CapabilityProfile
+  │ 5. 咨询 BudgetLedger
+  │ 6. 检查 Permission Interaction（MVP 静态规则表）
+  │ 7. 返回 Decision(allow, decision_id=d1)
   ▼
 R2 Checkpoint.forward(proposal, decision)
-  │ 7. 校验 decision_id、call_id、有效期、使用次数
-  │ 8. 调用 MCPGateway.call_tool(...)
+  │ 8. 校验 decision_id、call_id、有效期、使用次数
+  │ 9. 调用 MCPGateway.call_tool(...)
   ▼
 MCP Server (brave_web_search)
-  │ 9. 返回结果
+  │ 10. 返回结果
   ▼
 R1 Agent 继续规划下一个动作 ...
   │
-ActionProposal(call_id=c4, task_id=t1, tool=send_email, args={"to":"zhang@company.com", ...})
+ActionProposal(call_id=c4, task_id=t1, type=tool_call, tool=send_email, args={"to":"zhang@company.com", ...}, risk_level=high)
   │
   ▼
 R2 Checkpoint.evaluate(...)
-  │ 10. Policy 判定：require_approval（外部/敏感动作）
+  │ 11. Policy 判定：require_approval（外部/敏感动作）
   ▼
 R0-delegate 审批（MVP 用 config 中的固定审批人打桩）
-  │ 11. 返回 ApprovalRecord(approve/deny)
+  │ 12. 返回 ApprovalRecord(approve/deny)
   ▼
 R2 Checkpoint.forward(...) 或拒绝
-  │ 12. forward 前再次校验 decision 仍有效
+  │ 13. forward 前再次校验 decision 仍有效
   ▼
-R3 Audit：异步采集全流程 AuditEvent（task_start → propose → evaluate → execute/approve → task_end）
+R3 Audit：异步采集全流程 AuditEvent（task_start → propose → classify → evaluate → execute/approve → task_end）
 ```
 
 **流程中的边界说明**：
@@ -629,6 +713,7 @@ loop-controller/
 │   ├── __init__.py
 │   ├── task.py                   # Task 上下文
 │   ├── agent.py                  # Agent 抽象与 R1 执行循环
+│   ├── classifier.py             # LightweightClassifier / RiskSignal（MVP 规则版）
 │   ├── capability_profile.py     # CapabilityProfile / ToolPermission
 │   ├── checkpoint.py             # R2 Checkpoint：evaluate + forward
 │   ├── policy_engine.py          # PolicyEngine / OPAPolicyEngine
@@ -655,6 +740,9 @@ loop-controller/
 | 决策                           | 结论                                                                     | 原因                         | 未来可能的改进                              |
 | ---------------------------- | ---------------------------------------------------------------------- | -------------------------- | ------------------------------------ |
 | R1 不直接调用工具                   | R1 只生成 `ActionProposal`，R2 转发                                          | 防止 Agent 绕过策略；与 MCP 网关模式一致 | 未来可在沙箱内让 R1 执行只读工具，但仍需 R2 授权         |
+| R1 轻量分类器                    | R1 内规则版 `LightweightClassifier`，输出 `RiskSignal`，不决定执行                 | 符合 R1/R2 不用大模型要求；保留接口未来可替换小模型 | 未来替换为专用小模型，提升风险识别精度                |
+| ActionProposal 预留 `type` 字段 | 区分 `tool_call` 与 `inter_agent`；MVP 只处理 `tool_call`                         | 结构预留多 Agent 委托治理；MVP 不扩大范围 | 未来 R2 增加 `inter_agent` 治理分支                  |
+| MVP 单 Agent 模式                | 研究助手由一个 Agent 完成全部步骤，不实现子任务委托治理                                 | 降低 MVP 复杂度；先验证 R0-R3 工具调用闭环 | 未来扩展多 Agent 协作与委托链治理                    |
 | OPA HTTP sidecar             | MVP 用本地 OPA 进程 + HTTP 查询                                               | 标准、调试方便、Python 无成熟 Rego 库  | 未来可替换为 Go SDK、WASM 或自研字节码 VM         |
 | CapabilityProfile 与 Agent 分离 | Agent 通过 `profile_id` 关联 Profile                                       | 一个岗位多个 Agent 实例；策略独立演进     | 未来支持多 Profile 动态切换                   |
 | Decision 四态 + 有效期 + 单次使用     | allow/deny/modify/require\_approval，带 `expires_at` 和 `max_uses=1`      | 防止重放和长期滥用                  | 未来可增加 `defer`（异步等待外部条件）和 token 签名    |
