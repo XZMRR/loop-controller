@@ -5,7 +5,7 @@
 > **MVP 场景**：制度化的研究助手（Research Assistant），可搜索公开资料、读取本地知识库、写摘要、发送研究报告邮件。
 >
 > **状态**：草案 v0.3，已确定轻量分类器位置、Agent 交互边界与单 Agent MVP 范围，待评审\
-> **最后更新**：2026-08-12
+> **最后更新**：2026-08-13
 
 ***
 
@@ -168,6 +168,7 @@ class ActionProposal:
 ```
 
 **设计理由**：
+
 - `task_id` 把动作挂到一次完整任务；
 - `call_id` 用于把 R2 的判定、R3 的审计、最终工具执行结果串成一条链；
 - `type` 区分 Agent 交互（`inter_agent`）与工具调用（`tool_call`），MVP 只处理 `tool_call`，但结构已预留；
@@ -175,6 +176,7 @@ class ActionProposal:
 - `reason` 给 R0-delegate 审批时看，也用于 R3 审计解释性。
 
 **MVP 范围说明**：
+
 - `type` 默认 `"tool_call"`，R2 只处理该类型；
 - 若 R1 产生 `type="inter_agent"`（如子任务委托），MVP 阶段由 R1 内部处理，不进入 R2；
 - 多 Agent 委托治理作为后续扩展。
@@ -208,21 +210,21 @@ class LightweightClassifier(Protocol):
 
 **输入**：
 
-| 字段 | 说明 |
-|------|------|
-| `Task` | 用户原始请求、user_id、task_id |
-| `Agent` | 执行 Agent 的身份、profile_id |
-| `ActionProposal` | R1 规划出的具体动作 |
-| `CapabilityProfile` | 该 Agent 的能力边界 |
+| 字段                  | 说明                       |
+| ------------------- | ------------------------ |
+| `Task`              | 用户原始请求、user\_id、task\_id |
+| `Agent`             | 执行 Agent 的身份、profile\_id |
+| `ActionProposal`    | R1 规划出的具体动作              |
+| `CapabilityProfile` | 该 Agent 的能力边界            |
 
 **输出**：
 
-| 字段 | 说明 |
-|------|------|
-| `risk_level` | 风险等级，R2 参考 |
-| `tags` | 风险标签，便于 R2 命中规则 |
-| `reason` | 可解释性 |
-| `suggestion` | 可选缓解建议 |
+| 字段           | 说明              |
+| ------------ | --------------- |
+| `risk_level` | 风险等级，R2 参考      |
+| `tags`       | 风险标签，便于 R2 命中规则 |
+| `reason`     | 可解释性            |
+| `suggestion` | 可选缓解建议          |
 
 **MVP 实现方式：规则版打桩**
 
@@ -254,6 +256,7 @@ class RuleBasedClassifier:
 ```
 
 **设计理由**：
+
 - 领导/技术负责人要求 R1/R2 实时执行部分不用大模型，MVP 用规则实现；
 - 保留 `LightweightClassifier` 接口，未来可替换为专用小模型，不影响 R2；
 - 分类器只输出信号，不决定执行，避免把 R1 的预检变成越权决策。
@@ -319,7 +322,7 @@ class Checkpoint(Protocol):
 3. `decision.max_uses` 未超限；
 4. 如 `verdict == "modify"`，则使用 `decision.modified_args` 而非 `proposal.arguments`。
 
-### 3.7 `PolicyEngine`：OPA 的封装层
+### 3.8 `PolicyEngine`：OPA 的封装层
 
 **业务含义**：把 Rego 策略的加载、查询、版本管理封装起来，让 `Checkpoint` 只关心业务输入输出。
 
@@ -363,7 +366,7 @@ class OPAPolicyEngine:
 | 部署   | 开发时 `opa run --server`    | 生产可内嵌、sidecar、远端服务                |
 | 故障策略 | 默认拒绝（fail-closed）         | 未来可配置缓存/降级策略                      |
 
-### 3.8 `PermissionInteractionAnalyzer`：权限连锁分析
+### 3.9 `PermissionInteractionAnalyzer`：权限连锁分析
 
 **业务含义**：检测多个独立权限/工具组合后产生的新能力（A + B > C）。MVP 先用静态规则表，但接口要预留扩展。
 
@@ -391,7 +394,13 @@ rules:
 - MVP 实现走简单规则匹配；
 - 未来可替换为图分析或能力集合代数。
 
-### 3.9 `MCPGateway`：R2 的 MCP Client 代理
+**DSL 说明**：
+
+- Loop Controller 的**主 Policy DSL 是 Rego（OPA）**，用于工具级权限判定；
+- Permission Interaction 的静态规则表在 MVP 阶段使用 YAML 作为配置化打桩，便于快速调整常见高危组合；
+- 未来若规则复杂化，可将静态规则表迁移到 Rego 或保留为独立配置层，由 PolicyEngine 统一消费。
+
+### 3.10 `MCPGateway`：R2 的 MCP Client 代理
 
 **业务含义**：R2 不直接暴露原始 MCP client 给 R1，而是通过 `MCPGateway` 做两件事：
 
@@ -412,7 +421,53 @@ class MCPGateway(Protocol):
 - 过滤 `tools/list` 还能减少 LLM context window 占用（context rot 问题）；
 - 规范化工具名到真实 MCP 工具名的映射，屏蔽不同 server 的实现差异。
 
-### 3.10 `Tool` 与 `ToolResult`
+### 3.11 `RiskStateManager`：R2 的跨动作风险状态（MVP 打桩）
+
+**业务含义**：SafeAgent 等方案通过 STM/LTM 维护 session 级风险状态，使风险判断不是单点、孤立的。Loop Controller 在 R2 内预留 `RiskStateManager`，MVP 阶段可返回空风险画像，未来用于权限组合分析、动态风险评分、异常模式检测。
+
+```python
+from dataclasses import dataclass, field
+from typing import Protocol
+
+@dataclass(frozen=True)
+class RiskProfile:
+    session_id: str
+    cumulative_risk_score: float = 0.0       # 0.0-1.0
+    recent_tags: list[str] = field(default_factory=list)
+    denied_count: int = 0
+    approval_count: int = 0
+
+class RiskStateManager(Protocol):
+    def get_session_risk(self, session_id: str) -> RiskProfile: ...
+    def update_after_decision(
+        self,
+        session_id: str,
+        proposal: ActionProposal,
+        decision: Decision,
+    ) -> None: ...
+```
+
+**MVP 打桩实现**：
+
+```python
+class InMemoryRiskStateManager:
+    def __init__(self):
+        self._profiles: dict[str, RiskProfile] = {}
+
+    def get_session_risk(self, session_id: str) -> RiskProfile:
+        return self._profiles.get(session_id, RiskProfile(session_id=session_id))
+
+    def update_after_decision(self, session_id, proposal, decision):
+        # MVP 阶段：仅记录 denied 次数，供 R3 审计使用
+        pass
+```
+
+**设计理由**：
+
+- MVP 先不累积跨 turn 风险，避免把 R2 做重；
+- 接口已预留，未来可接入图分析、能力集合代数、专用小模型风险编码。
+
+### 3.12 `Tool` 与 `ToolResult`
 
 ```python
 from dataclasses import dataclass
@@ -436,7 +491,7 @@ class ToolResult:
     elapsed_ms: int = 0
 ```
 
-### 3.11 `BudgetLedger`：双类预算记账
+### 3.13 `BudgetLedger`：双类预算记账
 
 **业务含义**：分别跟踪 Token 级运行预算和现实财务支付预算。MVP 主要实现 Token 预算，但接口要预留支付预算。
 
@@ -460,7 +515,7 @@ class BudgetCost:
 - 把预算检查与 R2 判定解耦：R2 在判定前咨询 BudgetLedger；
 - `check_and_reserve` 先冻结预算，执行成功后再 `commit`，失败则 `refund`。
 
-### 3.12 `R0Delegate` 与 `ApprovalRecord`
+### 3.14 `R0Delegate` 与 `ApprovalRecord`
 
 **业务含义**：R0-delegate 是 R0 授权的人类审批人。MVP 不打真实 UI，只保留最小接口和配置化实现。
 
@@ -524,7 +579,7 @@ class ConfigR0Delegate:
 
 **安全说明**：审批人不能与任务发起者为同一人，也不能是被审批动作的执行 Agent。MVP 至少检查 `approver_id != requester_id`。
 
-### 3.13 `AuditEvent`：R3 的最小日志单元
+### 3.15 `AuditEvent`：R3 的最小日志单元
 
 **业务含义**：R3 异步、只读地采集 R1/R2/R0-delegate 的行为记录。注意 R3 不记录原始敏感参数，而是记录哈希或掩码后的版本。
 
@@ -718,6 +773,7 @@ loop-controller/
 │   ├── checkpoint.py             # R2 Checkpoint：evaluate + forward
 │   ├── policy_engine.py          # PolicyEngine / OPAPolicyEngine
 │   ├── permission_interaction.py # PermissionInteractionAnalyzer 接口与静态实现
+│   ├── risk_state.py             # RiskStateManager：MVP 打桩，未来跨 turn 风险画像
 │   ├── mcp_gateway.py            # MCPGateway：工具列表过滤 + 授权转发
 │   ├── budget.py                 # BudgetCost / BudgetLedger
 │   ├── r0_delegate.py            # R0-delegate 接口与打桩实现
@@ -737,21 +793,24 @@ loop-controller/
 
 ## 7. 关键设计决策与原因
 
-| 决策                           | 结论                                                                     | 原因                         | 未来可能的改进                              |
-| ---------------------------- | ---------------------------------------------------------------------- | -------------------------- | ------------------------------------ |
-| R1 不直接调用工具                   | R1 只生成 `ActionProposal`，R2 转发                                          | 防止 Agent 绕过策略；与 MCP 网关模式一致 | 未来可在沙箱内让 R1 执行只读工具，但仍需 R2 授权         |
-| R1 轻量分类器                    | R1 内规则版 `LightweightClassifier`，输出 `RiskSignal`，不决定执行                 | 符合 R1/R2 不用大模型要求；保留接口未来可替换小模型 | 未来替换为专用小模型，提升风险识别精度                |
-| ActionProposal 预留 `type` 字段 | 区分 `tool_call` 与 `inter_agent`；MVP 只处理 `tool_call`                         | 结构预留多 Agent 委托治理；MVP 不扩大范围 | 未来 R2 增加 `inter_agent` 治理分支                  |
-| MVP 单 Agent 模式                | 研究助手由一个 Agent 完成全部步骤，不实现子任务委托治理                                 | 降低 MVP 复杂度；先验证 R0-R3 工具调用闭环 | 未来扩展多 Agent 协作与委托链治理                    |
-| OPA HTTP sidecar             | MVP 用本地 OPA 进程 + HTTP 查询                                               | 标准、调试方便、Python 无成熟 Rego 库  | 未来可替换为 Go SDK、WASM 或自研字节码 VM         |
-| CapabilityProfile 与 Agent 分离 | Agent 通过 `profile_id` 关联 Profile                                       | 一个岗位多个 Agent 实例；策略独立演进     | 未来支持多 Profile 动态切换                   |
-| Decision 四态 + 有效期 + 单次使用     | allow/deny/modify/require\_approval，带 `expires_at` 和 `max_uses=1`      | 防止重放和长期滥用                  | 未来可增加 `defer`（异步等待外部条件）和 token 签名    |
-| R0-delegate 打桩               | MVP 用 config 文件指定固定审批人                                                 | 先跑通 R0-R3 闭环，不阻塞在 UI/通知    | 未来接入真实审批 UI、IM、邮件通知                  |
-| MCP Gateway 在 R2 内部          | R2 同时是 PDP 和 PEP                                                       | MVP 简化部署；避免组件过多            | 未来可把 PEP 拆分为独立 MCP Client Proxy      |
-| Audit 只记录哈希+掩码               | 平衡可追溯与隐私                                                               | 合规要求；防止审计日志本身成为泄露源         | 未来支持分级审计，R0 可查看完整日志；SHA-256 升级为 HMAC |
-| 规范化工具名                       | Loop Controller 内部用 `read_file`/`write_file`/`web_search`/`send_email` | 屏蔽不同 MCP server 的实现差异      | 未来通过 Tool Registry 做更灵活的映射           |
-| Permission Interaction 静态规则表 | MVP 用 YAML 规则 + 简单匹配                                                   | 先覆盖常见高危组合                  | 未来替换为图分析或能力集合代数                      |
-| Budget 独立 Ledger             | R2 判定前咨询 BudgetLedger                                                  | 解耦预算逻辑与策略逻辑                | 未来支持多币种、按任务/按 Agent 多维度预算            |
+| 决策                           | 结论                                                                     | 原因                            | 未来可能的改进                              |
+| ---------------------------- | ---------------------------------------------------------------------- | ----------------------------- | ------------------------------------ |
+| R1 不直接调用工具                   | R1 只生成 `ActionProposal`，R2 转发                                          | 防止 Agent 绕过策略；与 MCP 网关模式一致    | 未来可在沙箱内让 R1 执行只读工具，但仍需 R2 授权         |
+| R1 轻量分类器 vs R2 决策边界      | 轻量分类器在 R1，只输出 `RiskSignal`；R2 是唯一权威决策点，输出 `Decision`        | 符合内控隐喻：R1 是业务部门自检，R2 是风控部门终审 | 未来 R1 分类器可升级为小模型，R2 增加风险状态管理器    |
+| R1/R2 实时路径避免依赖 LLM        | 实时判定以规则/Rego/小模型为主；复杂推理放在 R3 异步审计                         | LLM 实时判定延迟高、不稳定、可被 prompt injection 绕过 | R2 未来可增加专用小模型做语义风险编码，但仍需确定性兜底 |
+| R2 风险状态管理                   | MVP 用 `RiskStateManager` 打桩，不跨 turn 累积风险                              | 先跑通单动作判定闭环                     | 未来引入 STM/LTM 式风险画像，支撑多步权限组合分析        |
+| 参考 SafeAgent 但不照搬            | SafeAgent 把分类器、策略、改写、记忆合并为一个 monolithic 安全核心；我们按 R0-R3 分层 | 便于独立升级、审计清晰、符合企业内控职责分离   | 未来 R2 内部子系统可借鉴其风险编码和改写生成思想        |
+| ActionProposal 预留 `type` 字段  | 区分 `tool_call` 与 `inter_agent`；MVP 只处理 `tool_call`                     | 结构预留多 Agent 委托治理；MVP 不扩大范围    | 未来 R2 增加 `inter_agent` 治理分支          |
+| MVP 单 Agent 模式               | 研究助手由一个 Agent 完成全部步骤，不实现子任务委托治理                                        | 降低 MVP 复杂度；先验证 R0-R3 工具调用闭环   | 未来扩展多 Agent 协作与委托链治理                 |
+| OPA HTTP sidecar             | MVP 用本地 OPA 进程 + HTTP 查询                                               | 标准、调试方便、Python 无成熟 Rego 库     | 未来可替换为 Go SDK、WASM 或自研字节码 VM         |
+| CapabilityProfile 与 Agent 分离 | Agent 通过 `profile_id` 关联 Profile                                       | 一个岗位多个 Agent 实例；策略独立演进        | 未来支持多 Profile 动态切换                   |
+| Decision 四态 + 有效期 + 单次使用     | allow/deny/modify/require\_approval，带 `expires_at` 和 `max_uses=1`      | 防止重放和长期滥用                     | 未来可增加 `defer`（异步等待外部条件）和 token 签名    |
+| R0-delegate 打桩               | MVP 用 config 文件指定固定审批人                                                 | 先跑通 R0-R3 闭环，不阻塞在 UI/通知       | 未来接入真实审批 UI、IM、邮件通知                  |
+| MCP Gateway 在 R2 内部          | R2 同时是 PDP 和 PEP                                                       | MVP 简化部署；避免组件过多               | 未来可把 PEP 拆分为独立 MCP Client Proxy      |
+| Audit 只记录哈希+掩码               | 平衡可追溯与隐私                                                               | 合规要求；防止审计日志本身成为泄露源            | 未来支持分级审计，R0 可查看完整日志；SHA-256 升级为 HMAC |
+| 规范化工具名                       | Loop Controller 内部用 `read_file`/`write_file`/`web_search`/`send_email` | 屏蔽不同 MCP server 的实现差异         | 未来通过 Tool Registry 做更灵活的映射           |
+| Permission Interaction 静态规则表 | MVP 用 YAML 规则 + 简单匹配                                                   | 先覆盖常见高危组合                     | 未来替换为图分析或能力集合代数                      |
+| Budget 独立 Ledger             | R2 判定前咨询 BudgetLedger                                                  | 解耦预算逻辑与策略逻辑                   | 未来支持多币种、按任务/按 Agent 多维度预算            |
 
 ***
 
@@ -774,9 +833,458 @@ loop-controller/
 - [overview.md](./overview.md)：架构概览与核心抽象候选
 - [../research/内控最小岗位结构抽象\_v0.1.md](../research/内控最小岗位结构抽象_v0.1.md)：企业内控角色抽象的理论来源
 - [../research/03\_runtime\_governance\_landscape.md](../research/03_runtime_governance_landscape.md)：Zenity/Palo Alto/OPA 竞对调研
+- [SafeAgent Core](https://github.com/SafeAgent-Development/safeagent_core)：monolithic 安全核心参考，把风险编码、策略、改写、记忆合并为一个 runtime
+- [SafeAgent Paper](https://arxiv.org/abs/2604.17562)：SafeAgent 论文，提出 context-aware advanced machine intelligence 安全架构
+- [AgentGuard MCP](https://github.com/Blackfrost-AI/agentguard-mcp)：MCP 网关层治理参考，工具级 allowlist/denylist + 审计链
+- [Vellaveto](https://github.com/paolovella/vellaveto)：side-effecting 决策边界与审计链参考
+- [Governed MCP](https://arxiv.org/pdf/2604.16870v1)：内核级 MCP 治理，强调 tool call 是 agent 的 syscall，必须不可绕过
 - [Open Policy Agent 集成文档](https://www.openpolicyagent.org/docs/latest/integration/)：OPA REST API / sidecar / SDK 模式
 - [OPA 1.0 / Rego v1 语法](https://www.openpolicyagent.org/docs/policy-reference/keywords/import/)：`import rego.v1` 与 future keywords
 - [MCP 规范 - 架构](https://modelcontextprotocol.io/specification/)：Host-Client-Server 模型
 - [MCP Filesystem Server](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem)：官方文件系统工具名
 - [OpenAI Agents SDK - Running agents](https://developers.openai.com/api/docs/guides/agents/running-agents)：Agent loop 设计参考
+
+***
+
+## 10. 轻量分类器（R1）与决策引擎（R2）：Python 接口草案
+
+> 本节为组员实现时可直接参考的接口定义。MVP 阶段优先保证接口稳定，具体实现可逐步替换。
+
+### 10.1 设计约定
+
+- 所有实时路径（R1 自检、R2 判定、R2 转发）**优先使用规则、Rego、小模型**，避免依赖通用 LLM 做最终判定；
+- 通用 LLM 可用于 **R3 异步审计分析**、Agent 规划、用户交互等非实时路径；
+- R1 的 `LightweightClassifier` **只输出风险信号**，不输出 `allow/deny` 等决策；
+- R2 的 `Checkpoint` **是唯一的权威决策点**，输出 `Decision`；
+- R2 的 `RiskStateManager` MVP 阶段打桩，接口已预留跨 turn 风险状态。
+
+### 10.2 完整接口草案
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Literal, Protocol
+from uuid import uuid4
+
+
+# ===================== R1 与 R2 共享的数据结构 =====================
+
+@dataclass(frozen=True)
+class Task:
+    task_id: str
+    user_id: str                    # original_principal
+    session_id: str
+    description: str
+    created_at: datetime = field(default_factory=lambda: datetime.utcnow())
+
+
+@dataclass(frozen=True)
+class Agent:
+    agent_id: str
+    name: str
+    profile_id: str
+    owner_id: str
+
+
+@dataclass(frozen=True)
+class ToolPermission:
+    tool_name: str
+    allowed: bool = False
+    allowed_args: dict[str, list[str]] | None = None
+    denied_args: dict[str, list[str]] | None = None
+    require_approval: bool = False
+    max_calls_per_task: int | None = None
+
+
+@dataclass(frozen=True)
+class CapabilityProfile:
+    profile_id: str
+    agent_id: str | None = None
+    allowed_tools: list[str] = field(default_factory=list)
+    tool_permissions: dict[str, ToolPermission] = field(default_factory=dict)
+    denied_args: dict[str, list[str]] = field(default_factory=dict)
+    max_budget_token: int = 0
+    max_budget_payment: float = 0.0
+    fixed_ceiling: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ActionProposal:
+    task_id: str
+    call_id: str
+    agent_id: str
+    type: Literal["tool_call", "inter_agent"] = "tool_call"   # MVP 只处理 tool_call
+    tool_name: str
+    arguments: dict[str, Any]
+    task_context: str
+    risk_level: Literal["low", "medium", "high", "critical"] = "low"
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class RiskSignal:
+    risk_level: Literal["low", "medium", "high", "critical"]
+    tags: list[str] = field(default_factory=list)
+    reason: str = ""
+    suggestion: str | None = None
+
+
+@dataclass(frozen=True)
+class Decision:
+    decision_id: str
+    call_id: str
+    task_id: str
+    verdict: Literal["allow", "deny", "modify", "require_approval"]
+    modified_args: dict[str, Any] | None = None
+    reason: str
+    expires_at: datetime
+    max_uses: int = 1
+    escalation_target: str | None = None
+
+
+@dataclass(frozen=True)
+class Tool:
+    canonical_name: str
+    mcp_name: str
+    description: str
+    input_schema: dict
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    call_id: str
+    task_id: str
+    tool_name: str
+    status: Literal["success", "error", "blocked"]
+    content: Any
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class BudgetCost:
+    token_count: int = 0
+    estimated_payment: float = 0.0
+
+
+@dataclass(frozen=True)
+class RiskProfile:
+    session_id: str
+    cumulative_risk_score: float = 0.0
+    recent_tags: list[str] = field(default_factory=list)
+    denied_count: int = 0
+    approval_count: int = 0
+
+
+@dataclass(frozen=True)
+class ApprovalRequest:
+    decision_id: str
+    call_id: str
+    task_id: str
+    agent_id: str
+    tool_name: str
+    arguments_summary: str
+    reason: str
+    requester_id: str
+    requested_at: datetime
+
+
+@dataclass(frozen=True)
+class ApprovalRecord:
+    approval_id: str
+    decision_id: str
+    approver_id: str
+    approved: bool
+    reason: str
+    responded_at: datetime
+
+
+@dataclass(frozen=True)
+class AuditEvent:
+    event_id: str
+    trace_id: str
+    timestamp: datetime
+    actor_type: Literal["agent", "user", "r0_delegate", "system", "checkpoint"]
+    actor_id: str
+    action: Literal[
+        "task_start", "task_end", "propose", "classify", "evaluate",
+        "execute", "approve", "deny", "modify", "require_approval",
+        "escalate", "audit_report",
+    ]
+    target: str
+    args_hash: str | None = None
+    args_mask: dict[str, str] | None = None
+    decision: str | None = None
+    reason: str | None = None
+    session_id: str | None = None
+    schema_version: str = "1.0"
+    policy_version: str | None = None
+    profile_version: str | None = None
+    parent_event_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+# ===================== R1 轻量分类器 =====================
+
+class LightweightClassifier(Protocol):
+    """R1 执行层内的轻量分类器。
+
+    只输出风险信号，不决定动作是否执行。
+    MVP 用规则实现；未来可替换为专用小模型或更复杂编码器。
+    """
+
+    def classify(
+        self,
+        task: Task,
+        agent: Agent,
+        proposal: ActionProposal,
+        profile: CapabilityProfile,
+    ) -> RiskSignal: ...
+
+
+class RuleBasedClassifier:
+    """MVP 规则版轻量分类器。"""
+
+    def classify(
+        self,
+        task: Task,
+        agent: Agent,
+        proposal: ActionProposal,
+        profile: CapabilityProfile,
+    ) -> RiskSignal:
+        if proposal.tool_name == "send_email":
+            return RiskSignal(
+                risk_level="high",
+                tags=["external_communication"],
+                reason="send_email 涉及外部通信",
+                suggestion="请确认收件人白名单",
+            )
+        if proposal.tool_name == "read_file":
+            return RiskSignal(
+                risk_level="medium",
+                tags=["data_access"],
+                reason="读取本地文件",
+            )
+        return RiskSignal(
+            risk_level="low",
+            tags=[],
+            reason="常规操作",
+        )
+
+
+# ===================== R2 决策引擎组件 =====================
+
+class PolicyEngine(Protocol):
+    """OPA/Rego 封装。"""
+
+    def load_policy(self, path: str) -> None: ...
+
+    def evaluate(self, package: str, input_doc: dict[str, Any]) -> dict[str, Any]: ...
+
+
+class PermissionInteractionAnalyzer(Protocol):
+    """检测多个独立权限/工具组合后的新能力。MVP 静态规则。"""
+
+    def check(
+        self,
+        current_proposal: ActionProposal,
+        history: list[ActionProposal],
+    ) -> RiskSignal | None: ...
+
+
+class BudgetLedger(Protocol):
+    def check_and_reserve(self, proposal: ActionProposal, cost: BudgetCost) -> bool: ...
+    def commit(self, proposal: ActionProposal, cost: BudgetCost) -> None: ...
+    def refund(self, proposal: ActionProposal, cost: BudgetCost) -> None: ...
+
+
+class RiskStateManager(Protocol):
+    """R2 跨动作风险状态。MVP 打桩。"""
+
+    def get_session_risk(self, session_id: str) -> RiskProfile: ...
+
+    def update_after_decision(
+        self,
+        session_id: str,
+        proposal: ActionProposal,
+        decision: Decision,
+    ) -> None: ...
+
+
+class R0Delegate(Protocol):
+    """R0 授权的人类审批人。MVP 用配置化固定审批人打桩。"""
+
+    async def request_approval(self, request: ApprovalRequest) -> ApprovalRecord: ...
+
+    async def get_decision(self, approval_id: str) -> ApprovalRecord | None: ...
+
+
+class MCPGateway(Protocol):
+    """R2 的 MCP Client 代理。"""
+
+    async def list_tools(self, profile: CapabilityProfile) -> list[Tool]: ...
+
+    async def call_tool(self, tool_name: str, arguments: dict, call_id: str) -> ToolResult: ...
+
+
+class AuditLogger(Protocol):
+    """R3 审计日志。"""
+
+    async def log(self, event: AuditEvent) -> None: ...
+
+
+# ===================== R2 统一入口：Checkpoint =====================
+
+class Checkpoint:
+    """R2 的统一入口。MVP 内同时承担 PDP 和 PEP 角色。"""
+
+    def __init__(
+        self,
+        policy_engine: PolicyEngine,
+        profile_store: dict[str, CapabilityProfile],
+        permission_interaction: PermissionInteractionAnalyzer,
+        budget_ledger: BudgetLedger,
+        risk_state_manager: RiskStateManager,
+        r0_delegate: R0Delegate,
+        mcp_gateway: MCPGateway,
+        audit_logger: AuditLogger,
+    ) -> None:
+        self.policy_engine = policy_engine
+        self.profile_store = profile_store
+        self.permission_interaction = permission_interaction
+        self.budget_ledger = budget_ledger
+        self.risk_state_manager = risk_state_manager
+        self.r0_delegate = r0_delegate
+        self.mcp_gateway = mcp_gateway
+        self.audit_logger = audit_logger
+        self._used_decisions: set[str] = set()
+
+    async def evaluate(
+        self,
+        task: Task,
+        agent: Agent,
+        proposal: ActionProposal,
+    ) -> Decision:
+        # 1. 基础校验
+        profile = self.profile_store.get(agent.profile_id)
+        if profile is None:
+            return self._deny(proposal, "Agent profile not found")
+
+        # 2. 预算检查（预留）
+        cost = BudgetCost(token_count=1)  # 简化示例
+        if not self.budget_ledger.check_and_reserve(proposal, cost):
+            return self._deny(proposal, "Budget exceeded")
+
+        # 3. 权限组合分析（MVP 静态规则）
+        # history 从 RiskStateManager 或审计日志中获取，MVP 可传空列表
+        interaction_risk = self.permission_interaction.check(proposal, [])
+        if interaction_risk and interaction_risk.risk_level in ("high", "critical"):
+            return self._deny(proposal, interaction_risk.reason)
+
+        # 4. 查询 OPA / Rego 主策略
+        input_doc = {
+            "proposal": {
+                "task_id": proposal.task_id,
+                "call_id": proposal.call_id,
+                "agent_id": proposal.agent_id,
+                "tool_name": proposal.tool_name,
+                "arguments": proposal.arguments,
+                "risk_level": proposal.risk_level,
+            },
+            "profile": {
+                "allowed_tools": profile.allowed_tools,
+                "denied_args": profile.denied_args,
+            },
+        }
+        policy_result = self.policy_engine.evaluate(
+            "loop_controller.tool_permission",
+            input_doc,
+        )
+        verdict = policy_result.get("verdict", "deny")
+        reason = policy_result.get("reason", "Policy default deny")
+        modified_args = policy_result.get("modified_args")
+
+        if verdict == "require_approval":
+            return Decision(
+                decision_id=str(uuid4()),
+                call_id=proposal.call_id,
+                task_id=proposal.task_id,
+                verdict="require_approval",
+                reason=reason,
+                expires_at=datetime.utcnow() + timedelta(minutes=15),
+                max_uses=1,
+                escalation_target="r0_delegate_default",
+            )
+
+        if verdict in ("allow", "modify"):
+            return Decision(
+                decision_id=str(uuid4()),
+                call_id=proposal.call_id,
+                task_id=proposal.task_id,
+                verdict=verdict,  # type: ignore[arg-type]
+                modified_args=modified_args,
+                reason=reason,
+                expires_at=datetime.utcnow() + timedelta(minutes=5),
+                max_uses=1,
+            )
+
+        return self._deny(proposal, reason)
+
+    async def forward(
+        self,
+        proposal: ActionProposal,
+        decision: Decision,
+    ) -> ToolResult:
+        # 1. 校验 Decision 有效性
+        if decision.call_id != proposal.call_id:
+            raise ValueError("Decision call_id mismatch")
+        if datetime.utcnow() > decision.expires_at:
+            raise ValueError("Decision expired")
+        if decision.decision_id in self._used_decisions:
+            raise ValueError("Decision already used")
+        if decision.verdict not in ("allow", "modify"):
+            raise ValueError(f"Cannot forward decision with verdict {decision.verdict}")
+
+        self._used_decisions.add(decision.decision_id)
+
+        # 2. 使用 modify 后的参数
+        arguments = decision.modified_args if decision.verdict == "modify" else proposal.arguments
+
+        # 3. 通过 MCP Gateway 转发（R2 是唯一授权出口）
+        return await self.mcp_gateway.call_tool(
+            proposal.tool_name,
+            arguments,
+            proposal.call_id,
+        )
+
+    def _deny(self, proposal: ActionProposal, reason: str) -> Decision:
+        return Decision(
+            decision_id=str(uuid4()),
+            call_id=proposal.call_id,
+            task_id=proposal.task_id,
+            verdict="deny",
+            reason=reason,
+            expires_at=datetime.utcnow(),
+            max_uses=0,
+        )
+
+
+# ===================== 为什么实时路径避免 LLM =====================
+
+# 1. 延迟：LLM 调用通常 100ms-数秒，实时工具调用会明显卡顿。
+# 2. 稳定性：LLM 输出不稳定，同一个 ActionProposal 可能得到不同判定。
+# 3. 可审计性：LLM 决策难以解释，企业风控要求可解释的规则。
+# 4. 安全：LLM 本身可能被 prompt injection 影响，不能作为最终决策边界。
+# 5. 测试：确定性规则更容易做自动化测试和回归。
+```
+
+### 10.3 关键边界再强调
+
+- **R1 的 `LightweightClassifier`**：只输出 `RiskSignal`，用于填充 `ActionProposal.risk_level` 和 `reason`，帮助 R2 快速命中规则；
+- **R2 的 `Checkpoint.evaluate`**：唯一输出 `Decision` 的地方；所有策略、预算、权限组合、审批逻辑都在这里收敛；
+- **R2 的 `Checkpoint.forward`**：唯一真正调用外部工具的地方；校验 Decision 后才通过 `MCPGateway` 发出；
+- **R3 的 `AuditLogger`**：异步记录；MVP 用 JSONL/SQLite，未来可升级不可篡改存储；
+- **通用 LLM**：只用于 R1 的规划（非治理）、R3 的审计分析、用户交互，不用于 R2 的实时判定。
+
+***
 
