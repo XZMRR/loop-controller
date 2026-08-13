@@ -1,8 +1,8 @@
 # Loop Controller — 面向企业内控的 Agent 运行框架
 
-> **项目阶段**：前期调研与架构设计已完成，进入核心抽象设计阶段  
-> **当前目标**：用 R0-R3 治理模型定义 Loop Controller 的核心架构，准备 MVP 设计  
-> **首选语言**：Python（Agent 生态最丰富，社区传播友好）  
+> **项目阶段**：核心抽象与 R2 运行时已实现，进入 MVP 集成阶段
+> **当前目标**：实现 Policy（Rego/OPA）与真实 MCP Server 接入，完成可运行的"制度化研究 Agent"
+> **首选语言**：Python（Agent 生态最丰富，社区传播友好）
 > **文档语言**：中文为主，代码与核心 API 文档以英文为主，便于国际化开源
 
 ---
@@ -97,7 +97,54 @@ tests/legacy/security_experiments/  # 现有 Agent 安全手段测试（已归�
 
 ---
 
-## 5. 当前阶段与路线图
+## 5. 快速开始
+
+### 环境要求
+
+- Python >= 3.13
+- Git
+
+### 运行单元测试
+
+```powershell
+# 安装 pytest（如果尚未安装）
+pip install pytest
+
+# 运行全部新测试（tests/legacy 已被 pytest 配置忽略）
+python -m pytest tests -v
+```
+
+当前已通过 17 个单元测试，覆盖：
+- `RuleBasedClassifier`（R1 轻量分类器）
+- `MockPolicyEngine`（R2 策略引擎打桩）
+- `Checkpoint`（R2 判定、转发、审批、重放保护、审计）
+
+### 运行端到端示例
+
+```powershell
+# 设置 PYTHONPATH 指向 src/
+$env:PYTHONPATH = "src"
+python examples/research_assistant_example.py
+```
+
+示例会模拟一个完整的研究助手任务：
+1. 读取内部合规检查清单；
+2. 搜索公开资料；
+3. 写入本地摘要文件；
+4. 发送邮件给张经理。
+
+每个动作都会经过 **R1 风险分类 → R2 策略判定 → R2 代理转发执行 → R3 审计日志** 的完整闭环。当前使用的是 Mock MCP Gateway，不会真实发送邮件或访问网络。
+
+### 项目入口
+
+- 核心代码：`src/loop_controller/`
+- 接口设计：`docs/architecture/05_mvp_core_abstractions.md`
+- 端到端示例：`examples/research_assistant_example.py`
+- 单元测试：`tests/test_*.py`
+
+---
+
+## 6. 当前阶段与路线图
 
 ### Phase 0：前期调研（已完成）
 
@@ -108,21 +155,20 @@ tests/legacy/security_experiments/  # 现有 Agent 安全手段测试（已归�
 - [x] 完成 T1 Guardrail 测试 + T3 MCP 权限边界测试
 - [x] 输出 R0-R3 架构初稿
 
-### Phase 1：核心抽象设计（进行中）
+### Phase 1：核心抽象设计（已完成）
 
-- [ ] 根据讨论反馈收敛 R0-R3 架构
-- [ ] 设计核心抽象：Agent、CapabilityProfile、Task、Loop、Checkpoint、Policy、AuditRecord
-- [ ] 输出核心 API 接口草案
-- [ ] 绘制 Loop 控制器状态机图
-- [ ] 确定 Policy 表达形式（Python / YAML / JSON / DSL）
+- [x] 根据讨论反馈收敛 R0-R3 架构
+- [x] 设计核心抽象：Agent、CapabilityProfile、Task、ActionProposal、Checkpoint、Policy、AuditEvent
+- [x] 输出核心 API 接口草案
+- [x] 明确 R1 轻量分类器与 R2 决策引擎边界
 
-### Phase 2：最小可行原型（MVP）
+### Phase 2：最小可行原型（MVP，进行中）
 
-- [ ] 实现一个最小化的 Loop 运行时
-- [ ] 集成至少一个 LLM Provider
-- [ ] 支持基础的工具调用与权限控制
+- [x] 实现一个最小化的 Loop 运行时
+- [ ] 接入 OPA/Rego 真实策略引擎
+- [ ] 接入真实 MCP Server（filesystem + mock email）
 - [ ] 输出可审计的执行 Trace
-- [ ] 目标场景："制度化的研究 Agent"
+- [x] 目标场景："制度化的研究 Agent"（示例已跑通 Mock 链路）
 
 ### Phase 3：迭代完善与开源规范
 
@@ -132,7 +178,7 @@ tests/legacy/security_experiments/  # 现有 Agent 安全手段测试（已归�
 
 ---
 
-## 6. 关键证据
+## 7. 关键证据
 
 - **T1 测试**：LLM 判定型 Guardrail 对信息提取型注入的拦截率在 20%-60% 之间波动，且多次触发 API 速率限制；无 Guardrail 时 Agent 100% 泄露敏感信息。
 - **T3 测试**：MCP 协议的 OAuth 2.1 授权为 OPTIONAL 且主要覆盖传输层，缺少工具级权限表达；Client Policy Gateway 是可行且必要的补充层。
@@ -142,9 +188,9 @@ tests/legacy/security_experiments/  # 现有 Agent 安全手段测试（已归�
 
 ---
 
-## 7. 贡献与联系
+## 8. 贡献与联系
 
-本项目目前处于早期调研与架构设计阶段，欢迎任何形式的反馈、建议和贡献。
+本项目目前进入 MVP 实现阶段，欢迎任何形式的反馈、建议和贡献。
 
 - 如果你对企业内控有经验，请帮助我们验证 R0-R3 映射模型的合理性；
 - 如果你有 Agent 框架的开发经验，请帮助我们评估技术路线的可行性；
@@ -152,6 +198,6 @@ tests/legacy/security_experiments/  # 现有 Agent 安全手段测试（已归�
 
 ---
 
-## 8. 许可证
+## 9. 许可证
 
-待定（建议选择 Apache-2.0 或 MIT，以符合开源社区规范）。
+Apache-2.0，详见 [LICENSE](./LICENSE)。
