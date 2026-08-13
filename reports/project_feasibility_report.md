@@ -121,7 +121,7 @@ Loop Controller 的核心隐喻是：**把 Agent 当作数字员工来管理**�
 
 ### 4.2 实测验证的关键缺口
 
-通过 `tests/security_experiments/` 的测试，验证了上述缺口：
+通过 `tests/legacy/security_experiments/` 的测试，验证了上述缺口：
 
 1. **R1 自控不可靠**：kimi-k2.5 在系统提示明确约束下仍会泄露邮箱、手机号、项目代号、账号密码（T1.4c）。
 2. **R2 标准分散且不稳定**：输入/输出 Guardrail 对信息提取型攻击防御能力弱，同一份脚本不同时间跑出不同结果（T1.1、T1.2）。

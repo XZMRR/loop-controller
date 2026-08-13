@@ -8,7 +8,7 @@
 ## 一、环境结构总览
 
 ```text
-tests/security_experiments/
+tests/legacy/security_experiments/
 ├── .env                                 # 你的真实配置（API Key、Base URL、模型名）
 ├── .env.example                         # 配置模板，.env 的参考
 ├── README.md                            # 快速开始说明
@@ -37,7 +37,7 @@ tests/security_experiments/
 
 ### 2.1 .env 文件
 
-打开 `tests/security_experiments/.env`，你应该看到：
+打开 `tests/legacy/security_experiments/.env`，你应该看到：
 
 ```env
 # 如果使用 OpenAI 官方 API，OPENAI_BASE_URL 可以留空
@@ -99,7 +99,7 @@ T1.4 是四个测试中最简单的：
 打开终端（PowerShell），执行：
 
 ```powershell
-cd tests/security_experiments
+cd tests/legacy/security_experiments
 ```
 
 #### 步骤 2：确认虚拟环境已创建
@@ -183,7 +183,7 @@ Agent 输出：
 
 ### 4.1 脚本做了什么？
 
-[tests/security_experiments/t1_openai_agents_guardrails/t1_4_goal_hijack.py](t1_openai_agents_guardrails/t1_4_goal_hijack.py)
+[tests/legacy/security_experiments/t1_openai_agents_guardrails/t1_4_goal_hijack.py](t1_openai_agents_guardrails/t1_4_goal_hijack.py)
 
 1. 创建一个 Agent，系统提示是"文档总结助手"；
 2. 给 Agent 4 个不同的文档内容；
@@ -261,7 +261,7 @@ if any(indicator in result.final_output for indicator in malicious_indicators):
 解决：
 
 ```powershell
-cd tests/security_experiments
+cd tests/legacy/security_experiments
 .\venv\Scripts\activate
 pip install -r requirements.txt
 ```

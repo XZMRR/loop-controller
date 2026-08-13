@@ -22,7 +22,7 @@ OpenAI Agents SDK 是一个 Python 库，Guardrail 是运行在你本地 Python 
 ### 1. 创建虚拟环境
 
 ```bash
-cd tests/security_experiments
+cd tests/legacy/security_experiments
 python -m venv venv
 
 # Windows

@@ -6,8 +6,8 @@
 >
 > **关联文档**：
 > - [reports/test_conclusion_report.md](./test_conclusion_report.md)
-> - [tests/security_experiments/test_results.md](../tests/security_experiments/test_results.md)
-> - [tests/security_experiments/t1_openai_agents_guardrails/t1_batch_reproducibility_test.py](../tests/security_experiments/t1_openai_agents_guardrails/t1_batch_reproducibility_test.py)
+> - [tests/legacy/security_experiments/test_results.md](../tests/legacy/security_experiments/test_results.md)
+> - [tests/legacy/security_experiments/t1_openai_agents_guardrails/t1_batch_reproducibility_test.py](../tests/legacy/security_experiments/t1_openai_agents_guardrails/t1_batch_reproducibility_test.py)
 
 ---
 
@@ -30,8 +30,8 @@
 | openai | 2.53.0 |
 | 模型 | kimi-k2.5 |
 | API 端点 | Moonshot Kimi OpenAI 兼容 API (`https://api.moonshot.cn/v1`) |
-| 测试脚本 | `tests/security_experiments/t1_openai_agents_guardrails/t1_batch_reproducibility_test.py` |
-| 原始结果文件 | `tests/security_experiments/t1_openai_agents_guardrails/results/t1_batch_reproducibility_results_*.json` |
+| 测试脚本 | `tests/legacy/security_experiments/t1_openai_agents_guardrails/t1_batch_reproducibility_test.py` |
+| 原始结果文件 | `tests/legacy/security_experiments/t1_openai_agents_guardrails/results/t1_batch_reproducibility_results_*.json` |
 
 ---
 
@@ -130,9 +130,9 @@ Agent 配置：
 ## 六、测试结果
 
 > 本表由批量测试脚本自动生成，对应结果文件：
-> - `tests/security_experiments/t1_openai_agents_guardrails/results/t1_4c_batch_reproducibility_results_20260805_095721.json`（T1.4c，N=10）
-> - `tests/security_experiments/t1_openai_agents_guardrails/results/t1_batch_reproducibility_results_20260805_085512.json`（T1.1/T1.2，N=2）
-> - `tests/security_experiments/t1_openai_agents_guardrails/results/t1_batch_reproducibility_results_20260805_093711.json`（T1.1/T1.2/T1.4c，N=3）
+> - `tests/legacy/security_experiments/t1_openai_agents_guardrails/results/t1_4c_batch_reproducibility_results_20260805_095721.json`（T1.4c，N=10）
+> - `tests/legacy/security_experiments/t1_openai_agents_guardrails/results/t1_batch_reproducibility_results_20260805_085512.json`（T1.1/T1.2，N=2）
+> - `tests/legacy/security_experiments/t1_openai_agents_guardrails/results/t1_batch_reproducibility_results_20260805_093711.json`（T1.1/T1.2/T1.4c，N=3）
 
 | 测试套件 | 用例 | 运行次数 | 拦截次数 | 泄露次数 | 异常次数 | 拦截率 / 泄露率 |
 |---------|------|---------|---------|---------|---------|----------------|
@@ -164,7 +164,7 @@ Agent 配置：
 要复现本测试，请执行：
 
 ```powershell
-cd "tests/security_experiments/t1_openai_agents_guardrails"
+cd "tests/legacy/security_experiments/t1_openai_agents_guardrails"
 $env:T1_BATCH_N_RUNS="10"
 python t1_batch_reproducibility_test.py
 ```

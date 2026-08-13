@@ -139,7 +139,7 @@ Loop Controller 的立项假设是：**现有 Agent 治理方案缺少一个从�
 ## 参考文档
 
 - [reports/test\_methodology\_appendix.md](./test_methodology_appendix.md)
-- [tests/security\_experiments/test\_results.md](../tests/security_experiments/test_results.md)
+- [tests/legacy/security\_experiments/test\_results.md](../tests/legacy/security_experiments/test_results.md)
 - [reports/agent\_security\_test\_plan.md](./agent_security_test_plan.md)
 - [reports/agent\_security\_framework\_brief.md](./agent_security_framework_brief.md)
 - [docs/research/03\_runtime\_governance\_landscape.md](../docs/research/03_runtime_governance_landscape.md)

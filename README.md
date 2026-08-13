@@ -87,7 +87,7 @@ reports/               # 汇报与研究报告
 ├── agent_security_framework_brief.md  # Agent 安全框架现状
 └── agent_security_test_plan.md        # 测试计划
 
-tests/security_experiments/  # 现有 Agent 安全手段测试
+tests/legacy/security_experiments/  # 现有 Agent 安全手段测试（已归档）
 ├── README.md
 ├── TEST_GUIDE.md
 ├── test_results.md
