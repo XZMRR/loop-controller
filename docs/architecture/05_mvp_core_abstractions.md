@@ -635,6 +635,105 @@ class AuditEvent:
 - `args_mask` 是结构化掩码，保留字段名，隐藏字段值；
 - 所有时间戳使用 UTC，避免时区歧义。
 
+### 3.16 编排边界与 ID/状态管理
+
+> **本节回答两个问题**：Loop Controller 核心代码到底管到哪一层？用户应用/部署系统需要额外承担什么？
+
+#### 3.16.1 Loop Controller 的边界
+
+Loop Controller 提供的是 **R0-R3 治理原语**，不是完整的 Agent 应用框架。具体边界如下：
+
+| 层次 | Loop Controller 提供 | 外层系统（用户应用/部署平台）负责 |
+|---|---|---|
+| R1 | `ActionProposal` 结构、`RiskSignal` 接口 | Agent 规划器、大模型调用、对话记忆 |
+| R2 | `Checkpoint.evaluate/forward`、策略引擎接口、预算接口、风险状态接口 | 动作编排循环、状态持久化、真实 MCP Server 生命周期 |
+| R0 | `R0Delegate` 接口 | 审批 UI/IM/邮件、人类审批人权限管理 |
+| R3 | `AuditEvent` 结构、`AuditLogger` 接口 | 日志存储、检索、告警、合规报表 |
+
+**一句话**：Loop Controller 负责“每个动作能不能做”，不负责“为什么要做这个动作”以及“如何把多个动作串成一次完整服务”。
+
+#### 3.16.2 ID 分配职责矩阵
+
+MVP 示例为了跑通，ID 生成比较分散。真实工程化后应由以下系统统一维护：
+
+| ID | 当前 MVP 实现 | 未来工程应由谁维护 | 说明 |
+|---|---|---|---|
+| `task_id` | `ResearchAssistant` 示例用 `uuid4()` | 外层 **Task Orchestrator** | 用户一次请求 = 一个 Task |
+| `session_id` | 同上 | 外层 **用户会话系统** | 跨 Task 的风险状态、审计追踪都按 session 聚合 |
+| `agent_id` | 示例硬编码 | **Agent Registry / 部署系统** | 部署时分配，不可由 Agent 自声明 |
+| `profile_id` | 示例硬编码 | **策略管理员 / 权限平台** | 决定该 Agent 能做什么 |
+| `owner_id` | 示例硬编码 | **Agent Registry** | 用于审计、问责 |
+| `call_id` | `plan_actions()` 里生成 | **R1 Agent 规划器** | 每次动作提案一个唯一 call_id |
+| `decision_id` | `Checkpoint` 生成 | **R2 Checkpoint** | 每个 Decision 一个唯一 ID |
+| `event_id` | `JsonlAuditLogger` 生成 | **R3 AuditLogger** | 每个审计事件一个唯一 ID |
+| `trace_id` | 等于 `task_id` | **Task Orchestrator** | 用于把同一 Task 下所有事件串起来 |
+
+**当前状态**：MVP 示例里 `task_id`/`session_id`/`agent_id`/`profile_id` 都是硬编码或随意生成，没有注册中心。这**不影响 R2 治理逻辑验证**，但会影响多 Agent、多会话、生产部署。
+
+#### 3.16.3 运行时状态与持久化
+
+| 状态 | 当前 MVP 实现 | 持久化 | 未来工程项 |
+|---|---|---|---|
+| 预算 `BudgetLedger` | `InMemoryBudgetLedger` | ❌ 内存 | 替换为 Redis/DB，支持 session/agent/task 多维 |
+| 风险状态 `RiskStateManager` | `InMemoryRiskStateManager` | ❌ 内存 | 替换为 Redis/DB，支持长期风险画像 |
+| 已用 Decision | `Checkpoint._used_decisions` | ❌ 内存 | 替换为 `DecisionStore`，防止重放和故障恢复 |
+| CapabilityProfile | `profile_store` 字典 | ❌ 内存 | 从配置中心/DB 加载，支持版本管理 |
+| 审计日志 | `JsonlAuditLogger` | ✅ 文件 | 扩展为结构化日志、Kafka/S3、索引查询 |
+| 策略 | OPA 外部进程 | ✅ 文件/Bundle | 生产 OPA 集群、策略版本管理 |
+
+**关键点**：MVP 把治理状态放在内存，是为了“能跑通、能演示”。工程化时必须把预算、风险状态、Decision 使用记录持久化，否则进程重启后治理状态会丢失。
+
+#### 3.16.4 外层编排器流程（示意）
+
+Loop Controller 不实现这个编排器，但它依赖编排器按以下流程调用：
+
+```
+User Request
+    │
+    ▼
+[Task Orchestrator] 创建 Task(task_id, session_id, user_id, agent_id, description)
+    │
+    ▼
+[R1 Agent Planner] 根据 Task.description 生成 ActionProposal 列表
+    │ 每个 proposal 包含 call_id, tool_name, arguments, task_context
+    │
+    ▼
+[Loop Controller / R2 Checkpoint] 对每个 proposal 调用 evaluate()
+    │ 可能返回 allow / modify / require_approval / deny
+    │
+    ├─ deny → 记录审计，跳过或终止任务
+    ├─ require_approval → 调用 R0-delegate，等待审批结果
+    └─ allow/modify → 调用 Checkpoint.forward() 执行工具
+    │
+    ▼
+[Tool Result] 返回给 Agent，继续下一步规划或结束任务
+    │
+    ▼
+[R3 AuditLogger] 异步采集所有事件
+```
+
+当前示例 `ResearchAssistant` 是一个**硬编码的最小编排器**，只用于演示。它不等同于真实生产中的 Task Orchestrator。
+
+#### 3.16.5 当前已实现 vs 未来工程项
+
+| 能力 | 当前 MVP | 未来工程 | 优先级判断 |
+|---|---|---|---|
+| 动作级策略判定（R2） | ✅ 已实现 | 无需扩展 | 核心，已稳定 |
+| 审计日志（R3） | ✅ 已实现文件版 | 结构化存储、索引、告警 | 中 |
+| BudgetLedger 内存版 | ✅ 已实现 | 持久化、多维预算 | 中 |
+| RiskStateManager 内存版 | ✅ 已实现阈值拦截 | 持久化、长期风险画像 | 中 |
+| Agent Registry / ID 管理 | ❌ 未实现 | 部署系统分配 agent_id/profile_id | 高（影响生产安全） |
+| Task Orchestrator 抽象 | ❌ 未实现 | 接收用户请求、驱动 R1/R2 循环 | 视场景而定 |
+| 真实 MCP Server 接入 | ❌ 未实现 | filesystem / email 等真实工具 | 高（用于演示真实外发） |
+| R1 Agent 规划器 | ❌ 未实现（示例硬编码） | 基于 LLM 的规划 | 中（ governance 先稳） |
+| R0-delegate 真实 UI | ❌ 未实现（ConfigR0Delegate 打桩） | 审批 IM/邮件/控制台 | 低（MVP 打桩即可） |
+
+**关于 Task Orchestrator**：
+- 当前核心任务是**做出能展示 R0-R3 闭环的 MVP**，示例中的硬编码编排器已经足够；
+- 设计一个独立的 `TaskOrchestrator` 抽象会让架构更完整，但会引入新抽象和讨论成本；
+- 建议**先接入真实 MCP Server**，让示例真正读写文件/邮件，比先做抽象更有演示价值；
+- 当需要支持多 Agent 委托、长会话、故障恢复时，再把 Task Orchestrator 抽象成核心模块。
+
 ***
 
 ## 4. 一次任务的生命周期
