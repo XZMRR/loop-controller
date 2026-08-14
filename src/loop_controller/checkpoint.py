@@ -38,11 +38,13 @@ class CheckpointConfig:
         policy_package: OPA/Rego 包名。
         decision_ttl_seconds: allow/modify Decision 有效期（秒）。
         approval_ttl_seconds: require_approval Decision 有效期（秒）。
+        risk_denied_threshold: 同一 session 内连续被拒绝次数阈值，超过后自动拒绝。
     """
 
     policy_package: str = "loop_controller.tool_permission"
     decision_ttl_seconds: int = 300
     approval_ttl_seconds: int = 900
+    risk_denied_threshold: int = 3
 
 
 class Checkpoint:
@@ -86,6 +88,7 @@ class Checkpoint:
         self.audit_logger = audit_logger
         self.config = config or CheckpointConfig()
         self._used_decisions: set[str] = set()
+        self._budget_costs: dict[str, BudgetCost] = {}
 
     def evaluate(
         self,
@@ -97,31 +100,49 @@ class Checkpoint:
 
         流程：
         1. 校验 Agent 的 CapabilityProfile；
-        2. 预算检查并预留；
-        3. 权限组合分析；
-        4. 调用 PolicyEngine 做最终判定；
-        5. 审计 evaluate 事件；
-        6. 更新 RiskStateManager。
+        2. 跨动作风险状态阈值检查；
+        3. 预算检查并预留；
+        4. 权限组合分析；
+        5. 调用 PolicyEngine 做最终判定；
+        6. 审计 evaluate 事件；
+        7. 更新 RiskStateManager。
         """
         # 1. 校验 CapabilityProfile
         profile = self.profile_store.get(agent.profile_id)
         if profile is None:
-            return self._deny(proposal, f"Agent profile {agent.profile_id} not found")
-
-        # 2. 预算预留
-        cost = self._estimate_cost(proposal)
-        if not self.budget_ledger.check_and_reserve(proposal, cost):
-            return self._deny(proposal, "Budget exceeded")
-
-        # 3. 权限组合分析
-        interaction_risk = self.permission_interaction.check(proposal, [])
-        if interaction_risk and interaction_risk.risk_level in ("high", "critical"):
-            decision = self._deny(proposal, interaction_risk.reason)
+            decision = self._deny(proposal, f"Agent profile {agent.profile_id} not found")
             self._log_event(task, agent, proposal, "evaluate", decision)
             self._update_risk_state(task.session_id, proposal, decision)
             return decision
 
-        # 4. 调用 PolicyEngine
+        # 2. 跨动作风险状态阈值拦截：同一 session 内连续被拒绝次数过多
+        if self.risk_state_manager is not None:
+            risk_profile = self.risk_state_manager.get_session_risk(task.session_id)
+            if risk_profile.denied_count >= self.config.risk_denied_threshold:
+                decision = self._deny(proposal, "Session risk threshold exceeded due to repeated denials")
+                self._log_event(task, agent, proposal, "evaluate", decision)
+                self._update_risk_state(task.session_id, proposal, decision)
+                return decision
+
+        # 3. 预算预留
+        cost = self._estimate_cost(proposal)
+        if not self.budget_ledger.check_and_reserve(proposal, cost):
+            decision = self._deny(proposal, "Budget exceeded")
+            self._log_event(task, agent, proposal, "evaluate", decision)
+            self._update_risk_state(task.session_id, proposal, decision)
+            return decision
+        self._budget_costs[proposal.call_id] = cost
+
+        # 4. 权限组合分析
+        interaction_risk = self.permission_interaction.check(proposal, [])
+        if interaction_risk and interaction_risk.risk_level in ("high", "critical"):
+            decision = self._deny(proposal, interaction_risk.reason)
+            self._refund_budget(proposal)
+            self._log_event(task, agent, proposal, "evaluate", decision)
+            self._update_risk_state(task.session_id, proposal, decision)
+            return decision
+
+        # 5. 调用 PolicyEngine
         input_doc = self._build_policy_input(proposal, profile, task)
         policy_result = self.policy_engine.evaluate(self.config.policy_package, input_doc)
         verdict = policy_result.get("verdict", "deny")
@@ -153,11 +174,12 @@ class Checkpoint:
             )
         else:
             decision = self._deny(proposal, reason)
+            self._refund_budget(proposal)
 
-        # 5. 审计
+        # 6. 审计
         self._log_event(task, agent, proposal, "evaluate", decision)
 
-        # 6. 更新风险状态
+        # 7. 更新风险状态
         self._update_risk_state(task.session_id, proposal, decision)
 
         return decision
@@ -194,7 +216,12 @@ class Checkpoint:
         # 2. 使用 modify 后的参数
         arguments = decision.modified_args if decision.verdict == "modify" else proposal.arguments
 
-        # 3. 通过 MCP Gateway 转发（R2 是唯一授权出口）
+        # 3. 提交预算预留
+        cost = self._budget_costs.pop(proposal.call_id, None)
+        if cost is not None:
+            self.budget_ledger.commit(proposal, cost)
+
+        # 4. 通过 MCP Gateway 转发（R2 是唯一授权出口）
         return self.mcp_gateway.call_tool(proposal.tool_name, arguments, proposal.call_id)
 
     def request_and_apply_approval(
@@ -206,9 +233,10 @@ class Checkpoint:
     ) -> Decision:
         """对 require_approval 的 Decision，请求 R0-delegate 审批并返回最终 Decision.
 
-        如果 R0-delegate 未配置，则直接拒绝。
+        如果 R0-delegate 未配置，则直接拒绝并释放预算预留。
         """
         if self.r0_delegate is None:
+            self._refund_budget(proposal)
             return self._deny(proposal, "R0-delegate not configured")
 
         approval_request = ApprovalRequest(
@@ -236,6 +264,7 @@ class Checkpoint:
             )
         else:
             final_decision = self._deny(proposal, f"Denied by {record.approver_id}: {record.reason}")
+            self._refund_budget(proposal)
 
         self._log_event(task, agent, proposal, "approve" if record.approved else "deny", final_decision)
         self._update_risk_state(task.session_id, proposal, final_decision)
@@ -252,6 +281,12 @@ class Checkpoint:
             expires_at=datetime.now(timezone.utc),
             max_uses=0,
         )
+
+    def _refund_budget(self, proposal: ActionProposal) -> None:
+        """释放为 proposal 预留的预算."""
+        cost = self._budget_costs.pop(proposal.call_id, None)
+        if cost is not None:
+            self.budget_ledger.refund(proposal, cost)
 
     @staticmethod
     def _build_policy_input(
