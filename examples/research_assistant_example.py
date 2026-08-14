@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from uuid import uuid4
@@ -25,9 +26,11 @@ from loop_controller import (
     Agent,
     CapabilityProfile,
     Checkpoint,
+    CheckpointConfig,
     ConfigR0Delegate,
     JsonlAuditLogger,
     MockPolicyEngine,
+    OPAPolicyEngine,
     RuleBasedClassifier,
     Task,
 )
@@ -59,7 +62,7 @@ class ResearchAssistant:
                 call_id=f"{task.task_id}-call-1",
                 agent_id=self.agent.agent_id,
                 tool_name="read_file",
-                arguments={"path": "/data/ai_compliance_checklist.md"},
+                arguments={"path": "/allowed/ai_compliance_checklist.md"},
                 task_context="读取内部合规检查清单",
             ),
             ActionProposal(
@@ -120,6 +123,15 @@ class ResearchAssistant:
 
 def main() -> None:
     """运行研究助手端到端示例."""
+    # 策略引擎选择：默认 Mock，环境变量 LOOP_CONTROLLER_POLICY_ENGINE=opa 时使用 OPA
+    policy_engine_name = os.getenv("LOOP_CONTROLLER_POLICY_ENGINE", "mock").lower()
+    if policy_engine_name == "opa":
+        policy_engine = OPAPolicyEngine()
+        print("[Config] Using OPA policy engine at http://127.0.0.1:8181")
+    else:
+        policy_engine = MockPolicyEngine()
+        print("[Config] Using Mock policy engine")
+
     # R0 配置：固定审批人自动批准（MVP 打桩）
     r0_delegate = ConfigR0Delegate(approver_id="r0_boss", auto_approve=True)
 
@@ -127,12 +139,14 @@ def main() -> None:
     log_path = Path(tempfile.gettempdir()) / "loop_controller_audit.jsonl"
     audit_logger = JsonlAuditLogger(log_path)
 
-    # R2 配置：Mock PolicyEngine + Checkpoint
+    # R2 配置：PolicyEngine + Checkpoint
+    # 风险阈值等可通过环境变量配置，如 LOOP_CONTROLLER_RISK_DENIED_THRESHOLD=3
     checkpoint = Checkpoint(
-        policy_engine=MockPolicyEngine(),
+        policy_engine=policy_engine,
         profile_store={},
         r0_delegate=r0_delegate,
         audit_logger=audit_logger,
+        config=CheckpointConfig.from_env(),
     )
 
     # R1 配置：Agent + CapabilityProfile + 轻量分类器

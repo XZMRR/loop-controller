@@ -44,25 +44,30 @@ class OPAPolicyEngine:
         self._base_url = base_url.rstrip("/")
 
     def evaluate(self, package: str, input_doc: dict[str, Any]) -> dict[str, Any]:
-        """通过 HTTP 调用 OPA."""
-        import urllib.error
-        import urllib.request
+        """通过 HTTP 调用 OPA.
 
-        url = f"{self._base_url}/v1/data/{package}"
+        直接查询 `{package}/result`，返回顶层 Decision 结构，避免 OPA
+        在查询包根路径时偶尔返回空文档的问题。
+        """
+        import http.client
+        import urllib.parse
+
+        parsed = urllib.parse.urlparse(f"{self._base_url}/v1/data/{package.replace('.', '/')}/result")
+        path = parsed.path
         data = self._serialize(input_doc)
-        request = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=5)
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            raise PolicyEngineError(f"OPA returned {exc.code}: {exc.read().decode('utf-8')}") from exc
-        except urllib.error.URLError as exc:
-            raise PolicyEngineError(f"Failed to connect to OPA: {exc.reason}") from exc
+            conn.request(
+                "POST",
+                path,
+                body=data,
+                headers={"Content-Type": "application/json"},
+            )
+            response = conn.getresponse()
+            body = response.read().decode("utf-8")
+        finally:
+            conn.close()
 
         return self._parse(body)
 
@@ -77,11 +82,8 @@ class OPAPolicyEngine:
         import json
 
         response = json.loads(body)
-        result = response.get("result", {})
-        # OPA 可能把 verdict/reason 嵌套在 result 下，这里统一展平
-        if isinstance(result, dict) and "result" in result:
-            return result["result"]
-        return result
+        # 查询 /result 时，OPA 返回 {"result": {"verdict": ..., "reason": ...}}
+        return response.get("result", {})
 
 
 class MockPolicyEngine:

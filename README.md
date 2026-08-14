@@ -103,6 +103,7 @@ tests/legacy/security_experiments/  # 现有 Agent 安全手段测试（已归�
 
 - Python >= 3.13
 - Git
+- [OPA](https://www.openpolicyagent.org/docs/latest/#running-opa)（可选，用于真实策略引擎；Mock 策略引擎可直接运行）
 
 ### 运行单元测试
 
@@ -114,10 +115,11 @@ pip install pytest
 python -m pytest tests -v
 ```
 
-当前已通过 17 个单元测试，覆盖：
+当前已通过 18 个单元测试，覆盖：
 - `RuleBasedClassifier`（R1 轻量分类器）
 - `MockPolicyEngine`（R2 策略引擎打桩）
 - `Checkpoint`（R2 判定、转发、审批、重放保护、审计）
+- `BudgetLedger` / `RiskStateManager`（跨任务预算与风险状态拦截）
 
 ### 运行端到端示例
 
@@ -134,6 +136,44 @@ python examples/research_assistant_example.py
 4. 发送邮件给张经理。
 
 每个动作都会经过 **R1 风险分类 → R2 策略判定 → R2 代理转发执行 → R3 审计日志** 的完整闭环。当前使用的是 Mock MCP Gateway，不会真实发送邮件或访问网络。
+
+### 使用 OPA 作为真实策略引擎
+
+1. 下载 OPA（可选；脚本会自动检测系统架构）：
+
+```powershell
+.\scripts\download_opa.ps1
+```
+
+或者使用 Chocolatey：
+
+```powershell
+choco install opa
+```
+
+2. 启动 OPA 服务（PowerShell）：
+
+```powershell
+.\scripts\run_opa.ps1
+```
+
+3. 另开终端运行示例：
+
+```powershell
+$env:PYTHONPATH = "src"
+$env:LOOP_CONTROLLER_POLICY_ENGINE = "opa"
+python examples/research_assistant_example.py
+```
+
+### 环境变量
+
+| 环境变量 | 说明 | 默认值 |
+|---|---|---|
+| `LOOP_CONTROLLER_POLICY_ENGINE` | 策略引擎：`mock` 或 `opa` | `mock` |
+| `LOOP_CONTROLLER_RISK_DENIED_THRESHOLD` | 同一 session 内连续被拒绝次数阈值 | `3` |
+| `LOOP_CONTROLLER_DECISION_TTL_SECONDS` | allow/modify Decision 有效期（秒） | `300` |
+| `LOOP_CONTROLLER_APPROVAL_TTL_SECONDS` | require_approval Decision 有效期（秒） | `900` |
+| `LOOP_CONTROLLER_POLICY_PACKAGE` | OPA/Rego 包名 | `loop_controller.tool_permission` |
 
 ### 项目入口
 

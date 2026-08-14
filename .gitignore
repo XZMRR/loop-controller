@@ -77,6 +77,9 @@ dmypy.json
 mcp_servers_official/
 *.zip
 
+# OPA binary cache
+.opa/
+
 # Logs
 *.log
 

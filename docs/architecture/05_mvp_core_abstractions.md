@@ -1,11 +1,11 @@
-# Loop Controller MVP 核心抽象与接口设计（草案 v0.3）
+# Loop Controller MVP 核心抽象与接口设计（草案 v0.4）
 
 > **文档定位**：在 [00\_r0r3\_architecture.md](./00_r0r3_architecture.md) 四层治理模型基础上，定义 MVP（最小可行产品）阶段的核心抽象、接口形态和调用流程。本文面向开发者和贡献者，用于统一 R0-R3 的代码语义。
 >
 > **MVP 场景**：制度化的研究助手（Research Assistant），可搜索公开资料、读取本地知识库、写摘要、发送研究报告邮件。
 >
-> **状态**：草案 v0.3，已确定轻量分类器位置、Agent 交互边界与单 Agent MVP 范围，待评审\
-> **最后更新**：2026-08-13
+> **状态**：草案 v0.4，已实现核心代码、OPA/Rego 策略、环境变量配置与端到端示例，待评审\
+> **最后更新**：2026-08-14
 
 ***
 
@@ -334,19 +334,25 @@ class PolicyEngine(Protocol):
     def evaluate(self, package: str, input_doc: dict) -> dict: ...
 ```
 
-**MVP 实现方式：OPA HTTP sidecar**
+**MVP 实现方式：OPA HTTP sidecar + `policies/default.rego`**
+
+策略文件位于项目根目录 `policies/default.rego`，运行 OPA：
+
+```powershell
+.\scripts\run_opa.ps1
+```
 
 ```python
-import requests
-
 class OPAPolicyEngine:
     def __init__(self, base_url: str = "http://localhost:8181"):
         self.base_url = base_url
 
     def evaluate(self, package: str, input_doc: dict) -> dict:
+        # 注意：OPA Data API 把 URL 路径中的 / 作为包分隔符，
+        # 因此 loop_controller.tool_permission 要映射为 /loop_controller/tool_permission/result。
         try:
             response = requests.post(
-                f"{self.base_url}/v1/data/{package}",
+                f"{self.base_url}/v1/data/{package.replace('.', '/')}/result",
                 json={"input": input_doc},
                 timeout=2.0,
             )
@@ -356,6 +362,12 @@ class OPAPolicyEngine:
             # 安全原则：OPA 不可用时默认拒绝，避免故障开放
             return {"verdict": "deny", "reason": "policy engine unavailable"}
 ```
+
+`policies/default.rego` 已覆盖研究助手场景的：
+- 工具白名单（`allowed_tools`）；
+- 文件读写路径限制（`/tmp/`、`/allowed/`）；
+- 外部邮件审批（收件人不是 `*@company.com` 则 `require_approval`）；
+- 兜底默认拒绝。
 
 **选择 OPA HTTP sidecar 的理由与未来改进**：
 
@@ -423,12 +435,9 @@ class MCPGateway(Protocol):
 
 ### 3.11 `RiskStateManager`：R2 的跨动作风险状态（MVP 打桩）
 
-**业务含义**：SafeAgent 等方案通过 STM/LTM 维护 session 级风险状态，使风险判断不是单点、孤立的。Loop Controller 在 R2 内预留 `RiskStateManager`，MVP 阶段可返回空风险画像，未来用于权限组合分析、动态风险评分、异常模式检测。
+**业务含义**：SafeAgent 等方案通过 STM/LTM 维护 session 级风险状态，使风险判断不是单点、孤立的。Loop Controller 在 R2 内预留 `RiskStateManager`，MVP 阶段已实现基于拒绝次数的阈值拦截，未来可扩展为动态风险评分、异常模式检测。
 
 ```python
-from dataclasses import dataclass, field
-from typing import Protocol
-
 @dataclass(frozen=True)
 class RiskProfile:
     session_id: str
@@ -447,7 +456,7 @@ class RiskStateManager(Protocol):
     ) -> None: ...
 ```
 
-**MVP 打桩实现**：
+**MVP 实现**：
 
 ```python
 class InMemoryRiskStateManager:
@@ -458,13 +467,24 @@ class InMemoryRiskStateManager:
         return self._profiles.get(session_id, RiskProfile(session_id=session_id))
 
     def update_after_decision(self, session_id, proposal, decision):
-        # MVP 阶段：仅记录 denied 次数，供 R3 审计使用
-        pass
+        profile = self._profiles.get(session_id, RiskProfile(session_id=session_id))
+        denied = profile.denied_count + (1 if decision.verdict == "deny" else 0)
+        approved = profile.approval_count + (1 if decision.verdict == "require_approval" else 0)
+        self._profiles[session_id] = RiskProfile(
+            session_id=session_id,
+            cumulative_risk_score=profile.cumulative_risk_score,
+            recent_tags=profile.recent_tags,
+            denied_count=denied,
+            approval_count=approved,
+        )
 ```
+
+**阈值拦截**：`Checkpoint` 在 `evaluate` 开始时读取当前 session 的 `RiskProfile.denied_count`，超过 `CheckpointConfig.risk_denied_threshold`（默认 3，可通过环境变量 `LOOP_CONTROLLER_RISK_DENIED_THRESHOLD` 调整）则自动拒绝，避免持续提交高风险动作。
 
 **设计理由**：
 
-- MVP 先不累积跨 turn 风险，避免把 R2 做重；
+- MVP 先实现轻量级跨 turn 风险记忆（拒绝/审批计数），不过度引入复杂模型；
+- 阈值通过环境变量暴露，方便根据实际场景调整，无需改代码；
 - 接口已预留，未来可接入图分析、能力集合代数、专用小模型风险编码。
 
 ### 3.12 `Tool` 与 `ToolResult`
@@ -782,10 +802,12 @@ loop-controller/
 ├── policies/
 │   └── default.rego              # MVP 默认 Rego 策略
 ├── examples/
-│   └── research_agent_example.py # 研究助手端到端示例
+│   └── research_assistant_example.py # 研究助手端到端示例
 ├── tests/
-│   ├── test_checkpoint.py        # Checkpoint + PolicyEngine 单元测试
-│   └── test_policy_engine.py     # Rego 策略测试
+│   ├── test_checkpoint.py        # Checkpoint 单元测试
+│   ├── test_classifier.py        # RuleBasedClassifier 单元测试
+│   ├── test_policy_engine.py     # MockPolicyEngine 单元测试
+│   └── test_e2e_multi_task.py    # 多任务 Budget / RiskState 端到端测试
 └── pyproject.toml
 ```
 
@@ -798,11 +820,11 @@ loop-controller/
 | R1 不直接调用工具                   | R1 只生成 `ActionProposal`，R2 转发                                          | 防止 Agent 绕过策略；与 MCP 网关模式一致    | 未来可在沙箱内让 R1 执行只读工具，但仍需 R2 授权         |
 | R1 轻量分类器 vs R2 决策边界      | 轻量分类器在 R1，只输出 `RiskSignal`；R2 是唯一权威决策点，输出 `Decision`        | 符合内控隐喻：R1 是业务部门自检，R2 是风控部门终审 | 未来 R1 分类器可升级为小模型，R2 增加风险状态管理器    |
 | R1/R2 实时路径避免依赖 LLM        | 实时判定以规则/Rego/小模型为主；复杂推理放在 R3 异步审计                         | LLM 实时判定延迟高、不稳定、可被 prompt injection 绕过 | R2 未来可增加专用小模型做语义风险编码，但仍需确定性兜底 |
-| R2 风险状态管理                   | MVP 用 `RiskStateManager` 打桩，不跨 turn 累积风险                              | 先跑通单动作判定闭环                     | 未来引入 STM/LTM 式风险画像，支撑多步权限组合分析        |
+| R2 风险状态管理                   | MVP 已实现基于拒绝次数的阈值拦截；阈值通过 `CheckpointConfig.from_env()` 读取环境变量 | 轻量级跨 turn 风险记忆，不过度引入模型 | 未来引入 STM/LTM 式风险画像，支撑多步权限组合分析        |
 | 参考 SafeAgent 但不照搬            | SafeAgent 把分类器、策略、改写、记忆合并为一个 monolithic 安全核心；我们按 R0-R3 分层 | 便于独立升级、审计清晰、符合企业内控职责分离   | 未来 R2 内部子系统可借鉴其风险编码和改写生成思想        |
 | ActionProposal 预留 `type` 字段  | 区分 `tool_call` 与 `inter_agent`；MVP 只处理 `tool_call`                     | 结构预留多 Agent 委托治理；MVP 不扩大范围    | 未来 R2 增加 `inter_agent` 治理分支          |
 | MVP 单 Agent 模式               | 研究助手由一个 Agent 完成全部步骤，不实现子任务委托治理                                        | 降低 MVP 复杂度；先验证 R0-R3 工具调用闭环   | 未来扩展多 Agent 协作与委托链治理                 |
-| OPA HTTP sidecar             | MVP 用本地 OPA 进程 + HTTP 查询                                               | 标准、调试方便、Python 无成熟 Rego 库     | 未来可替换为 Go SDK、WASM 或自研字节码 VM         |
+| OPA HTTP sidecar             | MVP 用本地 OPA 进程 + HTTP 查询；`OPAPolicyEngine` 自动把 Rego 包名 `x.y` 映射为 URL 路径 `x/y` | 标准、调试方便、Python 无成熟 Rego 库     | 未来可替换为 Go SDK、WASM 或自研字节码 VM         |
 | CapabilityProfile 与 Agent 分离 | Agent 通过 `profile_id` 关联 Profile                                       | 一个岗位多个 Agent 实例；策略独立演进        | 未来支持多 Profile 动态切换                   |
 | Decision 四态 + 有效期 + 单次使用     | allow/deny/modify/require\_approval，带 `expires_at` 和 `max_uses=1`      | 防止重放和长期滥用                     | 未来可增加 `defer`（异步等待外部条件）和 token 签名    |
 | R0-delegate 打桩               | MVP 用 config 文件指定固定审批人                                                 | 先跑通 R0-R3 闭环，不阻塞在 UI/通知       | 未来接入真实审批 UI、IM、邮件通知                  |

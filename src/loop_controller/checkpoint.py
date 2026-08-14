@@ -46,6 +46,43 @@ class CheckpointConfig:
     approval_ttl_seconds: int = 900
     risk_denied_threshold: int = 3
 
+    @classmethod
+    def from_env(cls, **overrides: Any) -> "CheckpointConfig":
+        """从环境变量加载配置，显式传入的参数优先级最高.
+
+        支持的环境变量：
+        - LOOP_CONTROLLER_POLICY_PACKAGE
+        - LOOP_CONTROLLER_DECISION_TTL_SECONDS
+        - LOOP_CONTROLLER_APPROVAL_TTL_SECONDS
+        - LOOP_CONTROLLER_RISK_DENIED_THRESHOLD
+        """
+        import os
+
+        return cls(
+            policy_package=overrides.get(
+                "policy_package",
+                os.getenv("LOOP_CONTROLLER_POLICY_PACKAGE", cls.policy_package),
+            ),
+            decision_ttl_seconds=int(
+                overrides.get(
+                    "decision_ttl_seconds",
+                    os.getenv("LOOP_CONTROLLER_DECISION_TTL_SECONDS", str(cls.decision_ttl_seconds)),
+                )
+            ),
+            approval_ttl_seconds=int(
+                overrides.get(
+                    "approval_ttl_seconds",
+                    os.getenv("LOOP_CONTROLLER_APPROVAL_TTL_SECONDS", str(cls.approval_ttl_seconds)),
+                )
+            ),
+            risk_denied_threshold=int(
+                overrides.get(
+                    "risk_denied_threshold",
+                    os.getenv("LOOP_CONTROLLER_RISK_DENIED_THRESHOLD", str(cls.risk_denied_threshold)),
+                )
+            ),
+        )
+
 
 class Checkpoint:
     """R2 统一入口.
