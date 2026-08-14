@@ -1,0 +1,50 @@
+# R1 轻量分类器规则配置表（MVP v0.1）
+#
+# 判定逻辑（RuleBasedClassifier.classify）：
+#   1. 工具未在 CapabilityProfile 授权 -> unauthorized_tool_level（直接短路，不查后续规则）
+#   2. 已授权工具 -> 取 default 等级，再对 arguments 逐条应用 args 规则
+#   3. 参数命中多条规则时等级取最高；未命中则维持 default
+#
+# 字段说明：
+#   default : 该工具的默认风险等级
+#   args    : 参数级规则列表
+#     key   : arguments 中的参数名
+#     match : 匹配器（MVP 仅支持 regex，忽略大小写）
+#     level : 命中后升级到的风险等级
+#     reason: 命中原因（写入 RiskSignal.reason，供审计可解释）
+
+classifier:
+  unauthorized_tool_level: high
+
+  tools:
+    web_search:
+      default: low
+      args:
+        - key: query
+          match: { type: regex, pattern: "(内部|机密|internal|secret|token|password)" }
+          level: medium
+          reason: "搜索词含内部/敏感关键词"
+
+    read_file:
+      default: medium
+      args:
+        - key: path
+          match: { type: regex, pattern: "(secret|credential|password|\\.env)" }
+          level: high
+          reason: "读取敏感文件路径"
+
+    write_file:
+      default: high
+      args:
+        - key: path
+          match: { type: regex, pattern: "(secret|credential|password|\\.env)" }
+          level: critical
+          reason: "写入敏感路径"
+
+    send_email:
+      default: high
+      args:
+        - key: to
+          match: { type: regex, pattern: "@(?!company\\.com$)" }
+          level: critical
+          reason: "外部收件人"
