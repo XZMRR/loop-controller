@@ -134,6 +134,13 @@
 
 - `asyncio_mode=auto` 下现有同步测试可直接改为 `async def`，无需 `@pytest.mark.asyncio`。
 
+### 真实 LLM 端到端验证
+
+- **环境**：DeepSeek 官方 API（`https://api.deepseek.com/v1`，`deepseek-chat`）。
+- **命令**：`$env:LLM_API_KEY="..."; $env:PYTHONPATH="src"; .venv\Scripts\python.exe examples/research_agent_example.py`
+- **结果**：任务执行完成；LLM 自主规划了 web_search → web_search → send_email；send_email 因收件人不在 `*@company.com` 白名单被 R2 deny；审计链 11 个事件，`verify_chain()` 返回 True。
+- **说明**：验证后 `config/llm_planner.yaml` 已恢复 `enabled: false`，API key 未写入任何文件。
+
 ---
 
 ## 验收状态（A1-A14）
