@@ -254,8 +254,11 @@ import dataclasses
 def test_hmac_sha256_requires_key(config_dir):
     config = ConfigLoader().load(config_dir)
     config_with_hmac = dataclasses.replace(config, audit_hash_algo="hmac-sha256")
-    with pytest.raises(ConfigValidationError, match="未设置"):
-        ConfigLoader()._check_audit_key(config_with_hmac)
+    # 直接测试 key 解析：用独立上下文清除全局 fixture 注入的 key。
+    with pytest.MonkeyPatch().context() as mp:
+        mp.delenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", raising=False)
+        with pytest.raises(ValueError, match="未设置"):
+            ConfigLoader.resolve_audit_key(config_with_hmac)
 
 
 def test_hmac_sha256_hex_key_ok(config_dir, monkeypatch):
@@ -277,17 +280,19 @@ def test_hmac_sha256_base64_key_ok(config_dir, monkeypatch):
     assert len(key) == 32
 
 
-def test_hmac_sha256_rejects_short_key(config_dir, monkeypatch):
-    monkeypatch.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", "a" * 16)  # 8 字节
+def test_hmac_sha256_rejects_short_key(config_dir):
     config = ConfigLoader().load(config_dir)
     config_with_hmac = dataclasses.replace(config, audit_hash_algo="hmac-sha256")
-    with pytest.raises(ConfigValidationError, match="长度"):
-        ConfigLoader()._check_audit_key(config_with_hmac)
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", "a" * 16)
+        with pytest.raises(ValueError, match="长度"):
+            ConfigLoader.resolve_audit_key(config_with_hmac)
 
 
-def test_hmac_sha256_rejects_invalid_encoding(config_dir, monkeypatch):
-    monkeypatch.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", "not-hex-or-base64!!!")
+def test_hmac_sha256_rejects_invalid_encoding(config_dir):
     config = ConfigLoader().load(config_dir)
     config_with_hmac = dataclasses.replace(config, audit_hash_algo="hmac-sha256")
-    with pytest.raises(ConfigValidationError, match="无法解析"):
-        ConfigLoader()._check_audit_key(config_with_hmac)
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", "not-hex-or-base64!!!")
+        with pytest.raises(ValueError, match="无法解析"):
+            ConfigLoader.resolve_audit_key(config_with_hmac)

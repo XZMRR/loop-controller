@@ -13,12 +13,12 @@
 - **当前缓解**：`JsonlAuditStore.seal()` 可手动或周期性调用；启用 HMAC-SHA256 时 seal 记录还受 `seal_key` 域分离签名保护；
 - **生产路径**：定期写 seal 记录 + WORM 存储 + 签名日志（post-MVP）。
 
-### L2. 默认 `sha256` 模式下低熵参数可被字典攻击
+### L2. 若显式回退 `sha256` 模式，低熵参数可被字典攻击
 
-审计日志默认 `hash_algo=sha256` 时 `args_hash = SHA-256(canonical_json(arguments))`。对已知邮箱、常见文件名等低熵参数，攻击者可彩虹表反推。
+审计日志默认 `hash_algo=hmac-sha256`（由 `ConfigLoader` 自动配置）。若部署方显式设置 `LOOP_CONTROLLER_AUDIT_HASH_ALGO=sha256` 或直接用 `JsonlAuditStore(..., hash_algo="sha256")` 回退，则 `args_hash = SHA-256(canonical_json(arguments))`，对已知邮箱、常见文件名等低熵参数，攻击者可彩虹表反推。
 
-- **当前缓解**：P0 已支持 `hmac-sha256`（通过 `LOOP_CONTROLLER_AUDIT_HASH_ALGO=hmac-sha256` + `LOOP_CONTROLLER_AUDIT_HMAC_KEY` 环境变量启用），HMAC key 从环境变量读取、event key 与 seal key 做域分离；
-- **升级触发条件**：任何涉及真实 PII 的部署必须启用 HMAC-SHA256。默认 sha256 仅用于无敏感数据的开发/演示。
+- **当前缓解**：`ConfigLoader.load()` 默认 `hmac-sha256`；`JsonlAuditStore` 默认仍保留 `sha256` 以便验证旧文件；HMAC key 从环境变量 `LOOP_CONTROLLER_AUDIT_HMAC_KEY` 读取、event key 与 seal key 做域分离；
+- **升级触发条件**：任何涉及真实 PII 的部署必须使用 HMAC-SHA256（即保持默认）。
 
 ### L3. 防重放与会话风险状态依赖单进程 asyncio 假设
 

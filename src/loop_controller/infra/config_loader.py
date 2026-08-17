@@ -174,7 +174,7 @@ class ConfigLoader:
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
 
-        audit_hash_algo = os.environ.get("LOOP_CONTROLLER_AUDIT_HASH_ALGO", "sha256")
+        audit_hash_algo = os.environ.get("LOOP_CONTROLLER_AUDIT_HASH_ALGO", "hmac-sha256")
         if audit_hash_algo not in ("sha256", "hmac-sha256"):
             raise ConfigValidationError(
                 f"环境变量 LOOP_CONTROLLER_AUDIT_HASH_ALGO 必须是 sha256 或 hmac-sha256，"

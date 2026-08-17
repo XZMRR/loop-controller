@@ -11,7 +11,7 @@
 - **人工审批链路**：高风险动作路由 R0-delegate 审批，deny 永远优先于 require_approval；
 - **权限组合分析**：静态规则表检测"A 权限 + B 权限 = C 风险"的组合（如读取知识库后外发邮件）；
 - **防重放授权**：Decision 单次使用、限期有效、跨重启持久化；
-- **可检测篡改的审计**：JSONL 全量日志 + SHA-256 哈希链 + 参数分级掩码；
+- **可检测篡改的审计**：JSONL 全量日志 + HMAC-SHA256 哈希链 + seal 记录 + 参数分级掩码；
 - **预算控制**：按工具计费的 token 预算，超支即拒。
 
 ## 架构
@@ -43,18 +43,24 @@ pip install -e ".[dev]"        # 或 uv sync
 mkdir -p /data/kb /data/output
 echo "# AI 合规 checklist" > /data/kb/ai_compliance_checklist.md
 
-# 3. 启动 OPA sidecar
+# 3. 配置审计 HMAC key（32 字节随机熵，hex 或 base64；生产环境应从密钥管理注入）
+export LOOP_CONTROLLER_AUDIT_HMAC_KEY=$(openssl rand -hex 32)
+
+# 4. 启动 OPA sidecar
 opa run --server --addr localhost:8181 policies/
 
-# 4. 跑端到端示例（研究助手：搜索 → 读知识库 → 写摘要 → 审批后发邮件）
+# 5. 跑端到端示例（研究助手：搜索 → 读知识库 → 写摘要 → 审批后发邮件）
 python examples/research_agent_example.py
 
-# 5. 跑测试
-pytest tests/ -v
+# 6. 跑测试
+LOOP_CONTROLLER_AUDIT_HMAC_KEY=$LOOP_CONTROLLER_AUDIT_HMAC_KEY pytest tests/ -v
 
-# 6. 校验审计链完整性
-python -c "from loop_controller.infra.audit_store import JsonlAuditStore; \
-           print(JsonlAuditStore('data/audit.jsonl').verify_chain())"
+# 7. 校验审计链完整性
+python -c "import os; from loop_controller.infra.config_loader import ConfigLoader; \
+           from loop_controller.infra.audit_store import JsonlAuditStore; \
+           cfg = ConfigLoader().load('config'); \
+           key = ConfigLoader.resolve_audit_key(cfg); \
+           print(JsonlAuditStore(cfg.audit_log_path, hash_algo='hmac-sha256', hmac_key=key).verify_chain())"
 ```
 
 ## 配置

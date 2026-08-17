@@ -288,10 +288,15 @@ class Checkpoint:
         # 任一来源（组合规则 / Rego / 前置检查）产出更严格的裁决时，覆盖更宽松的裁决；
         # 组合规则可以否决或升级 Rego 的 allow，反之不行。
         hits = list(rego_decision.get("policy_hits") or [])
-        if pending_approval or verdict == "require_approval":
+        # v1.2：高 session_risk 时，Reg 返回的 modify 也必须升级为 require_approval。
+        session_risk_above = session_risk.cumulative_risk_score >= profile.session_risk_threshold
+        if pending_approval or verdict == "require_approval" or (verdict == "modify" and session_risk_above):
             reason = rego_decision.get("reason", "requires human approval")
             if rule is not None and verdict != "require_approval":
                 hits.append(rule.id)
+            if verdict == "modify" and session_risk_above:
+                reason = "session risk score above threshold; modify upgraded to approval"
+                hits.append("session_risk_gate")
             self._risk_manager.update(task.session_id, "require_approval")
             if proposal.risk_level == "critical":
                 self._risk_manager.update(task.session_id, "critical")

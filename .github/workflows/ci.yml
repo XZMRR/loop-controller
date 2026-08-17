@@ -31,3 +31,4 @@ jobs:
         run: uv run pytest tests/ -q
         env:
           OPA_PATH: tools/opa
+          LOOP_CONTROLLER_AUDIT_HMAC_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

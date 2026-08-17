@@ -244,3 +244,79 @@ def test_sha256_ignores_hmac_key(tmp_path) -> None:
     # 用另一个 key 创建 store 仍然能验证，因为 sha256 不依赖 key。
     other = JsonlAuditStore(path, hash_algo="sha256", hmac_key=_other_key())
     assert other.verify_chain()
+
+
+def test_hmac_refuses_mixed_algo_file(tmp_path) -> None:
+    """hmac-sha256 store 打开已有 sha256 记录的文件时应拒绝启动（混合算法链不安全）。"""
+    path = tmp_path / "audit.jsonl"
+    legacy = JsonlAuditStore(path, hash_algo="sha256", hmac_key=_hmac_key())
+    legacy.append(_make_event())
+
+    with pytest.raises(ValueError, match="请先归档"):
+        JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+
+
+def test_sha256_can_verify_legacy_file(tmp_path) -> None:
+    """sha256 store 仍可正常验证旧 sha256 文件。"""
+    path = tmp_path / "audit.jsonl"
+    legacy = JsonlAuditStore(path, hash_algo="sha256")
+    legacy.append(_make_event())
+    legacy.append(_make_event())
+
+    verifier = JsonlAuditStore(path, hash_algo="sha256")
+    assert verifier.verify_chain()
+
+
+def test_hmac_key_not_in_audit_log(tmp_path) -> None:
+    """HMAC key 不能出现在审计日志文件中。"""
+    path = tmp_path / "audit.jsonl"
+    key = _hmac_key()
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=key)
+    store.append(_make_event())
+    store.seal()
+    raw = path.read_text(encoding="utf-8")
+    assert key.hex() not in raw
+    assert key.decode("latin-1") not in raw  # 也检查原始 bytes 形态
+
+
+def test_truncated_file_fails_verification(tmp_path) -> None:
+    """文件末尾被截断成不完整 JSON 行时，verify_chain 应失败。"""
+    path = tmp_path / "audit.jsonl"
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+    store.append(_make_event())
+    store.append(_make_event())
+
+    raw = path.read_bytes()
+    path.write_bytes(raw[:-10])  # 截断最后 10 字节
+    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key()).verify_chain()
+
+
+def test_forged_seal_metadata_fails(tmp_path) -> None:
+    """伪造 seal 的 chain_hash 或 seal_signature 都应导致校验失败。"""
+    path = tmp_path / "audit.jsonl"
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+    store.append(_make_event())
+    store.seal()
+
+    lines = path.read_text(encoding="utf-8").strip().split("\n")
+    seal_record = json.loads(lines[-1])
+    seal_record["metadata"]["chain_hash"] = "0" * 64
+    lines[-1] = json.dumps(seal_record, sort_keys=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key()).verify_chain()
+
+
+def test_reordering_events_fails_hmac(tmp_path) -> None:
+    """HMAC 模式下交换事件顺序也应导致 verify_chain 失败。"""
+    path = tmp_path / "audit.jsonl"
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+    store.append(_make_event(trace_id="t1"))
+    store.append(_make_event(trace_id="t2"))
+    store.append(_make_event(trace_id="t3"))
+
+    lines = path.read_text(encoding="utf-8").strip().split("\n")
+    lines[0], lines[1] = lines[1], lines[0]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key()).verify_chain()

@@ -926,3 +926,50 @@ async def test_forward_low_risk_success_updates_risk_manager(
     profile_after = risk_manager.get_profile(task.session_id)
     # deny: 0.20；low_risk_success: 0.20*0.9 - 0.05 = 0.13
     assert profile_after.cumulative_risk_score == pytest.approx(0.13)
+
+
+async def test_evaluate_modify_upgraded_when_session_risk_high(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v1.2：Reg 返回 modify 但 session_risk 超过阈值时，升级为 require_approval。"""
+    risk_manager = RiskStateManager()
+    # 让 score 超过默认阈值 0.6：4 次 deny → 0.2*4=0.8
+    for _ in range(4):
+        risk_manager.update(task.session_id, "deny")
+    cp, _, _ = make_checkpoint(
+        profile,
+        identity,
+        risk_manager=risk_manager,
+        engine_decision={
+            "verdict": "modify",
+            "reason": "auto modified",
+            "policy_hits": ["modify_rule"],
+            "modified_args": {"query": "safe query"},
+        },
+    )
+    proposal = make_proposal(task, agent, arguments={"query": "safe query"})
+
+    decision = await cp.evaluate(task, agent, proposal)
+
+    assert decision.verdict == "require_approval"
+    assert "session_risk_gate" in decision.policy_hits
+
+
+async def test_evaluate_deny_unchanged_when_session_risk_high(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v1.2：session_risk 高时 deny 仍保持 deny，不会被升级。"""
+    risk_manager = RiskStateManager()
+    for _ in range(4):
+        risk_manager.update(task.session_id, "deny")
+    cp, _, _ = make_checkpoint(
+        profile,
+        identity,
+        risk_manager=risk_manager,
+        engine_decision={"verdict": "deny", "reason": "policy deny", "policy_hits": ["deny_rule"]},
+    )
+    proposal = make_proposal(task, agent)
+
+    decision = await cp.evaluate(task, agent, proposal)
+
+    assert decision.verdict == "deny"

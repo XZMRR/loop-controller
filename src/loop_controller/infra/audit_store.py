@@ -7,7 +7,8 @@
 P0 新增 HMAC-SHA256 支持：
 - 通过 ``hash_algo`` 选择 ``sha256``（兼容旧日志）或 ``hmac-sha256``；
 - ``hmac-sha256`` 模式下从部署级 root key 派生 event key 与 seal key，做域分离；
-- 提供 ``seal()`` 写入 seal 记录，固定当前链累积 HMAC，缓解"最后一行删改无法检测"问题。
+- 提供 ``seal()`` 写入 seal 记录，固定当前链累积 HMAC，缓解"最后一行删改无法检测"问题；
+- 默认 ``hmac-sha256``；``sha256`` 仅用于读取/验证旧文件，或显式声明的开发模式。
 """
 
 from __future__ import annotations
@@ -63,6 +64,8 @@ class JsonlAuditStore:
     ) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        if hash_algo not in ("sha256", "hmac-sha256"):
+            raise ValueError(f"不支持的 hash_algo：{hash_algo}")
         self._hash_algo = hash_algo
         self._key_id = key_id
         if hash_algo == "hmac-sha256":
@@ -73,19 +76,29 @@ class JsonlAuditStore:
         else:
             self._event_key = b""
             self._seal_key = b""
-        self._seq, self._prev_hash, self._chain_hash = self._load_tail()
+        self._seq, self._prev_hash, self._chain_hash, last_algo = self._load_tail()
 
-    def _load_tail(self) -> tuple[int, str, str]:
-        """启动时重放文件末行，恢复 ``seq``、``prev_hash`` 与 ``_chain_hash``。
+        # 升级策略（P0）：若文件已存在且实际算法与当前不一致，拒绝启动，
+        # 要求运维人员手动迁移旧文件（如归档为 audit.jsonl.legacy）。
+        # 混合算法链无法安全校验，静默切换会导致后续 verify_chain 失败。
+        if last_algo is not None and last_algo != self._hash_algo:
+            raise ValueError(
+                f"审计文件 {self._path} 的现有记录使用 {last_algo}，"
+                f"但当前配置为 {self._hash_algo}。请先归档旧文件后再切换算法。"
+            )
+
+    def _load_tail(self) -> tuple[int, str, str, str | None]:
+        """启动时重放文件末行，恢复 ``seq``、``prev_hash``、``_chain_hash`` 与最后算法。
 
         保证重启后续写不断链；seal 记录也会被重放并更新 ``_chain_hash``。
+        返回的 ``last_algo`` 为 ``None`` 表示文件为空或不存在。
         """
         if not self._path.exists():
-            return 0, self._GENESIS, self._GENESIS
+            return 0, self._GENESIS, self._GENESIS, None
         with self._path.open("r", encoding="utf-8") as fh:
             lines = [line.strip() for line in fh if line.strip()]
         if not lines:
-            return 0, self._GENESIS, self._GENESIS
+            return 0, self._GENESIS, self._GENESIS, None
 
         # 过滤掉不完整行（崩溃残留），但保留完整行用于恢复状态。
         valid_lines: list[str] = []
@@ -97,11 +110,12 @@ class JsonlAuditStore:
             valid_lines.append(line)
 
         if not valid_lines:
-            return 0, self._GENESIS, self._GENESIS
+            return 0, self._GENESIS, self._GENESIS, None
 
         last = json.loads(valid_lines[-1])
         seq = int(last.get("seq", 0))
         prev_hash = self._hash(valid_lines[-1])
+        last_algo = last.get("hash_algo", "sha256")
 
         # 重放完整文件恢复 chain_hash。
         chain_hash = self._GENESIS
@@ -112,7 +126,7 @@ class JsonlAuditStore:
                 chain_hash = self._hash(line, chain_hash)
             else:
                 chain_hash = self._hash(line, chain_hash)
-        return seq, prev_hash, chain_hash
+        return seq, prev_hash, chain_hash, last_algo
 
     def _hash(self, text: str, chain_hash: str | None = None) -> str:
         """计算单行文本的哈希。

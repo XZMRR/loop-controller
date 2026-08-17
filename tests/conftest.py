@@ -17,6 +17,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OPA_BIN = REPO_ROOT / "tools" / "opa.exe"
 POLICIES_DIR = REPO_ROOT / "policies"
 
+# P0 HMAC：为全部测试自动注入一个 32 字节测试 key，避免默认 hmac-sha256 模式启动失败。
+# 该 key 仅用于测试，不进入任何日志/审计内容。
+TEST_AUDIT_HMAC_KEY = "a" * 64  # 64 hex chars = 32 bytes
+
+
+@pytest.fixture(autouse=True)
+def _set_default_audit_hmac_key(monkeypatch):
+    monkeypatch.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", TEST_AUDIT_HMAC_KEY)
+
 
 @pytest.fixture(scope="session")
 def opa_server() -> str:

@@ -245,6 +245,42 @@
 
 ---
 
+## P1/P0 Review 修正
+
+目标：回应规划 agent 在 `src/answer.md` 中提出的两点核心问题。
+
+### 1. 默认审计算法改为 hmac-sha256
+
+- `ConfigLoader.load()` 默认 `audit_hash_algo="hmac-sha256"`（部署级默认安全）；
+- `JsonlAuditStore` 构造函数仍保留 `sha256` 默认，用于底层兼容与旧文件验证；
+- `tests/conftest.py` 增加 `autouse` fixture，为全部测试注入 32 字节测试 key；
+- `.github/workflows/ci.yml` 注入 `LOOP_CONTROLLER_AUDIT_HMAC_KEY`；
+- `src/KNOWN_LIMITATIONS.md` L1/L2 更新为"已有缓解"，并明确 HMAC 为默认。
+
+### 2. HMAC 审计链篡改检测补全
+
+新增 `tests/test_audit_store.py` 用例：
+- `test_hmac_key_not_in_audit_log`：key 不出现在审计文件中；
+- `test_truncated_file_fails_verification`：文件末尾被截断成不完整 JSON 行时校验失败；
+- `test_forged_seal_metadata_fails`：伪造 seal 的 chain_hash 或 seal_signature 均失败；
+- `test_reordering_events_fails_hmac`：HMAC 模式下交换事件顺序也失败；
+- `test_hmac_refuses_mixed_algo_file`：hmac 模式打开已有 sha256 文件时拒绝启动；
+- `test_sha256_can_verify_legacy_file`：sha256 store 仍可验证旧文件。
+
+### 3. 旧 sha256 审计文件升级策略
+
+- `JsonlAuditStore.__init__` 检测现有记录算法与当前不一致时抛 `ValueError`，拒绝启动；
+- 运维需手动归档旧文件（如 `audit.jsonl.legacy`）后切换算法；
+- 文档中说明：混合算法链无法安全校验，不静默切换。
+
+### 4. session_risk 覆盖 modify 路径
+
+- `checkpoint.py` 在 Rego 返回 `modify` 且 `session_risk.cumulative_risk_score >= profile.session_risk_threshold` 时，升级为 `require_approval`；
+- reason 改写为 "session risk score above threshold; modify upgraded to approval"，policy_hits 追加 `session_risk_gate`；
+- 新增 `tests/test_checkpoint.py::test_evaluate_modify_upgraded_when_session_risk_high` 与 `test_evaluate_deny_unchanged_when_session_risk_high`。
+
+---
+
 ## 后续可选工作
 
 - **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。
