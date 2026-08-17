@@ -156,7 +156,7 @@
 
 ## 后续可选工作
 
-- **T3.5 LLMPlanner**：按方案 §5.1 JSON Schema 契约实现，优先级最低。
+- **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。
 - **签名/WORM 存储**：当前哈希链只能检测篡改，不能防御整体重写；生产环境需要签名或 WORM 存储。
 - **HMAC 升级**：`AuditEvent.hash_algo` 字段已预留，涉及真实 PII 时触发升级。
 - **多 worker 原子 DecisionStore**：当前单进程 asyncio 假设下检查+记账原子；多 worker 时需要原子语义。
