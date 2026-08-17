@@ -36,6 +36,7 @@ from loop_controller.models import (
     Task,
     ToolResult,
 )
+from loop_controller.llm_planner import HttpxLLMClient, LLMPlanner
 from loop_controller.planner import Planner, ScriptedPlanner
 from loop_controller.policy_engine import OPAPolicyEngine
 from loop_controller.r0_delegate import ConfigR0Delegate, R0Delegate
@@ -101,6 +102,7 @@ def build_runtime(
         cwd=str(project_root),
     )
     masker = Masker(config.masking_rules)
+    budget_ledger = InMemoryBudgetLedger()
     checkpoint = Checkpoint(
         profiles=config.profiles,
         policy_engine=policy_engine,
@@ -108,7 +110,7 @@ def build_runtime(
         gateway=gateway,
         identity=identity,
         decision_store=JsonlDecisionStore(config.decision_log_path),
-        budget_ledger=InMemoryBudgetLedger(),
+        budget_ledger=budget_ledger,
         permission_analyzer=ConfigPermissionInteractionAnalyzer(config.permission_rules),
         tool_costs={
             name: BudgetCost(token_count=entry.cost_per_call)
@@ -118,9 +120,19 @@ def build_runtime(
     )
     audit_store = JsonlAuditStore(config.audit_log_path)
 
-    if planner_yaml is None:
-        planner_yaml = project_root / "config" / "scripted_plan.yaml"
-    planner = ScriptedPlanner.from_yaml(planner_yaml)
+    if config.llm_planner is not None and config.llm_planner.enabled:
+        planner: Planner = LLMPlanner(
+            client=HttpxLLMClient(),
+            config=config.llm_planner,
+            gateway=gateway,
+            budget_ledger=budget_ledger,
+            audit_store=audit_store,
+            profiles=config.profiles,
+        )
+    else:
+        if planner_yaml is None:
+            planner_yaml = project_root / "config" / "scripted_plan.yaml"
+        planner = ScriptedPlanner.from_yaml(planner_yaml)
 
     return Runtime(
         planner=planner,
@@ -224,7 +236,7 @@ async def run_task(task: Task, agent: Agent, runtime: Runtime) -> None:
         while True:
             # 1. 规划下一步动作：Planner 只产出草案，框架组装 ActionProposal 并统一生成 call_id
             #    （v1.1 评审#7/#8：Planner 无权自定身份标识）
-            planned = runtime.planner.next_action(task, agent, observations)
+            planned = await runtime.planner.next_action(task, agent, observations)
             if planned is None:
                 break
             proposal = ActionProposal(

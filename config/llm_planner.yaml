@@ -1,0 +1,10 @@
+# LLMPlanner 配置（T3.5）
+# 默认关闭，演示时启用；API key 只通过环境变量读取，不落盘。
+enabled: false
+provider: openai-compatible
+base_url: https://api.openai.com/v1
+model: gpt-4o-mini
+api_key_env: LLM_API_KEY
+max_tokens: 1000
+temperature: 0.2
+timeout_s: 30

@@ -31,6 +31,7 @@ AuditAction = Literal[
     "deny",
     "execute",
     "task_end",
+    "planner_error",
 ]
 ApprovalVerdict = Literal["approve", "deny"]
 

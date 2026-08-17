@@ -26,10 +26,10 @@ def make_steps() -> list[PlannedAction]:
     ]
 
 
-def test_next_action_in_order(task, agent) -> None:
+async def test_next_action_in_order(task, agent) -> None:
     planner = ScriptedPlanner(make_steps())
 
-    first = planner.next_action(task, agent, [])
+    first = await planner.next_action(task, agent, [])
     assert first is not None
     assert first.tool_name == "web_search"
     assert first.arguments == {"query": "q1"}
@@ -40,15 +40,15 @@ def test_next_action_in_order(task, agent) -> None:
     assert not hasattr(first, "agent_id")
     assert not hasattr(first, "task_context")
 
-    second = planner.next_action(task, agent, [])
+    second = await planner.next_action(task, agent, [])
     assert second is not None
     assert second.tool_name == "send_email"
 
     # 序列耗尽 → None（任务完成）
-    assert planner.next_action(task, agent, []) is None
+    assert await planner.next_action(task, agent, []) is None
 
 
-def test_from_yaml(tmp_path, task, agent) -> None:
+async def test_from_yaml(tmp_path, task, agent) -> None:
     plan_file = tmp_path / "plan.yaml"
     plan_file.write_text(
         "steps:\n"
@@ -59,8 +59,8 @@ def test_from_yaml(tmp_path, task, agent) -> None:
     )
 
     planner = ScriptedPlanner.from_yaml(plan_file)
-    action = planner.next_action(task, agent, [])
+    action = await planner.next_action(task, agent, [])
 
     assert action is not None
     assert action.tool_name == "web_search"
-    assert planner.next_action(task, agent, []) is None
+    assert await planner.next_action(task, agent, []) is None

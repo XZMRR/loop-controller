@@ -50,7 +50,7 @@ Rego 策略文件为明文，仅依赖文件系统权限保护。恶意 Agent �
 | F1 | 审批为配置打桩 | `ConfigR0Delegate` 按 `approval.yaml` 固定返回 approve/deny，无真实人类通知与 UI |
 | F2 | 无 Agent 间交互治理 | 只治理 `tool_call`；多 Agent 委托、inter_agent 均未实现 |
 | F3 | 无 Earned Authority | 权限固定，无任务后临时提权；`fixed_ceiling` 保留为空 |
-| F4 | LLMPlanner 未实现 | 默认 `ScriptedPlanner`（脚本化动作序列）；LLM 规划为可选扩展 |
+| F4 | ~~LLMPlanner 未实现~~ 已实现（T3.5） | 默认仍关闭（`config/llm_planner.yaml`），开启后由 LLM 动态规划；密钥仅来自环境变量，失败不重试 |
 | F5 | 权限组合规则为静态 YAML | 无图分析/能力代数；规则需人工维护 |
 | F6 | 审计全量记录无采样 | 高负载场景需自行评估日志量 |
 | F7 | 财务支付预算未启用 | `payment_amount` 恒为 0 |

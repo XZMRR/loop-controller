@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from hashlib import sha256
+import os
 from pathlib import Path
 import re
 from typing import Any, Literal
@@ -44,6 +45,23 @@ class MCPServerConfig:
     name: str
     command: list[str]
     transport: str = "stdio"
+
+
+@dataclass(frozen=True)
+class LLMPlannerConfig:
+    """LLMPlanner 配置（T3.5）。
+
+    ``api_key_env`` 仅存储环境变量名，密钥在运行期从该变量读取，不落盘、不写入审计日志。
+    """
+
+    enabled: bool = False
+    provider: str = "openai-compatible"
+    base_url: str = "https://api.openai.com/v1"
+    model: str = "gpt-4o-mini"
+    api_key_env: str = "LLM_API_KEY"
+    max_tokens: int = 1000
+    temperature: float = 0.2
+    timeout_s: int = 30
 
 
 @dataclass(frozen=True)
@@ -118,6 +136,7 @@ class AppConfig:
     policy_dir: str
     audit_log_path: str
     decision_log_path: str
+    llm_planner: LLMPlannerConfig | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +166,7 @@ class ConfigLoader:
         permission_rules = self._load_permission_rules(config_dir / "permission_rules.yaml")
         masking_rules = self._load_masking_rules(config_dir / "masking_rules.yaml")
         approval = self._load_approval(config_dir / "approval.yaml")
+        llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
 
         app_config = AppConfig(
             agents=agents,
@@ -160,6 +180,7 @@ class ConfigLoader:
             policy_dir=str(root / "policies"),
             audit_log_path=str(root / "data" / "audit.jsonl"),
             decision_log_path=str(root / "data" / "decisions.jsonl"),
+            llm_planner=llm_planner,
         )
 
         self._check_profile_exists(app_config)
@@ -170,6 +191,7 @@ class ConfigLoader:
         self._check_glob_compile(app_config)
         self._check_regex_compile(app_config)
         self._check_approver_exists(app_config)
+        self._check_llm_planner_api_key(app_config)
         return app_config
 
     # -- 各 YAML 解析 -------------------------------------------------------
@@ -239,6 +261,13 @@ class ConfigLoader:
         data = self._read_yaml(path)
         rules = [ApprovalRule(**r) for r in data.get("rules", [])]
         return ApprovalConfig(default=data.get("approvers", {}).get("default", ""), rules=rules)
+
+    def _load_llm_planner(self, path: Path) -> LLMPlannerConfig | None:
+        """加载 LLMPlanner 配置；文件缺失时返回 None 以兼容旧配置树（测试用）。"""
+        if not path.exists():
+            return None
+        data = self._read_yaml(path)
+        return LLMPlannerConfig(**data)
 
     # -- 7 条启动校验 -------------------------------------------------------
 
@@ -346,6 +375,16 @@ class ConfigLoader:
                 raise ConfigValidationError(
                     f"审批人 {approver} 是 Agent 身份，不能作为审批人（approver != agent_id）"
                 )
+
+    def _check_llm_planner_api_key(self, config: AppConfig) -> None:
+        """T3.5 启动校验：LLMPlanner 启用时，api_key_env 指向的环境变量必须存在。"""
+        if config.llm_planner is None or not config.llm_planner.enabled:
+            return
+        env_name = config.llm_planner.api_key_env
+        if not os.environ.get(env_name):
+            raise ConfigValidationError(
+                f"LLMPlanner 已启用，但环境变量 {env_name} 未设置（密钥不落盘，请通过环境变量注入）"
+            )
 
     # -- 工具 ---------------------------------------------------------------
 

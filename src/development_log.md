@@ -106,6 +106,36 @@
 
 ---
 
+## 迭代 3.5：LLMPlanner（T3.5）
+
+目标：用真实 LLM 替换脚本化规划器，展示"真实 Agent 被治理"的演示效果。
+
+### 完成内容
+
+- **配置层**：新增 `config/llm_planner.yaml`，`LLMPlannerConfig` dataclass；启用时校验 `api_key_env` 环境变量存在。
+- **LLMPlanner 实现**：
+  - `HttpxLLMClient` 用 httpx 调用 OpenAI 兼容 `chat/completions`；`trust_env=False`；不依赖 openai 库。
+  - Prompt 五段结构：system + context + tools + history + ask。
+  - 历史分层摘要：最近 1 步完整保留（content 截断 2000 字符），早期步骤一行摘要。
+  - 响应解析：提取首个 JSON 对象（允许 markdown 包裹），Schema 校验 + 工具白名单预检。
+  - Token 预算路径 A：调用前 `check_and_reserve` 预估上限，调用后按 usage commit 实际值并退还差额；超支时审计 `metadata.planner_budget_exceeded`。
+  - 失败不重试：解析失败/预算耗尽/白名单失败 → 审计 `metadata.planner_error` 并返回 None。
+  - 密钥纪律：API key 只从环境变量读取，不落盘、不进审计日志。
+- **Runtime 集成**：`build_runtime` 在 `llm_planner.enabled=true` 时创建 `LLMPlanner`，否则继续使用 `ScriptedPlanner`；`Planner` 协议改为 async 以支持 `MCPGateway.list_tools`。
+- **单测**：`tests/test_llm_planner.py` 使用 fake client 覆盖 JSON/markdown/缺字段/非 JSON/未授权工具/历史摘要/预算 commit-refund/密钥纪律。
+
+### 关键决策
+
+- Planner 协议 async 化：LLMPlanner 需要异步拉取工具列表并调用 LLM，同步 Protocol 会让实现非常复杂。
+- 预算 ledger 与 Checkpoint 共用：`build_runtime` 把同一个 `InMemoryBudgetLedger` 注入 Checkpoint 与 LLMPlanner，per-task 额度真实共享。
+- 工具白名单只是提前失败优化：真正的权限判定仍在 R2；白名单失败与 Schema 失败走同一审计路径。
+
+### 踩坑记录
+
+- `asyncio_mode=auto` 下现有同步测试可直接改为 `async def`，无需 `@pytest.mark.asyncio`。
+
+---
+
 ## 验收状态（A1-A14）
 
 | ID | 状态 | 自动化位置 |

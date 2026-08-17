@@ -20,9 +20,11 @@ class Planner(Protocol):
 
     v1.1（评审#7/#8）：只输出**动作草案** ``PlannedAction``，不含 call_id/task_id/
     agent_id——这些身份字段由 run_task 框架统一生成/填充，Planner 无权自定。
+
+    T3.5：``next_action`` 改为 async，以便 LLMPlanner 调用 ``MCPGateway.list_tools``。
     """
 
-    def next_action(
+    async def next_action(
         self,
         task: Task,
         agent: Agent,
@@ -49,7 +51,7 @@ class ScriptedPlanner:
         steps = [PlannedAction(**step) for step in data.get("steps", [])]
         return cls(steps)
 
-    def next_action(
+    async def next_action(
         self,
         task: Task,
         agent: Agent,
