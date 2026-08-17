@@ -36,6 +36,8 @@ from loop_controller.models import (
     Task,
     ToolResult,
 )
+from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
+from loop_controller.session import SessionManager
 from loop_controller.llm_planner import HttpxLLMClient, LLMPlanner
 from loop_controller.planner import Planner, ScriptedPlanner
 from loop_controller.policy_engine import OPAPolicyEngine
@@ -62,6 +64,20 @@ class Runtime:
     audit_store: AuditStore
     masker: Masker
     profiles: dict[str, Any]  # CapabilityProfile
+    session_manager: SessionManager  # v1.2 会话分配与校验
+    risk_manager: RiskStateManager  # v1.2 会话级风险状态
+
+    def create_task(self, user_id: str, agent_id: str, description: str) -> Task:
+        """通过 SessionManager 分配/复用 session，构造 Task（v1.2 推荐入口）。"""
+        session = self.session_manager.get_or_create_session(user_id, agent_id)
+        task_id = uuid.uuid4().hex
+        return Task(
+            task_id=task_id,
+            session_id=session.session_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            description=description,
+        )
 
     async def start(self) -> None:
         """拉起 MCP server 子进程等异步初始化。"""
@@ -103,12 +119,16 @@ def build_runtime(
     )
     masker = Masker(config.masking_rules)
     budget_ledger = InMemoryBudgetLedger()
+    session_manager = SessionManager()
+    risk_manager = RiskStateManager(JsonlRiskStateStore(config.risk_state_path))
     checkpoint = Checkpoint(
         profiles=config.profiles,
         policy_engine=policy_engine,
         policy_store=policy_store,
         gateway=gateway,
         identity=identity,
+        session_manager=session_manager,
+        risk_manager=risk_manager,
         decision_store=JsonlDecisionStore(config.decision_log_path),
         budget_ledger=budget_ledger,
         permission_analyzer=ConfigPermissionInteractionAnalyzer(config.permission_rules),
@@ -150,6 +170,8 @@ def build_runtime(
         audit_store=audit_store,
         masker=masker,
         profiles=config.profiles,
+        session_manager=session_manager,
+        risk_manager=risk_manager,
     )
 
 
@@ -238,6 +260,9 @@ async def run_task(task: Task, agent: Agent, runtime: Runtime) -> None:
     profile = runtime.profiles[agent.profile_id]
     observations: list[ToolResult] = []
 
+    # v1.2：校验 task.session_id 存在、活跃且绑定一致（fail-closed）
+    runtime.session_manager.validate_and_touch(task)
+
     audit.append(_audit_event(task, action="task_start", masker=runtime.masker))
     try:
         while True:
@@ -302,10 +327,15 @@ async def run_task(task: Task, agent: Agent, runtime: Runtime) -> None:
                         )
                     )
                     decision = runtime.checkpoint.finalize_after_approval(decision, record)
+                    # v1.2：审批结果进入会话风险状态
+                    if record.verdict == "approve":
+                        runtime.risk_manager.update(task.session_id, "approval_granted")
+                    else:
+                        runtime.risk_manager.update(task.session_id, "approval_denied")
 
             # 5. 执行或被拦截，结果都进入 observations 供下一步规划
             if decision.verdict in ("allow", "modify"):
-                result = await runtime.checkpoint.forward(proposal, decision)
+                result = await runtime.checkpoint.forward(proposal, decision, session_id=task.session_id)
             else:
                 result = _blocked_result(proposal, decision)
             observations.append(result)

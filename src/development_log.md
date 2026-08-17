@@ -190,6 +190,61 @@
 
 ---
 
+---
+
+## P1 L2：会话级风险判定（v0.3.0）
+
+目标：实现 v1.2 §3 的 session 新约定、RiskStateManager 真用化、Rego `session_risk` 扩展。
+
+### 完成内容
+
+- **SessionManager**：新建 `src/loop_controller/session.py`；
+  - `Session` dataclass 与 `SessionManager` 类；
+  - `get_or_create_session(user_id, agent_id)` 按 30 分钟超时复用或新建 session（uuid hex）；
+  - `validate_and_touch(task)` fail-closed：session 不存在/不活跃/(user_id, agent_id) 绑定不一致均抛 ValueError；
+  - `is_session_active(session_id)` 与 `close_session(session_id)`。
+- **RiskStateManager 真用化**：新建 `src/loop_controller/risk_state.py`；
+  - `RiskEvent` dataclass 与 `RiskStateStore` Protocol；
+  - `JsonlRiskStateStore`：父目录可写检查、JSONL 追加、启动重放、末行不完整忽略并 WARNING；
+  - `RiskStateManager`：确定性算分（deny +0.20 / critical +0.30 / approval_denied +0.10 / approval_granted +0.05 / low_risk_success -0.05）、每条事件 ×0.9 衰减（0-1 封顶）、recent_tags bounded FIFO 最多 10 条；
+  - `allow` / `low_risk_success` 不进入 `recent_tags`。
+- **配置层**：
+  - `CapabilityProfile` 增加 `session_risk_threshold: float = 0.6`；
+  - `AppConfig` 增加 `risk_state_path`（默认 `./data/risk_state.jsonl`），`ConfigLoader.load()` 设置绝对路径并校验父目录可写。
+- **Checkpoint 集成**：
+  - `Checkpoint.__init__` 接收 `session_manager` 与 `risk_manager`；
+  - `evaluate` 将 `session_risk` 结构传入 `build_policy_input`；
+  - 返回 decision 后更新 risk：deny→deny、require_approval→require_approval、critical 信号→critical；
+  - `forward` 成功后 allow + risk_level=low 时更新 `low_risk_success`。
+- **Rego 策略**：`policies/default.rego` 新增 `session_risk_gate`，score >= threshold 且非 critical 时升级为 `require_approval`；兼容无 `session_risk` 的旧输入。
+- **Runtime 集成**：
+  - `Runtime` dataclass 增加 `session_manager` 与 `risk_manager`；
+  - 新增 `Runtime.create_task(user_id, agent_id, description)` 作为推荐入口；
+  - `build_runtime` 组装 `SessionManager`、`JsonlRiskStateStore`、`RiskStateManager` 并注入 Checkpoint；
+  - `run_task` 开头 `validate_and_touch(task)`，审批结果记录后更新 risk，forward 传入 session_id。
+- **测试**：
+  - 新建 `tests/test_session.py`、`tests/test_risk_state.py`；
+  - 更新 `tests/test_checkpoint.py` 断言 `session_risk` 进入 policy input 与 risk 更新；
+  - 更新 `tests/test_policy_engine.py` 新增 Python ↔ Rego input contract 与 `session_risk_gate` 用例；
+  - 更新 `tests/test_e2e_research_agent.py` 与 `examples/research_agent_example.py` 使用 `runtime.create_task`。
+
+### 关键决策
+
+- `Task.session_id == Task.task_id` 约定正式废除：模型校验器删除，session 由 `SessionManager` 权威分配。
+- `build_policy_input` 中 `session_risk` 可选传入：旧测试不传时不影响 Rego 判定，传入时才加入 input_doc。
+- `forward(session_id=...)` 显式传入 session_id，不扩展 `ActionProposal` schema，保持最小改动面。
+- Session 结束后不主动 close（推荐保留），由 30 分钟 gap 自然过期；`close_session` 提供显式关闭能力。
+
+### 验收状态更新
+
+| ID | 状态 | 自动化位置 |
+|---|---|---|
+| A15（新增） | 通过 | `tests/test_session.py` + `tests/test_risk_state.py` |
+| A16（新增） | 通过 | `tests/test_policy_engine.py::test_session_risk_*` |
+| A17（新增） | 通过 | `tests/test_checkpoint.py::test_evaluate_includes_session_risk*` |
+
+---
+
 ## 后续可选工作
 
 - **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。

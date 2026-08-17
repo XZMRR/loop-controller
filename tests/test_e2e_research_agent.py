@@ -33,7 +33,9 @@ from loop_controller.permission_interaction import ConfigPermissionInteractionAn
 from loop_controller.planner import ScriptedPlanner
 from loop_controller.policy_engine import OPAPolicyEngine
 from loop_controller.r0_delegate import ConfigR0Delegate
+from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
 from loop_controller.runtime import Runtime, run_task
+from loop_controller.session import SessionManager
 from loop_controller.utils.canonical import canonical_json
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -134,12 +136,16 @@ def _runtime_from_config(workdir: Path, opa_url: str, plan_path: Path | None = N
     policy_engine = OPAPolicyEngine(base_url=opa_url, timeout=2.0)
     gateway = _FakeGateway()
     masker = Masker(config.masking_rules)
+    session_manager = SessionManager()
+    risk_manager = RiskStateManager(JsonlRiskStateStore(workdir / "data" / "risk_state.jsonl"))
     checkpoint = Checkpoint(
         profiles=config.profiles,
         policy_engine=policy_engine,
         policy_store=policy_store,
         gateway=gateway,
         identity=identity,
+        session_manager=session_manager,
+        risk_manager=risk_manager,
         decision_store=InMemoryDecisionStore(),
         budget_ledger=InMemoryBudgetLedger(),
         permission_analyzer=ConfigPermissionInteractionAnalyzer(config.permission_rules),
@@ -162,13 +168,20 @@ def _runtime_from_config(workdir: Path, opa_url: str, plan_path: Path | None = N
         audit_store=audit_store,
         masker=masker,
         profiles=config.profiles,
+        session_manager=session_manager,
+        risk_manager=risk_manager,
     )
 
 
 async def _run(workdir: Path, opa_url: str, plan_path: Path | None = None) -> Runtime:
     runtime = _runtime_from_config(workdir, opa_url, plan_path)
     agent = runtime.checkpoint._identity.get_agent("researcher_001")
-    await run_task(_build_task(agent), agent, runtime)
+    task = runtime.create_task(
+        user_id="alice",
+        agent_id=agent.agent_id,
+        description="调研 AI 合规并发送摘要邮件",
+    )
+    await run_task(task, agent, runtime)
     return runtime
 
 

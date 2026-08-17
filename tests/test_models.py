@@ -36,9 +36,11 @@ def test_task_defaults_and_required():
     assert task.created_at.tzinfo == timezone.utc
 
 
-def test_task_session_id_must_equal_task_id():
-    with pytest.raises(ValidationError):
-        Task(task_id="t1", session_id="s2", user_id="alice", agent_id="a1", description="d")
+def test_task_session_id_no_longer_must_equal_task_id():
+    # v1.2 起废除 session_id == task_id 约定，session 由 SessionManager 分配
+    task = Task(task_id="t1", session_id="s2", user_id="alice", agent_id="a1", description="d")
+    assert task.session_id == "s2"
+    assert task.task_id == "t1"
 
 
 def test_task_frozen():

@@ -20,12 +20,12 @@
 - **当前缓解**：P0 已支持 `hmac-sha256`（通过 `LOOP_CONTROLLER_AUDIT_HASH_ALGO=hmac-sha256` + `LOOP_CONTROLLER_AUDIT_HMAC_KEY` 环境变量启用），HMAC key 从环境变量读取、event key 与 seal key 做域分离；
 - **升级触发条件**：任何涉及真实 PII 的部署必须启用 HMAC-SHA256。默认 sha256 仅用于无敏感数据的开发/演示。
 
-### L3. 防重放依赖单进程 asyncio 假设
+### L3. 防重放与会话风险状态依赖单进程 asyncio 假设
 
-`DecisionStore` 的"检查 + 记账"原子性建立在**单进程、单事件循环、无并行 `forward`** 的运行时假设上。
+`DecisionStore` 的"检查 + 记账"原子性与 `RiskStateStore` 的 JSONL 追加均建立在**单进程、单事件循环、无并行写入** 的运行时假设上。
 
-- **当前缓解**：假设已在架构文档 §6.6 显式声明；
-- **生产路径**：多 worker / 多进程部署前，必须先将 DecisionStore 升级为原子语义（SQLite `INSERT OR FAIL` 或分布式锁）。**违反此前提的部署不在安全承诺范围内。**
+- **当前缓解**：假设已在架构文档 §6.6 / v1.2 §3.2 显式声明；
+- **生产路径**：多 worker / 多进程部署前，必须将 DecisionStore 与 RiskStateStore 一起升级为同一套原子语义（SQLite `INSERT OR FAIL` 或分布式锁）。**违反此前提的部署不在安全承诺范围内。**
 
 ### L4. 策略明文存储
 

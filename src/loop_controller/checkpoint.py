@@ -32,6 +32,8 @@ from loop_controller.models import (
     ToolResult,
 )
 from loop_controller.policy_engine import PolicyEngine, build_policy_input
+from loop_controller.risk_state import RiskStateManager
+from loop_controller.session import SessionManager
 from loop_controller.utils.globmatch import glob_match
 
 logger = logging.getLogger(__name__)
@@ -176,6 +178,8 @@ class Checkpoint:
         policy_store: PolicyStore,
         gateway: MCPGateway,
         identity: IdentityProvider,
+        session_manager: SessionManager | None = None,  # v1.2 会话管理
+        risk_manager: RiskStateManager | None = None,  # v1.2 风险状态管理
         decision_store: DecisionStore | None = None,
         budget_ledger: BudgetLedger | None = None,
         permission_analyzer: PermissionInteractionAnalyzer | None = None,
@@ -188,6 +192,8 @@ class Checkpoint:
         self._policy_store = policy_store
         self._gateway = gateway
         self._identity = identity
+        self._session_manager = session_manager
+        self._risk_manager = risk_manager or RiskStateManager()  # 默认内存实现
         self._decision_store = decision_store or InMemoryDecisionStore()
         self._budget_ledger = budget_ledger or InfiniteBudgetLedger()
         self._permission_analyzer = permission_analyzer or NoopPermissionInteractionAnalyzer()
@@ -258,11 +264,13 @@ class Checkpoint:
             pending_approval = True  # require_approval 不短路，继续走 Rego（deny 优先原则）
 
         # 步骤 6：主策略查询（OPA/Rego；引擎内部任何异常已 fail-closed 为 deny）
+        session_risk = self._risk_manager.get_profile(task.session_id)
         rego_decision = await self._policy_engine.evaluate(
-            _PACKAGE, build_policy_input(proposal, agent, profile)
+            _PACKAGE, build_policy_input(proposal, agent, profile, session_risk)
         )
         verdict = rego_decision.get("verdict")
         if verdict == "deny":
+            self._risk_manager.update(task.session_id, "deny")
             return self._deny(
                 proposal,
                 rego_decision.get("reason", "denied by policy"),
@@ -271,6 +279,7 @@ class Checkpoint:
                 policy_hits=rego_decision.get("policy_hits"),
             )
         if verdict not in ("allow", "modify", "require_approval"):
+            self._risk_manager.update(task.session_id, "deny")
             return self._deny(proposal, "invalid policy verdict", now, policy_version)
 
         # 步骤 7：汇总输出 Decision。
@@ -283,8 +292,13 @@ class Checkpoint:
             reason = rego_decision.get("reason", "requires human approval")
             if rule is not None and verdict != "require_approval":
                 hits.append(rule.id)
+            self._risk_manager.update(task.session_id, "require_approval")
+            if proposal.risk_level == "critical":
+                self._risk_manager.update(task.session_id, "critical")
             return self._handle_require_approval(agent, proposal, profile, reason, now, policy_version, hits)
 
+        if proposal.risk_level == "critical":
+            self._risk_manager.update(task.session_id, "critical")
         return Decision(
             decision_id=uuid.uuid4().hex,
             call_id=proposal.call_id,
@@ -401,8 +415,17 @@ class Checkpoint:
 
     # -- forward：执行前校验（§6.6） ----------------------------------------
 
-    async def forward(self, proposal: ActionProposal, decision: Decision) -> ToolResult:
-        """校验 1-5 失败抛异常；modify 复核失败返回 blocked 结果（不抛异常）。"""
+    async def forward(
+        self,
+        proposal: ActionProposal,
+        decision: Decision,
+        session_id: str | None = None,
+    ) -> ToolResult:
+        """校验 1-5 失败抛异常；modify 复核失败返回 blocked 结果（不抛异常）。
+
+        Args:
+            session_id: v1.2 新增，用于 forward 成功后按低风险成功衰减会话风险分。
+        """
         # 校验 1-3：语义错误 / 过期授权一律抛异常（调用方 bug，不静默）
         if decision.call_id != proposal.call_id:
             raise CheckpointError("decision.call_id 与 proposal.call_id 不一致")
@@ -440,6 +463,13 @@ class Checkpoint:
         self._budget_ledger.commit(proposal.task_id, self._cost_for(proposal))
         if result.status == "success":
             self._history.setdefault(proposal.task_id, []).append(proposal)
+            # v1.2：allow 且风险低时按低风险成功衰减会话风险分
+            if (
+                session_id is not None
+                and decision.verdict == "allow"
+                and proposal.risk_level == "low"
+            ):
+                self._risk_manager.update(session_id, "low_risk_success")
         return result
 
     def _tool_permission_for(self, proposal: ActionProposal):

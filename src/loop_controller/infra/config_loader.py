@@ -139,6 +139,7 @@ class AppConfig:
     policy_dir: str
     audit_log_path: str
     decision_log_path: str
+    risk_state_path: str = "./data/risk_state.jsonl"  # v1.2 会话级风险状态持久化路径
     llm_planner: LLMPlannerConfig | None = None
     audit_hash_algo: Literal["sha256", "hmac-sha256"] = "sha256"
     audit_hmac_key_env: str = "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
@@ -192,6 +193,7 @@ class ConfigLoader:
             policy_dir=str(root / "policies"),
             audit_log_path=str(root / "data" / "audit.jsonl"),
             decision_log_path=str(root / "data" / "decisions.jsonl"),
+            risk_state_path=str(root / "data" / "risk_state.jsonl"),
             llm_planner=llm_planner,
             audit_hash_algo=audit_hash_algo,
         )
@@ -340,6 +342,7 @@ class ConfigLoader:
         for label, path_str in (
             ("audit_log", config.audit_log_path),
             ("decision_log", config.decision_log_path),
+            ("risk_state", config.risk_state_path),
         ):
             path = Path(path_str)
             probe = path.parent / f".write_probe_{label}"

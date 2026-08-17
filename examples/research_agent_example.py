@@ -27,7 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from loop_controller.infra.config_loader import ConfigLoader
-from loop_controller.models import Agent, Task
+from loop_controller.models import Agent
 from loop_controller.runtime import build_runtime, run_task
 
 
@@ -66,15 +66,13 @@ async def main() -> None:
     config = loader.load(CONFIG_DIR, opa_base_url=OPA_URL)
 
     agent = config.agents["researcher_001"]
-    task = Task(
-        task_id="research-demo-001",
-        session_id="research-demo-001",
+
+    runtime = build_runtime(config, opa_url=OPA_URL)
+    task = runtime.create_task(
         user_id="alice",
         agent_id=agent.agent_id,
         description="调研 AI 合规问题并发送摘要邮件给张经理",
     )
-
-    runtime = build_runtime(config, opa_url=OPA_URL)
     await runtime.start()
     try:
         await run_task(task, agent, runtime)

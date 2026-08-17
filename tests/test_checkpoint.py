@@ -28,6 +28,8 @@ from loop_controller.models import (
     ToolResult,
 )
 from loop_controller.permission_interaction import ConfigPermissionInteractionAnalyzer
+from loop_controller.risk_state import RiskStateManager
+from loop_controller.session import SessionManager
 
 PACKAGE = "loop_controller.tool_permission"
 
@@ -163,6 +165,8 @@ def make_checkpoint(
     permission_analyzer=None,
     tool_costs: dict | None = None,
     masker=None,
+    session_manager: SessionManager | None = None,
+    risk_manager: RiskStateManager | None = None,
 ) -> tuple[Checkpoint, FakePolicyEngine, FakeGateway]:
     engine = FakePolicyEngine(
         decision=engine_decision,
@@ -177,6 +181,8 @@ def make_checkpoint(
         policy_store=StubPolicyStore(),
         gateway=gw,
         identity=identity,
+        session_manager=session_manager,
+        risk_manager=risk_manager or RiskStateManager(),
         budget_ledger=budget_ledger or InMemoryBudgetLedger(),
         permission_analyzer=permission_analyzer,
         tool_costs=tool_costs,
@@ -822,3 +828,101 @@ async def test_forward_decision_reuse(
     with pytest.raises(CheckpointError):
         await cp.forward(proposal, decision)
     assert len(gw.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# v1.2 session_risk 集成
+# ---------------------------------------------------------------------------
+
+
+async def test_evaluate_includes_session_risk_in_policy_input(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v1.2：evaluate 应将 session_risk 结构传入 build_policy_input。"""
+    risk_manager = RiskStateManager()
+    risk_manager.update(task.session_id, "deny")
+    cp, engine, _ = make_checkpoint(profile, identity, risk_manager=risk_manager)
+    proposal = make_proposal(task, agent)
+
+    await cp.evaluate(task, agent, proposal)
+
+    assert len(engine.calls) == 1
+    input_doc = engine.calls[0]
+    assert "session_risk" in input_doc
+    assert input_doc["session_risk"]["score"] == pytest.approx(0.20)
+    assert input_doc["session_risk"]["threshold"] == profile.session_risk_threshold
+    assert input_doc["session_risk"]["denied_count"] == 1
+    assert input_doc["session_risk"]["recent_tags"] == ["deny"]
+    assert input_doc["session_risk"]["session_id"] == task.session_id
+
+
+async def test_evaluate_updates_risk_manager_on_deny(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """verdict=deny 时应写入 risk_manager。"""
+    risk_manager = RiskStateManager()
+    cp, _, _ = make_checkpoint(
+        profile,
+        identity,
+        risk_manager=risk_manager,
+        engine_decision={"verdict": "deny", "reason": "policy deny", "policy_hits": ["deny_rule"]},
+    )
+    proposal = make_proposal(task, agent)
+
+    await cp.evaluate(task, agent, proposal)
+
+    profile_after = risk_manager.get_profile(task.session_id)
+    assert profile_after.denied_count == 1
+    assert profile_after.recent_tags == ["deny"]
+    assert profile_after.cumulative_risk_score == pytest.approx(0.20)
+
+
+async def test_evaluate_updates_risk_manager_on_require_approval(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """verdict=require_approval 时应写入 risk_manager（tag 但无分数）。"""
+    risk_manager = RiskStateManager()
+    cp, _, _ = make_checkpoint(
+        profile,
+        identity,
+        risk_manager=risk_manager,
+        engine_decision={
+            "verdict": "require_approval",
+            "reason": "needs approval",
+            "policy_hits": ["approval_rule"],
+            "escalation_target": agent.owner_id,
+        },
+    )
+    proposal = make_proposal(task, agent, tool_name="send_email", arguments={"to": "z@company.com"})
+
+    await cp.evaluate(task, agent, proposal)
+
+    profile_after = risk_manager.get_profile(task.session_id)
+    assert profile_after.recent_tags == ["require_approval"]
+    assert profile_after.cumulative_risk_score == pytest.approx(0.0)
+
+
+async def test_forward_low_risk_success_updates_risk_manager(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """allow + risk_level=low 执行成功后应衰减风险分。"""
+    risk_manager = RiskStateManager()
+    risk_manager.update(task.session_id, "deny")
+    cp, _, _ = make_checkpoint(profile, identity, risk_manager=risk_manager)
+    proposal = make_proposal(task, agent, risk_level="low")
+    decision = Decision(
+        decision_id=uuid.uuid4().hex,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        verdict="allow",
+        reason="ok",
+        policy_version="v",
+        profile_version="v",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+
+    await cp.forward(proposal, decision, session_id=task.session_id)
+
+    profile_after = risk_manager.get_profile(task.session_id)
+    # deny: 0.20；low_risk_success: 0.20*0.9 - 0.05 = 0.13
+    assert profile_after.cumulative_risk_score == pytest.approx(0.13)

@@ -158,3 +158,69 @@ async def test_opa_down_fail_closed(agent, profile):
     decision = await _evaluate(engine, _proposal("web_search", {"query": "q"}), agent, profile)
     assert decision["verdict"] == "deny"
     assert decision["policy_hits"] == ["fail_closed"]
+
+
+async def test_session_risk_gate_upgrades_allow_to_approval(opa_server, agent, profile):
+    """v1.2：session_risk.score >= threshold 时，原本 allow 的 web_search 被升级为 require_approval。"""
+    from loop_controller.models import RiskProfile
+
+    engine = _make_engine(opa_server)
+    proposal = _proposal("web_search", {"query": "q"})
+    session_risk = RiskProfile(
+        session_id="session-with-high-risk",
+        cumulative_risk_score=0.65,
+        recent_tags=["deny"],
+    )
+    decision = await engine.evaluate(PACKAGE, build_policy_input(proposal, agent, profile, session_risk))
+    assert decision["verdict"] == "require_approval"
+    assert decision["policy_hits"] == ["session_risk_gate"]
+
+
+async def test_session_risk_input_contract_contains_all_fields(opa_server, agent, profile):
+    """v1.2 Python ↔ Rego input contract：session_risk 必须含 score/threshold/denied_count/recent_tags/session_id。"""
+    from loop_controller.models import RiskProfile
+
+    engine = _make_engine(opa_server)
+    proposal = _proposal("web_search", {"query": "q"})
+    session_risk = RiskProfile(
+        session_id="s-contract",
+        cumulative_risk_score=0.42,
+        denied_count=3,
+        recent_tags=["data_access"],
+    )
+    input_doc = build_policy_input(proposal, agent, profile, session_risk)
+    assert "session_risk" in input_doc
+    sr = input_doc["session_risk"]
+    assert sr["score"] == 0.42
+    assert sr["threshold"] == profile.session_risk_threshold
+    assert sr["denied_count"] == 3
+    assert sr["recent_tags"] == ["data_access"]
+    assert sr["session_id"] == "s-contract"
+
+
+async def test_session_risk_gate_does_not_crash_without_session_risk(opa_server, agent, profile):
+    """旧输入/测试没有 session_risk 时，策略不应崩溃，而是按原有规则判定。"""
+    engine = _make_engine(opa_server)
+    proposal = _proposal("web_search", {"query": "q"})
+    # 显式不传入 session_risk
+    input_doc = build_policy_input(proposal, agent, profile)
+    assert "session_risk" not in input_doc
+    decision = await engine.evaluate(PACKAGE, input_doc)
+    assert decision["verdict"] == "allow"
+    assert decision["policy_hits"] == ["web_search_allow"]
+
+
+async def test_critical_still_deny_overrides_session_risk_gate(opa_server, agent, profile):
+    """critical 信号保持 require_approval，session_risk_gate 不重复命中。"""
+    from loop_controller.models import RiskProfile
+
+    engine = _make_engine(opa_server)
+    proposal = _proposal("web_search", {"query": "q"}, risk_level="critical")
+    session_risk = RiskProfile(
+        session_id="s-critical",
+        cumulative_risk_score=0.99,
+        recent_tags=["deny"],
+    )
+    decision = await engine.evaluate(PACKAGE, build_policy_input(proposal, agent, profile, session_risk))
+    assert decision["verdict"] == "require_approval"
+    assert decision["policy_hits"] == ["critical_signal_gate"]

@@ -27,7 +27,9 @@ from loop_controller.mcp_gateway import MCPGateway
 from loop_controller.planner import Planner, ScriptedPlanner
 from loop_controller.infra.config_loader import ApprovalConfig, ApprovalRule
 from loop_controller.r0_delegate import ConfigR0Delegate
+from loop_controller.risk_state import RiskStateManager
 from loop_controller.runtime import Runtime, run_task
+from loop_controller.session import SessionManager
 
 
 class _FakePolicyEngine:
@@ -91,12 +93,16 @@ def _build_runtime(audit_path: Path, steps: list) -> Runtime:
         },
     )
     gateway = _FakeGateway()
+    session_manager = SessionManager()
+    risk_manager = RiskStateManager()
     checkpoint = Checkpoint(
         profiles={profile.profile_id: profile},
         policy_engine=_FakePolicyEngine(),
         policy_store=_StubPolicyStore(),
         gateway=gateway,
         identity=identity,
+        session_manager=session_manager,
+        risk_manager=risk_manager,
         decision_store=InMemoryDecisionStore(),
         budget_ledger=InMemoryBudgetLedger(),
         tool_costs={"web_search": BudgetCost(token_count=1)},
@@ -128,6 +134,8 @@ def _build_runtime(audit_path: Path, steps: list) -> Runtime:
         audit_store=audit_store,
         masker=checkpoint._masker,
         profiles={profile.profile_id: profile},
+        session_manager=session_manager,
+        risk_manager=risk_manager,
     )
 
 
@@ -149,9 +157,10 @@ def test_audit_event_sequence_and_fields(tmp_path) -> None:
         ],
     )
     agent = runtime.checkpoint._identity.get_agent("researcher_001")
+    session = runtime.session_manager.get_or_create_session("alice", agent.agent_id)
     task = Task(
         task_id="trace-001",
-        session_id="trace-001",
+        session_id=session.session_id,
         user_id="alice",
         agent_id=agent.agent_id,
         description="test audit",

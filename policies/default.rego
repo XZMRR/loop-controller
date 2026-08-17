@@ -11,16 +11,31 @@ decision := {"verdict": "require_approval", "reason": "critical risk signal requ
     input.risk_level == "critical"
 }
 
+# ---- 会话风险门控：异常累积 → 一律升级人工审批 ----
+# input.session_risk 不存在时规则自然失败，不会崩溃（兼容旧日志/测试）
+decision := {"verdict": "require_approval", "reason": "session risk score above threshold",
+             "escalation_target": input.agent.owner_id, "policy_hits": ["session_risk_gate"]} if {
+    session_risk_above_threshold
+    input.risk_level != "critical"   # critical 门控更严，避免重复命中
+}
+
+# 辅助规则：会话风险分超过阈值；不存在 session_risk 时失败，即不触发
+session_risk_above_threshold if {
+    input.session_risk.score >= input.session_risk.threshold
+}
+
 # ---- web_search ----
 decision := {"verdict": "allow", "reason": "web search allowed", "policy_hits": ["web_search_allow"]} if {
     input.tool_name == "web_search"
     input.risk_level != "critical"
+    not session_risk_above_threshold
 }
 
 # ---- read_file：限目录 ----
 decision := {"verdict": "allow", "reason": "read within allowed directories", "policy_hits": ["read_file_allow"]} if {
     input.tool_name == "read_file"
     input.risk_level != "critical"
+    not session_risk_above_threshold
     some pattern in input.profile.tools.read_file.allowed_args.path
     glob.match(pattern, ["/"], input.arguments.path)
 }
@@ -29,6 +44,7 @@ decision := {"verdict": "allow", "reason": "read within allowed directories", "p
 decision := {"verdict": "allow", "reason": "write within allowed directories", "policy_hits": ["write_file_allow"]} if {
     input.tool_name == "write_file"
     input.risk_level != "critical"
+    not session_risk_above_threshold
     some pattern in input.profile.tools.write_file.allowed_args.path
     glob.match(pattern, ["/"], input.arguments.path)
 }
@@ -47,6 +63,7 @@ decision := {"verdict": "allow", "reason": "internal email allowed", "policy_hit
     input.risk_level != "critical"
     input.profile.tools.send_email.require_approval == false
     recipient_allowed
+    not session_risk_above_threshold
 }
 
 decision := {"verdict": "deny", "reason": "recipient outside allowed patterns", "policy_hits": ["send_email_deny_external"]} if {

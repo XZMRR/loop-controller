@@ -14,7 +14,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
-from loop_controller.models import ActionProposal, Agent, CapabilityProfile
+from loop_controller.models import ActionProposal, Agent, CapabilityProfile, RiskProfile
 
 FAIL_CLOSED_DENY = {
     "verdict": "deny",
@@ -80,12 +80,14 @@ def build_policy_input(
     proposal: ActionProposal,
     agent: Agent,
     profile: CapabilityProfile,
+    session_risk: RiskProfile | None = None,
 ) -> dict[str, Any]:
     """构造 Rego input 文档（§6.3 的 JSON schema，唯一契约点）.
 
     ``task_context`` 只进这里、``description`` 原文不进（防 prompt injection 借道策略引擎）。
+    v1.2 扩展 ``session_risk``，供 default.rego 的 session_risk_gate 使用。
     """
-    return {
+    doc: dict[str, Any] = {
         "tool_name": proposal.tool_name,
         "arguments": proposal.arguments,
         "risk_level": proposal.risk_level,
@@ -106,3 +108,12 @@ def build_policy_input(
             }
         },
     }
+    if session_risk is not None:
+        doc["session_risk"] = {
+            "score": session_risk.cumulative_risk_score,
+            "threshold": profile.session_risk_threshold,
+            "denied_count": session_risk.denied_count,
+            "recent_tags": list(session_risk.recent_tags),
+            "session_id": session_risk.session_id,
+        }
+    return doc

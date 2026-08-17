@@ -50,7 +50,8 @@ def _utc_now() -> datetime:
 class Task(BaseModel):
     """一次用户请求的上下文。
 
-    MVP 约定：``session_id == task_id``（单任务单会话），由模型强制校验。
+    v1.2 起废除 ``session_id == task_id`` 约定：session 为同一 ``(user_id, agent_id)``
+    的连续任务流，由 ``SessionManager`` 分配与复用。
     ``description`` 原文不进入 Rego input，仅用于 R1 规划与 R3 审计。
     """
 
@@ -62,12 +63,6 @@ class Task(BaseModel):
     agent_id: str
     description: str
     created_at: datetime = Field(default_factory=_utc_now)
-
-    @model_validator(mode="after")
-    def _check_session_id(self) -> "Task":
-        if self.session_id != self.task_id:
-            raise ValueError("MVP 约定 session_id == task_id")
-        return self
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +117,7 @@ class CapabilityProfile(BaseModel):
     max_budget_token: int = 1_000_000
     max_budget_payment: float = 0.0
     fixed_ceiling: dict[str, Any] = Field(default_factory=dict)  # Earned Authority post-MVP
+    session_risk_threshold: float = Field(default=0.6, ge=0.0, le=1.0)  # v1.2 会话级风险门控阈值
 
 
 # ---------------------------------------------------------------------------
