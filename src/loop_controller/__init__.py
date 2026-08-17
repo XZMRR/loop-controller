@@ -1,32 +1,33 @@
 """Loop Controller: Agent 组织的制度基础设施.
 
-为 AI Agent 提供 R0-R3 四层治理模型的运行时实现，包括任务上下文、
-Agent 执行、能力画像、动作申报、风险分类、策略判定、审计等核心模块。
+为 AI Agent 提供 R0-R3 四层治理模型的运行时实现。本包按《MVP 完备方案：纯工具调用版 v1.1》
+渐进式构建；`models.py` 是唯一权威 Schema 来源。
 """
 
-from loop_controller.action_proposal import ActionProposal
-from loop_controller.agent import Agent
-from loop_controller.audit import AuditEvent, AuditLogger, JsonlAuditLogger
-from loop_controller.budget import BudgetCost, BudgetLedger, InMemoryBudgetLedger
-from loop_controller.capability_profile import CapabilityProfile, ToolPermission
-from loop_controller.checkpoint import Checkpoint, CheckpointConfig
-from loop_controller.classifier import LightweightClassifier, RiskSignal, RuleBasedClassifier
-from loop_controller.decision import Decision
-from loop_controller.mcp_gateway import MCPGateway, MockMCPGateway
-from loop_controller.permission_interaction import (
-    PermissionInteractionAnalyzer,
-    StaticPermissionInteractionAnalyzer,
+from loop_controller.checkpoint import Checkpoint, CheckpointError
+from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
+from loop_controller.mcp_gateway import MCPGateway, MCPGatewayError
+from loop_controller.models import (
+    ActionProposal,
+    Agent,
+    ApprovalRecord,
+    ApprovalRequest,
+    AuditEvent,
+    BudgetCost,
+    CapabilityProfile,
+    Decision,
+    PlannedAction,
+    RiskLevel,
+    RiskProfile,
+    RiskSignal,
+    Task,
+    Tool,
+    ToolPermission,
+    ToolResult,
+    Verdict,
 )
-from loop_controller.policy_engine import (
-    MockPolicyEngine,
-    OPAPolicyEngine,
-    PolicyEngine,
-    PolicyEngineError,
-)
-from loop_controller.r0_delegate import ApprovalRecord, ApprovalRequest, ConfigR0Delegate, R0Delegate
-from loop_controller.risk_state import InMemoryRiskStateManager, RiskProfile, RiskStateManager
-from loop_controller.task import Task
-from loop_controller.tool import Tool, ToolResult
+from loop_controller.planner import Planner, ScriptedPlanner
+from loop_controller.r0_delegate import ConfigR0Delegate, R0Delegate
 
 __all__ = [
     "ActionProposal",
@@ -34,33 +35,26 @@ __all__ = [
     "ApprovalRecord",
     "ApprovalRequest",
     "AuditEvent",
-    "AuditLogger",
     "BudgetCost",
-    "BudgetLedger",
     "CapabilityProfile",
     "Checkpoint",
-    "CheckpointConfig",
+    "CheckpointError",
     "ConfigR0Delegate",
     "Decision",
-    "InMemoryBudgetLedger",
-    "InMemoryRiskStateManager",
-    "JsonlAuditLogger",
+    "R0Delegate",
     "LightweightClassifier",
     "MCPGateway",
-    "MockMCPGateway",
-    "MockPolicyEngine",
-    "OPAPolicyEngine",
-    "PermissionInteractionAnalyzer",
-    "PolicyEngine",
-    "PolicyEngineError",
+    "MCPGatewayError",
+    "PlannedAction",
+    "Planner",
+    "RiskLevel",
     "RiskProfile",
     "RiskSignal",
-    "RiskStateManager",
     "RuleBasedClassifier",
-    "StaticPermissionInteractionAnalyzer",
+    "ScriptedPlanner",
     "Task",
     "Tool",
     "ToolPermission",
     "ToolResult",
-    "R0Delegate",
+    "Verdict",
 ]

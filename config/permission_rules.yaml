@@ -1,0 +1,22 @@
+# 权限组合静态规则（§6.2）
+# when_all 全部满足才命中；history_tool 对 history 做存在性匹配（任一历史动作满足即可）。
+# action 可选值：deny | require_approval（按规则表显式声明执行，偏离 D8）。
+rules:
+  - id: contact_plus_external_email
+    description: "读取联系人/知识库后向外部邮箱发信 = 数据外泄风险"
+    when_all:
+      - history_tool: read_file
+        history_arg_match: {path: "**/*contact*"}
+      - current_tool: send_email
+        current_arg_not_match: {to: "*@company.com"}
+    action: require_approval
+    reason: "检测到 读取内部资料→外发邮件 组合"
+  - id: kb_read_plus_external_email
+    description: "读取知识库后向外部邮箱发信"
+    when_all:
+      - history_tool: read_file
+        history_arg_match: {path: "/data/kb/**"}
+      - current_tool: send_email
+        current_arg_not_match: {to: "*@company.com"}
+    action: deny
+    reason: "内部知识库内容禁止外发"

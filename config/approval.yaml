@@ -1,0 +1,7 @@
+# R0-delegate 打桩配置（§7.5）
+approvers:
+  default: zhang_manager
+rules:
+  - tool_name: send_email
+    approver: zhang_manager
+    behavior: approve        # approve | deny；演示用固定行为

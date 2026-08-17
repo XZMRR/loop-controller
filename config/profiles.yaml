@@ -1,0 +1,28 @@
+# Loop Controller CapabilityProfile 配置（§4.6 / §3.3）
+# tools 中未声明的工具名 → R2 直接 deny（默认拒绝）。
+# allowed_args / denied_args 的值支持 POSIX glob。
+profiles:
+  - profile_id: research_assistant_v1
+    description: 研究助手岗位说明书
+    max_budget_token: 100000
+    max_budget_payment: 0.0
+    tools:
+      web_search:
+        allowed: true
+        max_calls_per_task: 10
+      read_file:
+        allowed: true
+        allowed_args:
+          path: ["/data/kb/**"]
+        max_calls_per_task: 20
+      write_file:
+        allowed: true
+        allowed_args:
+          path: ["/data/output/**"]
+        max_calls_per_task: 5
+      send_email:
+        allowed: true
+        require_approval: true
+        allowed_args:
+          to: ["*@company.com"]
+        max_calls_per_task: 1

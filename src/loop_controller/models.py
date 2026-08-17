@@ -1,0 +1,351 @@
+"""统一核心抽象（唯一权威 Schema）.
+
+本模块是 Loop Controller 全项目唯一 Schema 来源，对应《MVP 完备方案：纯工具调用版 v1.1》§3 与 §7.1。
+任何其他模块需要数据结构改动，必须先改本文件并检查全文引用。
+
+所有模型均为 Pydantic v2 模型，`frozen=True` 表达不可变语义；
+需要"修改"时使用 `model_copy(update={...})`。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+# ---------------------------------------------------------------------------
+# 枚举类型（照抄方案，不自行发明取值）
+# ---------------------------------------------------------------------------
+
+RiskLevel = Literal["low", "medium", "high", "critical"]
+Verdict = Literal["allow", "deny", "modify", "require_approval"]
+ToolResultStatus = Literal["success", "error", "blocked"]
+ActorType = Literal["agent", "user", "r0_delegate", "system", "checkpoint"]
+AuditAction = Literal[
+    "task_start",
+    "propose",
+    "classify",
+    "evaluate",
+    "approve",
+    "deny",
+    "execute",
+    "task_end",
+]
+ApprovalVerdict = Literal["approve", "deny"]
+
+
+def _utc_now() -> datetime:
+    """统一的 timezone-aware UTC 当前时间（禁止 naive datetime，偏离 D16）。"""
+    return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# §3.1 Task
+# ---------------------------------------------------------------------------
+
+
+class Task(BaseModel):
+    """一次用户请求的上下文。
+
+    MVP 约定：``session_id == task_id``（单任务单会话），由模型强制校验。
+    ``description`` 原文不进入 Rego input，仅用于 R1 规划与 R3 审计。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+    session_id: str
+    user_id: str
+    agent_id: str
+    description: str
+    created_at: datetime = Field(default_factory=_utc_now)
+
+    @model_validator(mode="after")
+    def _check_session_id(self) -> "Task":
+        if self.session_id != self.task_id:
+            raise ValueError("MVP 约定 session_id == task_id")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# §3.2 Agent
+# ---------------------------------------------------------------------------
+
+
+class Agent(BaseModel):
+    """R1 执行实体，身份预先分配于 ``agents.yaml``，运行期不可变。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    agent_id: str
+    name: str
+    profile_id: str  # MVP 一对一静态绑定，不支持运行时切换
+    owner_id: str  # 所属人类用户/部门，用于审批路由
+
+
+# ---------------------------------------------------------------------------
+# §3.3 CapabilityProfile
+# ---------------------------------------------------------------------------
+
+
+class ToolPermission(BaseModel):
+    """单个工具的精细化权限配置。
+
+    ``allowed_args`` / ``denied_args`` 的值支持 POSIX glob（如 ``*@company.com``、``/data/kb/**``）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    tool_name: str
+    allowed: bool = False
+    require_approval: bool = False
+    allowed_args: dict[str, list[str]] = Field(default_factory=dict)
+    denied_args: dict[str, list[str]] = Field(default_factory=dict)
+    max_calls_per_task: int | None = None
+
+
+class CapabilityProfile(BaseModel):
+    """Agent 的岗位说明书。
+
+    ``tools`` 中没有声明的工具名，R2 直接 deny（默认拒绝），不进入 Rego 查询。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    profile_id: str
+    version: str = ""  # = 配置文件内容 SHA-256 前 12 位，由 PolicyStore/ConfigLoader 填充
+    description: str = ""
+    tools: dict[str, ToolPermission] = Field(default_factory=dict)
+    max_budget_token: int = 1_000_000
+    max_budget_payment: float = 0.0
+    fixed_ceiling: dict[str, Any] = Field(default_factory=dict)  # Earned Authority post-MVP
+
+
+# ---------------------------------------------------------------------------
+# §3.4 ActionProposal
+# ---------------------------------------------------------------------------
+
+
+class ActionProposal(BaseModel):
+    """R1 向 R2 的动作申报。
+
+    ``risk_level`` / ``risk_tags`` 由 R1 分类器写入，**只是 R2 的输入信号**，
+    不构成任何判定效力；真正判定由 R2（Rego + 组合规则）完成。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+    call_id: str  # v1.1：run_task 框架统一生成的 UUID（Planner 不生成）；R2 校验全局唯一
+    agent_id: str
+    tool_name: str  # 规范化工具名
+    arguments: dict[str, Any]
+    task_context: str  # 由 Task.description 纯截断（前 200 字符）生成
+    risk_level: RiskLevel = "low"
+    risk_tags: list[str] = Field(default_factory=list)
+    reason: str = ""  # R1 认为需要此动作的理由，供审批人与审计阅读
+
+
+# ---------------------------------------------------------------------------
+# §3.5 RiskSignal
+# ---------------------------------------------------------------------------
+
+
+class RiskSignal(BaseModel):
+    """R1 轻量分类器输出的风险信号。
+
+    ``suggestion`` 仅供 R1 自省与审计，不进入 R2 判定。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    risk_level: RiskLevel
+    tags: list[str] = Field(default_factory=list)
+    reason: str = ""
+    suggestion: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# §3.6 Decision
+# ---------------------------------------------------------------------------
+
+
+class Decision(BaseModel):
+    """R2 对 ActionProposal 的权威判定。
+
+    ``expires_at`` 的分档逻辑（allow/modify 5min、require_approval 15min、deny 立即过期）
+    由 Checkpoint 的工厂方法集中处理，不在此模型内。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    decision_id: str  # R2 生成的 UUID
+    call_id: str
+    task_id: str
+    verdict: Verdict
+    reason: str  # 不允许为空字符串（审批可读性与审计可解释性底线）
+    modified_args: dict[str, Any] | None = None  # verdict == "modify" 时回写
+    escalation_target: str | None = None  # verdict == "require_approval" 时指向审批人
+    policy_hits: list[str] = Field(default_factory=list)  # 由 OPA 返回，Checkpoint 透传
+    policy_version: str = ""  # 判定时生效的策略版本
+    profile_version: str = ""  # 判定时生效的 Profile 版本
+    expires_at: datetime
+    max_uses: int = 1  # MVP 固定为 1（deny 为 0）
+
+
+# ---------------------------------------------------------------------------
+# §3.7 Tool / ToolResult
+# ---------------------------------------------------------------------------
+
+
+class Tool(BaseModel):
+    """MCP 工具元数据。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    canonical_name: str  # Loop Controller 内部名，如 "read_file"
+    mcp_name: str  # 真实 MCP server 工具名，如 "read_text_file"
+    description: str
+    input_schema: dict  # JSON Schema，与 MCP 协议对齐
+
+
+class ToolResult(BaseModel):
+    """工具调用结果；``blocked`` = 被治理链路拦截。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    call_id: str
+    task_id: str
+    tool_name: str  # canonical_name
+    status: ToolResultStatus
+    content: Any
+    error_code: str | None = None
+    elapsed_ms: int = 0
+
+
+# ---------------------------------------------------------------------------
+# §3.8 BudgetCost
+# ---------------------------------------------------------------------------
+
+
+class BudgetCost(BaseModel):
+    """单次动作成本估算。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    token_count: int = 0
+    payment_amount: float = 0.0  # MVP 恒为 0
+    currency: str = "USD"
+
+
+# ---------------------------------------------------------------------------
+# §3.9 RiskProfile
+# ---------------------------------------------------------------------------
+
+
+class RiskProfile(BaseModel):
+    """Session 级风险画像（MVP 打桩：仅统计计数供审计引用，不参与判定）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    session_id: str
+    cumulative_risk_score: float = 0.0
+    recent_tags: list[str] = Field(default_factory=list)
+    denied_count: int = 0
+    approval_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# §3.10 ApprovalRequest / ApprovalRecord
+# ---------------------------------------------------------------------------
+
+
+class ApprovalRequest(BaseModel):
+    """提交给 R0-delegate 的审批请求。
+
+    ``decision_id`` 强绑定触发审批的 Decision，不允许为空。
+    审批人看到的是掩码后参数（``arguments_masked``）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    request_id: str
+    decision_id: str
+    call_id: str
+    task_id: str
+    agent_id: str
+    tool_name: str
+    arguments_masked: dict
+    reason: str  # R2 给出的升级理由
+    requester_id: str  # 任务发起者 user_id
+    approver_id: str  # 被指派的审批人
+    created_at: datetime = Field(default_factory=_utc_now)
+
+
+class ApprovalRecord(BaseModel):
+    """R0-delegate 的审批结果（两态：approve / deny，escalate 移出 MVP）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    request_id: str
+    decision_id: str  # 回指，强绑定
+    verdict: ApprovalVerdict
+    approver_id: str
+    comment: str
+    decided_at: datetime = Field(default_factory=_utc_now)
+
+
+# ---------------------------------------------------------------------------
+# §7.1 AuditEvent
+# ---------------------------------------------------------------------------
+
+
+class AuditEvent(BaseModel):
+    """R3 审计最小日志单元。
+
+    ``seq`` / ``prev_hash`` 由 AuditStore 分配（哈希链）；``args_hash`` 与
+    ``args_mask`` 记录脱敏后的参数，原始参数永不落盘。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: str = "1.0"
+    event_id: str  # UUID
+    seq: int = 0  # 全局单调递增序号，由 AuditStore 分配
+    prev_hash: str = ""  # 上一条事件规范 JSON 的 SHA-256；首条为 "GENESIS"
+    trace_id: str  # == Task.task_id
+    session_id: str  # == Task.session_id
+    call_id: str | None = None  # 动作级 ID；task_start/task_end 为空
+    timestamp: datetime = Field(default_factory=_utc_now)
+    actor_type: ActorType
+    actor_id: str
+    action: AuditAction
+    target: str | None = None  # tool_name 或 "checkpoint"
+    decision: Verdict | None = None
+    args_hash: str | None = None  # 规范 JSON 的 SHA-256
+    hash_algo: str = "sha256"  # 升级 HMAC 时改此字段，schema 不变
+    args_mask: dict | None = None  # 掩码后的结构化参数
+    reason: str | None = None
+    policy_version: str | None = None
+    profile_version: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)  # 分类器 suggestion、审批 comment 等
+
+
+# ---------------------------------------------------------------------------
+# §5.1 PlannedAction（ScriptedPlanner 的步骤产物）
+# ---------------------------------------------------------------------------
+
+
+class PlannedAction(BaseModel):
+    """Planner 输出的动作草案（§5.1，v1.1 评审#7/#8）。
+
+    不含 call_id/task_id/agent_id——这些身份字段由 run_task 框架在组装
+    ``ActionProposal`` 时统一生成/填充，Planner（尤其是 LLMPlanner）无权自定。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    tool_name: str
+    arguments: dict[str, Any]
+    reason: str = ""

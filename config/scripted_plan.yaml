@@ -1,0 +1,15 @@
+# ScriptedPlanner 脚本（§5.1）
+# 治理链路演示：行为完全确定、可复现。
+steps:
+  - tool_name: web_search
+    arguments: {query: "OpenAI 企业合规 争议"}
+    reason: "调研公开资料"
+  - tool_name: read_file
+    arguments: {path: "/data/kb/ai_compliance_checklist.md"}
+    reason: "读取内部合规清单"
+  - tool_name: write_file
+    arguments: {path: "/data/output/summary.md", content: "# 研究摘要\n\n（占位内容）"}
+    reason: "写出摘要"
+  - tool_name: send_email
+    arguments: {to: "zhang@company.com", subject: "AI 合规调研摘要", body: "请查收附件"}
+    reason: "发送报告给张经理"

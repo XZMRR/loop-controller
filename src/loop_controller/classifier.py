@@ -1,44 +1,35 @@
-"""R1 轻量分类器.
+"""轻量分类器（§3.5）：只输出风险信号，不构成任何判定效力。
 
-轻量分类器位于 R1 执行层，对即将提交的 ActionProposal 做快速风险扫描，
-输出 RiskSignal。它只输出风险信号，不做最终是否执行的判定。
-MVP 使用规则实现；接口已预留，未来可替换为专用小模型或更复杂编码器。
+``RuleBasedClassifier`` 是规则版打桩：给 R1 自检用，产出 ``RiskSignal``，
+由 R1 执行循环写回 ``ActionProposal.risk_level / risk_tags`` 进入 Rego input。
+真正的判定权在 R2（Rego + 组合规则）——分类器没有否决权（§3.5 冲突规则）。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Literal, Protocol, runtime_checkable
+import re
+from typing import Protocol, runtime_checkable
 
-from loop_controller.action_proposal import ActionProposal
-from loop_controller.agent import Agent
-from loop_controller.capability_profile import CapabilityProfile
-from loop_controller.task import Task
+from loop_controller.models import ActionProposal, Agent, CapabilityProfile, RiskSignal, Task
 
-
-@dataclass(frozen=True)
-class RiskSignal:
-    """轻量分类器输出的风险信号.
-
-    Attributes:
-        risk_level: 风险等级，R2 可参考。
-        tags: 风险标签列表，如 ["external_communication", "pii_involved"]。
-        reason: 可解释的风险原因。
-        suggestion: 可选的缓解建议，供 R1 调整动作。
-    """
-
-    risk_level: Literal["low", "medium", "high", "critical"]
-    tags: list[str] = field(default_factory=list)
-    reason: str = ""
-    suggestion: str | None = None
+# 敏感模式（与 config/masking_rules.yaml 的 value_patterns / field_name_blacklist 对齐，
+# 避免"日志里脱敏了但分类器没认出来"的口径漂移）。
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_BEARER_RE = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
+_SENSITIVE_FIELD_NAMES = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "authorization",
+    "credential",
+)
 
 
 @runtime_checkable
 class LightweightClassifier(Protocol):
-    """R1 轻量分类器接口.
-
-    实现类必须只输出 RiskSignal，不能输出 allow/deny 等决策。
-    """
+    """R1 轻量分类器接口（§3.5）。"""
 
     def classify(
         self,
@@ -46,35 +37,20 @@ class LightweightClassifier(Protocol):
         agent: Agent,
         proposal: ActionProposal,
         profile: CapabilityProfile,
-    ) -> RiskSignal:
-        """对 ActionProposal 做风险预检，返回风险信号.
-
-        Args:
-            task: 当前任务上下文。
-            agent: 执行 Agent。
-            proposal: 待提交的动作申报。
-            profile: Agent 的能力画像。
-
-        Returns:
-            RiskSignal，包含风险等级、标签、原因和建议。
-        """
-        ...
+    ) -> RiskSignal: ...
 
 
 class RuleBasedClassifier:
-    """基于规则的轻量分类器，MVP 打桩实现.
+    """规则版分类器（MVP 打桩），四条规则：
 
-    规则按工具名匹配，便于快速调整。未来可替换为基于小模型或
-    更复杂特征工程的分类器，而无需改动 R2。
+    | 规则 | risk_level | tags |
+    |---|---|---|
+    | ``tool_name == "send_email"`` | high | ``[external_communication]`` |
+    | ``tool_name == "read_file"`` | medium | ``[data_access]`` |
+    | 参数值匹配敏感模式（邮箱） | high | 追加 ``[pii_involved]`` |
+    | 参数值匹配敏感模式（Bearer token / 密码字段名） | high | 追加 ``[credential_involved]`` |
+    | 其他 | low | ``[]`` |
     """
-
-    def __init__(self, rules: dict[str, RiskSignal] | None = None) -> None:
-        """初始化规则表.
-
-        Args:
-            rules: 可选的自定义规则，key 为规范化工具名。
-        """
-        self._rules = rules or _DEFAULT_RULES
 
     def classify(
         self,
@@ -83,48 +59,48 @@ class RuleBasedClassifier:
         proposal: ActionProposal,
         profile: CapabilityProfile,
     ) -> RiskSignal:
-        """按工具名查找预设规则，返回对应 RiskSignal.
+        level = "low"
+        tags: list[str] = []
+        hits: list[str] = []
 
-        未命中规则时返回 low 风险。
-        """
-        if proposal.type != "tool_call":
-            return RiskSignal(
-                risk_level="low",
-                tags=["inter_agent"],
-                reason="非工具调用类型，由 R1 内部处理",
-            )
+        if proposal.tool_name == "send_email":
+            level = "high"
+            tags.append("external_communication")
+            hits.append("tool=send_email")
+        elif proposal.tool_name == "read_file":
+            level = "medium"
+            tags.append("data_access")
+            hits.append("tool=read_file")
 
-        if proposal.tool_name in self._rules:
-            return self._rules[proposal.tool_name]
+        # 参数级敏感模式：邮箱 / Bearer token / 密码字段名
+        pii, cred = self._scan_arguments(proposal.arguments)
+        if pii:
+            level = "high"
+            tags.append("pii_involved")
+            hits.append("value=email_address")
+        if cred:
+            level = "high"
+            tags.append("credential_involved")
+            hits.append("value=credential")
 
         return RiskSignal(
-            risk_level="low",
-            tags=[],
-            reason="常规操作",
+            risk_level=level,
+            tags=tags,
+            reason="; ".join(hits) or "no rule matched",
         )
 
-
-# MVP 默认规则表。可按项目需求扩展。
-_DEFAULT_RULES: dict[str, RiskSignal] = {
-    "send_email": RiskSignal(
-        risk_level="high",
-        tags=["external_communication"],
-        reason="send_email 涉及外部通信",
-        suggestion="请确认收件人白名单",
-    ),
-    "write_file": RiskSignal(
-        risk_level="medium",
-        tags=["data_modification"],
-        reason="写文件可能覆盖或篡改已有内容",
-    ),
-    "read_file": RiskSignal(
-        risk_level="medium",
-        tags=["data_access"],
-        reason="读取本地文件",
-    ),
-    "web_search": RiskSignal(
-        risk_level="low",
-        tags=["external_query"],
-        reason="向外部搜索引擎查询公开信息",
-    ),
-}
+    @staticmethod
+    def _scan_arguments(arguments: dict) -> tuple[bool, bool]:
+        """浅层扫描参数（与掩码同口径），返回 (含 PII?, 含凭证?)。"""
+        pii = False
+        cred = False
+        for key, value in arguments.items():
+            lowered_key = str(key).lower()
+            if any(field in lowered_key for field in _SENSITIVE_FIELD_NAMES):
+                cred = True
+            text = str(value)
+            if _EMAIL_RE.search(text):
+                pii = True
+            if _BEARER_RE.search(text):
+                cred = True
+        return pii, cred

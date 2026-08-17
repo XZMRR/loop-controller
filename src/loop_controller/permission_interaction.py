@@ -1,101 +1,85 @@
-"""权限组合风险分析.
+"""权限组合规则分析器（§6.2 / 开发指南 T2.3）.
 
-检测多个独立权限/工具组合后产生的新能力（A + B > C）。
-MVP 阶段使用静态规则表，接口已预留未来扩展为图分析或能力集合代数。
+``ConfigPermissionInteractionAnalyzer`` 加载 ``permission_rules.yaml`` 中的静态规则，
+对当前动作与任务历史做 POSIX glob 匹配；命中 deny 立即短路，命中 require_approval
+则挂起标记继续走 Rego（deny 优先原则）。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from loop_controller.action_proposal import ActionProposal
-from loop_controller.classifier import RiskSignal
-
-
-@dataclass(frozen=True)
-class PermissionInteractionRule:
-    """静态权限组合规则.
-
-    Attributes:
-        id: 规则标识。
-        tool_names: 触发规则的工具名集合。
-        condition: 人类可读的条件描述；MVP 阶段由代码解析简化条件。
-        risk: 风险等级。
-        action: R2 应采取的动作，如 require_approval / deny。
-    """
-
-    id: str
-    tool_names: list[str]
-    condition: str
-    risk: str
-    action: str
+from loop_controller.infra.config_loader import PermissionCondition, PermissionRule
+from loop_controller.models import ActionProposal
+from loop_controller.utils.globmatch import glob_match
 
 
 @runtime_checkable
 class PermissionInteractionAnalyzer(Protocol):
-    """权限组合分析器接口."""
+    """权限组合分析接口（§6.2）。"""
 
     def check(
         self,
-        current_proposal: ActionProposal,
+        current: ActionProposal,
         history: list[ActionProposal],
-    ) -> RiskSignal | None:
-        """检查当前动作与历史动作组合后是否产生新风险.
-
-        Args:
-            current_proposal: 当前待判定动作。
-            history: 同一任务内已发生的动作申报。
-
-        Returns:
-            若触发组合风险则返回 RiskSignal，否则返回 None。
-        """
-        ...
+    ) -> PermissionRule | None: ...
 
 
-class StaticPermissionInteractionAnalyzer:
-    """基于静态规则表的权限组合分析器.
+class ConfigPermissionInteractionAnalyzer:
+    """基于 YAML 配置的组合规则分析器。"""
 
-    规则示例：
-        read_file 读取 contact 后 send_email → 疑似泄露通讯录钓鱼。
-    """
-
-    def __init__(self, rules: list[PermissionInteractionRule] | None = None) -> None:
-        """初始化规则表."""
-        self._rules = rules or _DEFAULT_RULES
+    def __init__(self, rules: list[PermissionRule]) -> None:
+        self._rules = list(rules)
 
     def check(
         self,
-        current_proposal: ActionProposal,
+        current: ActionProposal,
         history: list[ActionProposal],
-    ) -> RiskSignal | None:
-        """按规则表匹配组合风险."""
-        tool_sequence = [p.tool_name for p in history] + [current_proposal.tool_name]
-        tool_set = set(tool_sequence)
-
+    ) -> PermissionRule | None:
         for rule in self._rules:
-            if set(rule.tool_names).issubset(tool_set):
-                return RiskSignal(
-                    risk_level="high",  # MVP 简化：组合风险统一 high
-                    tags=["permission_interaction", rule.id],
-                    reason=f"触发权限组合规则：{rule.condition}",
-                )
+            if self._match(rule, current, history):
+                return rule
         return None
 
+    @staticmethod
+    def _match(rule: PermissionRule, current: ActionProposal, history: list[ActionProposal]) -> bool:
+        return all(
+            ConfigPermissionInteractionAnalyzer._match_condition(cond, current, history)
+            for cond in rule.when_all
+        )
 
-_DEFAULT_RULES: list[PermissionInteractionRule] = [
-    PermissionInteractionRule(
-        id="read_contact_then_email",
-        tool_names=["read_file", "send_email"],
-        condition="读取文件后发送外部邮件，存在数据外泄风险",
-        risk="high",
-        action="require_approval",
-    ),
-    PermissionInteractionRule(
-        id="search_then_write",
-        tool_names=["web_search", "write_file"],
-        condition="搜索外部信息后写入本地文件，需确认信息来源可信度",
-        risk="medium",
-        action="allow",
-    ),
-]
+    @staticmethod
+    def _match_condition(
+        cond: PermissionCondition,
+        current: ActionProposal,
+        history: list[ActionProposal],
+    ) -> bool:
+        # history 侧：任一历史动作满足 tool_name + 参数 glob 匹配
+        if cond.history_tool:
+            return any(
+                h.tool_name == cond.history_tool
+                and _args_match_patterns(h.arguments, cond.history_arg_match or {})
+                for h in history
+            )
+
+        # current 侧：tool_name 匹配且参数不满足（not_match）指定 glob
+        if cond.current_tool:
+            if current.tool_name != cond.current_tool:
+                return False
+            if cond.current_arg_not_match:
+                # not_match：当前参数匹配了这些 pattern 才返回 False
+                return not _args_match_patterns(current.arguments, cond.current_arg_not_match)
+            return True
+
+        return True
+
+
+def _args_match_patterns(args: dict, patterns: dict[str, str]) -> bool:
+    """args 中每个 key 至少有一个 glob pattern 匹配其字符串值。"""
+    for key, pattern in patterns.items():
+        if key not in args:
+            return False
+        value = str(args[key])
+        if not glob_match(pattern, value):
+            return False
+    return True

@@ -1,0 +1,21 @@
+# 参数掩码规则（§7.4）
+field_name_blacklist:        # 字段名匹配（不区分大小写，含子串匹配）
+  - password
+  - passwd
+  - secret
+  - token
+  - api_key
+  - authorization
+  - credential
+value_patterns:              # 值模式匹配（正则）
+  - name: bearer_token
+    pattern: "Bearer\\s+\\S+"
+  - name: email_address
+    pattern: "[\\w.+-]+@[\\w-]+\\.[\\w.]+"
+    replacement: "***@***"
+masking_applies_to:          # v1.1：分级掩码（自审#1）
+  audit_log:                 # 落盘审计日志：两类规则全部应用
+    - field_name_blacklist
+    - value_patterns
+  approval_request:          # 审批视图：只应用凭证类黑名单（收件人/路径/正文须对审批人可见）
+    - field_name_blacklist

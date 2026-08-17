@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.6.x"
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --dev
+
+      - name: Download OPA
+        run: |
+          mkdir -p tools
+          curl -L -o tools/opa https://openpolicyagent.org/downloads/v1.0.1/opa_linux_amd64_static
+          chmod +x tools/opa
+
+      - name: Run tests
+        run: uv run pytest tests/ -q
+        env:
+          OPA_PATH: tools/opa

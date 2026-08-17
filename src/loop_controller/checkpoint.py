@@ -1,335 +1,481 @@
-"""R2 Checkpoint：策略执行入口.
+"""Checkpoint（方案 §6.1 / §6.6）：R2 判定与执行前校验。
 
-Checkpoint 是 R2 的统一入口，负责：
-1. evaluate：接收 R1 的 ActionProposal，返回 Decision；
-2. forward：对 allow/modify 的 Decision，校验有效性并代理转发到 MCP Gateway。
+``evaluate()`` 实现判定流水线步骤 0-7；``forward()`` 实现执行前校验 1-8。
+治理语义只许住在本组件：``forward`` 的校验、modify 复核不得下沉到 MCPGateway，
+也不得上浮到 R1（开发指南纪律 4）。
+
+当前状态（迭代 1/2 完成，已对齐 v1.1）：
+- 步骤 1 DecisionStore：``JsonlDecisionStore`` 持久化 + call_id 全局唯一检测（v1.1）；
+- 步骤 3 调用次数上限、步骤 4 预算（按工具 ``cost_per_call``）、步骤 5 权限组合、步骤 6 OPA 已接通；
+- 审批分支：``require_approval`` → R0-delegate async 接口（评审#4）。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
-from uuid import uuid4
+from typing import Callable, Protocol, runtime_checkable
 
-from loop_controller.action_proposal import ActionProposal
-from loop_controller.agent import Agent
-from loop_controller.audit import AuditEvent, AuditLogger, hash_arguments, mask_arguments
-from loop_controller.budget import BudgetCost, BudgetLedger, InMemoryBudgetLedger
-from loop_controller.capability_profile import CapabilityProfile
-from loop_controller.decision import Decision
-from loop_controller.mcp_gateway import MCPGateway, MockMCPGateway
-from loop_controller.permission_interaction import (
-    PermissionInteractionAnalyzer,
-    StaticPermissionInteractionAnalyzer,
+from loop_controller.infra.config_loader import PermissionRule
+from loop_controller.infra.identity import IdentityProvider
+from loop_controller.infra.policy_store import PolicyStore
+from loop_controller.mcp_gateway import MCPGateway
+from loop_controller.models import (
+    ActionProposal,
+    Agent,
+    ApprovalRequest,
+    BudgetCost,
+    CapabilityProfile,
+    Decision,
+    Task,
+    ToolResult,
 )
-from loop_controller.policy_engine import PolicyEngine
-from loop_controller.r0_delegate import ApprovalRequest, ApprovalRecord, R0Delegate
-from loop_controller.risk_state import RiskStateManager
-from loop_controller.task import Task
-from loop_controller.tool import ToolResult
+from loop_controller.policy_engine import PolicyEngine, build_policy_input
+from loop_controller.utils.globmatch import glob_match
+
+logger = logging.getLogger(__name__)
+
+# 与 policies/default.rego 的 package 声明一致（Rego 侧斜杠路径见 policy_engine）。
+_PACKAGE = "loop_controller.tool_permission"
+
+# Decision.expires_at 分档（§3.6）：allow/modify +5min、require_approval +15min、deny 立即过期。
+_ALLOW_MODIFY_DELTA = timedelta(minutes=5)
+_APPROVAL_DELTA = timedelta(minutes=15)
+
+# 每次工具调用的估算成本（§3.8）：v1.1（评审#3）起按工具 ``tool_costs`` 计费，
+# 未配置的工具回退到该默认值（恒为正，防零成本绕过预算）。
+_DEFAULT_PER_CALL_COST = BudgetCost(token_count=1)
 
 
-@dataclass
-class CheckpointConfig:
-    """Checkpoint 配置.
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-    Attributes:
-        policy_package: OPA/Rego 包名。
-        decision_ttl_seconds: allow/modify Decision 有效期（秒）。
-        approval_ttl_seconds: require_approval Decision 有效期（秒）。
+
+class CheckpointError(Exception):
+    """forward 前置校验失败（调用方语义错误 / 授权过期 / 重放），向上抛异常。"""
+
+
+# ---------------------------------------------------------------------------
+# §4.5 DecisionStore：判定存储（防重放）
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class DecisionStore(Protocol):
+    """持久化已签发的 Decision 使用记录，提供跨重启防重放（§4.5）。"""
+
+    def is_call_id_seen(self, call_id: str) -> bool: ...  # v1.1：全局唯一性检测（不再按 task_id 分区）
+    def is_decision_used(self, decision_id: str) -> bool: ...
+    def record_proposal(self, task_id: str, call_id: str) -> None: ...
+    def record_decision_use(self, decision_id: str) -> None: ...
+
+
+class InMemoryDecisionStore:
+    """内存版 DecisionStore（迭代 1 占位；T2.1 替换为 Jsonl 持久化版）。
+
+    接口与最终实现一致，仅不持久化（进程重启即失效）。
     """
 
-    policy_package: str = "loop_controller.tool_permission"
-    decision_ttl_seconds: int = 300
-    approval_ttl_seconds: int = 900
+    def __init__(self) -> None:
+        self._call_ids: set[str] = set()
+        self._used_decision_ids: set[str] = set()
+
+    def is_call_id_seen(self, call_id: str) -> bool:
+        return call_id in self._call_ids
+
+    def is_decision_used(self, decision_id: str) -> bool:
+        return decision_id in self._used_decision_ids
+
+    def record_proposal(self, task_id: str, call_id: str) -> None:
+        self._call_ids.add(call_id)
+
+    def record_decision_use(self, decision_id: str) -> None:
+        self._used_decision_ids.add(decision_id)
+
+
+# ---------------------------------------------------------------------------
+# §3.8 BudgetLedger：预算记账
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class BudgetLedger(Protocol):
+    """预算记账（§3.8）：reserve → commit / refund 三路径。"""
+
+    def check_and_reserve(self, task_id: str, cost: BudgetCost) -> bool: ...
+    def commit(self, task_id: str, cost: BudgetCost) -> None: ...
+    def refund(self, task_id: str, cost: BudgetCost) -> None: ...
+
+
+class InfiniteBudgetLedger:
+    """恒通过的预算占位（迭代 1；T2.4 换 InMemoryBudgetLedger 真计数）。"""
+
+    def check_and_reserve(self, task_id: str, cost: BudgetCost) -> bool:
+        return True
+
+    def commit(self, task_id: str, cost: BudgetCost) -> None:
+        pass
+
+    def refund(self, task_id: str, cost: BudgetCost) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# §6.2 PermissionInteractionAnalyzer：权限组合规则
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class PermissionInteractionAnalyzer(Protocol):
+    """权限组合分析（§6.2）：返回命中的规则；无命中返回 None。"""
+
+    def check(
+        self,
+        current: ActionProposal,
+        history: list[ActionProposal],
+    ) -> PermissionRule | None: ...
+
+
+class NoopPermissionInteractionAnalyzer:
+    """恒无命中的组合规则占位（迭代 1；T2.3 换真实现）。"""
+
+    def check(
+        self,
+        current: ActionProposal,
+        history: list[ActionProposal],
+    ) -> PermissionRule | None:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint：evaluate + forward
+# ---------------------------------------------------------------------------
 
 
 class Checkpoint:
-    """R2 统一入口.
+    """R2 判定与执行前校验（PDP + PEP 合一）。
 
-    MVP 内同时承担 PDP（策略决策点）和 PEP（策略执行点）角色。
+    Args:
+        profiles: profile_id -> CapabilityProfile（来自 ConfigLoader）。
+        policy_engine: OPA/Rego 主策略引擎。
+        policy_store: 策略版本来源（Decision.policy_version）。
+        gateway: MCPGateway（forward 的唯一执行通道）。
+        identity: 可信身份源（步骤 0 交叉校验用）。
+        decision_store: 防重放存储（默认内存占位）。
+        budget_ledger: 预算记账（默认恒通过占位）。
+        permission_analyzer: 组合规则分析（默认无命中占位）。
+        now: 可注入的时间源（测试用），默认 UTC now。
     """
 
     def __init__(
         self,
+        *,
+        profiles: dict[str, CapabilityProfile],
         policy_engine: PolicyEngine,
-        profile_store: dict[str, CapabilityProfile],
-        permission_interaction: PermissionInteractionAnalyzer | None = None,
+        policy_store: PolicyStore,
+        gateway: MCPGateway,
+        identity: IdentityProvider,
+        decision_store: DecisionStore | None = None,
         budget_ledger: BudgetLedger | None = None,
-        risk_state_manager: RiskStateManager | None = None,
-        r0_delegate: R0Delegate | None = None,
-        mcp_gateway: MCPGateway | None = None,
-        audit_logger: AuditLogger | None = None,
-        config: CheckpointConfig | None = None,
+        permission_analyzer: PermissionInteractionAnalyzer | None = None,
+        tool_costs: dict[str, BudgetCost] | None = None,  # v1.1：tool_name -> 单次调用成本
+        masker=None,  # Masker（T3.2 接入 build_approval_request）
+        now: Callable[[], datetime] | None = None,
     ) -> None:
-        """初始化 Checkpoint.
+        self._profiles = profiles
+        self._policy_engine = policy_engine
+        self._policy_store = policy_store
+        self._gateway = gateway
+        self._identity = identity
+        self._decision_store = decision_store or InMemoryDecisionStore()
+        self._budget_ledger = budget_ledger or InfiniteBudgetLedger()
+        self._permission_analyzer = permission_analyzer or NoopPermissionInteractionAnalyzer()
+        self._tool_costs = tool_costs or {}
+        self._masker = masker
+        self._now = now or _utc_now
+        # per-task 已成功执行的动作历史（§6.1 步骤 5 / 偏离 D12），任务结束即弃。
+        self._history: dict[str, list[ActionProposal]] = {}
 
-        Args:
-            policy_engine: 策略引擎，如 OPAPolicyEngine 或 MockPolicyEngine。
-            profile_store: CapabilityProfile 内存存储。
-            permission_interaction: 权限组合分析器，默认静态规则。
-            budget_ledger: 预算账本，默认内存版。
-            risk_state_manager: 跨动作风险状态，默认 None（MVP 不打桩实例化）。
-            r0_delegate: R0-delegate 审批接口，默认 None。
-            mcp_gateway: MCP Client 代理，默认 Mock。
-            audit_logger: 审计日志接口，默认 None。
-            config: Checkpoint 配置。
-        """
-        self.policy_engine = policy_engine
-        self.profile_store = profile_store
-        self.permission_interaction = permission_interaction or StaticPermissionInteractionAnalyzer()
-        self.budget_ledger = budget_ledger or InMemoryBudgetLedger()
-        self.risk_state_manager = risk_state_manager
-        self.r0_delegate = r0_delegate
-        self.mcp_gateway = mcp_gateway or MockMCPGateway()
-        self.audit_logger = audit_logger
-        self.config = config or CheckpointConfig()
-        self._used_decisions: set[str] = set()
+    # -- 生命周期 -----------------------------------------------------------
 
-    def evaluate(
-        self,
-        task: Task,
-        agent: Agent,
-        proposal: ActionProposal,
-    ) -> Decision:
-        """对 ActionProposal 做策略判定，返回 Decision.
+    def forget_task(self, task_id: str) -> None:
+        """任务结束时丢弃该任务的 per-task 历史（runtime 在 task_end 调用）。"""
+        self._history.pop(task_id, None)
 
-        流程：
-        1. 校验 Agent 的 CapabilityProfile；
-        2. 预算检查并预留；
-        3. 权限组合分析；
-        4. 调用 PolicyEngine 做最终判定；
-        5. 审计 evaluate 事件；
-        6. 更新 RiskStateManager。
-        """
-        # 1. 校验 CapabilityProfile
-        profile = self.profile_store.get(agent.profile_id)
+    def _cost_for(self, proposal: ActionProposal) -> BudgetCost:
+        """该工具单次调用的估算成本（v1.1：按工具 cost_per_call；未配置回退默认值）。"""
+        return self._tool_costs.get(proposal.tool_name, _DEFAULT_PER_CALL_COST)
+
+    # -- evaluate：判定流水线（§6.1） ----------------------------------------
+
+    async def evaluate(self, task: Task, agent: Agent, proposal: ActionProposal) -> Decision:
+        """对一次工具申报给出权威判定。步骤顺序固定，任一失败即短路。"""
+        now = self._now()
+        policy_version = self._policy_store.current_version()
+
+        # 步骤 0：身份交叉校验（agent 必须来自 IdentityProvider，proposal 与之一致）
+        if proposal.agent_id != agent.agent_id:
+            return self._deny(proposal, "identity mismatch", now, policy_version)
+        if self._identity.get_agent(agent.agent_id) is None:
+            return self._deny(proposal, "unknown agent", now, policy_version)
+
+        # 步骤 1：重放检测（DecisionStore；v1.1 全局唯一性检测）
+        if self._decision_store.is_call_id_seen(proposal.call_id):
+            return self._deny(proposal, "duplicate call_id", now, policy_version)
+        self._decision_store.record_proposal(task.task_id, proposal.call_id)
+
+        # 步骤 2：Profile 与工具存在性（默认拒绝，不进入 Rego，减少攻击面）
+        profile = self._profiles.get(agent.profile_id)
         if profile is None:
-            return self._deny(proposal, f"Agent profile {agent.profile_id} not found")
+            return self._deny(proposal, "unknown profile", now, policy_version)
+        perm = profile.tools.get(proposal.tool_name)
+        if perm is None or not perm.allowed:
+            return self._deny(proposal, "tool not permitted", now, policy_version)
 
-        # 2. 预算预留
-        cost = self._estimate_cost(proposal)
-        if not self.budget_ledger.check_and_reserve(proposal, cost):
-            return self._deny(proposal, "Budget exceeded")
-
-        # 3. 权限组合分析
-        interaction_risk = self.permission_interaction.check(proposal, [])
-        if interaction_risk and interaction_risk.risk_level in ("high", "critical"):
-            decision = self._deny(proposal, interaction_risk.reason)
-            self._log_event(task, agent, proposal, "evaluate", decision)
-            self._update_risk_state(task.session_id, proposal, decision)
-            return decision
-
-        # 4. 调用 PolicyEngine
-        input_doc = self._build_policy_input(proposal, profile, task)
-        policy_result = self.policy_engine.evaluate(self.config.policy_package, input_doc)
-        verdict = policy_result.get("verdict", "deny")
-        reason = policy_result.get("reason", "Policy default deny")
-        modified_args = policy_result.get("modified_args")
-
-        decision: Decision
-        if verdict == "require_approval":
-            decision = Decision(
-                decision_id=str(uuid4()),
-                call_id=proposal.call_id,
-                task_id=proposal.task_id,
-                verdict="require_approval",
-                reason=reason,
-                expires_at=datetime.now(timezone.utc) + timedelta(seconds=self.config.approval_ttl_seconds),
-                max_uses=1,
-                escalation_target="r0_delegate_default",
+        # 步骤 3：调用次数上限（per-task 成功执行历史计数 vs max_calls_per_task）
+        if perm.max_calls_per_task is not None:
+            call_count = sum(
+                1 for h in self._history.get(task.task_id, []) if h.tool_name == proposal.tool_name
             )
-        elif verdict in ("allow", "modify"):
-            decision = Decision(
-                decision_id=str(uuid4()),
-                call_id=proposal.call_id,
-                task_id=proposal.task_id,
-                verdict=verdict,
-                modified_args=modified_args,
-                reason=reason,
-                expires_at=datetime.now(timezone.utc) + timedelta(seconds=self.config.decision_ttl_seconds),
-                max_uses=1,
+            if call_count >= perm.max_calls_per_task:
+                return self._deny(proposal, "call limit exceeded", now, policy_version)
+
+        # 步骤 4：预算（InMemoryBudgetLedger 按任务设置 Profile 上限；成本按工具 cost_per_call）
+        if hasattr(self._budget_ledger, "set_budget"):
+            self._budget_ledger.set_budget(task.task_id, profile.max_budget_token)
+        if not self._budget_ledger.check_and_reserve(task.task_id, self._cost_for(proposal)):
+            return self._deny(proposal, "budget exceeded", now, policy_version)
+
+        # 步骤 5：权限组合分析（T2.3 换真实现；当前占位恒 None）
+        history = self._history.get(task.task_id, [])
+        pending_approval = False
+        rule = self._permission_analyzer.check(proposal, history)
+        if rule is not None:
+            if rule.action == "deny":
+                # deny 短路，不进入 Rego
+                return self._deny(proposal, rule.reason, now, policy_version, policy_hits=[rule.id])
+            pending_approval = True  # require_approval 不短路，继续走 Rego（deny 优先原则）
+
+        # 步骤 6：主策略查询（OPA/Rego；引擎内部任何异常已 fail-closed 为 deny）
+        rego_decision = await self._policy_engine.evaluate(
+            _PACKAGE, build_policy_input(proposal, agent, profile)
+        )
+        verdict = rego_decision.get("verdict")
+        if verdict == "deny":
+            return self._deny(
+                proposal,
+                rego_decision.get("reason", "denied by policy"),
+                now,
+                policy_version,
+                policy_hits=rego_decision.get("policy_hits"),
             )
-        else:
-            decision = self._deny(proposal, reason)
+        if verdict not in ("allow", "modify", "require_approval"):
+            return self._deny(proposal, "invalid policy verdict", now, policy_version)
 
-        # 5. 审计
-        self._log_event(task, agent, proposal, "evaluate", decision)
+        # 步骤 7：汇总输出 Decision。
+        # 裁决优先级总表（v1.1 显式声明，评审#6）：
+        #     deny > require_approval > modify > allow
+        # 任一来源（组合规则 / Rego / 前置检查）产出更严格的裁决时，覆盖更宽松的裁决；
+        # 组合规则可以否决或升级 Rego 的 allow，反之不行。
+        hits = list(rego_decision.get("policy_hits") or [])
+        if pending_approval or verdict == "require_approval":
+            reason = rego_decision.get("reason", "requires human approval")
+            if rule is not None and verdict != "require_approval":
+                hits.append(rule.id)
+            return self._handle_require_approval(agent, proposal, profile, reason, now, policy_version, hits)
 
-        # 6. 更新风险状态
-        self._update_risk_state(task.session_id, proposal, decision)
+        return Decision(
+            decision_id=uuid.uuid4().hex,
+            call_id=proposal.call_id,
+            task_id=proposal.task_id,
+            verdict=verdict,  # allow / modify
+            reason=rego_decision.get("reason", "allowed by policy"),
+            modified_args=rego_decision.get("modified_args") if verdict == "modify" else None,
+            escalation_target=rego_decision.get("escalation_target"),
+            policy_hits=hits,
+            policy_version=policy_version,
+            profile_version=profile.version,
+            expires_at=now + _ALLOW_MODIFY_DELTA,
+            max_uses=1,
+        )
 
-        return decision
-
-    def forward(
+    def _handle_require_approval(
         self,
-        proposal: ActionProposal,
-        decision: Decision,
-    ) -> ToolResult:
-        """对 allow/modify Decision，校验后通过 MCP Gateway 转发工具调用.
-
-        Args:
-            proposal: 原始动作申报。
-            decision: R2 签发的 Decision。
-
-        Returns:
-            ToolResult。
-
-        Raises:
-            ValueError: Decision 无效或已过期。
-        """
-        # 1. 校验 Decision 有效性
-        if decision.call_id != proposal.call_id:
-            raise ValueError("Decision call_id mismatch")
-        if datetime.now(timezone.utc) > decision.expires_at:
-            raise ValueError("Decision expired")
-        if decision.decision_id in self._used_decisions:
-            raise ValueError("Decision already used")
-        if decision.verdict not in ("allow", "modify"):
-            raise ValueError(f"Cannot forward decision with verdict {decision.verdict}")
-
-        self._used_decisions.add(decision.decision_id)
-
-        # 2. 使用 modify 后的参数
-        arguments = decision.modified_args if decision.verdict == "modify" else proposal.arguments
-
-        # 3. 通过 MCP Gateway 转发（R2 是唯一授权出口）
-        return self.mcp_gateway.call_tool(proposal.tool_name, arguments, proposal.call_id)
-
-    def request_and_apply_approval(
-        self,
-        task: Task,
         agent: Agent,
         proposal: ActionProposal,
-        decision: Decision,
+        profile: CapabilityProfile,
+        reason: str,
+        now: datetime,
+        policy_version: str,
+        hits: list[str],
     ) -> Decision:
-        """对 require_approval 的 Decision，请求 R0-delegate 审批并返回最终 Decision.
+        """返回 require_approval Decision；真正审批由 R1 执行循环 + R0Delegate 完成。"""
+        return Decision(
+            decision_id=uuid.uuid4().hex,
+            call_id=proposal.call_id,
+            task_id=proposal.task_id,
+            verdict="require_approval",
+            reason=reason,
+            escalation_target=agent.owner_id,
+            policy_hits=hits,
+            policy_version=policy_version,
+            profile_version=profile.version,
+            expires_at=now + _APPROVAL_DELTA,
+            max_uses=1,
+        )
 
-        如果 R0-delegate 未配置，则直接拒绝。
-        """
-        if self.r0_delegate is None:
-            return self._deny(proposal, "R0-delegate not configured")
-
-        approval_request = ApprovalRequest(
+    def build_approval_request(
+        self,
+        decision: Decision,
+        proposal: ActionProposal,
+        task: Task,
+    ) -> ApprovalRequest:
+        """组装审批请求；冲突校验失败直接抛 CheckpointError（§3.10）。"""
+        approver_id = decision.escalation_target or ""
+        if approver_id == task.user_id or approver_id == proposal.agent_id:
+            raise CheckpointError(
+                f"审批人冲突：approver_id={approver_id} 与 requester/agent 相同"
+            )
+        return ApprovalRequest(
+            request_id=uuid.uuid4().hex,
             decision_id=decision.decision_id,
             call_id=proposal.call_id,
             task_id=proposal.task_id,
             agent_id=proposal.agent_id,
             tool_name=proposal.tool_name,
-            arguments_summary=str(mask_arguments(proposal.arguments)),
+            arguments_masked=(
+                self._masker.mask(proposal.arguments, "approval_request")
+                if self._masker is not None
+                else dict(proposal.arguments)
+            ),
             reason=decision.reason,
             requester_id=task.user_id,
-            requested_at=datetime.now(timezone.utc),
+            approver_id=approver_id,
         )
-        record = self.r0_delegate.request_approval(approval_request)
 
-        if record.approved:
-            final_decision = Decision(
-                decision_id=str(uuid4()),
-                call_id=proposal.call_id,
-                task_id=proposal.task_id,
-                verdict="allow",
-                reason=f"Approved by {record.approver_id}: {record.reason}",
-                expires_at=datetime.now(timezone.utc) + timedelta(seconds=self.config.decision_ttl_seconds),
-                max_uses=1,
+    def finalize_after_approval(self, decision: Decision, record) -> Decision:
+        """审批通过后生成可执行 Decision（approve→allow；deny→deny）。"""
+        now = self._now()
+        if record.verdict == "deny":
+            return decision.model_copy(
+                update={
+                    "verdict": "deny",
+                    "reason": f"approval denied: {record.comment}",
+                    "expires_at": now,
+                    "max_uses": 0,
+                }
             )
-        else:
-            final_decision = self._deny(proposal, f"Denied by {record.approver_id}: {record.reason}")
+        return decision.model_copy(
+            update={
+                "verdict": "allow",
+                "reason": f"approval granted: {record.comment}",
+                "expires_at": now + _ALLOW_MODIFY_DELTA,
+                "policy_hits": decision.policy_hits + ["approval:granted"],
+            }
+        )
 
-        self._log_event(task, agent, proposal, "approve" if record.approved else "deny", final_decision)
-        self._update_risk_state(task.session_id, proposal, final_decision)
-        return final_decision
-
-    def _deny(self, proposal: ActionProposal, reason: str) -> Decision:
-        """生成 deny Decision."""
+    def _deny(
+        self,
+        proposal: ActionProposal,
+        reason: str,
+        now: datetime,
+        policy_version: str,
+        *,
+        policy_hits: list[str] | None = None,
+        profile_version: str = "",
+    ) -> Decision:
+        """deny 快捷构造：立即过期、max_uses=0（§3.6 分档）。"""
         return Decision(
-            decision_id=str(uuid4()),
+            decision_id=uuid.uuid4().hex,
             call_id=proposal.call_id,
             task_id=proposal.task_id,
             verdict="deny",
             reason=reason,
-            expires_at=datetime.now(timezone.utc),
+            policy_hits=list(policy_hits or []),
+            policy_version=policy_version,
+            profile_version=profile_version,
+            expires_at=now,  # 立即过期
             max_uses=0,
         )
 
-    @staticmethod
-    def _build_policy_input(
-        proposal: ActionProposal,
-        profile: CapabilityProfile,
-        task: Task,
-    ) -> dict[str, Any]:
-        """构造给 PolicyEngine 的输入文档."""
-        return {
-            "proposal": {
-                "task_id": proposal.task_id,
-                "call_id": proposal.call_id,
-                "agent_id": proposal.agent_id,
-                "tool_name": proposal.tool_name,
-                "arguments": proposal.arguments,
-                "task_context": proposal.task_context,
-                "risk_level": proposal.risk_level,
-            },
-            "profile": {
-                "profile_id": profile.profile_id,
-                "allowed_tools": profile.allowed_tools,
-                "denied_args": profile.denied_args,
-                "tool_permissions": {
-                    name: {
-                        "allowed": perm.allowed,
-                        "require_approval": perm.require_approval,
-                    }
-                    for name, perm in profile.tool_permissions.items()
-                },
-            },
-            "task": {
-                "task_id": task.task_id,
-                "user_id": task.user_id,
-                "session_id": task.session_id,
-                "description": task.description,
-            },
-        }
+    # -- forward：执行前校验（§6.6） ----------------------------------------
+
+    async def forward(self, proposal: ActionProposal, decision: Decision) -> ToolResult:
+        """校验 1-5 失败抛异常；modify 复核失败返回 blocked 结果（不抛异常）。"""
+        # 校验 1-3：语义错误 / 过期授权一律抛异常（调用方 bug，不静默）
+        if decision.call_id != proposal.call_id:
+            raise CheckpointError("decision.call_id 与 proposal.call_id 不一致")
+        if decision.verdict not in ("allow", "modify"):
+            raise CheckpointError(f"verdict {decision.verdict!r} 不可执行（仅 allow/modify）")
+        if self._now() >= decision.expires_at:
+            raise CheckpointError("decision 已过期（授权作废）")
+
+        # 校验 4-5：防重放——先记账再执行，防并发复用。
+        # 运行时假设（v1.1 显式声明，评审#2）：MVP 为单进程 asyncio 事件循环，
+        # 同一时刻不存在并行的 forward 调用，步骤 4-5 之间无 await 点，因此检查+记账原子。
+        # 若未来引入多 worker/多进程部署，DecisionStore 必须升级为原子语义（§9.3）。
+        if self._decision_store.is_decision_used(decision.decision_id):
+            raise CheckpointError("decision 已被使用（防重放）")
+        self._decision_store.record_decision_use(decision.decision_id)
+
+        # 校验 6：modify 复核（PEP 职责，不抛异常，返回 blocked）
+        effective_args = proposal.arguments
+        if decision.verdict == "modify":
+            if decision.modified_args is None or set(decision.modified_args) != set(proposal.arguments):
+                return self._blocked(proposal, "modified_args 缺失或改动超出参数值范围")
+            perm = self._tool_permission_for(proposal)
+            if perm is None or not self._args_allowed(perm, decision.modified_args):
+                return self._blocked(proposal, "modify 后参数未通过 Profile 白/黑名单复核")
+            effective_args = decision.modified_args
+
+        # 校验 7-8：转发执行；成功才记入 per-task 历史；异常 refund 预算
+        try:
+            result = await self._gateway.call_tool(
+                proposal.tool_name, effective_args, proposal.call_id, proposal.task_id
+            )
+        except Exception:
+            self._budget_ledger.refund(proposal.task_id, self._cost_for(proposal))
+            raise
+        self._budget_ledger.commit(proposal.task_id, self._cost_for(proposal))
+        if result.status == "success":
+            self._history.setdefault(proposal.task_id, []).append(proposal)
+        return result
+
+    def _tool_permission_for(self, proposal: ActionProposal):
+        """按 proposal 定位工具的 ToolPermission（modify 复核用）。"""
+        agent = self._identity.get_agent(proposal.agent_id)
+        if agent is None:
+            return None
+        profile = self._profiles.get(agent.profile_id)
+        if profile is None:
+            return None
+        return profile.tools.get(proposal.tool_name)
 
     @staticmethod
-    def _estimate_cost(proposal: ActionProposal) -> BudgetCost:
-        """估算单次动作成本；MVP 简化实现."""
-        return BudgetCost(token_count=1)
+    def _args_allowed(perm, args: dict) -> bool:
+        """Profile 参数白/黑名单复核（与 §3.3 语义一致：浅层字符串匹配）。"""
+        for key, patterns in perm.allowed_args.items():
+            if key not in args:
+                continue
+            value = str(args[key])
+            if not any(glob_match(p, value) for p in patterns):
+                return False
+        for key, patterns in perm.denied_args.items():
+            if key not in args:
+                continue
+            value = str(args[key])
+            if any(glob_match(p, value) for p in patterns):
+                return False
+        return True
 
-    def _log_event(
-        self,
-        task: Task,
-        agent: Agent,
-        proposal: ActionProposal,
-        action: str,
-        decision: Decision,
-    ) -> None:
-        """记录审计事件."""
-        if self.audit_logger is None:
-            return
-
-        event = AuditEvent(
-            event_id=str(uuid4()),
-            trace_id=task.task_id,
-            timestamp=datetime.now(timezone.utc),
-            actor_type="agent" if action in ("propose", "classify") else "checkpoint",
-            actor_id=agent.agent_id if action in ("propose", "classify") else "checkpoint",
-            action=action,  # type: ignore[arg-type]
-            target=proposal.tool_name,
-            args_hash=hash_arguments(proposal.arguments),
-            args_mask=mask_arguments(proposal.arguments),
-            decision=decision.verdict,
-            reason=decision.reason,
-            session_id=task.session_id,
+    @staticmethod
+    def _blocked(proposal: ActionProposal, detail: str) -> ToolResult:
+        return ToolResult(
+            call_id=proposal.call_id,
+            task_id=proposal.task_id,
+            tool_name=proposal.tool_name,
+            status="blocked",
+            content=detail,
+            error_code="modify_recheck_failed",
         )
-        self.audit_logger.log(event)
-
-    def _update_risk_state(
-        self,
-        session_id: str,
-        proposal: ActionProposal,
-        decision: Decision,
-    ) -> None:
-        """更新跨动作风险状态."""
-        if self.risk_state_manager is None:
-            return
-        self.risk_state_manager.update_after_decision(session_id, proposal, decision)

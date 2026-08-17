@@ -1,26 +1,34 @@
-"""策略引擎.
+"""策略引擎（§6.4）.
 
-PolicyEngine 负责把业务输入交给 OPA/Rego 并返回结构化判定结果。
-MVP 提供：
-- OPAPolicyEngine：调用本地 OPA HTTP 服务；
-- MockPolicyEngine：用于测试和快速原型，不依赖外部 OPA 进程。
+``OPAPolicyEngine`` 通过 HTTP 查询本地 OPA sidecar，**任何异常路径
+（连接失败、超时、非 2xx、返回缺 verdict）统一返回 deny**——fail-closed
+逻辑集中在一处，不散落于 try/except。
+
+``build_policy_input`` 是 Python ↔ Rego 的唯一契约点（§6.3 的 input schema），
+改 schema 只改这里。
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+
+import httpx
+
+from loop_controller.models import ActionProposal, Agent, CapabilityProfile
+
+FAIL_CLOSED_DENY = {
+    "verdict": "deny",
+    "reason": "policy engine unavailable",
+    "policy_hits": ["fail_closed"],
+}
 
 
 @runtime_checkable
 class PolicyEngine(Protocol):
-    """策略引擎接口."""
+    """策略引擎接口（全链路 async，禁止同步阻塞调用）。"""
 
-    def evaluate(self, package: str, input_doc: dict[str, Any]) -> dict[str, Any]:
+    async def evaluate(self, package: str, input_doc: dict[str, Any]) -> dict[str, Any]:
         """评估输入文档，返回策略判定结果.
-
-        Args:
-            package: Rego 包名，如 "loop_controller.tool_permission"。
-            input_doc: 输入数据，包含 proposal、profile 等。
 
         Returns:
             至少包含 verdict 和 reason 的字典。
@@ -31,97 +39,70 @@ class PolicyEngine(Protocol):
 class OPAPolicyEngine:
     """调用本地 OPA HTTP 服务的策略引擎.
 
-    使用 OPA REST API：`POST /v1/data/<package>`。
-    需要先在本地启动 OPA：`opa run --server --bundle policies/`
+    使用 OPA REST API：``POST /v1/data/<package>``（包名以 ``/`` 分隔）。
+    需要先启动 OPA：``opa run --server --bundle policies/``。
     """
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8181") -> None:
+    def __init__(self, base_url: str = "http://127.0.0.1:8181", timeout: float = 2.0) -> None:
         """初始化.
 
         Args:
             base_url: OPA HTTP 服务地址。
+            timeout: 请求超时（秒）。
         """
         self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
 
-    def evaluate(self, package: str, input_doc: dict[str, Any]) -> dict[str, Any]:
-        """通过 HTTP 调用 OPA."""
-        import urllib.error
-        import urllib.request
-
-        url = f"{self._base_url}/v1/data/{package}"
-        data = self._serialize(input_doc)
-        request = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+    async def evaluate(self, package: str, input_doc: dict[str, Any]) -> dict[str, Any]:
+        """通过 HTTP 调用 OPA；任何异常一律 fail-closed 返回 deny."""
+        url = f"{self._base_url}/v1/data/{package.replace('.', '/')}"
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            raise PolicyEngineError(f"OPA returned {exc.code}: {exc.read().decode('utf-8')}") from exc
-        except urllib.error.URLError as exc:
-            raise PolicyEngineError(f"Failed to connect to OPA: {exc.reason}") from exc
+            # trust_env=False：访问本地 OPA 必须绕过系统代理（代理会返回 502）
+            async with httpx.AsyncClient(trust_env=False, timeout=self._timeout) as client:
+                resp = await client.post(url, json={"input": input_doc})
+                resp.raise_for_status()
+                body = resp.json()
+        except Exception:  # noqa: BLE001 - fail-closed 统一兜底
+            return dict(FAIL_CLOSED_DENY)
 
-        return self._parse(body)
-
-    @staticmethod
-    def _serialize(input_doc: dict[str, Any]) -> bytes:
-        import json
-
-        return json.dumps({"input": input_doc}).encode("utf-8")
-
-    @staticmethod
-    def _parse(body: str) -> dict[str, Any]:
-        import json
-
-        response = json.loads(body)
-        result = response.get("result", {})
-        # OPA 可能把 verdict/reason 嵌套在 result 下，这里统一展平
+        result = body.get("result", {})
         if isinstance(result, dict) and "result" in result:
-            return result["result"]
-        return result
+            result = result["result"]
+        decision = result.get("decision") if isinstance(result, dict) else None
+        if not isinstance(decision, dict) or decision.get("verdict") not in (
+            "allow", "deny", "modify", "require_approval",
+        ):
+            return dict(FAIL_CLOSED_DENY)
+        return decision
 
 
-class MockPolicyEngine:
-    """内存版策略引擎，用于测试和不依赖 OPA 的场景.
+def build_policy_input(
+    proposal: ActionProposal,
+    agent: Agent,
+    profile: CapabilityProfile,
+) -> dict[str, Any]:
+    """构造 Rego input 文档（§6.3 的 JSON schema，唯一契约点）.
 
-    根据简单规则返回 verdict：
-    - 工具不在 allowed_tools 中 → deny；
-    - send_email 外部邮箱 → require_approval；
-    - 其他 → allow。
+    ``task_context`` 只进这里、``description`` 原文不进（防 prompt injection 借道策略引擎）。
     """
-
-    def evaluate(self, package: str, input_doc: dict[str, Any]) -> dict[str, Any]:
-        """基于输入文档中的 profile 和 proposal 做简化判定."""
-        proposal = input_doc.get("proposal", {})
-        profile = input_doc.get("profile", {})
-        tool_name = proposal.get("tool_name", "")
-        allowed_tools = profile.get("allowed_tools", [])
-        args = proposal.get("arguments", {})
-
-        if tool_name not in allowed_tools:
-            return {"verdict": "deny", "reason": f"Tool {tool_name} not in allowed_tools"}
-
-        if tool_name == "send_email":
-            to = str(args.get("to", "")).lower()
-            if "@company.com" not in to:
-                return {
-                    "verdict": "require_approval",
-                    "reason": "External email address requires R0-delegate approval",
+    return {
+        "tool_name": proposal.tool_name,
+        "arguments": proposal.arguments,
+        "risk_level": proposal.risk_level,
+        "risk_tags": proposal.risk_tags,
+        "task_context": proposal.task_context,
+        "agent": {
+            "agent_id": agent.agent_id,
+            "owner_id": agent.owner_id,
+        },
+        "profile": {
+            "tools": {
+                name: {
+                    "require_approval": perm.require_approval,
+                    "allowed_args": perm.allowed_args,
+                    "denied_args": perm.denied_args,
                 }
-
-        if tool_name == "write_file":
-            path = str(args.get("path", ""))
-            if "/tmp/" not in path and "/allowed/" not in path:
-                return {"verdict": "deny", "reason": f"Write path {path} not allowed"}
-
-        return {"verdict": "allow", "reason": "Policy allows this action"}
-
-
-class PolicyEngineError(Exception):
-    """策略引擎调用异常."""
-
-
-PolicyVerdict = Literal["allow", "deny", "modify", "require_approval"]
+                for name, perm in profile.tools.items()
+            }
+        },
+    }

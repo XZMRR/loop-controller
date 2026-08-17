@@ -1,0 +1,362 @@
+"""配置加载器（§4.1）.
+
+进程启动时一次性加载全部静态配置，构造不可变 ``AppConfig``。
+运行期不监听、不热更新（改配置 = 重启进程）。
+
+启动校验（任一失败则拒绝启动，fail-closed）：
+1. 每个 Agent 引用的 profile_id 必须存在；
+2. 每个 Profile 的 tools 中工具名必须能在 tool_mapping 中找到；
+3. ``policy_dir`` 下必须存在 ``default.rego`` 且 OPA 试查询返回结构合法的 deny；
+4. 审计/决策日志目录可写；
+5. 全部 glob 模式可编译；
+6. 全部掩码正则可编译；
+7. 审批人必须存在于 users 中。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from hashlib import sha256
+from pathlib import Path
+import re
+from typing import Any, Literal
+
+import httpx
+import yaml
+
+from loop_controller.models import Agent, CapabilityProfile, ToolPermission
+from loop_controller.utils.globmatch import compile_glob
+
+POLICY_PACKAGE = "loop_controller.tool_permission"
+
+
+class ConfigValidationError(Exception):
+    """配置加载或校验失败（启动拒绝）。"""
+
+
+# ---------------------------------------------------------------------------
+# 配置类型（infra 层，非 §3 核心 Schema）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MCPServerConfig:
+    name: str
+    command: list[str]
+    transport: str = "stdio"
+
+
+@dataclass(frozen=True)
+class ToolMappingEntry:
+    server: str
+    mcp_name: str
+    cost_per_call: int = 1  # v1.1（评审#3）：每次调用的 token 成本估算，供 BudgetLedger 计费
+
+
+@dataclass(frozen=True)
+class PermissionCondition:
+    """组合规则中的一个条件（§6.2）。
+
+    每行只包含四类字段之一；``when_all`` 由多个条件组成，全部满足才命中。
+    """
+
+    history_tool: str | None = None
+    history_arg_match: dict[str, str] | None = None
+    current_tool: str | None = None
+    current_arg_not_match: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class PermissionRule:
+    id: str
+    description: str
+    when_all: list[PermissionCondition]
+    action: Literal["deny", "require_approval"]
+    reason: str
+
+
+@dataclass(frozen=True)
+class ValuePattern:
+    name: str
+    pattern: str
+    replacement: str = "***"
+
+
+@dataclass(frozen=True)
+class MaskingRules:
+    field_name_blacklist: list[str]
+    value_patterns: list[ValuePattern]
+    # v1.1（自审#1）分级掩码：视图 -> 应用的规则名列表。
+    #   audit_log:       落盘审计日志应用全部规则（field_name_blacklist + value_patterns）；
+    #   approval_request:审批视图只应用 field_name_blacklist（收件人/路径/正文须对审批人可见）。
+    masking_applies_to: dict[str, list[str]]
+
+
+@dataclass(frozen=True)
+class ApprovalRule:
+    tool_name: str
+    approver: str
+    behavior: Literal["approve", "deny"]
+
+
+@dataclass(frozen=True)
+class ApprovalConfig:
+    default: str
+    rules: list[ApprovalRule] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    agents: dict[str, Agent]
+    users: dict[str, str]  # user_id -> display_name
+    profiles: dict[str, CapabilityProfile]
+    mcp_servers: dict[str, MCPServerConfig]
+    tool_mapping: dict[str, ToolMappingEntry]
+    permission_rules: list[PermissionRule]
+    masking_rules: MaskingRules
+    approval: ApprovalConfig
+    policy_dir: str
+    audit_log_path: str
+    decision_log_path: str
+
+
+# ---------------------------------------------------------------------------
+# ConfigLoader
+# ---------------------------------------------------------------------------
+
+
+class ConfigLoader:
+    """加载 config/ 目录并执行 7 条启动校验。"""
+
+    def load(self, config_dir: str | Path, opa_base_url: str | None = None) -> AppConfig:
+        """加载并校验配置.
+
+        Args:
+            config_dir: config/ 目录路径；同级根目录下的 policies/ 与 data/ 由此推导。
+            opa_base_url: OPA HTTP 地址。为 None 时跳过校验 3（测试/无 OPA 场景）。
+
+        Raises:
+            ConfigValidationError: 任一启动校验失败。
+        """
+        config_dir = Path(config_dir)
+        root = config_dir.parent
+
+        agents, users = self._load_agents(config_dir / "agents.yaml")
+        profiles = self._load_profiles(config_dir / "profiles.yaml")
+        mcp_servers, tool_mapping = self._load_mcp_servers(config_dir / "mcp_servers.yaml")
+        permission_rules = self._load_permission_rules(config_dir / "permission_rules.yaml")
+        masking_rules = self._load_masking_rules(config_dir / "masking_rules.yaml")
+        approval = self._load_approval(config_dir / "approval.yaml")
+
+        app_config = AppConfig(
+            agents=agents,
+            users=users,
+            profiles=profiles,
+            mcp_servers=mcp_servers,
+            tool_mapping=tool_mapping,
+            permission_rules=permission_rules,
+            masking_rules=masking_rules,
+            approval=approval,
+            policy_dir=str(root / "policies"),
+            audit_log_path=str(root / "data" / "audit.jsonl"),
+            decision_log_path=str(root / "data" / "decisions.jsonl"),
+        )
+
+        self._check_profile_exists(app_config)
+        self._check_tool_mapping(app_config)
+        if opa_base_url is not None:
+            self._check_policy_loadable(opa_base_url, app_config)
+        self._check_dirs_writable(app_config)
+        self._check_glob_compile(app_config)
+        self._check_regex_compile(app_config)
+        self._check_approver_exists(app_config)
+        return app_config
+
+    # -- 各 YAML 解析 -------------------------------------------------------
+
+    def _load_agents(self, path: Path) -> tuple[dict[str, Agent], dict[str, str]]:
+        data = self._read_yaml(path)
+        agents: dict[str, Agent] = {}
+        for item in data.get("agents", []):
+            agent = Agent(**item)
+            agents[agent.agent_id] = agent
+        users: dict[str, str] = {}
+        for item in data.get("users", []):
+            users[item["user_id"]] = item.get("display_name", item["user_id"])
+        return agents, users
+
+    def _load_profiles(self, path: Path) -> dict[str, CapabilityProfile]:
+        data = self._read_yaml(path)
+        version = sha256(path.read_bytes()).hexdigest()[:12]
+        profiles: dict[str, CapabilityProfile] = {}
+        for item in data.get("profiles", []):
+            tools_raw = item.pop("tools", {})
+            tools: dict[str, ToolPermission] = {}
+            for tool_name, perm in tools_raw.items():
+                tools[tool_name] = ToolPermission(tool_name=tool_name, **perm)
+            profile = CapabilityProfile(version=version, tools=tools, **item)
+            profiles[profile.profile_id] = profile
+        return profiles
+
+    def _load_mcp_servers(
+        self, path: Path
+    ) -> tuple[dict[str, MCPServerConfig], dict[str, ToolMappingEntry]]:
+        data = self._read_yaml(path)
+        servers: dict[str, MCPServerConfig] = {}
+        for name, conf in data.get("servers", {}).items():
+            servers[name] = MCPServerConfig(name=name, **conf)
+        mapping: dict[str, ToolMappingEntry] = {}
+        for canonical, entry in data.get("tool_mapping", {}).items():
+            mapping[canonical] = ToolMappingEntry(**entry)
+        return servers, mapping
+
+    def _load_permission_rules(self, path: Path) -> list[PermissionRule]:
+        data = self._read_yaml(path)
+        rules: list[PermissionRule] = []
+        for item in data.get("rules", []):
+            conditions = [PermissionCondition(**c) for c in item.get("when_all", [])]
+            rules.append(
+                PermissionRule(
+                    id=item["id"],
+                    description=item.get("description", ""),
+                    when_all=conditions,
+                    action=item["action"],
+                    reason=item.get("reason", ""),
+                )
+            )
+        return rules
+
+    def _load_masking_rules(self, path: Path) -> MaskingRules:
+        data = self._read_yaml(path)
+        patterns = [ValuePattern(**p) for p in data.get("value_patterns", [])]
+        return MaskingRules(
+            field_name_blacklist=data.get("field_name_blacklist", []),
+            value_patterns=patterns,
+            masking_applies_to=data.get("masking_applies_to", {}),
+        )
+
+    def _load_approval(self, path: Path) -> ApprovalConfig:
+        data = self._read_yaml(path)
+        rules = [ApprovalRule(**r) for r in data.get("rules", [])]
+        return ApprovalConfig(default=data.get("approvers", {}).get("default", ""), rules=rules)
+
+    # -- 7 条启动校验 -------------------------------------------------------
+
+    def _check_profile_exists(self, config: AppConfig) -> None:
+        for agent_id, agent in config.agents.items():
+            if agent.profile_id not in config.profiles:
+                raise ConfigValidationError(
+                    f"Agent {agent_id} 引用的 profile_id {agent.profile_id} 不存在"
+                )
+
+    def _check_tool_mapping(self, config: AppConfig) -> None:
+        for profile_id, profile in config.profiles.items():
+            for tool_name in profile.tools:
+                if tool_name not in config.tool_mapping:
+                    raise ConfigValidationError(
+                        f"Profile {profile_id} 的工具 {tool_name} 不在 tool_mapping 中"
+                    )
+
+    def _check_policy_loadable(self, opa_base_url: str, config: AppConfig) -> None:
+        policy_dir = Path(config.policy_dir)
+        default_rego = policy_dir / "default.rego"
+        if not default_rego.exists():
+            raise ConfigValidationError(
+                f"policy_dir {policy_dir} 下缺少 default.rego"
+            )
+        try:
+            result = self._query_opa(opa_base_url, POLICY_PACKAGE, {})
+        except Exception as exc:  # noqa: BLE001 - fail-closed 启动拒绝
+            raise ConfigValidationError(f"OPA 试查询失败（{opa_base_url}）：{exc}") from exc
+        decision = result.get("decision", {})
+        if not isinstance(decision, dict) or decision.get("verdict") != "deny":
+            raise ConfigValidationError(
+                "OPA 试查询未返回结构合法的 deny（空 input 必须命中 default deny）"
+            )
+
+    @staticmethod
+    def _query_opa(base_url: str, package: str, input_doc: dict[str, Any]) -> dict[str, Any]:
+        """启动期同步 OPA 查询（仅配置校验使用；运行期查询在 policy_engine）.
+
+        - URL 路径用 ``/`` 分隔包名：Rego 包 ``loop_controller.tool_permission``
+          对应 ``/v1/data/loop_controller/tool_permission``（点号会被 OPA 当作
+          字面路径段，导致查询不到）。
+        - ``trust_env=False``：访问本地 OPA 必须绕过系统/环境代理，否则
+          httpx 会经由代理返回 502。
+        """
+        url = f"{base_url.rstrip('/')}/v1/data/{package.replace('.', '/')}"
+        resp = httpx.post(url, json={"input": input_doc}, timeout=2.0, trust_env=False)
+        resp.raise_for_status()
+        body = resp.json()
+        result = body.get("result", {})
+        if isinstance(result, dict) and "result" in result:
+            return result["result"]
+        return result
+
+    def _check_dirs_writable(self, config: AppConfig) -> None:
+        for label, path_str in (
+            ("audit_log", config.audit_log_path),
+            ("decision_log", config.decision_log_path),
+        ):
+            path = Path(path_str)
+            probe = path.parent / f".write_probe_{label}"
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                probe.write_text("", encoding="utf-8")
+                probe.unlink()
+            except OSError as exc:
+                raise ConfigValidationError(
+                    f"{label} 目录 {path.parent} 不可写：{exc}"
+                ) from exc
+
+    def _check_glob_compile(self, config: AppConfig) -> None:
+        patterns: list[str] = []
+        for profile in config.profiles.values():
+            for perm in profile.tools.values():
+                for values in list(perm.allowed_args.values()) + list(perm.denied_args.values()):
+                    patterns.extend(values)
+        for rule in config.permission_rules:
+            for cond in rule.when_all:
+                if cond.history_arg_match:
+                    patterns.extend(cond.history_arg_match.values())
+                if cond.current_arg_not_match:
+                    patterns.extend(cond.current_arg_not_match.values())
+        for pattern in patterns:
+            try:
+                compile_glob(pattern)
+            except ValueError as exc:
+                raise ConfigValidationError(f"非法 glob 模式 {pattern!r}：{exc}") from exc
+
+    def _check_regex_compile(self, config: AppConfig) -> None:
+        for vp in config.masking_rules.value_patterns:
+            try:
+                re.compile(vp.pattern)
+            except re.error as exc:
+                raise ConfigValidationError(
+                    f"非法掩码正则 {vp.pattern!r}：{exc}"
+                ) from exc
+
+    def _check_approver_exists(self, config: AppConfig) -> None:
+        """v1.1（评审#9）校验 7：approver 存在于 users 且不等于任何 agent_id。"""
+        approvers = [config.approval.default] + [r.approver for r in config.approval.rules]
+        for approver in approvers:
+            if approver and approver not in config.users:
+                raise ConfigValidationError(f"审批人 {approver} 不存在于 users 中")
+            if approver and approver in config.agents:
+                raise ConfigValidationError(
+                    f"审批人 {approver} 是 Agent 身份，不能作为审批人（approver != agent_id）"
+                )
+
+    # -- 工具 ---------------------------------------------------------------
+
+    @staticmethod
+    def _read_yaml(path: Path) -> dict[str, Any]:
+        if not path.exists():
+            raise ConfigValidationError(f"配置文件缺失：{path}")
+        with path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            raise ConfigValidationError(f"配置文件格式错误（应为 mapping）：{path}")
+        return data

@@ -1,0 +1,13 @@
+# Loop Controller 身份配置（§4.2）
+# agent_id 预先分配，运行期不可变；Profile 一对一静态绑定。
+agents:
+  - agent_id: researcher_001
+    name: Research Assistant
+    profile_id: research_assistant_v1
+    owner_id: zhang_manager
+
+users:
+  - user_id: alice
+    display_name: Alice
+  - user_id: zhang_manager
+    display_name: 张经理

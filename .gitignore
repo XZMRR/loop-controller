@@ -77,6 +77,12 @@ dmypy.json
 mcp_servers_official/
 *.zip
 
+# Local OPA binary (58MB, downloaded into tools/)
+tools/
+
+# Runtime data (generated)
+data/*.jsonl
+
 # Logs
 *.log
 

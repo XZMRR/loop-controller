@@ -1,0 +1,60 @@
+package loop_controller.tool_permission
+
+import rego.v1
+
+# 默认拒绝
+default decision := {"verdict": "deny", "reason": "no policy allows this action", "policy_hits": ["default_deny"]}
+
+# ---- 通用规则：critical 风险信号必须人工审批（分类器信号经由制度生效）----
+decision := {"verdict": "require_approval", "reason": "critical risk signal requires approval",
+             "escalation_target": input.agent.owner_id, "policy_hits": ["critical_signal_gate"]} if {
+    input.risk_level == "critical"
+}
+
+# ---- web_search ----
+decision := {"verdict": "allow", "reason": "web search allowed", "policy_hits": ["web_search_allow"]} if {
+    input.tool_name == "web_search"
+    input.risk_level != "critical"
+}
+
+# ---- read_file：限目录 ----
+decision := {"verdict": "allow", "reason": "read within allowed directories", "policy_hits": ["read_file_allow"]} if {
+    input.tool_name == "read_file"
+    input.risk_level != "critical"
+    some pattern in input.profile.tools.read_file.allowed_args.path
+    glob.match(pattern, ["/"], input.arguments.path)
+}
+
+# ---- write_file：限目录 ----
+decision := {"verdict": "allow", "reason": "write within allowed directories", "policy_hits": ["write_file_allow"]} if {
+    input.tool_name == "write_file"
+    input.risk_level != "critical"
+    some pattern in input.profile.tools.write_file.allowed_args.path
+    glob.match(pattern, ["/"], input.arguments.path)
+}
+
+# ---- send_email：白名单内收件人 → 按 Profile 决定是否审批；白名单外 → deny ----
+decision := {"verdict": "require_approval", "reason": "send_email requires human approval",
+             "escalation_target": input.agent.owner_id, "policy_hits": ["send_email_approval"]} if {
+    input.tool_name == "send_email"
+    input.risk_level != "critical"
+    input.profile.tools.send_email.require_approval == true
+    recipient_allowed
+}
+
+decision := {"verdict": "allow", "reason": "internal email allowed", "policy_hits": ["send_email_allow"]} if {
+    input.tool_name == "send_email"
+    input.risk_level != "critical"
+    input.profile.tools.send_email.require_approval == false
+    recipient_allowed
+}
+
+decision := {"verdict": "deny", "reason": "recipient outside allowed patterns", "policy_hits": ["send_email_deny_external"]} if {
+    input.tool_name == "send_email"
+    not recipient_allowed
+}
+
+recipient_allowed if {
+    some pattern in input.profile.tools.send_email.allowed_args.to
+    glob.match(pattern, [], lower(input.arguments.to))
+}
