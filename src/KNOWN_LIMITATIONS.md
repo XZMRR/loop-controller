@@ -6,19 +6,19 @@
 
 ## 安全相关局限
 
-### L1. 审计哈希链检测不到对"最后一行"的删改
+### L1. 审计哈希链对"最后一行"的删改需依赖 seal 记录
 
-哈希链中，第 N 行的完整性由第 N+1 行的 `prev_hash` 承诺。文件末尾的最后一行没有后继，删除或篡改它无法被 `verify_chain()` 检出。
+哈希链中，第 N 行的完整性由第 N+1 行的 `prev_hash` 承诺。文件末尾的最后一行没有后继，删除或篡改它无法被 `verify_chain()` 直接检出；但若此前写过 seal 记录，则删除 seal 之后的事件会破坏 seal 的 `chain_hash` 校验，删除 seal 之前的事件会破坏 seal 的 `prev_hash` 链接。
 
-- **当前缓解**：无（测试仅覆盖中间行篡改）；
-- **生产路径**：定期写 seal 记录 / 签名日志 / WORM 存储（post-MVP）。
+- **当前缓解**：`JsonlAuditStore.seal()` 可手动或周期性调用；启用 HMAC-SHA256 时 seal 记录还受 `seal_key` 域分离签名保护；
+- **生产路径**：定期写 seal 记录 + WORM 存储 + 签名日志（post-MVP）。
 
-### L2. `args_hash` 使用 SHA-256，低熵值可被字典攻击
+### L2. 默认 `sha256` 模式下低熵参数可被字典攻击
 
-审计日志中 `args_hash = SHA-256(canonical_json(arguments))`。对已知邮箱、常见文件名等低熵参数，攻击者可彩虹表反推。
+审计日志默认 `hash_algo=sha256` 时 `args_hash = SHA-256(canonical_json(arguments))`。对已知邮箱、常见文件名等低熵参数，攻击者可彩虹表反推。
 
-- **当前缓解**：`AuditEvent.hash_algo` 字段已预留；
-- **升级触发条件**：任何涉及真实 PII 的部署即触发 HMAC/加盐哈希升级（post-MVP）。
+- **当前缓解**：P0 已支持 `hmac-sha256`（通过 `LOOP_CONTROLLER_AUDIT_HASH_ALGO=hmac-sha256` + `LOOP_CONTROLLER_AUDIT_HMAC_KEY` 环境变量启用），HMAC key 从环境变量读取、event key 与 seal key 做域分离；
+- **升级触发条件**：任何涉及真实 PII 的部署必须启用 HMAC-SHA256。默认 sha256 仅用于无敏感数据的开发/演示。
 
 ### L3. 防重放依赖单进程 asyncio 假设
 

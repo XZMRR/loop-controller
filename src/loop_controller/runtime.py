@@ -18,7 +18,7 @@ from loop_controller.budget import InMemoryBudgetLedger
 from loop_controller.checkpoint import Checkpoint
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
 from loop_controller.infra.audit_store import AuditStore, JsonlAuditStore
-from loop_controller.infra.config_loader import AppConfig
+from loop_controller.infra.config_loader import AppConfig, ConfigLoader
 from loop_controller.infra.decision_store import JsonlDecisionStore
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import FilePolicyStore
@@ -118,7 +118,14 @@ def build_runtime(
         },
         masker=masker,
     )
-    audit_store = JsonlAuditStore(config.audit_log_path)
+    audit_key: bytes | None = None
+    if config.audit_hash_algo == "hmac-sha256":
+        audit_key = ConfigLoader.resolve_audit_key(config)
+    audit_store = JsonlAuditStore(
+        config.audit_log_path,
+        hash_algo=config.audit_hash_algo,
+        hmac_key=audit_key,
+    )
 
     if config.llm_planner is not None and config.llm_planner.enabled:
         planner: Planner = LLMPlanner(

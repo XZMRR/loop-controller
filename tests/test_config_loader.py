@@ -1,8 +1,9 @@
 """config_loader 单元测试.
 
-覆盖 §4.1 全部 7 条启动校验（每条一个正例 + 一个反例）：
+覆盖 §4.1 全部 8 条启动校验（每条一个正例 + 一个反例）：
 1. profile_id 存在性；2. 工具映射存在性；3. default.rego + OPA 试查询；
-4. 日志目录可写；5. glob 编译；6. 正则编译；7. approver 存在性。
+4. 日志目录可写；5. glob 编译；6. 正则编译；7. approver 存在性；
+8. HMAC key 存在性与格式（P0）。
 """
 
 from __future__ import annotations
@@ -241,3 +242,52 @@ def test_check_approver_is_agent(config_dir):
     _write_yaml(approval_path, data)
     with pytest.raises(ConfigValidationError, match="不能作为审批人"):
         ConfigLoader().load(config_dir)
+
+
+# ---------------------------------------------------------------------------
+# 校验 8：HMAC key 存在性与格式（P0）
+# ---------------------------------------------------------------------------
+
+import dataclasses
+
+
+def test_hmac_sha256_requires_key(config_dir):
+    config = ConfigLoader().load(config_dir)
+    config_with_hmac = dataclasses.replace(config, audit_hash_algo="hmac-sha256")
+    with pytest.raises(ConfigValidationError, match="未设置"):
+        ConfigLoader()._check_audit_key(config_with_hmac)
+
+
+def test_hmac_sha256_hex_key_ok(config_dir, monkeypatch):
+    monkeypatch.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", "a" * 64)
+    config = ConfigLoader().load(config_dir)
+    config_with_hmac = dataclasses.replace(config, audit_hash_algo="hmac-sha256")
+    ConfigLoader()._check_audit_key(config_with_hmac)  # 不抛即通过
+    key = ConfigLoader.resolve_audit_key(config_with_hmac)
+    assert len(key) == 32
+
+
+def test_hmac_sha256_base64_key_ok(config_dir, monkeypatch):
+    import base64
+    raw = base64.b64encode(b"x" * 32).decode("ascii")
+    monkeypatch.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", raw)
+    config = ConfigLoader().load(config_dir)
+    config_with_hmac = dataclasses.replace(config, audit_hash_algo="hmac-sha256")
+    key = ConfigLoader.resolve_audit_key(config_with_hmac)
+    assert len(key) == 32
+
+
+def test_hmac_sha256_rejects_short_key(config_dir, monkeypatch):
+    monkeypatch.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", "a" * 16)  # 8 字节
+    config = ConfigLoader().load(config_dir)
+    config_with_hmac = dataclasses.replace(config, audit_hash_algo="hmac-sha256")
+    with pytest.raises(ConfigValidationError, match="长度"):
+        ConfigLoader()._check_audit_key(config_with_hmac)
+
+
+def test_hmac_sha256_rejects_invalid_encoding(config_dir, monkeypatch):
+    monkeypatch.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", "not-hex-or-base64!!!")
+    config = ConfigLoader().load(config_dir)
+    config_with_hmac = dataclasses.replace(config, audit_hash_algo="hmac-sha256")
+    with pytest.raises(ConfigValidationError, match="无法解析"):
+        ConfigLoader()._check_audit_key(config_with_hmac)

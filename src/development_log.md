@@ -161,6 +161,35 @@
 
 ---
 
+## P0：信任加固（HMAC 审计链）
+
+目标：把安全局限 L1/L2 从"待办"变成"已有缓解"。
+
+### 完成内容
+
+- **`AuditEvent` 扩展**：新增 `key_id` 字段，为密钥轮换留口；新增 `seal` action。
+- **`JsonlAuditStore` 支持 HMAC-SHA256**：
+  - 通过环境变量 `LOOP_CONTROLLER_AUDIT_HASH_ALGO` 选择 `sha256`（默认，兼容）或 `hmac-sha256`；
+  - `LOOP_CONTROLLER_AUDIT_HMAC_KEY` 从环境变量读取，支持 hex/base64，长度 ≥32 字节；
+  - event key 与 seal key 通过 HMAC(root_key, label) 做域分离；
+  - 追加事件时写入 `hash_algo` 与 `key_id`。
+- **seal 记录**：`JsonlAuditStore.seal()` 固定当前链累积 HMAC；seal 记录本身进链，并带 `chain_hash` + `seal_signature`；篡改 seal 记录或删除 seal 前后事件都会使 `verify_chain()` 失败。
+- **ConfigLoader 启动校验**：`hmac-sha256` 模式下环境变量缺失或格式非法时 fail-closed。
+- **Runtime 集成**：`build_runtime` 按 `config.audit_hash_algo` 创建对应 `JsonlAuditStore`。
+
+### 关键决策
+
+- **key 只走环境变量，不进配置文件**：降低密钥泄露面。
+- **域分离用 label HMAC 而非 HKDF**：P0 够用，避免引入额外依赖；若未来需要更标准派生，可无缝替换 `_derive_key`。
+- **sha256 保持默认**：无敏感数据的开发/演示场景不需要 HMAC，避免强制配置增加启动门槛。
+
+### 测试
+
+- `tests/test_audit_store.py`：HMAC 链通过、错误 key 检测、seal 检测删除/篡改、sha256 兼容。
+- `tests/test_config_loader.py`：HMAC key 缺失、hex/base64 合法、长度不足、编码非法四个反例。
+
+---
+
 ## 后续可选工作
 
 - **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。

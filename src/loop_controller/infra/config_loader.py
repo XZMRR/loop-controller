@@ -10,11 +10,14 @@
 4. 审计/决策日志目录可写；
 5. 全部 glob 模式可编译；
 6. 全部掩码正则可编译；
-7. 审批人必须存在于 users 中。
+7. 审批人必须存在于 users 中；
+8. 若 ``audit_hash_algo=hmac-sha256``，则 ``audit_hmac_key_env`` 指向的环境变量必须存在且能解析为 ≥32 字节的随机 key。
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import dataclass, field
 from hashlib import sha256
 import os
@@ -137,6 +140,8 @@ class AppConfig:
     audit_log_path: str
     decision_log_path: str
     llm_planner: LLMPlannerConfig | None = None
+    audit_hash_algo: Literal["sha256", "hmac-sha256"] = "sha256"
+    audit_hmac_key_env: str = "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +173,13 @@ class ConfigLoader:
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
 
+        audit_hash_algo = os.environ.get("LOOP_CONTROLLER_AUDIT_HASH_ALGO", "sha256")
+        if audit_hash_algo not in ("sha256", "hmac-sha256"):
+            raise ConfigValidationError(
+                f"环境变量 LOOP_CONTROLLER_AUDIT_HASH_ALGO 必须是 sha256 或 hmac-sha256，"
+                f"当前值：{audit_hash_algo}"
+            )
+
         app_config = AppConfig(
             agents=agents,
             users=users,
@@ -181,6 +193,7 @@ class ConfigLoader:
             audit_log_path=str(root / "data" / "audit.jsonl"),
             decision_log_path=str(root / "data" / "decisions.jsonl"),
             llm_planner=llm_planner,
+            audit_hash_algo=audit_hash_algo,
         )
 
         self._check_profile_exists(app_config)
@@ -192,6 +205,7 @@ class ConfigLoader:
         self._check_regex_compile(app_config)
         self._check_approver_exists(app_config)
         self._check_llm_planner_api_key(app_config)
+        self._check_audit_key(app_config)
         return app_config
 
     # -- 各 YAML 解析 -------------------------------------------------------
@@ -385,6 +399,44 @@ class ConfigLoader:
             raise ConfigValidationError(
                 f"LLMPlanner 已启用，但环境变量 {env_name} 未设置（密钥不落盘，请通过环境变量注入）"
             )
+
+    def _check_audit_key(self, config: AppConfig) -> None:
+        """P0 启动校验：HMAC 模式下环境变量必须存在且能解析为 ≥32 字节随机 key。"""
+        if config.audit_hash_algo != "hmac-sha256":
+            return
+        try:
+            self.resolve_audit_key(config)
+        except ValueError as exc:
+            raise ConfigValidationError(
+                f"audit_hash_algo=hmac-sha256 时，{config.audit_hmac_key_env} 未设置或格式非法：{exc}"
+            ) from exc
+
+    @staticmethod
+    def resolve_audit_key(config: AppConfig) -> bytes:
+        """解析 ``audit_hmac_key_env`` 指向的环境变量为 bytes key。
+
+        支持 hex（64 字符）或 base64 编码；解码后长度必须 ≥32 字节。
+        返回 bytes；解析失败抛 ``ValueError``。
+        """
+        env_name = config.audit_hmac_key_env
+        raw = os.environ.get(env_name)
+        if not raw:
+            raise ValueError(f"环境变量 {env_name} 未设置")
+        raw = raw.strip()
+        if len(raw) == 64:
+            try:
+                key = bytes.fromhex(raw)
+                if len(key) >= 32:
+                    return key
+            except ValueError:
+                pass
+        try:
+            key = base64.b64decode(raw, validate=True)
+        except binascii.Error as exc:
+            raise ValueError(f"无法解析为 hex 或 base64：{exc}") from exc
+        if len(key) < 32:
+            raise ValueError(f"key 长度 {len(key)} 字节，必须 ≥32 字节")
+        return key
 
     # -- 工具 ---------------------------------------------------------------
 

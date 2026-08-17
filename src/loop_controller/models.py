@@ -31,6 +31,7 @@ AuditAction = Literal[
     "deny",
     "execute",
     "task_end",
+    "seal",
     "planner_error",
 ]
 ApprovalVerdict = Literal["approve", "deny"]
@@ -324,8 +325,9 @@ class AuditEvent(BaseModel):
     action: AuditAction
     target: str | None = None  # tool_name 或 "checkpoint"
     decision: Verdict | None = None
-    args_hash: str | None = None  # 规范 JSON 的 SHA-256
-    hash_algo: str = "sha256"  # 升级 HMAC 时改此字段，schema 不变
+    args_hash: str | None = None  # 规范 JSON 的 SHA-256 / HMAC-SHA256
+    hash_algo: str = "sha256"  # "sha256" | "hmac-sha256"；升级 HMAC 时改此字段，schema 不变
+    key_id: str | None = None  # HMAC key 标识，为轮换留口
     args_mask: dict | None = None  # 掩码后的结构化参数
     reason: str | None = None
     policy_version: str | None = None

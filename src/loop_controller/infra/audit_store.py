@@ -1,13 +1,19 @@
-"""审计存储（§4.4 / §7.1）：T3.1 完整版。
+"""审计存储（§4.4 / §7.1）：T3.1 + P0 HMAC 完整版。
 
-``JsonlAuditStore`` 追加写入 ``audit.jsonl``，并为每个事件分配 ``seq``、计算
-``prev_hash``（上一条事件规范 JSON 的 SHA-256），提供 ``verify_chain`` 检测
-删除/改写/插入/顺序变更，以及 ``query_by_trace`` 按 trace_id 检索。
+``JsonlAuditStore`` 追加写入 ``audit.jsonl``，为每个事件分配 ``seq``、计算
+``prev_hash``，提供 ``verify_chain`` 检测删除/改写/插入/顺序变更，以及
+``query_by_trace`` 按 trace_id 检索。
+
+P0 新增 HMAC-SHA256 支持：
+- 通过 ``hash_algo`` 选择 ``sha256``（兼容旧日志）或 ``hmac-sha256``；
+- ``hmac-sha256`` 模式下从部署级 root key 派生 event key 与 seal key，做域分离；
+- 提供 ``seal()`` 写入 seal 记录，固定当前链累积 HMAC，缓解"最后一行删改无法检测"问题。
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -25,35 +31,100 @@ class AuditStore(Protocol):
     def query_by_trace(self, trace_id: str) -> list[AuditEvent]: ...
 
 
-def _hash_text(text: str) -> str:
+def _derive_key(root_key: bytes, label: bytes) -> bytes:
+    """用 HMAC-SHA256(root_key, label) 做简单域分离；足够满足 P0 需求。"""
+    return hmac.new(root_key, label, hashlib.sha256).digest()
+
+
+def _sha256_text(text: str) -> str:
     """SHA-256 文本摘要（UTF-8）。"""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _hmac_text(key: bytes, text: str) -> str:
+    """HMAC-SHA256 文本摘要（UTF-8）。"""
+    return hmac.new(key, text.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 class JsonlAuditStore:
-    """JSONL 审计存储 + SHA-256 哈希链。"""
+    """JSONL 审计存储 + SHA-256/HMAC-SHA256 哈希链 + seal 记录。"""
 
     _GENESIS = "GENESIS"
+    _EVENT_LABEL = b"lc:audit:event:v1"
+    _SEAL_LABEL = b"lc:audit:seal:v1"
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        hash_algo: str = "sha256",
+        hmac_key: bytes | None = None,
+        key_id: str | None = None,
+    ) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._seq, self._prev_hash = self._load_tail()
+        self._hash_algo = hash_algo
+        self._key_id = key_id
+        if hash_algo == "hmac-sha256":
+            if hmac_key is None:
+                raise ValueError("hmac-sha256 必须提供 hmac_key")
+            self._event_key = _derive_key(hmac_key, self._EVENT_LABEL)
+            self._seal_key = _derive_key(hmac_key, self._SEAL_LABEL)
+        else:
+            self._event_key = b""
+            self._seal_key = b""
+        self._seq, self._prev_hash, self._chain_hash = self._load_tail()
 
-    def _load_tail(self) -> tuple[int, str]:
-        """启动时重放文件末行，恢复 ``seq`` 与 ``prev_hash``，保证重启后续写不断链。"""
+    def _load_tail(self) -> tuple[int, str, str]:
+        """启动时重放文件末行，恢复 ``seq``、``prev_hash`` 与 ``_chain_hash``。
+
+        保证重启后续写不断链；seal 记录也会被重放并更新 ``_chain_hash``。
+        """
         if not self._path.exists():
-            return 0, self._GENESIS
+            return 0, self._GENESIS, self._GENESIS
         with self._path.open("r", encoding="utf-8") as fh:
             lines = [line.strip() for line in fh if line.strip()]
         if not lines:
-            return 0, self._GENESIS
-        try:
-            last = json.loads(lines[-1])
-        except json.JSONDecodeError:
-            # 文件末行已损坏：无法安全追加，视为空链重启（调用方应运行 verify_chain 发现）。
-            return 0, self._GENESIS
-        return int(last.get("seq", 0)), _hash_text(lines[-1])
+            return 0, self._GENESIS, self._GENESIS
+
+        # 过滤掉不完整行（崩溃残留），但保留完整行用于恢复状态。
+        valid_lines: list[str] = []
+        for line in lines:
+            try:
+                json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            valid_lines.append(line)
+
+        if not valid_lines:
+            return 0, self._GENESIS, self._GENESIS
+
+        last = json.loads(valid_lines[-1])
+        seq = int(last.get("seq", 0))
+        prev_hash = self._hash(valid_lines[-1])
+
+        # 重放完整文件恢复 chain_hash。
+        chain_hash = self._GENESIS
+        for line in valid_lines:
+            record = json.loads(line)
+            if record.get("action") == "seal":
+                # seal 记录自身的 chain_hash 写入 metadata，但 seal 行也参与链。
+                chain_hash = self._hash(line, chain_hash)
+            else:
+                chain_hash = self._hash(line, chain_hash)
+        return seq, prev_hash, chain_hash
+
+    def _hash(self, text: str, chain_hash: str | None = None) -> str:
+        """计算单行文本的哈希。
+
+        - sha256 模式：返回 SHA-256(text)；
+        - hmac-sha256 模式：返回 HMAC(event_key, chain_hash + text)，
+          其中 chain_hash 为到上一行为止的累积 HMAC；首行使用 GENESIS。
+        """
+        if self._hash_algo == "sha256":
+            return _sha256_text(text)
+        base = chain_hash if chain_hash is not None else self._GENESIS
+        return _hmac_text(self._event_key, base + text)
 
     def append(self, event: AuditEvent) -> None:
         """分配 seq/prev_hash 后追加写入 JSONL。"""
@@ -62,25 +133,59 @@ class JsonlAuditStore:
             update={
                 "seq": self._seq,
                 "prev_hash": self._prev_hash,
+                "hash_algo": self._hash_algo,
+                "key_id": self._key_id,
             }
         )
-        # 规范 JSON 计算哈希，避免字段顺序/空白差异导致校验漂移（§7.3 / 踩坑 #6）。
-        # mode="json" 把 datetime 等不可 JSON 序列化的类型先转成字符串。
         line = canonical_json(to_write.model_dump(mode="json", exclude_none=True))
         with self._path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
             fh.flush()
-        self._prev_hash = _hash_text(line)
+        self._prev_hash = self._hash(line, self._chain_hash)
+        self._chain_hash = self._prev_hash
+
+    def seal(self, reason: str = "periodic_seal") -> AuditEvent:
+        """写入 seal 记录，固定当前链累积 HMAC。
+
+        seal 记录本身也是审计链的一部分；其 ``metadata.chain_hash`` 字段
+        包含写入前整个链的累积 HMAC，并用 ``seal_key`` 做域分离签名
+        （``seal_signature``），用于事后独立校验。
+        """
+        chain_hash = self._chain_hash
+        seal_signature = ""
+        if self._hash_algo == "hmac-sha256":
+            seal_signature = _hmac_text(self._seal_key, chain_hash)
+        event = AuditEvent(
+            event_id="seal",
+            trace_id="",
+            session_id="",
+            actor_type="system",
+            actor_id="audit_store",
+            action="seal",
+            target="audit_chain",
+            reason=reason,
+            metadata={
+                "chain_hash": chain_hash,
+                "seal_signature": seal_signature,
+            },
+        )
+        self.append(event)
+        return event
 
     def verify_chain(self) -> bool:
-        """重放全文件校验三件事：seq 连续递增、prev_hash 链接正确、每行可解析。"""
+        """重放全文件校验：seq 连续递增、prev_hash 链接正确、每行可解析。
+
+        hmac-sha256 模式下同时校验累积 HMAC；seal 记录的 chain_hash 与当前
+        累积值一致时通过。
+        """
         if not self._path.exists():
             return True
         expected_prev = self._GENESIS
         expected_seq = 1
+        chain_hash = self._GENESIS
         with self._path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
+            for raw in fh:
+                line = raw.strip()
                 if not line:
                     continue
                 try:
@@ -91,8 +196,23 @@ class JsonlAuditStore:
                     return False
                 if record.get("prev_hash") != expected_prev:
                     return False
+
+                # 重新计算当前行的 hash 与 chain_hash。
+                current_hash = self._hash(line, chain_hash)
+                chain_hash = current_hash
+
+                # seal 记录额外校验 metadata.chain_hash 与 seal_signature。
+                if record.get("action") == "seal":
+                    metadata = record.get("metadata", {})
+                    if metadata.get("chain_hash") != expected_prev:
+                        return False
+                    if self._hash_algo == "hmac-sha256":
+                        expected_sig = _hmac_text(self._seal_key, expected_prev)
+                        if metadata.get("seal_signature") != expected_sig:
+                            return False
+
                 expected_seq += 1
-                expected_prev = _hash_text(line)
+                expected_prev = current_hash
         return True
 
     def query_by_trace(self, trace_id: str) -> list[AuditEvent]:
