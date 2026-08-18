@@ -1,320 +1,529 @@
-不需要先看代码。这 6 点都属于方案层决策，可以直接定案；其中 1-4 是 P1 L2 的开工边界，5 是 P0，6 是 P2，不应阻塞当前 P1。
+已查看。以下是对 8 个问题的定案；其中 Q3、Q5、Q7 我没有完全照代码 agent 的倾向，而是做了架构上的修正。
 
-## 1. Session 分配职责：归 Runtime，新增 SessionManager
+# 总体结论
 
-**定案：新增 `SessionManager`，挂在 `Runtime` 上。**
-
-推荐结构：
-
-```python
-task = runtime.create_task(
-    user_id="...",
-    agent_id="...",
-    description="...",
-)
-```
-
-原则：
-
-- `session_id` 是治理状态，不应由 Agent、Planner 或普通调用方自行决定；
-- `SessionManager` 负责：
-  - `get_or_create_session(user_id, agent_id)`；
-  - 30 分钟间隔判定；
-  - `validate_and_touch(task)`；
-  - session 过期与关闭；
-- `Task` 数据结构暂时不变，仍然携带 `session_id`，避免大范围改动；
-- `runtime.create_task(...)` 是正式入口；
-- 为了兼容已有测试，`run_task(task, ...)` 可以继续存在，但必须校验：
-  - `task.session_id` 存在；
-  - session 仍活跃；
-  - session 绑定的 `(user_id, agent_id)` 与 Task 一致；
-  - 不一致则 fail-closed。
-
-也就是说：**既新增 `runtime.create_task`，又保留底层 `run_task(task)`，但后者必须验证 session binding。**
-
-现有 example 和 e2e 改成 `runtime.create_task(...)`，只是一行级别调整；单元测试仍可直接构造 `Task`，但要注入受控的 `SessionManager` fixture。
+1. **不 force-push develop**；
+2. **v0.2.0 先补 `key_id` 与版本号，再打 tag**；
+3. **多轮交互采用“外部驱动 + 显式 ask_user 信号”**；
+4. **Task 继续表示用户目标，ConversationContext 绑定 session**；
+5. **Decision 有效期与消费次数由 DecisionStore 统一管理**；
+6. **CLI 是 v0.3.0 必选项**；
+7. **策略模板按 profile 显式选择，不做文本拼接式合并**；
+8. **新建 v0.2.0 检查清单，并同步 `pyproject.toml` 版本号**。
 
 ---
 
-## 2. RiskStateManager：显式配置路径，P1 初始版本仍按单进程实现
+# Q1：develop 已推送，与发布检查时序冲突
 
-**定案：新增 `risk_state_path` 配置，不写死隐藏路径。**
+## 定案
 
-建议：
+**接受现状，不 force-push。**
+
+处理顺序调整为：
+
+1. 在当前 `origin/develop` HEAD 上补做 v0.2.0 发布检查；
+2. 若发现问题，直接新增修正 commit；
+3. 所有检查通过后，在最终 HEAD 上打 `v0.2.0`；
+4. push tag。
+
+也就是说，原计划中的：
+
+```text
+检查 → push → tag
+```
+
+现实调整为：
+
+```text
+已 push → 补检查 → 必要时 fix-forward → tag 最终 HEAD
+```
+
+## 理由
+
+- develop 已经公开，改写历史没有必要；
+- 当前问题不是代码污染，而是发布流程顺序变化；
+- 只要 tag 打在最终验证过的 HEAD 上，发布语义仍然正确。
+
+---
+
+# Q2：`key_id` 目前为空，是否影响 v0.2.0
+
+## 定案
+
+**影响，发布前必须修。**
+
+不要接受审计事件里长期存在无意义的 `null`。
+
+建议实现：
 
 ```yaml
-risk_state_path: "./data/risk_state.jsonl"
+audit_key_id: "default"
 ```
 
-对应：
+同时允许环境变量覆盖：
 
-```python
-class AppConfig(BaseModel):
-    risk_state_path: Path = Path("./data/risk_state.jsonl")
+```bash
+LOOP_CONTROLLER_AUDIT_KEY_ID="default"
 ```
 
-启动检查：
+规则：
 
-- 父目录不存在则创建或报错，行为与现有 `data/` 检查策略一致；
-- 文件不可写则启动失败；
-- 启动时重放 JSONL；
-- 最后一行若是崩溃造成的不完整 JSON：
-  - 忽略该行；
-  - 记录 WARNING；
-  - 不阻止启动；
-  - 但不能静默吞掉。
+- `key_id` 必须非空；
+- 默认值可以是 `"default"`；
+- 不从 HMAC key 派生；
+- 不把 key 本身、key 的明文 hash 作为 `key_id`；
+- 未来轮换时由部署方显式更新 `key_id`。
 
-持久化方式：
+## 理由
 
-- P1 初版：单进程、单 writer；
-- Runtime 内用 `asyncio.Lock` 串行化写入；
-- 每次追加完整 JSONL 行；
-- 写后 flush，必要时 fsync；
-- 通过 `RiskStateStore` 接口隔离实现，例如：
+`key_id` 的作用是运维识别：
 
-```python
-class RiskStateStore(Protocol):
-    def append_event(...)
-    def load_all(...)
+```text
+这条审计链当时使用的是哪一把 key
 ```
 
-关于多 writer：
+它不是防伪材料，因此没必要从 secret 派生；显式配置更清晰，也更方便未来轮换。
 
-- **L2 初版不要等多 worker 方案。**
-- 当前仍沿用 L3 单进程 asyncio 假设；
-- 但 P1 后续做“多 worker DecisionStore”时，必须把 `RiskStateStore` 一起迁移到同一套存储或锁机制；
-- 不要现在单独为 RiskStateManager 搞一套文件锁方案，否则后面会出现两套并发语义。
+## 发布要求
 
-换句话说：
+将原检查项改为：
 
-> P1-L2 的代码合入可以基于单进程假设；但如果 v0.3.0 宣称支持多 worker，RiskStateManager 也必须包含在多 worker 原子性方案里。
+- [ ] HMAC 模式下 `key_id` 非空；
+- [ ] 默认值为 `"default"` 或部署方显式配置；
+- [ ] seal 与 audit event 使用同一个 `key_id`；
+- [ ] 更换 `key_id` 后验证工具能正确识别。
 
 ---
 
-## 3. `session_risk_threshold`：放 CapabilityProfile，传入 Rego input
+# Q3：多轮对话的交互模型
 
-**定案：per-profile 配置，默认 0.6。**
+## 定案
+
+采用：
+
+```text
+方案 A 的外部驱动模型
++
+方案 C 的显式 ask_user 信号
+```
+
+但不是把 `ask_user` 做成一个普通 tool call。
+
+## 最终交互模型
+
+Runtime 仍然是库，不内部阻塞等待用户。
+
+Planner 的返回类型扩展为：
 
 ```python
-class CapabilityProfile(BaseModel):
-    session_risk_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+PlannedAction | UserQuestion | None
 ```
 
-理由：
+例如：
 
-- 不同 Agent 的权限和信任等级不同；
-- 高权限 Agent 可能需要更低阈值；
-- 阈值属于能力档案的一部分，应该随 `profile_version` 一起进入审计。
-
-`build_policy_input` 需要显式扩展：
-
-```json
-{
-  "session_risk": {
-    "score": 0.42,
-    "threshold": 0.6,
-    "recent_tags": ["deny", "critical"],
-    "session_id": "..."
-  }
-}
+```python
+class UserQuestion(BaseModel):
+    question: str
+    reason: str | None = None
 ```
 
-Rego 规则只比较：
+Runtime 行为：
 
-```rego
-input.session_risk.score >= input.session_risk.threshold
+| Planner 返回 | Runtime 行为 |
+|---|---|
+| `PlannedAction` | 走正常 R2 治理与工具执行 |
+| `UserQuestion` | 记录 agent message，返回 `needs_user_input` |
+| `None` | 返回 `completed` |
+
+外部调用方收到：
+
+```python
+TaskRunResult(status="needs_user_input")
 ```
 
-注意三点：
+之后由外部调用方完成：
 
-1. 阈值不要写死在 Rego policy 里；
-2. 不要把整个 `CapabilityProfile` 无筛选地塞进 Rego input，只传治理所需字段；
-3. 必须补 Python ↔ Rego input contract test，防止再次出现字段不一致导致 default deny。
+```python
+runtime.add_user_message(...)
+runtime.resume_task(...)
+```
 
-`session_risk_gate` 仍然只能产生 `require_approval`，不能覆盖硬 deny；优先级依旧是：
+## 为什么不选纯方案 A
+
+纯方案 A 没有回答一个关键问题：
+
+> Agent 如何明确告诉 Runtime：“我现在不是结束，而是在等用户补充”？
+
+如果仅靠自然语言结尾猜测，可靠性太差。
+
+## 为什么不选方案 B
+
+`run_task` 内部阻塞等待输入会把 Runtime 从库变成交互服务，破坏当前部署形态，也会让测试、超时、取消和后续 Proxy 服务化都更复杂。
+
+## 为什么不让 ask_user 成为工具调用
+
+`ask_user` 不产生外部副作用，不应该进入 R2 的工具治理链路。它是 R1 与调用方之间的控制信号，不是 tool call。
+
+---
+
+# Q4：Task 与 ConversationMessage 的关联规则
+
+## 定案
+
+采用：
+
+```text
+一个用户目标 = 一个 Task
+一个 session 可以包含多个 Task
+一次多轮澄清属于同一个 Task
+ConversationContext 绑定 session
+```
+
+## 具体规则
+
+### 1. Task 的语义
+
+`Task` 表示用户目标，而不是一次消息回合。
+
+例如：
+
+```text
+帮我写个合规报告
+```
+
+这是一个 Task。
+
+后续：
+
+```text
+主题是 AI 数据安全
+需要包含 GDPR 和中国个保法
+```
+
+仍然是同一个 Task 的补充输入。
+
+### 2. 什么时候创建新 Task
+
+当用户开启一个新目标时创建新 Task。
+
+例如：
+
+```text
+再帮我写一份产品介绍
+```
+
+这是新 Task，但仍可复用同一个 session。
+
+### 3. `task_id = None` 的含义
+
+保留该可能性，但 v0.3.0 正常路径不应产生。
+
+约定：
+
+- 用户消息和 Agent 消息在 v0.3.0 中都必须带 `task_id`；
+- `task_id = None` 仅保留给未来的 session 级消息；
+- 当前 R2 构建治理上下文时，可以忽略 `task_id = None` 的消息。
+
+### 4. `run_task` 加载哪些上下文
+
+加载整个 session 的上下文，但排序与截断时优先：
+
+1. 当前 Task 的描述；
+2. 当前 Task 的最近消息；
+3. 同一 session 内其他 Task 的最近消息。
+
+这样可以同时支持：
+
+- 同一目标的多轮澄清；
+- 同一 session 中多个相关目标之间的上下文继承。
+
+---
+
+# Q5：异步审批与 DecisionStore 的兼容性
+
+## 定案
+
+**DecisionStore 统一管理 Decision 的有效期与消费状态。ApprovalStore 只管理审批事件。**
+
+但要修正代码 agent 的表述：
+
+- `expires_at`、`max_uses` 属于 `Decision`；
+- `used_count` 不属于不可变 `Decision`，它属于 DecisionStore 的运行状态。
+
+## 职责边界
+
+### Decision 模型
+
+`Decision` 是不可变授权凭证，包含：
+
+- `decision_id`
+- `call_id`
+- `verdict`
+- `expires_at`
+- `max_uses`
+- `modified_args`
+- `policy_hits`
+- `reason`
+
+如果当前实现缺少 `expires_at` 或 `max_uses`，需要补齐。
+
+### DecisionStore
+
+DecisionStore 负责：
+
+- 注册 Decision；
+- 校验 `decision_id` 是否存在；
+- 校验是否过期；
+- 校验 `used_count < max_uses`；
+- 消费 Decision；
+- 防止重复使用；
+- 防 `call_id` 重放。
+
+建议内部记录：
+
+```text
+decision_id
+call_id
+task_id
+session_id
+status
+expires_at
+max_uses
+used_count
+created_at
+consumed_at
+```
+
+### ApprovalStore
+
+ApprovalStore 只负责：
+
+- 记录审批请求；
+- 记录审批人；
+- 记录 approve / deny / expire；
+- 保存审批理由；
+- 支持重启恢复。
+
+它不判断最终能否执行。
+
+## 审批通过后的流程
+
+```text
+ApprovalStore 记录 approved
+→ ApprovalService / Checkpoint 创建新的 allow Decision
+→ DecisionStore 注册该 Decision
+→ forward 时由 DecisionStore 校验并消费
+```
+
+这样可以避免 §8 R4 提到的双写不一致问题。
+
+---
+
+# Q6：CLI 入口
+
+## 定案
+
+**CLI 是 v0.3.0 必选项。**
+
+新增：
+
+```text
+src/loop_controller/cli.py
+```
+
+并在 `pyproject.toml` 中注册：
+
+```toml
+[project.scripts]
+lc = "loop_controller.cli:main"
+```
+
+v0.3.0 最小命令：
+
+```bash
+lc approvals list
+lc approvals show <decision_id>
+lc approvals approve <decision_id> --approver alice --reason "..."
+lc approvals deny <decision_id> --approver alice --reason "..."
+```
+
+## 理由
+
+v0.3.0 的核心叙事是“真实治理闭环”。如果没有 CLI，异步审批只能停留在库接口，无法完成可演示、可操作的人工闭环。
+
+Web UI 仍然不做。
+
+---
+
+# Q7：策略模板如何与现有配置集成
+
+## 定案
+
+部分采纳代码 agent 建议，但不允许简单的文本拼接式合并。
+
+采用：
+
+```text
+policies/
+  default.rego
+  templates/
+    file_whitelist.rego
+    sensitive_directories.rego
+    external_email.rego
+    session_risk.rego
+    critical_tools.rego
+```
+
+`profiles.yaml` 新增：
+
+```yaml
+policy_files:
+  - "default.rego"
+  - "templates/file_whitelist.rego"
+  - "templates/external_email.rego"
+```
+
+## 合并方式
+
+不要把多个 `.rego` 文件拼接成一个大文件。
+
+正确方式是：
+
+1. PolicyStore 记录 profile 选择的 policy files；
+2. PolicyEngine 查询 base policy 与被选择的 template policy；
+3. 收集多个 candidate decisions；
+4. 用统一优先级合并：
 
 ```text
 deny > require_approval > modify > allow
 ```
 
----
+## 版本号
 
-## 4. `recent_tags`：固定最近 10 条，只记录风险证据，不随分数衰减
+`policy_version` 必须反映当前 profile 实际启用的 policy files。
 
-**定案：`recent_tags` 是 bounded FIFO，最多 10 条。**
-
-维护规则：
-
-- 只记录风险相关标签：
-  - `deny`
-  - `critical`
-  - `require_approval`
-  - `approval_denied`
-  - `approval_granted`
-- `allow`、`low_risk_success` 不进入 `recent_tags`；
-- 低风险成功只影响 `cumulative_risk_score`，不清洗风险证据；
-- 新风险事件到来时追加；
-- 超过 10 条时淘汰最旧的一条；
-- `recent_tags` 不做时间衰减；
-- 分数衰减只作用于 `cumulative_risk_score`。
-
-即：
+建议计算方式：
 
 ```text
-score 会恢复；
-recent_tags 不会因为成功调用而被“洗掉”；
-recent_tags 只通过 FIFO 自然淘汰。
+sha256(
+  排序后的 relative path
+  + 每个文件内容 hash
+)
 ```
 
-Session 结束后：
+不能只 hash 整个 `policies/` 目录，否则无法区分“文件存在但未被该 profile 启用”和“该 profile 实际启用了该模板”。
 
-- 活跃内存中的 RiskProfile 可以移除；
-- JSONL 风险事件仍保留，用于重放和审计；
-- 新 Session 从零开始；
-- 跨 Session 信誉、长期信誉、Earned Authority 不属于 P1，放到后续阶段。
+## `session_risk_threshold`
 
-需要补的测试：
+继续由 `CapabilityProfile` 提供，并进入 Rego input：
 
-1. 连续 11 个风险事件后，只保留后 10 个；
-2. 低风险成功会降低 score，但不会删除 `recent_tags`；
-3. 新 session 的 score 和 tags 都从零开始；
-4. 重启后通过 JSONL replay 能恢复相同状态。
+```rego
+input.session_risk.score >= input.session_risk.threshold
+```
+
+模板不自己定义阈值。
 
 ---
 
-## 5. P0 HMAC key：只能来自环境变量，单部署级 root key
+# Q8：发布检查清单与版本号
 
-**定案：P0 使用环境变量，不进配置文件，不接 KMS。**
+## 定案
 
-建议配置里只存环境变量名：
+两个都做。
 
-```yaml
-audit_hmac_key_env: "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
+### 1. 新建 v0.2.0 检查清单
+
+保留：
+
+```text
+发布检查清单_v0.1.0.md
 ```
 
-实际 key 只从环境变量读取：
+新增：
+
+```text
+发布检查清单_v0.2.0.md
+```
+
+理由：
+
+- v0.1.0 清单是历史发布记录；
+- 不覆盖历史版本；
+- 每个版本的发布门槛可以独立追溯。
+
+### 2. 更新包版本号
+
+发布前将：
+
+```toml
+version = "0.2.0"
+```
+
+写入 `pyproject.toml`。
+
+tag 必须打在包含以下内容的最终提交上：
+
+- `key_id` 非空；
+- `pyproject.toml` 版本号为 `0.2.0`；
+- v0.2.0 检查清单已更新；
+- 全量测试通过；
+- 手动真实 MCP gate 通过。
+
+---
+
+# 调整后的执行顺序
+
+当前最优顺序变为：
+
+## Step 1：发布修正
+
+先做一个小的 release-preparation commit：
+
+- 补 `audit_key_id`；
+- 补 v0.2.0 检查清单；
+- 更新 `pyproject.toml` version；
+- 更新 README / KNOWN_LIMITATIONS；
+- 跑全量测试与真实 MCP gate。
+
+## Step 2：打 v0.2.0 tag
+
+在最终 HEAD 上：
 
 ```bash
-export LOOP_CONTROLLER_AUDIT_HMAC_KEY="..."
+git tag -a v0.2.0 <final-head> -m "v0.2.0: trusted execution baseline"
+git push origin v0.2.0
 ```
 
-要求：
+## Step 3：进入 Iteration 4
 
-- key 至少 32 字节随机熵， hex 或 base64 编码；
-- `hash_algo = hmac-sha256` 时，如果环境变量缺失或格式非法，启动 fail-closed；
-- `sha256` 只作为兼容旧审计文件或开发模式保留；
-- 新增 audit event 里应带 `key_id`，为未来轮换留口。
+开始动态会话上下文，但采用本文 Q3/Q4 的修正模型：
 
-key 粒度：
+- 外部驱动；
+- 显式 `UserQuestion`；
+- `resume_task`；
+- session 级 ConversationContext。
 
-- P0 不做 per-trace key；
-- 不做 per-session key；
-- 使用单个部署级 root key；
-- key 轮换通过 `key_id` 支持，P2 再接 KMS。
+## Step 4：进入 Iteration 5
 
-事件链和 seal 可以共用同一个 root key，但必须做域分离：
+实现异步审批，但按 Q5 的职责边界：
 
-```text
-event key = HKDF(root_key, "lc:audit:event:v1")
-seal key  = HKDF(root_key, "lc:audit:seal:v1")
-```
-
-如果不想引入 HKDF，也至少要用不同 label 做 HMAC domain separation，不能事件和 seal 直接混用同一段输入语义。
+- ApprovalStore 记录审批；
+- DecisionStore 统一判断能否执行；
+- `used_count` 不进入不可变 Decision。
 
 ---
 
-## 6. P2 Proxy：Checkpoint 需要服务化，HTTP 先行，身份由连接凭证决定
+# 对代码 agent 倾向的处理结果
 
-**定案：P2 的 Proxy 形态下，Checkpoint 应包装成独立决策服务。**
+| 问题 | 是否采纳代码 agent 倾向 | 说明 |
+|---|---|---|
+| Q1 | 采纳 | 不 force-push |
+| Q2 | 采纳 | 发布前补非空 `key_id` |
+| Q3 | 部分采纳 | 外部驱动是对的，但需要显式 `UserQuestion` |
+| Q4 | 采纳并补充 | 一个用户目标一个 Task；session 加载完整上下文 |
+| Q5 | 部分采纳 | DecisionStore 统一校验是对的，但 `used_count` 不进 Decision |
+| Q6 | 采纳 | CLI 是 v0.3.0 必选项 |
+| Q7 | 部分采纳 | `policy_files` 是对的，但不能文本拼接合并 |
+| Q8 | 采纳 | 新清单 + 更新版本号 |
 
-目标结构：
-
-```text
-外来 Agent
-   │
-   ▼
-LC Proxy（MCP Server / PEP）
-   │  HTTP JSON，mTLS 或服务令牌
-   ▼
-Checkpoint Service（PDP / R2）
-   ├── OPA
-   ├── DecisionStore
-   ├── RiskStateManager
-   └── AuditStore
-   │
-   ▼
-真实 MCP Tool Server
-```
-
-P2 初版使用 HTTP JSON 即可：
-
-- schema 与现有 `ActionProposal` / `Decision` 对齐；
-- API 要版本化，例如 `/v1/...`；
-- gRPC 是后续性能优化，不是 P2 必需项；
-- Proxy 不直接访问 OPA；
-- Proxy 不能自行 allow；
-- Checkpoint 服务超时或不可达时，Proxy fail-closed。
-
-角色边界要稍微调整表述：
-
-- Checkpoint Service 是唯一决策权威；
-- LC Proxy 是可信 PEP，负责执行已经下发的 Decision；
-- Proxy 校验：
-  - `decision_id`；
-  - `expires_at`；
-  - `max_uses = 1`；
-  - `modified_params`；
-- 这不会破坏“R2 唯一权威”，因为 Proxy 不能自己产生授权。
-
-### 身份字段怎么来
-
-Proxy 形态下必须坚持：
-
-> Agent 自报的 `agent_id`、`user_id`、`task_id` 一律不能作为权威身份。
-
-具体规则：
-
-- `agent_id`：
-  - 来自 MCP 连接凭证与 Proxy 配置的映射；
-  - 可来自 API key、mTLS client cert、stdio 启动绑定等；
-  - 不能来自工具参数或 prompt 字段；
-- `user_id`：
-  - 同样来自连接凭证映射；
-  - 如果外来 Agent 没有用户概念，则映射到配置好的服务身份；
-- `session_id`：
-  - 由 Proxy 侧 SessionManager 创建；
-  - 基于权威 `(user_id, agent_id)` 和连接上下文；
-  - 仍沿用 30 分钟 gap 规则；
-- `task_id`：
-  - P2 初版由 Proxy 创建治理侧 synthetic task；
-  - 外来 Agent 自报的 task 标识只能作为 `declared_task_id` 元数据进入审计；
-- `call_id`：
-  - 由 Proxy 或 Checkpoint 生成；
-  - 仍必须全局唯一并进入 DecisionStore 防重放；
-  - 不能由外来 Agent 提供。
-
-自报信息可以继续遵循 v1.2 的铁律：
-
-```text
-只能收紧，不能放宽。
-```
-
-例如外来 Agent 自报“这是高风险操作”，Proxy 可以把它加入 declared context；但如果它自报“这是低风险”，不能直接降低治理等级。
-
----
-
-## 开工顺序建议
-
-前三点已经可以解锁 P1 L2：
-
-1. `SessionManager` + `runtime.create_task`；
-2. `risk_state_path` + JSONL replay；
-3. `CapabilityProfile.session_risk_threshold`；
-4. `build_policy_input` 扩展 + Rego contract test；
-5. `recent_tags` FIFO 规则与评分测试。
-
-优先级上：
-
-- **如果只有一个代码 agent：先 P0 HMAC，再 P1 L2。**
-- **如果可以并行：P0 HMAC 和 P1 L2 没有代码边界冲突，可以并行。**
-- P2 Proxy 现在不要动，只把上述身份原则记录下来，避免提前过度设计。
+这些决定可以直接作为 v0.3.0 的执行口径。
