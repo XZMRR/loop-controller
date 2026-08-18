@@ -15,6 +15,10 @@ from loop_controller.checkpoint import DecisionStore
 from loop_controller.models import Decision
 
 
+class DecisionStoreError(Exception):
+    """DecisionStore 自身完整性错误（如日志损坏）。"""
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -55,26 +59,30 @@ class JsonlDecisionStore(DecisionStore):
         self._load()
 
     def _load(self) -> None:
-        """启动时重放全量日志，恢复内存状态。"""
+        """启动时重放全量日志，恢复内存状态；损坏行直接失败（P1 fail-closed）。"""
         if not self._path.exists():
             return
         with self._path.open("r", encoding="utf-8") as fh:
-            for line in fh:
+            for lineno, line in enumerate(fh, start=1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as exc:
+                    raise DecisionStoreError(
+                        f"decision log 第 {lineno} 行 JSON 损坏：{self._path}"
+                    ) from exc
                 rtype = record.get("type")
                 if rtype == "proposal":
                     self._call_ids.add(record.get("call_id"))
                 elif rtype == "decision":
                     try:
                         decision = _deserialize_decision(record)
-                    except (TypeError, ValueError):
-                        continue
+                    except (TypeError, ValueError) as exc:
+                        raise DecisionStoreError(
+                            f"decision log 第 {lineno} 行 Decision 反序列化失败：{self._path}"
+                        ) from exc
                     self._decisions[decision.decision_id] = decision
                     self._used_counts.setdefault(decision.decision_id, 0)
                 elif rtype == "decision_use":

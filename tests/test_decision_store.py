@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from loop_controller.infra.decision_store import JsonlDecisionStore
+import pytest
+
+from loop_controller.infra.decision_store import DecisionStoreError, JsonlDecisionStore
 from loop_controller.models import Decision
 
 
@@ -83,3 +85,17 @@ def test_append_only_format(tmp_path) -> None:
     assert len(lines) == 2
     assert "\"type\": \"proposal\"" in lines[0]
     assert "\"type\": \"decision\"" in lines[1]
+
+
+def test_corrupt_log_fail_closed(tmp_path) -> None:
+    """P1：日志损坏时必须阻止启动并报告行号，不能 fail-open 跳过。"""
+    path = tmp_path / "decisions.jsonl"
+    store = JsonlDecisionStore(path)
+    store.record_proposal("t1", "c1")
+
+    # 追加一行非法 JSON
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("this is not json\n")
+
+    with pytest.raises(DecisionStoreError, match=r"decision log 第 2 行"):
+        JsonlDecisionStore(path)
