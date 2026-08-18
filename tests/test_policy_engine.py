@@ -180,7 +180,6 @@ async def test_session_risk_input_contract_contains_all_fields(opa_server, agent
     """v1.2 Python ↔ Rego input contract：session_risk 必须含 score/threshold/denied_count/recent_tags/session_id。"""
     from loop_controller.models import RiskProfile
 
-    engine = _make_engine(opa_server)
     proposal = _proposal("web_search", {"query": "q"})
     session_risk = RiskProfile(
         session_id="s-contract",

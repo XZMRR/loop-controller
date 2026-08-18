@@ -15,7 +15,6 @@ from typing import Any, Protocol, runtime_checkable
 import httpx
 
 from loop_controller.models import ActionProposal, Agent, CapabilityProfile, RiskProfile
-from loop_controller.governance_context import build_context_meta
 
 FAIL_CLOSED_DENY = {
     "verdict": "deny",

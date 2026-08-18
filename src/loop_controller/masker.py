@@ -11,8 +11,7 @@ import hashlib
 import re
 from typing import Any, Literal
 
-from loop_controller.infra.config_loader import MaskingRules, ValuePattern
-
+from loop_controller.infra.config_loader import MaskingRules
 
 MaskLevel = Literal["audit_log", "approval_request"]
 

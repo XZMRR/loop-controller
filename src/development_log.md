@@ -281,9 +281,71 @@
 
 ---
 
+## Iteration 5：真实异步审批 CLI（v0.3.0）
+
+目标：把 R0 审批从配置化同步打桩替换为真实异步人工审批，CLI 与 Runtime 共享持久化存储。
+
+### 完成内容
+
+- **DecisionStore 扩展**：
+  - `Decision` 新增 `expires_at` / `max_uses` / `used_count`；
+  - 原子化 `use_decision(decision_id, now)` 检查过期与次数，避免重复执行。
+- **ApprovalStore 协议与实现**：
+  - 新建 `src/loop_controller/infra/approval_store.py`；
+  - `JsonlApprovalStore` 以 JSONL 持久化 `ApprovalRequest` / `ApprovalRecord`；
+  - CLI 与 Runtime 通过同一文件共享状态。
+- **AsyncApprovalManager**：
+  - 新建 `src/loop_controller/approval_manager.py` 替代 `ConfigR0Delegate`；
+  - `submit()` 把审批请求落盘；`check()` 查询审批结果。
+- **Runtime 暂停态与恢复**：
+  - `TaskRunResult` 新增 `needs_approval` 状态及 `decision_id` / `request_id` / `pending_decision` / `pending_proposal` 字段；
+  - `run_task` 遇到 `require_approval` 时提交请求并返回 `needs_approval`；
+  - `resume_task(..., pending=...)` 读取审批结果后继续执行已审批动作；
+  - 修正 `ended` 标志，避免暂停态错误写入 `task_end`；
+  - 审批通过后的 allow Decision 执行时写入 `approval_consumed`，超期时写入 `approval_expired`。
+- **CLI 入口**：
+  - 新建 `src/loop_controller/cli.py`，实现 `lc approvals list/approve/deny`；
+  - 校验审批人存在于用户列表、审批人不能是请求者或执行 Agent、deny 必须带 reason；
+  - `pyproject.toml` 注册 `lc` 脚本；
+  - 支持 `LOOP_CONTROLLER_CONVERSATION_PATH` / `LOOP_CONTROLLER_APPROVAL_STORE_PATH` 环境变量覆盖。
+- **配置与文档**：
+  - `ApprovalRule` 移除 `behavior` 字段，`approval.yaml` 仅用于确定 `escalation_target`；
+  - 更新 `src/README.md`、`src/KNOWN_LIMITATIONS.md`，标记 F1 已实现；
+  - 更新 `examples/research_agent_example.py` 演示异步审批流程。
+
+### 关键决策
+
+- **审批行为不再由配置决定**：`approval.yaml` 只指定审批人；真实 approve/deny 必须由 CLI 写入，避免配置即终审权。
+- **DecisionStore 与 ApprovalStore 分离**：前者记录 R2 判定元信息，后者记录人工审批流程；关注点清晰，便于未来接入真实消息通知。
+- **resume_task 显式传入 pending**：调用方必须提供暂停时的 `TaskRunResult`，确保恢复的是同一决策，不依赖隐式全局状态。
+
+### 测试
+
+- `tests/test_r0_delegate.py` 改为测试 `AsyncApprovalManager`；
+- `tests/test_cli.py` 覆盖 `lc approvals list/approve/deny`、审批人冲突校验、deny 必填 reason；
+- `tests/test_e2e_research_agent.py` 覆盖 approve/deny 路径完整事件序列，以及审批超时 `approval_expired` 事件；
+- `tests/test_audit_events.py` 更新事件序列以包含 `approval_consumed`；
+- `tests/test_config_loader.py` 移除 `behavior` 字段；
+- 全量 201 用例通过。
+
+### 踩坑记录
+
+- **pytest-asyncio 未安装导致异步用例被跳过**：安装 `pytest-asyncio>=0.23` 后，异步用例才真正执行，暴露出 mcp SDK 版本兼容性问题。
+- **mcp SDK 版本差异**：当前环境 mcp SDK 使用装饰器式 handler（`@server.list_tools()` / `@server.call_tool()`）与 camelCase 字段（`inputSchema` / `isError`）；`mcp_gateway.py` 与 `mocks/email_server.py` 已做兼容处理。
+- **测试目录隔离**：`tmp_path_factory.mktemp("cli-config")` 会导致 `approvals.jsonl` 跨测试污染，改为 `tmp_path / "project"`。
+- **`ended` 标志误写 task_end**：resume 后 `ScriptedPlanner` 再次返回 send_email，循环体中错误设置 `ended=True` 导致暂停态写入了 `task_end`，已修正。
+
+### 验收状态更新
+
+| ID | 状态 | 自动化位置 |
+|---|---|---|
+| A5 | 通过 | `tests/test_e2e_research_agent.py` approve/deny 路径 |
+| F1 | 已实现 | `AsyncApprovalManager` + `JsonlApprovalStore` + `lc approvals` |
+
 ## 后续可选工作
 
 - **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。
 - **签名/WORM 存储**：当前哈希链只能检测篡改，不能防御整体重写；生产环境需要签名或 WORM 存储。
 - **HMAC 升级**：`AuditEvent.hash_algo` 字段已预留，涉及真实 PII 时触发升级。
 - **多 worker 原子 DecisionStore**：当前单进程 asyncio 假设下检查+记账原子；多 worker 时需要原子语义。
+- **CLI 通知扩展**：当前 CLI 依赖轮询文件；未来可扩展为 SSE/HTTP webhook 推送审批请求。

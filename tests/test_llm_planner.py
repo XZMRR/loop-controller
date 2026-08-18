@@ -11,8 +11,12 @@ import pytest
 
 from loop_controller.budget import InMemoryBudgetLedger
 from loop_controller.infra.audit_store import JsonlAuditStore
-from loop_controller.infra.config_loader import ConfigLoader, ConfigValidationError, LLMPlannerConfig
-from loop_controller.llm_planner import HttpxLLMClient, LLMPlanner, LLMResponse
+from loop_controller.infra.config_loader import (
+    ConfigLoader,
+    ConfigValidationError,
+    LLMPlannerConfig,
+)
+from loop_controller.llm_planner import LLMPlanner, LLMResponse
 from loop_controller.models import (
     Agent,
     AuditEvent,

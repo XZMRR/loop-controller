@@ -17,7 +17,7 @@ import asyncio
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import _config  # noqa: F401  初始化 OpenAI Agents SDK 默认客户端
@@ -25,7 +25,6 @@ from agents import Agent, GuardrailFunctionOutput, ModelSettings, RunContextWrap
 from agents.decorators import input_guardrail, output_guardrail
 from agents.exceptions import InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered
 from dotenv import load_dotenv
-from openai import RateLimitError
 from pydantic import BaseModel
 
 load_dotenv()
@@ -314,7 +313,7 @@ async def run_batch(name: str, runner, cases: list[tuple[str, str]]) -> list[dic
             record["test_suite"] = name
             record["run_index"] = i + 1
             record["model"] = DEFAULT_MODEL
-            record["timestamp"] = datetime.now(timezone.utc).isoformat()
+            record["timestamp"] = datetime.now(UTC).isoformat()
             records.append(record)
 
             status = "🚫 拦截" if record.get("blocked") else "✅ 放行"
@@ -417,7 +416,7 @@ async def main():
     summary = summarize(all_records)
 
     # 保存结果
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     result_file = RESULTS_DIR / f"t1_batch_reproducibility_results_{timestamp}.json"
     with open(result_file, "w", encoding="utf-8") as f:
         json.dump(
@@ -426,7 +425,7 @@ async def main():
                     "model": DEFAULT_MODEL,
                     "n_runs_per_case": N_RUNS,
                     "sleep_seconds": SLEEP_SECONDS,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 },
                 "summary": summary,
                 "records": all_records,

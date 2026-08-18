@@ -13,31 +13,38 @@ import shutil
 import socket
 import subprocess
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
-import yaml
 
+from loop_controller.approval_manager import AsyncApprovalManager
 from loop_controller.budget import InMemoryBudgetLedger
 from loop_controller.checkpoint import Checkpoint, InMemoryDecisionStore
 from loop_controller.classifier import RuleBasedClassifier
+from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import JsonlAuditStore
-from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.config_loader import ConfigLoader
+from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import FilePolicyStore
 from loop_controller.masker import Masker
-from loop_controller.models import Agent, AuditEvent, Task, ToolResult
 from loop_controller.mcp_gateway import MCPGateway
+from loop_controller.models import (
+    Agent,
+    ApprovalRecord,
+    AuditEvent,
+    Task,
+    TaskRunResult,
+    ToolResult,
+)
 from loop_controller.permission_interaction import ConfigPermissionInteractionAnalyzer
 from loop_controller.planner import ScriptedPlanner
 from loop_controller.policy_engine import OPAPolicyEngine
-from loop_controller.r0_delegate import ConfigR0Delegate
 from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
-from loop_controller.runtime import Runtime, run_task
+from loop_controller.runtime import Runtime, resume_task, run_task
 from loop_controller.session import SessionManager
-from loop_controller.utils.canonical import canonical_json
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OPA_BIN = Path(os.environ.get("OPA_PATH", REPO_ROOT / "tools" / "opa.exe"))
@@ -112,13 +119,6 @@ def workdir(tmp_path: Path) -> Path:
     return root
 
 
-def _set_approval_behavior(workdir: Path, behavior: str) -> None:
-    path = workdir / "config" / "approval.yaml"
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    data["rules"][0]["behavior"] = behavior
-    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
-
-
 def _build_task(agent: Agent) -> Task:
     return Task(
         task_id="e2e-research-001",
@@ -158,6 +158,7 @@ def _runtime_from_config(workdir: Path, opa_url: str, plan_path: Path | None = N
     )
     audit_store = JsonlAuditStore(workdir / "data" / "audit.jsonl")
     conversation_store = JsonlConversationStore(workdir / "data" / "conversations.jsonl")
+    approval_store_path = workdir / "data" / "approvals.jsonl"
     if plan_path is None:
         plan_path = workdir / "config" / "scripted_plan.yaml"
     planner = ScriptedPlanner.from_yaml(plan_path)
@@ -166,7 +167,7 @@ def _runtime_from_config(workdir: Path, opa_url: str, plan_path: Path | None = N
         classifier=RuleBasedClassifier(),
         checkpoint=checkpoint,
         gateway=gateway,
-        r0_delegate=ConfigR0Delegate(config.approval),
+        approval_manager=AsyncApprovalManager(JsonlApprovalStore(approval_store_path)),
         audit_store=audit_store,
         masker=masker,
         profiles=config.profiles,
@@ -176,7 +177,7 @@ def _runtime_from_config(workdir: Path, opa_url: str, plan_path: Path | None = N
     )
 
 
-async def _run(workdir: Path, opa_url: str, plan_path: Path | None = None) -> Runtime:
+async def _run(workdir: Path, opa_url: str, plan_path: Path | None = None) -> tuple[TaskRunResult, Runtime]:
     runtime = _runtime_from_config(workdir, opa_url, plan_path)
     agent = runtime.checkpoint._identity.get_agent("researcher_001")
     task = runtime.create_task(
@@ -184,7 +185,41 @@ async def _run(workdir: Path, opa_url: str, plan_path: Path | None = None) -> Ru
         agent_id=agent.agent_id,
         description="调研 AI 合规并发送摘要邮件",
     )
-    await run_task(task, agent, runtime)
+    result = await run_task(task, agent, runtime)
+    return result, runtime
+
+
+async def _run_and_resume(
+    workdir: Path,
+    opa_url: str,
+    plan_path: Path | None = None,
+    *,
+    verdict: str = "approve",
+) -> Runtime:
+    """运行任务直到需要审批，然后写入审批结果并恢复，返回 Runtime 用于后续断言。"""
+    result, runtime = await _run(workdir, opa_url, plan_path)
+    assert result.status == "needs_approval"
+    runtime.approval_manager._store.record_response(
+        ApprovalRecord(
+            request_id=result.request_id or "",
+            decision_id=result.decision_id or "",
+            verdict=verdict,
+            approver_id="zhang_manager",
+            comment=f"{verdict} by e2e test",
+            decided_at=datetime.now(UTC),
+        )
+    )
+    agent = runtime.checkpoint._identity.get_agent("researcher_001")
+    # 复用 result 中的 task_id：从 runtime 历史中没有持久化 task 对象，因此重新构造一个等效 Task
+    task = Task(
+        task_id=result.task_id,
+        session_id=result.session_id,
+        user_id="alice",
+        agent_id=agent.agent_id,
+        description="调研 AI 合规并发送摘要邮件",
+    )
+    resume = await resume_task(task, agent, runtime, pending=result)
+    assert resume.status == "completed"
     return runtime
 
 
@@ -199,10 +234,48 @@ def _events(workdir: Path) -> list[AuditEvent]:
     return events
 
 
+async def test_e2e_approval_expired_after_timeout(opa_server, workdir) -> None:
+    """A6：审批通过后的 Decision 超期后不能执行，并写入 approval_expired 审计事件。"""
+    result, runtime = await _run(workdir, opa_server)
+    assert result.status == "needs_approval"
+
+    runtime.approval_manager._store.record_response(
+        ApprovalRecord(
+            request_id=result.request_id or "",
+            decision_id=result.decision_id or "",
+            verdict="approve",
+            approver_id="zhang_manager",
+            comment="approved by e2e test",
+            decided_at=datetime.now(UTC),
+        )
+    )
+
+    # 让审批通过生成的 allow Decision 立即过期
+    decision_id = result.decision_id or ""
+    old = runtime.checkpoint._decision_store._decisions[decision_id]
+    runtime.checkpoint._decision_store._decisions[decision_id] = old.model_copy(
+        update={"expires_at": datetime.now(UTC) - timedelta(seconds=1)}
+    )
+
+    agent = runtime.checkpoint._identity.get_agent("researcher_001")
+    task = Task(
+        task_id=result.task_id,
+        session_id=result.session_id,
+        user_id="alice",
+        agent_id=agent.agent_id,
+        description="调研 AI 合规并发送摘要邮件",
+    )
+
+    with pytest.raises(Exception):  # CheckpointError：decision 已过期
+        await resume_task(task, agent, runtime, pending=result)
+
+    actions = [e.action for e in _events(workdir)]
+    assert "approval_expired" in actions
+
+
 async def test_e2e_approve_path_event_sequence(opa_server, workdir) -> None:
     """A5 + A14：approve 路径下完整事件序列；web_search 映射到本地 mock（断网可运行）。"""
-    _set_approval_behavior(workdir, "approve")
-    runtime = await _run(workdir, opa_server)
+    runtime = await _run_and_resume(workdir, opa_server)
 
     actions = [e.action for e in _events(workdir)]
     assert actions == [
@@ -210,16 +283,17 @@ async def test_e2e_approve_path_event_sequence(opa_server, workdir) -> None:
         "propose", "evaluate", "execute",   # web_search
         "propose", "evaluate", "execute",   # read_file
         "propose", "evaluate", "execute",   # write_file
-        "propose", "evaluate", "approve", "execute",  # send_email
+        "propose", "evaluate",               # send_email 被 require_approval 拦截
+        "task_start",                         # resume_task 再写一次 task_start
+        "approve", "approval_consumed", "execute",  # send_email 审批通过、消费、执行
         "task_end",
     ]
     assert runtime.audit_store.verify_chain()
 
 
 async def test_e2e_deny_path(opa_server, workdir) -> None:
-    """A5：approval.yaml behavior=deny 时 send_email 被 deny，任务仍能结束。"""
-    _set_approval_behavior(workdir, "deny")
-    runtime = await _run(workdir, opa_server)
+    """A5：审批 deny 时 send_email 被拦截，任务仍能结束。"""
+    runtime = await _run_and_resume(workdir, opa_server, verdict="deny")
 
     actions = [e.action for e in _events(workdir)]
     assert "deny" in actions
@@ -229,8 +303,7 @@ async def test_e2e_deny_path(opa_server, workdir) -> None:
 
 async def test_e2e_tamper_detection(opa_server, workdir) -> None:
     """A12：篡改 audit.jsonl 任意一行后 verify_chain 返回 False。"""
-    _set_approval_behavior(workdir, "approve")
-    await _run(workdir, opa_server)
+    await _run_and_resume(workdir, opa_server)
 
     audit_path = workdir / "data" / "audit.jsonl"
     lines = audit_path.read_text(encoding="utf-8").strip().split("\n")
@@ -256,8 +329,7 @@ async def test_e2e_masking(opa_server, workdir) -> None:
         "    reason: send report\n",
         encoding="utf-8",
     )
-    _set_approval_behavior(workdir, "approve")
-    await _run(workdir, opa_server, plan_path)
+    await _run_and_resume(workdir, opa_server, plan_path)
 
     audit_path = workdir / "data" / "audit.jsonl"
     raw = audit_path.read_text(encoding="utf-8")
@@ -270,8 +342,9 @@ async def test_e2e_masking(opa_server, workdir) -> None:
 
     # 审批请求视图：收件人与正文必须可见，凭证类字段被掩码
     runtime = _runtime_from_config(workdir, opa_server, plan_path)
+    from datetime import datetime, timedelta
+
     from loop_controller.models import ActionProposal, Decision
-    from datetime import datetime, timezone, timedelta
 
     agent = runtime.checkpoint._identity.get_agent("researcher_001")
     proposal = ActionProposal(
@@ -291,7 +364,7 @@ async def test_e2e_masking(opa_server, workdir) -> None:
         escalation_target=agent.owner_id,
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
     )
     task = _build_task(agent)
     request = runtime.checkpoint.build_approval_request(decision, proposal, task)

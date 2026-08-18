@@ -4,6 +4,7 @@
 渐进式构建；`models.py` 是唯一权威 Schema 来源。
 """
 
+from loop_controller.approval_manager import AsyncApprovalManager
 from loop_controller.checkpoint import Checkpoint, CheckpointError
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
 from loop_controller.mcp_gateway import MCPGateway, MCPGatewayError
@@ -27,21 +28,19 @@ from loop_controller.models import (
     Verdict,
 )
 from loop_controller.planner import Planner, ScriptedPlanner
-from loop_controller.r0_delegate import ConfigR0Delegate, R0Delegate
 
 __all__ = [
     "ActionProposal",
     "Agent",
     "ApprovalRecord",
     "ApprovalRequest",
+    "AsyncApprovalManager",
     "AuditEvent",
     "BudgetCost",
     "CapabilityProfile",
     "Checkpoint",
     "CheckpointError",
-    "ConfigR0Delegate",
     "Decision",
-    "R0Delegate",
     "LightweightClassifier",
     "MCPGateway",
     "MCPGatewayError",

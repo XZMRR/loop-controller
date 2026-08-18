@@ -9,10 +9,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
 # 枚举类型（照抄方案，不自行发明取值）
@@ -33,15 +33,17 @@ AuditAction = Literal[
     "task_end",
     "seal",
     "planner_error",
+    "approval_expired",
+    "approval_consumed",
 ]
 ApprovalVerdict = Literal["approve", "deny"]
 ConversationRole = Literal["user", "agent"]
-TaskRunStatus = Literal["completed", "needs_user_input"]
+TaskRunStatus = Literal["completed", "needs_user_input", "needs_approval"]
 
 
 def _utc_now() -> datetime:
     """统一的 timezone-aware UTC 当前时间（禁止 naive datetime，偏离 D16）。"""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -401,3 +403,7 @@ class TaskRunResult(BaseModel):
     task_id: str
     session_id: str
     question: str | None = None  # status == "needs_user_input" 时非空
+    decision_id: str | None = None  # status == "needs_approval" 时非空
+    request_id: str | None = None  # status == "needs_approval" 时非空
+    pending_decision: Decision | None = None  # needs_approval 时保存完整 Decision
+    pending_proposal: ActionProposal | None = None  # needs_approval 时保存完整 ActionProposal

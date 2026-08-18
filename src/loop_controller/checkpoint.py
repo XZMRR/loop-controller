@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Callable, Protocol, runtime_checkable
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import Protocol, runtime_checkable
 
+from loop_controller.governance_context import build_context_meta, build_governance_context
 from loop_controller.infra.config_loader import PermissionRule
 from loop_controller.infra.identity import IdentityProvider
 from loop_controller.infra.policy_store import PolicyStore
@@ -32,7 +34,6 @@ from loop_controller.models import (
     Task,
     ToolResult,
 )
-from loop_controller.governance_context import build_context_meta, build_governance_context
 from loop_controller.policy_engine import PolicyEngine, build_policy_input
 from loop_controller.risk_state import RiskStateManager
 from loop_controller.session import SessionManager
@@ -53,7 +54,7 @@ _DEFAULT_PER_CALL_COST = BudgetCost(token_count=1)
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class CheckpointError(Exception):
@@ -70,9 +71,10 @@ class DecisionStore(Protocol):
     """持久化已签发的 Decision 使用记录，提供跨重启防重放（§4.5）。"""
 
     def is_call_id_seen(self, call_id: str) -> bool: ...  # v1.1：全局唯一性检测（不再按 task_id 分区）
-    def is_decision_used(self, decision_id: str) -> bool: ...
     def record_proposal(self, task_id: str, call_id: str) -> None: ...
-    def record_decision_use(self, decision_id: str) -> None: ...
+    def record_decision(self, decision: Decision) -> None: ...  # v0.3.0：记录完整 Decision 元信息
+    def get_decision(self, decision_id: str) -> Decision | None: ...  # v0.3.0
+    def use_decision(self, decision_id: str, now: datetime) -> bool: ...  # v0.3.0：原子检查过期/次数并落盘
 
 
 class InMemoryDecisionStore:
@@ -83,19 +85,32 @@ class InMemoryDecisionStore:
 
     def __init__(self) -> None:
         self._call_ids: set[str] = set()
-        self._used_decision_ids: set[str] = set()
+        self._decisions: dict[str, Decision] = {}
+        self._used_counts: dict[str, int] = {}
 
     def is_call_id_seen(self, call_id: str) -> bool:
         return call_id in self._call_ids
 
-    def is_decision_used(self, decision_id: str) -> bool:
-        return decision_id in self._used_decision_ids
-
     def record_proposal(self, task_id: str, call_id: str) -> None:
         self._call_ids.add(call_id)
 
-    def record_decision_use(self, decision_id: str) -> None:
-        self._used_decision_ids.add(decision_id)
+    def record_decision(self, decision: Decision) -> None:
+        self._decisions[decision.decision_id] = decision
+        self._used_counts.setdefault(decision.decision_id, 0)
+
+    def get_decision(self, decision_id: str) -> Decision | None:
+        return self._decisions.get(decision_id)
+
+    def use_decision(self, decision_id: str, now: datetime) -> bool:
+        decision = self._decisions.get(decision_id)
+        if decision is None:
+            return False
+        if now >= decision.expires_at:
+            return False
+        if self._used_counts.get(decision_id, 0) >= decision.max_uses:
+            return False
+        self._used_counts[decision_id] = self._used_counts.get(decision_id, 0) + 1
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +335,7 @@ class Checkpoint:
 
         if proposal.risk_level == "critical":
             self._risk_manager.update(task.session_id, "critical")
-        return Decision(
+        decision = Decision(
             decision_id=uuid.uuid4().hex,
             call_id=proposal.call_id,
             task_id=proposal.task_id,
@@ -334,6 +349,8 @@ class Checkpoint:
             expires_at=now + _ALLOW_MODIFY_DELTA,
             max_uses=1,
         )
+        self._decision_store.record_decision(decision)
+        return decision
 
     def _handle_require_approval(
         self,
@@ -345,8 +362,8 @@ class Checkpoint:
         policy_version: str,
         hits: list[str],
     ) -> Decision:
-        """返回 require_approval Decision；真正审批由 R1 执行循环 + R0Delegate 完成。"""
-        return Decision(
+        """返回 require_approval Decision；真正审批由 AsyncApprovalManager + CLI 完成。"""
+        decision = Decision(
             decision_id=uuid.uuid4().hex,
             call_id=proposal.call_id,
             task_id=proposal.task_id,
@@ -359,6 +376,8 @@ class Checkpoint:
             expires_at=now + _APPROVAL_DELTA,
             max_uses=1,
         )
+        self._decision_store.record_decision(decision)
+        return decision
 
     def build_approval_request(
         self,
@@ -421,7 +440,7 @@ class Checkpoint:
         profile_version: str = "",
     ) -> Decision:
         """deny 快捷构造：立即过期、max_uses=0（§3.6 分档）。"""
-        return Decision(
+        decision = Decision(
             decision_id=uuid.uuid4().hex,
             call_id=proposal.call_id,
             task_id=proposal.task_id,
@@ -433,6 +452,8 @@ class Checkpoint:
             expires_at=now,  # 立即过期
             max_uses=0,
         )
+        self._decision_store.record_decision(decision)
+        return decision
 
     # -- forward：执行前校验（§6.6） ----------------------------------------
 
@@ -455,13 +476,12 @@ class Checkpoint:
         if self._now() >= decision.expires_at:
             raise CheckpointError("decision 已过期（授权作废）")
 
-        # 校验 4-5：防重放——先记账再执行，防并发复用。
+        # 校验 4-5：防重放——原子检查决策是否存在、未过期、未超次数并记账。
         # 运行时假设（v1.1 显式声明，评审#2）：MVP 为单进程 asyncio 事件循环，
-        # 同一时刻不存在并行的 forward 调用，步骤 4-5 之间无 await 点，因此检查+记账原子。
+        # 同一时刻不存在并行的 forward 调用，因此 use_decision 内部检查+记账原子。
         # 若未来引入多 worker/多进程部署，DecisionStore 必须升级为原子语义（§9.3）。
-        if self._decision_store.is_decision_used(decision.decision_id):
-            raise CheckpointError("decision 已被使用（防重放）")
-        self._decision_store.record_decision_use(decision.decision_id)
+        if not self._decision_store.use_decision(decision.decision_id, self._now()):
+            raise CheckpointError("decision 已过期、已用完或不存在（防重放）")
 
         # 校验 6：modify 复核（PEP 职责，不抛异常，返回 blocked）
         effective_args = proposal.arguments

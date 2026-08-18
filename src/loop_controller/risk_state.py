@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -44,7 +44,7 @@ class RiskEvent:
     event_type: str
     score_delta: float
     tag: str
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def to_dict(self) -> dict:
         """序列化为 JSONL 行字典。"""
@@ -57,13 +57,13 @@ class RiskEvent:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "RiskEvent":
+    def from_dict(cls, data: dict) -> RiskEvent:
         """从 JSONL 行字典反序列化。"""
         ts = data.get("timestamp")
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts)
         else:
-            ts = datetime.now(timezone.utc)
+            ts = datetime.now(UTC)
         return cls(
             session_id=data["session_id"],
             event_type=data["event_type"],

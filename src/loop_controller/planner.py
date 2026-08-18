@@ -55,7 +55,7 @@ class ScriptedPlanner:
         self._index = 0
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "ScriptedPlanner":
+    def from_yaml(cls, path: str | Path) -> ScriptedPlanner:
         """从 ``scripted_plan.yaml`` 加载步骤序列。"""
         with open(path, encoding="utf-8") as fh:
             data = yaml.safe_load(fh)

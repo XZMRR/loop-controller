@@ -17,7 +17,6 @@ import time
 from contextlib import AsyncExitStack
 
 import anyio
-
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -63,12 +62,13 @@ class _ServerClient:
         self._session = session
         listed = await session.list_tools()
         for t in listed.tools:
-            # mcp SDK 2.x：Tool 字段为 snake_case（input_schema），非 camelCase。
+            # mcp SDK 1.x/2.x 字段名可能为 camelCase 或 snake_case，兼容两者。
+            input_schema = getattr(t, "input_schema", None) or getattr(t, "inputSchema", None)
             self._tools[t.name] = Tool(
                 canonical_name="",
                 mcp_name=t.name,
-                description=t.description,
-                input_schema=dict(t.input_schema or {}),
+                description=t.description or "",
+                input_schema=dict(input_schema or {}),
             )
 
     def get_tool(self, mcp_name: str) -> Tool:
@@ -83,9 +83,10 @@ class _ServerClient:
         if self._session is None:
             raise MCPGatewayError(f"server {self._config.name} 未启动")
         result = await self._session.call_tool(mcp_name, arguments)
-        # mcp SDK 2.x：字段为 snake_case（is_error），非 camelCase（isError）。
+        # mcp SDK 1.x/2.x 字段名可能为 camelCase 或 snake_case，兼容两者。
         texts = [item.text for item in result.content if item.type == "text"]
-        return ("\n".join(texts), bool(result.is_error))
+        is_error = getattr(result, "is_error", None) or getattr(result, "isError", None)
+        return ("\n".join(texts), bool(is_error))
 
     async def aclose(self) -> None:
         await self._stack.aclose()

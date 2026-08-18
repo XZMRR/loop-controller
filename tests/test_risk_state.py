@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from loop_controller.risk_state import (
-    InMemoryRiskStateStore,
     JsonlRiskStateStore,
     RiskEvent,
     RiskStateManager,

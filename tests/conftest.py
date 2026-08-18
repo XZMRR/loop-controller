@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 import httpx
 import pytest

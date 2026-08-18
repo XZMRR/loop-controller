@@ -6,7 +6,7 @@ model_copy(update=...) 不可变修改方式。
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -33,7 +33,7 @@ from loop_controller.models import (
 def test_task_defaults_and_required():
     task = Task(task_id="t1", session_id="t1", user_id="alice", agent_id="a1", description="d")
     assert task.created_at.tzinfo is not None  # timezone-aware UTC
-    assert task.created_at.tzinfo == timezone.utc
+    assert task.created_at.tzinfo == UTC
 
 
 def test_task_session_id_no_longer_must_equal_task_id():
@@ -110,7 +110,7 @@ def test_risk_signal_suggestion_optional():
 
 
 def test_decision_required_and_versions():
-    expires = datetime.now(timezone.utc)
+    expires = datetime.now(UTC)
     decision = Decision(
         decision_id="d1",
         call_id="c1",
@@ -135,7 +135,7 @@ def test_decision_required_and_versions():
 
 def test_decision_reason_cannot_be_empty():
     # reason 为空字符串：模型层不强制，但 Checkpoint 工厂必须保证非空（Code Review 底线）
-    expires = datetime.now(timezone.utc)
+    expires = datetime.now(UTC)
     d = Decision(
         decision_id="d1", call_id="c1", task_id="t1", verdict="deny",
         reason="", expires_at=expires,
@@ -180,9 +180,9 @@ def test_approval_request_and_record():
         requester_id="alice",
         approver_id="zhang_manager",
     )
-    assert req.created_at.tzinfo == timezone.utc
+    assert req.created_at.tzinfo == UTC
     record = ApprovalRecord(request_id="r1", decision_id="d1", verdict="approve", approver_id="z", comment="ok")
-    assert record.decided_at.tzinfo == timezone.utc
+    assert record.decided_at.tzinfo == UTC
     with pytest.raises(ValidationError):
         ApprovalRecord(request_id="r1", decision_id="d1", verdict="escalate", approver_id="z", comment="x")
 

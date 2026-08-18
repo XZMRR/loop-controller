@@ -3,20 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
+from loop_controller.approval_manager import AsyncApprovalManager
 from loop_controller.budget import InMemoryBudgetLedger
 from loop_controller.checkpoint import Checkpoint, InMemoryDecisionStore
 from loop_controller.classifier import RuleBasedClassifier
+from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import JsonlAuditStore
+from loop_controller.infra.config_loader import (
+    MaskingRules,
+    ValuePattern,
+)
 from loop_controller.infra.conversation_store import JsonlConversationStore
-from loop_controller.infra.config_loader import MaskingRules, ValuePattern
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import PolicyStore
 from loop_controller.masker import Masker
+from loop_controller.mcp_gateway import MCPGateway
 from loop_controller.models import (
     Agent,
-    AuditEvent,
+    ApprovalRecord,
     BudgetCost,
     CapabilityProfile,
     PlannedAction,
@@ -24,12 +31,9 @@ from loop_controller.models import (
     ToolPermission,
     ToolResult,
 )
-from loop_controller.mcp_gateway import MCPGateway
 from loop_controller.planner import Planner, ScriptedPlanner
-from loop_controller.infra.config_loader import ApprovalConfig, ApprovalRule
-from loop_controller.r0_delegate import ConfigR0Delegate
 from loop_controller.risk_state import RiskStateManager
-from loop_controller.runtime import Runtime, run_task
+from loop_controller.runtime import Runtime, resume_task, run_task
 from loop_controller.session import SessionManager
 
 
@@ -120,19 +124,15 @@ def _build_runtime(audit_path: Path, steps: list) -> Runtime:
     )
     audit_store = JsonlAuditStore(audit_path)
     conversation_store = JsonlConversationStore(audit_path.parent / "conversations.jsonl")
+    approval_store_path = audit_path.parent / "approvals.jsonl"
     planner: Planner = ScriptedPlanner(steps)
-    r0 = ConfigR0Delegate(
-        ApprovalConfig(
-            default="zhang_manager",
-            rules=[ApprovalRule(tool_name="send_email", approver="zhang_manager", behavior="approve")],
-        )
-    )
+    r0 = AsyncApprovalManager(JsonlApprovalStore(approval_store_path))
     return Runtime(
         planner=planner,
         classifier=RuleBasedClassifier(),
         checkpoint=checkpoint,
         gateway=gateway,
-        r0_delegate=r0,
+        approval_manager=r0,
         audit_store=audit_store,
         masker=checkpoint._masker,
         profiles={profile.profile_id: profile},
@@ -169,14 +169,32 @@ def test_audit_event_sequence_and_fields(tmp_path) -> None:
         description="test audit",
     )
 
-    asyncio.run(run_task(task, agent, runtime))
+    result = asyncio.run(run_task(task, agent, runtime))
+    assert result.status == "needs_approval"
+
+    # 模拟 CLI 审批通过
+    runtime.approval_manager._store.record_response(
+        ApprovalRecord(
+            request_id=result.request_id or "",
+            decision_id=result.decision_id or "",
+            verdict="approve",
+            approver_id="zhang_manager",
+            comment="approved by test",
+            decided_at=datetime.now(UTC),
+        )
+    )
+
+    resume_result = asyncio.run(resume_task(task, agent, runtime, pending=result))
+    assert resume_result.status == "completed"
 
     events = runtime.audit_store.query_by_trace(task.task_id)
     actions = [e.action for e in events]
     assert actions == [
         "task_start",
-        "propose", "evaluate", "execute",
-        "propose", "evaluate", "approve", "execute",
+        "propose", "evaluate", "execute",   # web_search
+        "propose", "evaluate",               # send_email 被 require_approval 拦截
+        "task_start",                         # resume_task 再写一次 task_start
+        "approve", "approval_consumed", "execute",  # send_email 审批通过、消费、执行
         "task_end",
     ]
 
@@ -201,7 +219,7 @@ def test_audit_event_sequence_and_fields(tmp_path) -> None:
     assert evaluate.profile_version == "test-profile-v1"
 
     # send_email 审批路径：approve 事件记录审批结果
-    approve = events[6]
+    approve = events[7]
     assert approve.action == "approve"
     assert approve.args_mask is not None
     # 审计事件中的 args_mask 使用 audit_log 档，邮箱也被掩码

@@ -1,6 +1,6 @@
 # 已知局限（Known Limitations）
 
-> 本文件列出 Loop Controller v0.2.0 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
+> 本文件列出 Loop Controller v0.3.0-iter5 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
 
 ---
 
@@ -47,7 +47,7 @@ Rego 策略文件为明文，仅依赖文件系统权限保护。恶意 Agent �
 
 | # | 边界 | 说明 |
 |---|---|---|
-| F1 | 审批为配置打桩 | `ConfigR0Delegate` 按 `approval.yaml` 固定返回 approve/deny，无真实人类通知与 UI；v0.3.0 将替换为异步审批 CLI |
+| F1 | ~~审批为配置打桩~~ 已实现异步审批 CLI | v0.3.0 Iteration 5 用 `AsyncApprovalManager` + `JsonlApprovalStore` + `lc approvals list/approve/deny` 替换 `ConfigR0Delegate`；审批人通过 CLI 写入结果，任务 `resume_task` 后继续 |
 | F2 | 无 Agent 间交互治理 | 只治理 `tool_call`；多 Agent 委托、inter_agent 均未实现 |
 | F3 | 无 Earned Authority | 权限固定，无任务后临时提权；`fixed_ceiling` 保留为空 |
 | F4 | ~~LLMPlanner 未实现~~ 已实现（T3.5） | 默认仍关闭（`config/llm_planner.yaml`），开启后由 LLM 动态规划；密钥仅来自环境变量，失败不重试 |

@@ -8,7 +8,7 @@ T1.4c 无 Guardrail 信息泄露批量测试
 import asyncio
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import _config  # noqa: F401
@@ -114,7 +114,7 @@ async def main():
             record["test_suite"] = "T1.4c 无 Guardrail 信息泄露"
             record["run_index"] = i + 1
             record["model"] = DEFAULT_MODEL
-            record["timestamp"] = datetime.now(timezone.utc).isoformat()
+            record["timestamp"] = datetime.now(UTC).isoformat()
             records.append(record)
 
             status = f"⚠️  泄露 {len(record.get('leaked_items', []))} 项" if record.get("leaked") else "✅ 未泄露"
@@ -149,7 +149,7 @@ async def main():
             }
         )
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     result_file = RESULTS_DIR / f"t1_4c_batch_reproducibility_results_{timestamp}.json"
     with open(result_file, "w", encoding="utf-8") as f:
         json.dump(
@@ -158,7 +158,7 @@ async def main():
                     "model": DEFAULT_MODEL,
                     "n_runs_per_case": N_RUNS,
                     "sleep_seconds": SLEEP_SECONDS,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 },
                 "summary": summary,
                 "records": records,

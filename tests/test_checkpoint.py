@@ -8,13 +8,18 @@ FakePolicyEngine 注入判定。
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from loop_controller.budget import InMemoryBudgetLedger
 from loop_controller.checkpoint import Checkpoint, CheckpointError
-from loop_controller.infra.config_loader import MaskingRules, PermissionCondition, PermissionRule, ValuePattern
+from loop_controller.infra.config_loader import (
+    MaskingRules,
+    PermissionCondition,
+    PermissionRule,
+    ValuePattern,
+)
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.masker import Masker
 from loop_controller.models import (
@@ -220,7 +225,7 @@ def make_proposal(
 async def test_evaluate_allow_full_path(
     task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
 ) -> None:
-    now = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
     cp, engine, gw = make_checkpoint(profile, identity, now=now)
     proposal = make_proposal(task, agent)
 
@@ -374,7 +379,7 @@ def test_build_approval_request_conflict(
         escalation_target=task.user_id,  # 与 requester 相同 → 冲突
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
     )
 
     with pytest.raises(CheckpointError, match="审批人冲突"):
@@ -411,7 +416,7 @@ def test_build_approval_request_uses_approval_request_mask_level(
         escalation_target=agent.owner_id,
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
     )
 
     request = cp.build_approval_request(decision, proposal, task)
@@ -435,7 +440,7 @@ def test_finalize_after_approval(
         policy_hits=["send_email_approval"],
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
     )
 
     approved = cp.finalize_after_approval(
@@ -674,9 +679,10 @@ async def test_forward_modify_recheck_failed_on_value(
         policy_hits=["modify_rule"],
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
     )
 
+    cp._decision_store.record_decision(decision)
     result = await cp.forward(proposal, decision)
 
     assert result.status == "blocked"
@@ -701,9 +707,10 @@ async def test_forward_modify_recheck_failed_on_structure(
         modified_args={"path": "/data/kb/doc.md", "extra": True},  # 键集合变化
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
     )
 
+    cp._decision_store.record_decision(decision)
     result = await cp.forward(proposal, decision)
 
     assert result.status == "blocked"
@@ -727,9 +734,10 @@ async def test_forward_modify_allowed_value_passes(
         modified_args={"path": "/data/kb/other.md"},  # 仍在白名单内 → 复核通过
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
     )
 
+    cp._decision_store.record_decision(decision)
     result = await cp.forward(proposal, decision)
 
     assert result.status == "success"
@@ -755,7 +763,7 @@ async def test_forward_call_id_mismatch(
         reason="ok",
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
     )
 
     with pytest.raises(CheckpointError):
@@ -776,7 +784,7 @@ async def test_forward_expired_decision(
         reason="ok",
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),  # 已过期
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),  # 已过期
     )
 
     with pytest.raises(CheckpointError):
@@ -797,7 +805,7 @@ async def test_forward_deny_verdict_not_executable(
         reason="denied",
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
     )
 
     with pytest.raises(CheckpointError):
@@ -817,9 +825,10 @@ async def test_forward_decision_reuse(
         reason="ok",
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
     )
 
+    cp._decision_store.record_decision(decision)
     first = await cp.forward(proposal, decision)
     assert first.status == "success"
     assert len(gw.calls) == 1
@@ -918,9 +927,10 @@ async def test_forward_low_risk_success_updates_risk_manager(
         reason="ok",
         policy_version="v",
         profile_version="v",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
     )
 
+    cp._decision_store.record_decision(decision)
     await cp.forward(proposal, decision, session_id=task.session_id)
 
     profile_after = risk_manager.get_profile(task.session_id)

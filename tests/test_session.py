@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from loop_controller.models import Task
-from loop_controller.session import InMemorySessionBackend, Session, SessionManager
+from loop_controller.session import InMemorySessionBackend, SessionManager
 
 
 def _fixed_now(start: datetime):
@@ -50,7 +50,7 @@ class TestSessionManager:
         assert s2.session_id != s3.session_id
 
     def test_timeout_creates_new_session(self):
-        base = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+        base = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
         now_fn = _fixed_now(base)
         manager = SessionManager(session_timeout_minutes=30, now=now_fn)
 
@@ -59,7 +59,7 @@ class TestSessionManager:
         assert s1.session_id != s2.session_id
 
     def test_validate_and_touch_updates_last_task_at(self):
-        base = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+        base = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
         manager = SessionManager(now=lambda: base)
         session = manager.get_or_create_session("alice", "agent_1")
 

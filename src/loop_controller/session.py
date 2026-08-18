@@ -8,8 +8,9 @@ SessionManager 维护活跃 session 内存表，按可配置的超时窗口判�
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
 
 
@@ -74,7 +75,7 @@ class SessionManager:
     ) -> None:
         self._timeout = timedelta(minutes=session_timeout_minutes)
         self._backend = backend or InMemorySessionBackend()
-        self._now = now or (lambda: datetime.now(timezone.utc))
+        self._now = now or (lambda: datetime.now(UTC))
 
     def get_or_create_session(self, user_id: str, agent_id: str) -> Session:
         """查询活跃 session；不存在或上一任务结束超过 timeout 则创建新 session_id（uuid hex）。"""

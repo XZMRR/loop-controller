@@ -14,21 +14,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from loop_controller.approval_manager import AsyncApprovalManager
 from loop_controller.budget import InMemoryBudgetLedger
-from loop_controller.checkpoint import Checkpoint
+from loop_controller.checkpoint import Checkpoint, CheckpointError
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
+from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import AuditStore, JsonlAuditStore
 from loop_controller.infra.config_loader import AppConfig, ConfigLoader
 from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.decision_store import JsonlDecisionStore
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import FilePolicyStore
+from loop_controller.llm_planner import HttpxLLMClient, LLMPlanner
 from loop_controller.masker import Masker
 from loop_controller.mcp_gateway import MCPGateway
-from loop_controller.permission_interaction import ConfigPermissionInteractionAnalyzer
 from loop_controller.models import (
     ActionProposal,
     Agent,
+    ApprovalRecord,
     AuditAction,
     AuditEvent,
     BudgetCost,
@@ -41,12 +44,11 @@ from loop_controller.models import (
     ToolResult,
     UserQuestion,
 )
-from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
-from loop_controller.session import SessionManager
-from loop_controller.llm_planner import HttpxLLMClient, LLMPlanner
+from loop_controller.permission_interaction import ConfigPermissionInteractionAnalyzer
 from loop_controller.planner import Planner, ScriptedPlanner
 from loop_controller.policy_engine import OPAPolicyEngine
-from loop_controller.r0_delegate import ConfigR0Delegate, R0Delegate
+from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
+from loop_controller.session import SessionManager
 from loop_controller.utils.canonical import canonical_json
 
 logger = logging.getLogger(__name__)
@@ -65,7 +67,7 @@ class Runtime:
     classifier: LightweightClassifier
     checkpoint: Checkpoint
     gateway: MCPGateway
-    r0_delegate: R0Delegate
+    approval_manager: AsyncApprovalManager  # v0.3.0 异步审批管理器
     audit_store: AuditStore
     masker: Masker
     profiles: dict[str, Any]  # CapabilityProfile
@@ -187,6 +189,9 @@ def build_runtime(
         hmac_key=audit_key,
         key_id=config.audit_key_id,
     )
+    approval_manager = AsyncApprovalManager(
+        JsonlApprovalStore(config.approval_store_path)
+    )
 
     if config.llm_planner is not None and config.llm_planner.enabled:
         planner: Planner = LLMPlanner(
@@ -207,7 +212,7 @@ def build_runtime(
         classifier=RuleBasedClassifier(),
         checkpoint=checkpoint,
         gateway=gateway,
-        r0_delegate=ConfigR0Delegate(config.approval),
+        approval_manager=approval_manager,
         audit_store=audit_store,
         masker=masker,
         profiles=config.profiles,
@@ -299,9 +304,9 @@ def _blocked_decision(decision: Decision, proposal: ActionProposal, reason: str)
 async def run_task(task: Task, agent: Agent, runtime: Runtime) -> TaskRunResult:
     """R1 执行循环入口（§5.2）。
 
-    v0.3.0：返回 ``TaskRunResult``，支持 ``needs_user_input`` 暂停态。
+    v0.3.0：返回 ``TaskRunResult``，支持 ``needs_user_input`` / ``needs_approval`` 暂停态。
     """
-    return await _run_task_loop(task, agent, runtime, observations=[])
+    return await _run_task_loop(task, agent, runtime, observations=[], pending=None)
 
 
 async def resume_task(
@@ -310,9 +315,12 @@ async def resume_task(
     runtime: Runtime,
     *,
     observations: list[ToolResult] | None = None,
+    pending: TaskRunResult | None = None,
 ) -> TaskRunResult:
-    """在用户补充输入后恢复任务执行。"""
-    return await _run_task_loop(task, agent, runtime, observations=observations or [])
+    """在用户补充输入或审批完成后恢复任务执行。"""
+    return await _run_task_loop(
+        task, agent, runtime, observations=observations or [], pending=pending
+    )
 
 
 async def _run_task_loop(
@@ -321,12 +329,12 @@ async def _run_task_loop(
     runtime: Runtime,
     *,
     observations: list[ToolResult],
+    pending: TaskRunResult | None,
 ) -> TaskRunResult:
     """R1 执行循环（§5.2）：Planner → Classifier → Checkpoint.evaluate → forward/拦截。
 
-    返回 ``completed`` 或 ``needs_user_input``。``needs_user_input`` 时会在
-    ``conversation_store`` 写入一条 Agent 消息，外部调用方应写入用户回复后调用
-    ``resume_task`` 继续。
+    返回 ``completed``、``needs_user_input`` 或 ``needs_approval``。
+    两种暂停态都不写 ``task_end``；外部补充输入/审批后调用 ``resume_task`` 继续。
     """
     audit = runtime.audit_store
     profile = runtime.profiles[agent.profile_id]
@@ -338,6 +346,22 @@ async def _run_task_loop(
     audit.append(_audit_event(task, action="task_start", masker=runtime.masker))
     ended = False
     try:
+        # v0.3.0 Iteration 5：恢复待审批动作
+        if pending is not None and pending.status == "needs_approval":
+            decision = pending.pending_decision
+            proposal = pending.pending_proposal
+            if decision is None or proposal is None:
+                raise ValueError("needs_approval pending 缺少 decision 或 proposal")
+
+            record = runtime.approval_manager.check(decision.decision_id)
+            if record is None:
+                # 尚未审批，保持暂停态
+                return pending
+
+            decision = _finalize_after_approval(runtime, task, proposal, decision, record, audit)
+            await _execute_decision(task, runtime, proposal, decision, audit, observations)
+            ended = True
+
         while True:
             # 1. 规划下一步动作：Planner 只产出草案，框架组装 ActionProposal 并统一生成 call_id
             #    （v1.1 评审#7/#8：Planner 无权自定身份标识）
@@ -402,46 +426,26 @@ async def _run_task_loop(
                 )
             )
 
-            # 4. 需要审批 → 请求 R0-delegate（async 接口，MVP 实现立即返回）
+            # 4. 需要审批 → 持久化 ApprovalRequest 并返回 needs_approval 暂停态
             if decision.verdict == "require_approval":
                 try:
                     request = runtime.checkpoint.build_approval_request(decision, proposal, task)
                 except Exception as exc:  # noqa: BLE001 - 冲突校验失败按 deny 处理
                     decision = _blocked_decision(decision, proposal, str(exc))
                 else:
-                    record = await runtime.r0_delegate.request_approval(request)
-                    audit.append(
-                        _audit_event(
-                            task,
-                            action="approve" if record.verdict == "approve" else "deny",
-                            proposal=proposal,
-                            record=record,
-                            masker=runtime.masker,
-                        )
+                    await runtime.approval_manager.submit(request)
+                    return TaskRunResult(
+                        status="needs_approval",
+                        task_id=task.task_id,
+                        session_id=task.session_id,
+                        decision_id=decision.decision_id,
+                        request_id=request.request_id,
+                        pending_decision=decision,
+                        pending_proposal=proposal,
                     )
-                    decision = runtime.checkpoint.finalize_after_approval(decision, record)
-                    # v1.2：审批结果进入会话风险状态
-                    if record.verdict == "approve":
-                        runtime.risk_manager.update(task.session_id, "approval_granted")
-                    else:
-                        runtime.risk_manager.update(task.session_id, "approval_denied")
 
             # 5. 执行或被拦截，结果都进入 observations 供下一步规划
-            if decision.verdict in ("allow", "modify"):
-                result = await runtime.checkpoint.forward(proposal, decision, session_id=task.session_id)
-            else:
-                result = _blocked_result(proposal, decision)
-            observations.append(result)
-            audit.append(
-                _audit_event(
-                    task,
-                    action="execute",
-                    proposal=proposal,
-                    result=result,
-                    masker=runtime.masker,
-                )
-            )
-            ended = True
+            await _execute_decision(task, runtime, proposal, decision, audit, observations)
     finally:
         if ended:
             audit.append(_audit_event(task, action="task_end", masker=runtime.masker))
@@ -453,3 +457,84 @@ async def _run_task_loop(
         session_id=task.session_id,
         question=None,
     )
+
+
+async def _execute_decision(
+    task: Task,
+    runtime: Runtime,
+    proposal: ActionProposal,
+    decision: Decision,
+    audit: AuditStore,
+    observations: list[ToolResult],
+) -> None:
+    """根据 Decision 执行或拦截，并写审计。"""
+    is_approval = "approval:granted" in decision.policy_hits
+    if decision.verdict in ("allow", "modify"):
+        try:
+            result = await runtime.checkpoint.forward(proposal, decision, session_id=task.session_id)
+        except CheckpointError as exc:
+            # v0.3.0：审批通过后的 Decision 过期时写入 approval_expired 审计事件
+            if is_approval and "已过期" in str(exc):
+                audit.append(
+                    _audit_event(
+                        task,
+                        action="approval_expired",
+                        proposal=proposal,
+                        decision=decision,
+                        reason="审批授权已过期",
+                        masker=runtime.masker,
+                    )
+                )
+            raise
+        # v0.3.0：审批通过后的 Decision 成功执行即消费，写入 approval_consumed
+        if is_approval:
+            audit.append(
+                _audit_event(
+                    task,
+                    action="approval_consumed",
+                    proposal=proposal,
+                    decision=decision,
+                    reason="审批授权已消费",
+                    masker=runtime.masker,
+                )
+            )
+    else:
+        result = _blocked_result(proposal, decision)
+    observations.append(result)
+    audit.append(
+        _audit_event(
+            task,
+            action="execute",
+            proposal=proposal,
+            decision=decision,
+            result=result,
+            masker=runtime.masker,
+        )
+    )
+
+
+def _finalize_after_approval(
+    runtime: Runtime,
+    task: Task,
+    proposal: ActionProposal,
+    decision: Decision,
+    record: ApprovalRecord,
+    audit: AuditStore,
+) -> Decision:
+    """审批记录已存在时，完成审批审计与 finalize。"""
+    audit.append(
+        _audit_event(
+            task,
+            action="approve" if record.verdict == "approve" else "deny",
+            proposal=proposal,
+            record=record,
+            masker=runtime.masker,
+        )
+    )
+    decision = runtime.checkpoint.finalize_after_approval(decision, record)
+    # v1.2：审批结果进入会话风险状态
+    if record.verdict == "approve":
+        runtime.risk_manager.update(task.session_id, "approval_granted")
+    else:
+        runtime.risk_manager.update(task.session_id, "approval_denied")
+    return decision

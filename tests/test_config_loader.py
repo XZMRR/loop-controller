@@ -8,12 +8,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import dataclasses
 import os
 import shutil
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -93,7 +94,7 @@ def build_config_dir(root: Path) -> Path:
     })
     _write_yaml(config / "approval.yaml", {
         "approvers": {"default": "zhang_manager"},
-        "rules": [{"tool_name": "send_email", "approver": "zhang_manager", "behavior": "approve"}],
+        "rules": [{"tool_name": "send_email", "approver": "zhang_manager"}],
     })
     (root / "policies" / "default.rego").write_text(MINIMAL_REGO, encoding="utf-8")
     return config
@@ -247,8 +248,6 @@ def test_check_approver_is_agent(config_dir):
 # ---------------------------------------------------------------------------
 # 校验 8：HMAC key 存在性与格式（P0）
 # ---------------------------------------------------------------------------
-
-import dataclasses
 
 
 def test_hmac_sha256_requires_key(config_dir):

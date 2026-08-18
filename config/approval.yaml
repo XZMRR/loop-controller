@@ -1,7 +1,7 @@
-# R0-delegate 打桩配置（§7.5）
+# R0 审批人配置（v0.3.0 Iteration 5）
+# 仅用于确定 escalation_target；真实 approve/deny 由 `lc approvals` CLI 写入。
 approvers:
   default: zhang_manager
 rules:
   - tool_name: send_email
     approver: zhang_manager
-    behavior: approve        # approve | deny；演示用固定行为

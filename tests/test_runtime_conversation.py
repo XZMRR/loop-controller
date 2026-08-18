@@ -5,20 +5,22 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import pytest
-
+from loop_controller.approval_manager import AsyncApprovalManager
 from loop_controller.budget import InMemoryBudgetLedger
 from loop_controller.checkpoint import Checkpoint, InMemoryDecisionStore
 from loop_controller.classifier import RuleBasedClassifier
+from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import JsonlAuditStore
-from loop_controller.infra.config_loader import MaskingRules, ValuePattern
+from loop_controller.infra.config_loader import (
+    MaskingRules,
+)
 from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import PolicyStore
 from loop_controller.masker import Masker
+from loop_controller.mcp_gateway import MCPGateway
 from loop_controller.models import (
     Agent,
-    AuditEvent,
     BudgetCost,
     CapabilityProfile,
     ConversationContext,
@@ -28,10 +30,7 @@ from loop_controller.models import (
     ToolResult,
     UserQuestion,
 )
-from loop_controller.mcp_gateway import MCPGateway
 from loop_controller.planner import Planner
-from loop_controller.infra.config_loader import ApprovalConfig, ApprovalRule
-from loop_controller.r0_delegate import ConfigR0Delegate
 from loop_controller.risk_state import RiskStateManager
 from loop_controller.runtime import Runtime, resume_task, run_task
 from loop_controller.session import SessionManager
@@ -143,18 +142,14 @@ def _build_runtime(audit_path: Path, planner: Planner) -> Runtime:
     )
     audit_store = JsonlAuditStore(audit_path)
     conversation_store = JsonlConversationStore(audit_path.parent / "conversations.jsonl")
-    r0 = ConfigR0Delegate(
-        ApprovalConfig(
-            default="zhang_manager",
-            rules=[ApprovalRule(tool_name="web_search", approver="zhang_manager", behavior="approve")],
-        )
-    )
+    approval_store_path = audit_path.parent / "approvals.jsonl"
+    r0 = AsyncApprovalManager(JsonlApprovalStore(approval_store_path))
     return Runtime(
         planner=planner,
         classifier=RuleBasedClassifier(),
         checkpoint=checkpoint,
         gateway=gateway,
-        r0_delegate=r0,
+        approval_manager=r0,
         audit_store=audit_store,
         masker=checkpoint._masker,
         profiles={profile.profile_id: profile},

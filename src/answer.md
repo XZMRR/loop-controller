@@ -1,529 +1,106 @@
-已查看。以下是对 8 个问题的定案；其中 Q3、Q5、Q7 我没有完全照代码 agent 的倾向，而是做了架构上的修正。
-
-# 总体结论
-
-1. **不 force-push develop**；
-2. **v0.2.0 先补 `key_id` 与版本号，再打 tag**；
-3. **多轮交互采用“外部驱动 + 显式 ask_user 信号”**；
-4. **Task 继续表示用户目标，ConversationContext 绑定 session**；
-5. **Decision 有效期与消费次数由 DecisionStore 统一管理**；
-6. **CLI 是 v0.3.0 必选项**；
-7. **策略模板按 profile 显式选择，不做文本拼接式合并**；
-8. **新建 v0.2.0 检查清单，并同步 `pyproject.toml` 版本号**。
+这是一份**高质量、高信噪比的工程审查**，覆盖了安全边界、状态一致性、工程质量和架构演进四个维度。以下是我的中立分析：
 
 ---
 
-# Q1：develop 已推送，与发布检查时序冲突
+## 一、总体评价
 
-## 定案
+**审查者的核心判断是准确的**：当前代码是"可运行治理 MVP"，不是"生产级安全治理系统"。P0/P1/P2 的分级合理，且每个问题都给出了**可执行的修复路径**而非空泛批评。
 
-**接受现状，不 force-push。**
-
-处理顺序调整为：
-
-1. 在当前 `origin/develop` HEAD 上补做 v0.2.0 发布检查；
-2. 若发现问题，直接新增修正 commit；
-3. 所有检查通过后，在最终 HEAD 上打 `v0.2.0`；
-4. push tag。
-
-也就是说，原计划中的：
-
-```text
-检查 → push → tag
-```
-
-现实调整为：
-
-```text
-已 push → 补检查 → 必要时 fix-forward → tag 最终 HEAD
-```
-
-## 理由
-
-- develop 已经公开，改写历史没有必要；
-- 当前问题不是代码污染，而是发布流程顺序变化；
-- 只要 tag 打在最终验证过的 HEAD 上，发布语义仍然正确。
+特别值得肯定的是：
+- **P0 定位精准**：预算不返还和审批绑定缺失都是**可被利用的漏洞**，不是代码风格问题。
+- **对 Main 分支的考古有价值**：审查没有简单要求"合并 main"，而是逐条评估哪些能力值得迁移到 develop 的新 Runtime 架构上。
+- **诚实性审查**（审计链不能声称"不可篡改"）体现了对安全承诺的审慎态度。
 
 ---
 
-# Q2：`key_id` 目前为空，是否影响 v0.2.0
+## 二、按优先级分析：哪些必须参考
 
-## 定案
+### 🔴 必采纳（阻塞级）
 
-**影响，发布前必须修。**
+#### 1. P0：预算预留在拒绝路径未返还
+**这是实实在在的 DoS 漏洞。**
 
-不要接受审计事件里长期存在无意义的 `null`。
+攻击者只需发送大量越权请求（如读取 `/etc/passwd`），每次都会预留预算但不返还，合法任务的预算将被耗尽。v1.0 文档 §3.8 虽然粗糙（`token_count=1` 占位），但**"拒绝不扣费"是基本语义承诺**，当前实现违背了这一承诺。
 
-建议实现：
+**建议立即修复**，且审查给出的"pending/finalized 生命周期"方案比零散补丁更可持续。
 
-```yaml
-audit_key_id: "default"
-```
+#### 2. P0：审批记录缺少强绑定验证
+**这是审批绕过风险。**
 
-同时允许环境变量覆盖：
+v1.0 文档 §3.10 只要求了 `approver_id != requester_id` 的组装期校验，但审查发现 `finalize_after_approval()` 缺少对 `decision_id`、`request_id`、`call_id` 的回指验证。这意味着一个合法的 `ApprovalRecord` 可能被重用到另一个不相关的 Decision 上。
 
-```bash
-LOOP_CONTROLLER_AUDIT_KEY_ID="default"
-```
+审查列出的 6 条校验规则**应全部采纳**。
 
-规则：
+#### 3. P1：DecisionStore 损坏偏 fail-open
+**与架构的 fail-closed 原则直接冲突。**
 
-- `key_id` 必须非空；
-- 默认值可以是 `"default"`；
-- 不从 HMAC key 派生；
-- 不把 key 本身、key 的明文 hash 作为 `key_id`；
-- 未来轮换时由部署方显式更新 `key_id`。
-
-## 理由
-
-`key_id` 的作用是运维识别：
-
-```text
-这条审计链当时使用的是哪一把 key
-```
-
-它不是防伪材料，因此没必要从 secret 派生；显式配置更清晰，也更方便未来轮换。
-
-## 发布要求
-
-将原检查项改为：
-
-- [ ] HMAC 模式下 `key_id` 非空；
-- [ ] 默认值为 `"default"` 或部署方显式配置；
-- [ ] seal 与 audit event 使用同一个 `key_id`；
-- [ ] 更换 `key_id` 后验证工具能正确识别。
+v1.0 文档 §4.1 明确启动校验应 fail-closed，但 DecisionStore 在加载时跳过损坏行，导致防重放状态丢失。审查建议"非法 JSON 阻止 Runtime 启动"**完全符合 v1.0 的设计原则**。
 
 ---
 
-# Q3：多轮对话的交互模型
+### 🟡 强烈建议采纳（质量门禁级）
 
-## 定案
+#### 4. P1：CI 中 OPA 路径不一致
+这会导致**测试静默跳过**，使"124 passed"这个数字产生误导——关键集成测试可能根本没跑。审查建议的 `OPA_PATH` 统一优先 + 平台回退 + skip 数量门禁**应立刻实施**。
 
-采用：
+#### 5. P1：工程质量门禁（Ruff / mypy）
+MVP 阶段代码量小，正是建立门禁的最佳时机。拖到后期修复成本指数上升。建议采纳，但**不必阻塞功能开发**，可以并行推进。
 
-```text
-方案 A 的外部驱动模型
-+
-方案 C 的显式 ask_user 信号
-```
-
-但不是把 `ask_user` 做成一个普通 tool call。
-
-## 最终交互模型
-
-Runtime 仍然是库，不内部阻塞等待用户。
-
-Planner 的返回类型扩展为：
-
-```python
-PlannedAction | UserQuestion | None
-```
-
-例如：
-
-```python
-class UserQuestion(BaseModel):
-    question: str
-    reason: str | None = None
-```
-
-Runtime 行为：
-
-| Planner 返回 | Runtime 行为 |
-|---|---|
-| `PlannedAction` | 走正常 R2 治理与工具执行 |
-| `UserQuestion` | 记录 agent message，返回 `needs_user_input` |
-| `None` | 返回 `completed` |
-
-外部调用方收到：
-
-```python
-TaskRunResult(status="needs_user_input")
-```
-
-之后由外部调用方完成：
-
-```python
-runtime.add_user_message(...)
-runtime.resume_task(...)
-```
-
-## 为什么不选纯方案 A
-
-纯方案 A 没有回答一个关键问题：
-
-> Agent 如何明确告诉 Runtime：“我现在不是结束，而是在等用户补充”？
-
-如果仅靠自然语言结尾猜测，可靠性太差。
-
-## 为什么不选方案 B
-
-`run_task` 内部阻塞等待输入会把 Runtime 从库变成交互服务，破坏当前部署形态，也会让测试、超时、取消和后续 Proxy 服务化都更复杂。
-
-## 为什么不让 ask_user 成为工具调用
-
-`ask_user` 不产生外部副作用，不应该进入 R2 的工具治理链路。它是 R1 与调用方之间的控制信号，不是 tool call。
+#### 6. P2：完整 E2E 使用真实组件
+当前 FakeGateway 的 E2E 测的是"治理逻辑"，没测"真实 MCP 调用路径"。审查建议的发布前测试（真实 OPA + filesystem MCP + mock email MCP）**是 MVP 对外演示前的最低要求**。
 
 ---
 
-# Q4：Task 与 ConversationMessage 的关联规则
+### 🟢 可参考但需权衡（架构演进级）
 
-## 定案
+#### 7. Main 的跨任务 Session 风险状态
+**这与 v1.0 的 MVP 范围有冲突。**
 
-采用：
+v1.0 文档 §1.2 明确将"跨 turn 风险累积"移出 MVP，§3.9 规定 `RiskStateManager` 纯内存、任务结束即弃。审查建议从 main 吸收 Session 风险状态，本质上是**把 post-MVP 能力提前引入**。
 
-```text
-一个用户目标 = 一个 Task
-一个 session 可以包含多个 Task
-一次多轮澄清属于同一个 Task
-ConversationContext 绑定 session
-```
+**中立建议**：
+- 如果 main 的实现稳定且迁移成本低，可以作为 **v1.1 增强** 吸收，但**不应阻塞 MVP 的冻结和发布**。
+- 如果吸收，必须补充 v1.0 文档中未定义的 Session 过期/衰减规则（审查提到了，但 main 的实现可能也不完整）。
 
-## 具体规则
+#### 8. Main 的拒绝路径预算退款逻辑
+这与 P0 直接呼应，但审查指出 main 的实现"较简单"。**建议以 develop 的新 Runtime 架构为基座重新实现**，而不是移植旧代码。采纳其"拒绝不消耗预算"的语义，而非具体实现。
 
-### 1. Task 的语义
-
-`Task` 表示用户目标，而不是一次消息回合。
-
-例如：
-
-```text
-帮我写个合规报告
-```
-
-这是一个 Task。
-
-后续：
-
-```text
-主题是 AI 数据安全
-需要包含 GDPR 和中国个保法
-```
-
-仍然是同一个 Task 的补充输入。
-
-### 2. 什么时候创建新 Task
-
-当用户开启一个新目标时创建新 Task。
-
-例如：
-
-```text
-再帮我写一份产品介绍
-```
-
-这是新 Task，但仍可复用同一个 session。
-
-### 3. `task_id = None` 的含义
-
-保留该可能性，但 v0.3.0 正常路径不应产生。
-
-约定：
-
-- 用户消息和 Agent 消息在 v0.3.0 中都必须带 `task_id`；
-- `task_id = None` 仅保留给未来的 session 级消息；
-- 当前 R2 构建治理上下文时，可以忽略 `task_id = None` 的消息。
-
-### 4. `run_task` 加载哪些上下文
-
-加载整个 session 的上下文，但排序与截断时优先：
-
-1. 当前 Task 的描述；
-2. 当前 Task 的最近消息；
-3. 同一 session 内其他 Task 的最近消息。
-
-这样可以同时支持：
-
-- 同一目标的多轮澄清；
-- 同一 session 中多个相关目标之间的上下文继承。
+#### 9. Main 的编排边界文档
+这部分是**纯文档收益**，没有代码风险。建议直接吸收并合入 v1.0 架构文档，明确 Runtime 生成可信 ID、Checkpoint 唯一权威等边界。
 
 ---
 
-# Q5：异步审批与 DecisionStore 的兼容性
+## 三、可以商榷或补充的点
 
-## 定案
+### 1. 审计链完整性表述
+审查建议对外表述为"支持链式篡改检测"而非"不可篡改"。**完全同意**。但可补充：在 MVP 演示中，可以现场运行 `verify_chain()` 并展示"篡改一行后校验失败"的效果，这比文字声明更有说服力。
 
-**DecisionStore 统一管理 Decision 的有效期与消费状态。ApprovalStore 只管理审批事件。**
+### 2. MCP 供应链风险（npx -y）
+审查建议固定 Node 版本和 npm 包版本。**合理**，但 MVP 阶段可以退而求其次：在 `mcp_servers.yaml` 中增加 `version` 字段并文档化，不要求锁定到具体 hash。
 
-但要修正代码 agent 的表述：
-
-- `expires_at`、`max_uses` 属于 `Decision`；
-- `used_count` 不属于不可变 `Decision`，它属于 DecisionStore 的运行状态。
-
-## 职责边界
-
-### Decision 模型
-
-`Decision` 是不可变授权凭证，包含：
-
-- `decision_id`
-- `call_id`
-- `verdict`
-- `expires_at`
-- `max_uses`
-- `modified_args`
-- `policy_hits`
-- `reason`
-
-如果当前实现缺少 `expires_at` 或 `max_uses`，需要补齐。
-
-### DecisionStore
-
-DecisionStore 负责：
-
-- 注册 Decision；
-- 校验 `decision_id` 是否存在；
-- 校验是否过期；
-- 校验 `used_count < max_uses`；
-- 消费 Decision；
-- 防止重复使用；
-- 防 `call_id` 重放。
-
-建议内部记录：
-
-```text
-decision_id
-call_id
-task_id
-session_id
-status
-expires_at
-max_uses
-used_count
-created_at
-consumed_at
-```
-
-### ApprovalStore
-
-ApprovalStore 只负责：
-
-- 记录审批请求；
-- 记录审批人；
-- 记录 approve / deny / expire；
-- 保存审批理由；
-- 支持重启恢复。
-
-它不判断最终能否执行。
-
-## 审批通过后的流程
-
-```text
-ApprovalStore 记录 approved
-→ ApprovalService / Checkpoint 创建新的 allow Decision
-→ DecisionStore 注册该 Decision
-→ forward 时由 DecisionStore 校验并消费
-```
-
-这样可以避免 §8 R4 提到的双写不一致问题。
+### 3. 示例中的 `/data/...` 路径问题
+审查指出系统根目录可能有权限问题。**建议改为项目内相对路径**（如 `project_root/data/`），并通过 `ConfigLoader` 解析为绝对路径，这样跨平台演示更稳定。
 
 ---
 
-# Q6：CLI 入口
+## 四、对"推荐整合顺序"的评价
 
-## 定案
+审查推荐的 9 步顺序**大体合理**，但我建议微调：
 
-**CLI 是 v0.3.0 必选项。**
-
-新增：
-
-```text
-src/loop_controller/cli.py
-```
-
-并在 `pyproject.toml` 中注册：
-
-```toml
-[project.scripts]
-lc = "loop_controller.cli:main"
-```
-
-v0.3.0 最小命令：
-
-```bash
-lc approvals list
-lc approvals show <decision_id>
-lc approvals approve <decision_id> --approver alice --reason "..."
-lc approvals deny <decision_id> --approver alice --reason "..."
-```
-
-## 理由
-
-v0.3.0 的核心叙事是“真实治理闭环”。如果没有 CLI，异步审批只能停留在库接口，无法完成可演示、可操作的人工闭环。
-
-Web UI 仍然不做。
+| 审查顺序 | 我的建议 | 理由 |
+|---------|---------|------|
+| 1. 修复预算生命周期 | ✅ 保持第 1 | P0 安全漏洞 |
+| 2. 强化审批记录绑定 | ✅ 保持第 2 | P0 安全漏洞 |
+| 3. 修复 DecisionStore | ✅ 保持第 3 | 与 1/2 同属状态一致性 |
+| 4. 统一 OPA_PATH | ✅ 保持第 4 | 否则测试不可信 |
+| 5. 修复 Ruff/mypy | ⚠️ 降至与 6 并行 | 不阻塞功能，可 CI 并行跑 |
+| 6. 迁移 Session 风险 | ⚠️ 明确为 v1.1 | 超出 MVP 范围，不要阻塞发布 |
+| 7. 增加正式 E2E | ✅ 提前到第 5 | 演示前必须完成 |
+| 8. 清理旧示例 | ✅ 保持 | 低优先级 |
+| 9. 合并回主分支 | ❌ 删除此步骤 | develop 应成为新主分支，而非合并回旧 main |
 
 ---
 
-# Q7：策略模板如何与现有配置集成
+## 五、一句话总结
 
-## 定案
-
-部分采纳代码 agent 建议，但不允许简单的文本拼接式合并。
-
-采用：
-
-```text
-policies/
-  default.rego
-  templates/
-    file_whitelist.rego
-    sensitive_directories.rego
-    external_email.rego
-    session_risk.rego
-    critical_tools.rego
-```
-
-`profiles.yaml` 新增：
-
-```yaml
-policy_files:
-  - "default.rego"
-  - "templates/file_whitelist.rego"
-  - "templates/external_email.rego"
-```
-
-## 合并方式
-
-不要把多个 `.rego` 文件拼接成一个大文件。
-
-正确方式是：
-
-1. PolicyStore 记录 profile 选择的 policy files；
-2. PolicyEngine 查询 base policy 与被选择的 template policy；
-3. 收集多个 candidate decisions；
-4. 用统一优先级合并：
-
-```text
-deny > require_approval > modify > allow
-```
-
-## 版本号
-
-`policy_version` 必须反映当前 profile 实际启用的 policy files。
-
-建议计算方式：
-
-```text
-sha256(
-  排序后的 relative path
-  + 每个文件内容 hash
-)
-```
-
-不能只 hash 整个 `policies/` 目录，否则无法区分“文件存在但未被该 profile 启用”和“该 profile 实际启用了该模板”。
-
-## `session_risk_threshold`
-
-继续由 `CapabilityProfile` 提供，并进入 Rego input：
-
-```rego
-input.session_risk.score >= input.session_risk.threshold
-```
-
-模板不自己定义阈值。
-
----
-
-# Q8：发布检查清单与版本号
-
-## 定案
-
-两个都做。
-
-### 1. 新建 v0.2.0 检查清单
-
-保留：
-
-```text
-发布检查清单_v0.1.0.md
-```
-
-新增：
-
-```text
-发布检查清单_v0.2.0.md
-```
-
-理由：
-
-- v0.1.0 清单是历史发布记录；
-- 不覆盖历史版本；
-- 每个版本的发布门槛可以独立追溯。
-
-### 2. 更新包版本号
-
-发布前将：
-
-```toml
-version = "0.2.0"
-```
-
-写入 `pyproject.toml`。
-
-tag 必须打在包含以下内容的最终提交上：
-
-- `key_id` 非空；
-- `pyproject.toml` 版本号为 `0.2.0`；
-- v0.2.0 检查清单已更新；
-- 全量测试通过；
-- 手动真实 MCP gate 通过。
-
----
-
-# 调整后的执行顺序
-
-当前最优顺序变为：
-
-## Step 1：发布修正
-
-先做一个小的 release-preparation commit：
-
-- 补 `audit_key_id`；
-- 补 v0.2.0 检查清单；
-- 更新 `pyproject.toml` version；
-- 更新 README / KNOWN_LIMITATIONS；
-- 跑全量测试与真实 MCP gate。
-
-## Step 2：打 v0.2.0 tag
-
-在最终 HEAD 上：
-
-```bash
-git tag -a v0.2.0 <final-head> -m "v0.2.0: trusted execution baseline"
-git push origin v0.2.0
-```
-
-## Step 3：进入 Iteration 4
-
-开始动态会话上下文，但采用本文 Q3/Q4 的修正模型：
-
-- 外部驱动；
-- 显式 `UserQuestion`；
-- `resume_task`；
-- session 级 ConversationContext。
-
-## Step 4：进入 Iteration 5
-
-实现异步审批，但按 Q5 的职责边界：
-
-- ApprovalStore 记录审批；
-- DecisionStore 统一判断能否执行；
-- `used_count` 不进入不可变 Decision。
-
----
-
-# 对代码 agent 倾向的处理结果
-
-| 问题 | 是否采纳代码 agent 倾向 | 说明 |
-|---|---|---|
-| Q1 | 采纳 | 不 force-push |
-| Q2 | 采纳 | 发布前补非空 `key_id` |
-| Q3 | 部分采纳 | 外部驱动是对的，但需要显式 `UserQuestion` |
-| Q4 | 采纳并补充 | 一个用户目标一个 Task；session 加载完整上下文 |
-| Q5 | 部分采纳 | DecisionStore 统一校验是对的，但 `used_count` 不进 Decision |
-| Q6 | 采纳 | CLI 是 v0.3.0 必选项 |
-| Q7 | 部分采纳 | `policy_files` 是对的，但不能文本拼接合并 |
-| Q8 | 采纳 | 新清单 + 更新版本号 |
-
-这些决定可以直接作为 v0.3.0 的执行口径。
+> **这份审查的 P0 和 P1 项应被视为开发阻塞项（blockers），必须修复；P2 和工程门禁应在 MVP 冻结前完成；Main 分支的 Session 风险状态是优质增强，但建议作为 v1.1 引入，避免扩大 MVP 范围。审查整体值得团队逐条对照执行。**

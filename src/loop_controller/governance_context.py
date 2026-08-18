@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from loop_controller.models import ConversationContext, ConversationMessage, Task
 
@@ -20,7 +20,7 @@ _MAX_AGENT_MESSAGES = 3
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _format_messages(messages: list[ConversationMessage], prefix: str) -> list[str]:

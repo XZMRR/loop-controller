@@ -1,6 +1,6 @@
 [project]
 name = "loop-controller"
-version = "0.2.0"
+version = "0.3.0"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.0",
@@ -8,6 +8,9 @@ dependencies = [
     "pyyaml>=6.0",
     "mcp>=1.0",
 ]
+
+[project.scripts]
+lc = "loop_controller.cli:main"
 
 [dependency-groups]
 dev = [

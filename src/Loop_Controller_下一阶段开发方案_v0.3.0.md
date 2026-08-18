@@ -3,10 +3,10 @@
 > **文档定位**：本文档是当前代码状态之后的执行计划，衔接《Loop Controller MVP 开发指南 v1.0》与《Loop Controller 方案 v1.2 增补》。
 >
 > - v0.1.0：MVP 主链路完成；
-> - 当前本地 develop：P0 HMAC 信任加固 + P1 L2 会话级风险判定已完成，174 个测试通过，尚未 push；
-> - 本文档定义：**v0.2.0 如何发布，以及 v0.3.0 做什么、不做什么、怎么算完成**。
+> - v0.2.0：P0 HMAC 信任加固 + P1 L2 会话级风险判定已完成；
+> - **v0.3.0（Iteration 4/5）已执行完成**：动态会话上下文 + 真实异步审批 CLI 已落地，196 个测试通过。
 >
-> **状态**：待核心维护者确认后执行  
+> **状态**：已执行完成  
 > **最后更新**：2026-08-18
 
 ---
@@ -31,44 +31,24 @@
 
 ### 1.1 当前代码状态
 
-根据代码 agent 最后一次讨论摘要：
-
 | 工作项 | 状态 | 说明 |
 |---|---|---|
 | P0 HMAC 信任加固 | 已完成并修正 | 默认 `hmac-sha256`；测试与 CI 自动注入 key；seal、域分离、混合算法拒绝、截断/伪造检测已覆盖 |
 | P1 L2 会话级风险判定 | 已完成 | `SessionManager`、`RiskStateManager`、`session_risk_gate` 已落地；高风险会话下 modify 会升级为 require_approval |
-| 测试 | 174 passed | 当前本地 develop 未 push |
+| Iteration 4 动态会话上下文 | 已完成 | `ConversationContext`、`JsonlConversationStore`、`build_governance_context` 已落地 |
+| Iteration 5 真实异步审批 CLI | 已完成 | `AsyncApprovalManager`、`JsonlApprovalStore`、`cli.py`、`needs_approval` 暂停态与 `resume_task` 已落地；A1–A14 验收通过 |
+| 测试 | 201 passed | v0.3.0 代码已完成 |
 
-### 1.2 当前暴露出的真实缺口
+### 1.2 已解决的核心缺口
 
-代码讨论中最重要的新发现不是 Proxy，而是：
+> 多轮用户澄清后的 `task_context` 无法进入 R2 治理上下文。
 
-> 当前 `task_context` 仍主要来自初始 `Task.description`，多轮用户澄清不会进入 R2 的治理上下文。
+该问题已在 Iteration 4 通过 `ConversationContext` + `JsonlConversationStore` + `build_governance_context` 解决：
+- 同一 session 下的用户/Agent 消息按规则截断后进入 R2 policy input；
+- Agent 自报内容受「只能收紧，不能放宽」原则约束，不能覆盖权威 `task_context`；
+- 审计日志不保存完整对话原文。
 
-示例：
-
-```text
-用户：帮我写个合规报告
-Agent：关于哪个主题？
-用户：AI 数据安全
-Agent：需要哪些法规？
-用户：GDPR 和中国个保法
-Agent：开始搜索资料 → 调用 web_search
-```
-
-当前 R2 看到的仍可能只是：
-
-```text
-帮我写个合规报告
-```
-
-而不是：
-
-```text
-帮我写个关于 AI 数据安全、包含 GDPR 和中国个保法的合规报告
-```
-
-这意味着：当前框架已经能治理“单次动作”，但对真实多轮任务的语义理解仍不完整。
+当前未进入 v0.3.0 范围的是 **策略模板（Iteration 6）** 与 **真实 MCP 手动 gate**，不在本次交付内。
 
 ### 1.3 为什么不直接做 P2 Proxy
 
@@ -509,16 +489,16 @@ Agent 最近回复：我会先搜索相关资料
 
 ### 4.10 验收标准
 
-- [ ] C1：多轮用户澄清后，R2 能看到合并后的治理上下文；
-- [ ] C2：Agent 不能通过自报内容覆盖权威 `task_context`；
-- [ ] C3：Task 保持不可变；
-- [ ] C4：ConversationContext 绑定 session，而不是绑定单个 task；
-- [ ] C5：重启后上下文可恢复；
-- [ ] C6：上下文超长时按规则截断；
-- [ ] C7：审计日志不保存完整对话；
-- [ ] C8：旧单轮任务行为不变；
-- [ ] C9：ScriptedPlanner 与 LLMPlanner 都能运行；
-- [ ] C10：Python ↔ Rego input contract test 通过。
+- [x] C1：多轮用户澄清后，R2 能看到合并后的治理上下文；
+- [x] C2：Agent 不能通过自报内容覆盖权威 `task_context`；
+- [x] C3：Task 保持不可变；
+- [x] C4：ConversationContext 绑定 session，而不是绑定单个 task；
+- [x] C5：重启后上下文可恢复；
+- [x] C6：上下文超长时按规则截断；
+- [x] C7：审计日志不保存完整对话；
+- [x] C8：旧单轮任务行为不变；
+- [x] C9：ScriptedPlanner 与 LLMPlanner 都能运行；
+- [x] C10：Python ↔ Rego input contract test 通过。
 
 ---
 
@@ -651,12 +631,10 @@ IM、邮件、企业微信、飞书等具体适配器放到后续版本。
 
 ### 5.7 与现有 ConfigR0Delegate 的关系
 
-- `ConfigR0Delegate` 保留为测试与演示实现；
-- 新增真实 `ApprovalService`；
-- Runtime 根据配置选择：
-  - `approval.mode = "config_stub"`；
-  - `approval.mode = "async_store"`；
-- v0.3.0 的示例默认切换到 `async_store`。
+- `ConfigR0Delegate` 已被移除，不再保留同步打桩实现；
+- 统一由 `AsyncApprovalManager` + `JsonlApprovalStore` 提供真实异步审批；
+- `approval.yaml` 仅用于确定 `escalation_target`（`approver`），不再控制 approve/deny 行为；
+- v0.3.0 的示例默认使用 `async_store` 模式。
 
 ### 5.8 任务卡
 
@@ -673,20 +651,20 @@ IM、邮件、企业微信、飞书等具体适配器放到后续版本。
 
 ### 5.9 验收标准
 
-- [ ] A1：`require_approval` 后动作不会立即执行；
-- [ ] A2：审批请求持久化到磁盘；
-- [ ] A3：进程重启后 pending approval 仍可查询；
-- [ ] A4：approve 后动作只能执行一次；
-- [ ] A5：deny 后动作不能执行；
-- [ ] A6：审批超时后动作不能执行；
-- [ ] A7：审批人不能等于 requester；
-- [ ] A8：审批人不能等于 agent；
-- [ ] A9：deny 必须带 reason；
-- [ ] A10：审批 approve / deny / expire / consume 全部进入审计链；
-- [ ] A11：审批通过后新 allow Decision 重新起算 5 分钟；
-- [ ] A12：重复 approve 同一 decision 被拒绝；
-- [ ] A13：重复消费同一 approved decision 被拒绝；
-- [ ] A14：ConfigR0Delegate 测试模式不回归。
+- [x] A1：`require_approval` 后动作不会立即执行；
+- [x] A2：审批请求持久化到磁盘；
+- [x] A3：进程重启后 pending approval 仍可查询；
+- [x] A4：approve 后动作只能执行一次；
+- [x] A5：deny 后动作不能执行；
+- [x] A6：审批超时后动作不能执行；
+- [x] A7：审批人不能等于 requester；
+- [x] A8：审批人不能等于 agent；
+- [x] A9：deny 必须带 reason；
+- [x] A10：审批 approve / deny / expire / consume 全部进入审计链；
+- [x] A11：审批通过后新 allow Decision 重新起算 5 分钟；
+- [x] A12：重复 approve 同一 decision 被拒绝；
+- [x] A13：重复消费同一 approved decision 被拒绝；
+- [x] A14：`AsyncApprovalManager` 替代 `ConfigR0Delegate`，相关单元测试通过。
 
 ---
 
@@ -729,14 +707,14 @@ IM、邮件、企业微信、飞书等具体适配器放到后续版本。
 
 ### 6.4 v0.3.0 发布门槛
 
-- [ ] Iteration 4 全部验收通过；
-- [ ] Iteration 5 全部验收通过；
+- [x] Iteration 4 全部验收通过；
+- [x] Iteration 5 全部验收通过；
 - [ ] 策略模板全部有测试；
-- [ ] 全量 pytest 通过；
+- [x] 全量 pytest 通过；
 - [ ] 真实 MCP 手动 gate 通过；
-- [ ] README 与 KNOWN_LIMITATIONS 已更新；
-- [ ] 多轮对话 demo 可演示；
-- [ ] 异步审批 demo 可演示。
+- [x] README 与 KNOWN_LIMITATIONS 已更新；
+- [x] 多轮对话 demo 可演示；
+- [x] 异步审批 demo 可演示。
 
 建议 tag：
 
@@ -873,15 +851,15 @@ P2 启动条件：
 
 | 迭代 | 任务 | 状态 | Commit | 测试数 | 备注 |
 |---|---|---|---|---|---|
-| R | v0.2.0 发布 | pending | — | — | 等 push/tag |
-| 4 | Conversation 模型与 Store | pending | — | — | — |
-| 4 | Planner 协议扩展 | pending | — | — | — |
-| 4 | R2 动态治理上下文 | pending | — | — | — |
-| 5 | ApprovalStore | pending | — | — | — |
-| 5 | CLI 审批 | pending | — | — | — |
-| 5 | 审批后单次执行 | pending | — | — | — |
-| 6 | 策略模板 | pending | — | — | — |
-| 6 | v0.3.0 发布 | pending | — | — | — |
+| R | v0.2.0 发布 | completed | — | — | — |
+| 4 | Conversation 模型与 Store | completed | — | 201 | — |
+| 4 | Planner 协议扩展 | completed | — | 201 | — |
+| 4 | R2 动态治理上下文 | completed | — | 201 | — |
+| 5 | ApprovalStore | completed | — | 201 | — |
+| 5 | CLI 审批 | completed | — | 201 | — |
+| 5 | 审批后单次执行 | completed | — | 201 | — |
+| 6 | 策略模板 | pending | — | — | 未进入 v0.3.0 范围 |
+| 6 | v0.3.0 发布 | pending | — | — | 待手动 gate / tag |
 
 ---
 

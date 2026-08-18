@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -98,9 +99,9 @@ class JsonlConversationStore:
         if messages:
             updated_at = messages[-1].created_at
         else:
-            from datetime import datetime, timezone
+            from datetime import datetime
 
-            updated_at = datetime.now(timezone.utc)
+            updated_at = datetime.now(UTC)
         return ConversationContext(
             session_id=session_id,
             messages=messages,

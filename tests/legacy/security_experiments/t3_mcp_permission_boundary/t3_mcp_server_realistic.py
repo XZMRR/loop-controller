@@ -12,9 +12,7 @@ T3 MCP Mock Server（更接近真实 filesystem server 的版本）
 """
 
 import asyncio
-import os
 import posixpath
-from pathlib import Path, PurePosixPath
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -170,7 +168,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [
                 TextContent(
                     type="text",
-                    text=f"❌ 权限拒绝：Server 策略禁止删除任何文件。",
+                    text="❌ 权限拒绝：Server 策略禁止删除任何文件。",
                 )
             ]
 
