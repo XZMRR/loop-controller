@@ -97,10 +97,11 @@ class SessionManager:
 
     def is_session_active(self, session_id: str) -> bool:
         """按 session_id 查询是否仍活跃。"""
-        session = getattr(self._backend, "_sessions", {}).get(session_id)
+        sessions = getattr(self._backend, "_sessions", {})
+        session = sessions.get(session_id)
         if session is None:
             return False
-        return session.active
+        return bool(session.active)
 
     def validate_and_touch(self, task) -> bool:
         """校验 task.session_id 存在且活跃，且绑定 (user_id, agent_id) 与 task 一致。

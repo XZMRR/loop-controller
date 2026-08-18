@@ -10,7 +10,14 @@ from __future__ import annotations
 import re
 from typing import Protocol, runtime_checkable
 
-from loop_controller.models import ActionProposal, Agent, CapabilityProfile, RiskSignal, Task
+from loop_controller.models import (
+    ActionProposal,
+    Agent,
+    CapabilityProfile,
+    RiskLevel,
+    RiskSignal,
+    Task,
+)
 
 # 敏感模式（与 config/masking_rules.yaml 的 value_patterns / field_name_blacklist 对齐，
 # 避免"日志里脱敏了但分类器没认出来"的口径漂移）。
@@ -59,10 +66,9 @@ class RuleBasedClassifier:
         proposal: ActionProposal,
         profile: CapabilityProfile,
     ) -> RiskSignal:
-        level = "low"
+        level: RiskLevel = "low"
         tags: list[str] = []
         hits: list[str] = []
-
         if proposal.tool_name == "send_email":
             level = "high"
             tags.append("external_communication")

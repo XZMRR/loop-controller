@@ -23,12 +23,16 @@ import re
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import httpx
 import yaml
 
-from loop_controller.models import Agent, CapabilityProfile, ToolPermission
+from loop_controller.models import (
+    Agent,
+    CapabilityProfile,
+    ToolPermission,
+)
 from loop_controller.utils.globmatch import compile_glob
 
 POLICY_PACKAGE = "loop_controller.tool_permission"
@@ -127,6 +131,9 @@ class ApprovalConfig:
     rules: list[ApprovalRule] = field(default_factory=list)
 
 
+AuditHashAlgorithm = Literal["sha256", "hmac-sha256"]
+
+
 @dataclass(frozen=True)
 class AppConfig:
     agents: dict[str, Agent]
@@ -145,7 +152,7 @@ class AppConfig:
     conversation_max_messages_per_session: int = 100  # v0.3.0 每个 session 保留消息数
     approval_store_path: str = "./data/approvals.jsonl"  # v0.3.0 审批请求/结果持久化路径
     llm_planner: LLMPlannerConfig | None = None
-    audit_hash_algo: Literal["sha256", "hmac-sha256"] = "sha256"
+    audit_hash_algo: AuditHashAlgorithm = "sha256"
     audit_hmac_key_env: str = "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
     audit_key_id: str = "default"  # HMAC key 标识，为密钥轮换留口
 
@@ -179,7 +186,10 @@ class ConfigLoader:
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
 
-        audit_hash_algo = os.environ.get("LOOP_CONTROLLER_AUDIT_HASH_ALGO", "hmac-sha256")
+        audit_hash_algo = cast(
+            AuditHashAlgorithm,
+            os.environ.get("LOOP_CONTROLLER_AUDIT_HASH_ALGO", "hmac-sha256"),
+        )
         if audit_hash_algo not in ("sha256", "hmac-sha256"):
             raise ConfigValidationError(
                 f"环境变量 LOOP_CONTROLLER_AUDIT_HASH_ALGO 必须是 sha256 或 hmac-sha256，"
@@ -356,8 +366,8 @@ class ConfigLoader:
         body = resp.json()
         result = body.get("result", {})
         if isinstance(result, dict) and "result" in result:
-            return result["result"]
-        return result
+            return cast(dict[str, Any], result["result"])
+        return cast(dict[str, Any], result)
 
     def _check_dirs_writable(self, config: AppConfig) -> None:
         for label, path_str in (
