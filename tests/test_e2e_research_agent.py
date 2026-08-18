@@ -23,6 +23,7 @@ from loop_controller.budget import InMemoryBudgetLedger
 from loop_controller.checkpoint import Checkpoint, InMemoryDecisionStore
 from loop_controller.classifier import RuleBasedClassifier
 from loop_controller.infra.audit_store import JsonlAuditStore
+from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import FilePolicyStore
@@ -156,6 +157,7 @@ def _runtime_from_config(workdir: Path, opa_url: str, plan_path: Path | None = N
         masker=masker,
     )
     audit_store = JsonlAuditStore(workdir / "data" / "audit.jsonl")
+    conversation_store = JsonlConversationStore(workdir / "data" / "conversations.jsonl")
     if plan_path is None:
         plan_path = workdir / "config" / "scripted_plan.yaml"
     planner = ScriptedPlanner.from_yaml(plan_path)
@@ -170,6 +172,7 @@ def _runtime_from_config(workdir: Path, opa_url: str, plan_path: Path | None = N
         profiles=config.profiles,
         session_manager=session_manager,
         risk_manager=risk_manager,
+        conversation_store=conversation_store,
     )
 
 

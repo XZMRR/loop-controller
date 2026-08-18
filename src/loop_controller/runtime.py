@@ -19,6 +19,7 @@ from loop_controller.checkpoint import Checkpoint
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
 from loop_controller.infra.audit_store import AuditStore, JsonlAuditStore
 from loop_controller.infra.config_loader import AppConfig, ConfigLoader
+from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.decision_store import JsonlDecisionStore
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import FilePolicyStore
@@ -31,10 +32,14 @@ from loop_controller.models import (
     AuditAction,
     AuditEvent,
     BudgetCost,
+    ConversationContext,
+    ConversationMessage,
     Decision,
     RiskSignal,
     Task,
+    TaskRunResult,
     ToolResult,
+    UserQuestion,
 )
 from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
 from loop_controller.session import SessionManager
@@ -66,6 +71,7 @@ class Runtime:
     profiles: dict[str, Any]  # CapabilityProfile
     session_manager: SessionManager  # v1.2 会话分配与校验
     risk_manager: RiskStateManager  # v1.2 会话级风险状态
+    conversation_store: JsonlConversationStore  # v0.3.0 会话上下文
 
     def create_task(self, user_id: str, agent_id: str, description: str) -> Task:
         """通过 SessionManager 分配/复用 session，构造 Task（v1.2 推荐入口）。"""
@@ -78,6 +84,36 @@ class Runtime:
             agent_id=agent_id,
             description=description,
         )
+
+    def add_user_message(self, session_id: str, task_id: str, content: str) -> ConversationMessage:
+        """记录一条用户消息；供外部调用方在收到 ``needs_user_input`` 后写入回复。"""
+        message = ConversationMessage(
+            message_id=uuid.uuid4().hex,
+            session_id=session_id,
+            task_id=task_id,
+            role="user",
+            content=content,
+        )
+        self.conversation_store.append_message(message)
+        return message
+
+    def add_agent_message(
+        self, session_id: str, task_id: str, content: str
+    ) -> ConversationMessage:
+        """记录一条 Agent 消息；通常由 Runtime 在 ``ask_user`` 时自动调用。"""
+        message = ConversationMessage(
+            message_id=uuid.uuid4().hex,
+            session_id=session_id,
+            task_id=task_id,
+            role="agent",
+            content=content,
+        )
+        self.conversation_store.append_message(message)
+        return message
+
+    def get_conversation_context(self, session_id: str) -> ConversationContext:
+        """获取指定 session 的当前对话上下文。"""
+        return self.conversation_store.get_context(session_id)
 
     async def start(self) -> None:
         """拉起 MCP server 子进程等异步初始化。"""
@@ -121,6 +157,10 @@ def build_runtime(
     budget_ledger = InMemoryBudgetLedger()
     session_manager = SessionManager()
     risk_manager = RiskStateManager(JsonlRiskStateStore(config.risk_state_path))
+    conversation_store = JsonlConversationStore(
+        config.conversation_path,
+        max_messages_per_session=config.conversation_max_messages_per_session,
+    )
     checkpoint = Checkpoint(
         profiles=config.profiles,
         policy_engine=policy_engine,
@@ -173,6 +213,7 @@ def build_runtime(
         profiles=config.profiles,
         session_manager=session_manager,
         risk_manager=risk_manager,
+        conversation_store=conversation_store,
     )
 
 
@@ -255,30 +296,79 @@ def _blocked_decision(decision: Decision, proposal: ActionProposal, reason: str)
     )
 
 
-async def run_task(task: Task, agent: Agent, runtime: Runtime) -> None:
-    """R1 执行循环（§5.2）：Planner → Classifier → Checkpoint.evaluate → forward/拦截。"""
+async def run_task(task: Task, agent: Agent, runtime: Runtime) -> TaskRunResult:
+    """R1 执行循环入口（§5.2）。
+
+    v0.3.0：返回 ``TaskRunResult``，支持 ``needs_user_input`` 暂停态。
+    """
+    return await _run_task_loop(task, agent, runtime, observations=[])
+
+
+async def resume_task(
+    task: Task,
+    agent: Agent,
+    runtime: Runtime,
+    *,
+    observations: list[ToolResult] | None = None,
+) -> TaskRunResult:
+    """在用户补充输入后恢复任务执行。"""
+    return await _run_task_loop(task, agent, runtime, observations=observations or [])
+
+
+async def _run_task_loop(
+    task: Task,
+    agent: Agent,
+    runtime: Runtime,
+    *,
+    observations: list[ToolResult],
+) -> TaskRunResult:
+    """R1 执行循环（§5.2）：Planner → Classifier → Checkpoint.evaluate → forward/拦截。
+
+    返回 ``completed`` 或 ``needs_user_input``。``needs_user_input`` 时会在
+    ``conversation_store`` 写入一条 Agent 消息，外部调用方应写入用户回复后调用
+    ``resume_task`` 继续。
+    """
     audit = runtime.audit_store
     profile = runtime.profiles[agent.profile_id]
-    observations: list[ToolResult] = []
+    conversation_context = runtime.get_conversation_context(task.session_id)
 
     # v1.2：校验 task.session_id 存在、活跃且绑定一致（fail-closed）
     runtime.session_manager.validate_and_touch(task)
 
     audit.append(_audit_event(task, action="task_start", masker=runtime.masker))
+    ended = False
     try:
         while True:
             # 1. 规划下一步动作：Planner 只产出草案，框架组装 ActionProposal 并统一生成 call_id
             #    （v1.1 评审#7/#8：Planner 无权自定身份标识）
-            planned = await runtime.planner.next_action(task, agent, observations)
+            planned = await runtime.planner.next_action(
+                task, agent, observations, conversation_context
+            )
             if planned is None:
+                ended = True
                 break
+
+            # v0.3.0：Planner 显式请求用户输入；任务未结束，不写 task_end
+            if isinstance(planned, UserQuestion):
+                runtime.add_agent_message(
+                    task.session_id,
+                    task.task_id,
+                    f"请求用户补充：{planned.question}",
+                )
+                return TaskRunResult(
+                    status="needs_user_input",
+                    task_id=task.task_id,
+                    session_id=task.session_id,
+                    question=planned.question,
+                )
+
             proposal = ActionProposal(
                 task_id=task.task_id,
                 call_id=uuid.uuid4().hex,  # run_task 框架统一生成
                 agent_id=agent.agent_id,
                 tool_name=planned.tool_name,
                 arguments=dict(planned.arguments),
-                task_context=task.description[:200],  # §5.3 纯截断，不做摘要改写
+                task_context=task.description[:200],  # 会被 checkpoint 用治理上下文替换
                 reason=planned.reason,
             )
 
@@ -298,8 +388,10 @@ async def run_task(task: Task, agent: Agent, runtime: Runtime) -> None:
                 )
             )
 
-            # 3. R2 判定
-            decision = await runtime.checkpoint.evaluate(task, agent, proposal)
+            # 3. R2 判定（传入 conversation_context 供框架构建治理上下文）
+            decision = await runtime.checkpoint.evaluate(
+                task, agent, proposal, conversation_context=conversation_context
+            )
             audit.append(
                 _audit_event(
                     task,
@@ -349,6 +441,15 @@ async def run_task(task: Task, agent: Agent, runtime: Runtime) -> None:
                     masker=runtime.masker,
                 )
             )
+            ended = True
     finally:
-        audit.append(_audit_event(task, action="task_end", masker=runtime.masker))
-        runtime.checkpoint.forget_task(task.task_id)
+        if ended:
+            audit.append(_audit_event(task, action="task_end", masker=runtime.masker))
+            runtime.checkpoint.forget_task(task.task_id)
+
+    return TaskRunResult(
+        status="completed",
+        task_id=task.task_id,
+        session_id=task.session_id,
+        question=None,
+    )

@@ -54,7 +54,7 @@ Rego 策略文件为明文，仅依赖文件系统权限保护。恶意 Agent �
 | F5 | 权限组合规则为静态 YAML | 无图分析/能力代数；规则需人工维护 |
 | F6 | 审计全量记录无采样 | 高负载场景需自行评估日志量 |
 | F7 | 财务支付预算未启用 | `payment_amount` 恒为 0 |
-| F8 | 多轮对话上下文未进入 R2 | `task_context` 仍主要来自初始 `Task.description`；用户后续澄清不参与治理判定；计划 v0.3.0 通过 `ConversationContext` 解决 |
+| F8 | ~~多轮对话上下文未进入 R2~~ 已实现 | v0.3.0 Iteration 4 通过 `ConversationContext` + `build_governance_context` 让当前 Task 的最近用户/Agent 消息进入 R2；跨 Task 同 session 消息暂未混入 |
 | F9 | 外部 Agent 直接接入尚不支持 | 当前仅支持框架内 Planner（Scripted / LLM）；外部 ReAct / Harness / Loop 等 Agent 需通过尚未实现的 MCP Proxy 接入 |
 | F10 | SSE/HTTP MCP transport 未支持 | 当前仅支持 stdio；SSE/HTTP transport 放入 P2 Proxy 阶段统一实现 |
 

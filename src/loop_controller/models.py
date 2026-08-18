@@ -35,6 +35,8 @@ AuditAction = Literal[
     "planner_error",
 ]
 ApprovalVerdict = Literal["approve", "deny"]
+ConversationRole = Literal["user", "agent"]
+TaskRunStatus = Literal["completed", "needs_user_input"]
 
 
 def _utc_now() -> datetime:
@@ -348,3 +350,54 @@ class PlannedAction(BaseModel):
     tool_name: str
     arguments: dict[str, Any]
     reason: str = ""
+
+
+# ---------------------------------------------------------------------------
+# v0.3.0 Iteration 4：动态会话上下文
+# ---------------------------------------------------------------------------
+
+
+class UserQuestion(BaseModel):
+    """Planner 显式请求用户补充输入。
+
+    不是 tool call，不进入 R2 治理链路；由 Runtime 截断并返回给外部调用方。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    question: str
+    reason: str | None = None
+
+
+class ConversationMessage(BaseModel):
+    """session 级对话中的一条消息。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    message_id: str
+    session_id: str
+    task_id: str
+    role: ConversationRole
+    content: str
+    created_at: datetime = Field(default_factory=_utc_now)
+
+
+class ConversationContext(BaseModel):
+    """session 级对话上下文；绑定 session，不绑定单个 Task。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    session_id: str
+    messages: list[ConversationMessage] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=_utc_now)
+
+
+class TaskRunResult(BaseModel):
+    """``run_task`` / ``resume_task`` 的返回结果。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: TaskRunStatus
+    task_id: str
+    session_id: str
+    question: str | None = None  # status == "needs_user_input" 时非空

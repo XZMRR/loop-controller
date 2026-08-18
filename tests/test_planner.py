@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from loop_controller.models import Agent, PlannedAction, Task
+from loop_controller.models import Agent, ConversationContext, PlannedAction, Task
 from loop_controller.planner import ScriptedPlanner
 
 
@@ -19,6 +19,11 @@ def agent() -> Agent:
     return Agent(agent_id="researcher_001", name="RA", profile_id="p1", owner_id="zhang_manager")
 
 
+@pytest.fixture
+def conversation_context(task) -> ConversationContext:
+    return ConversationContext(session_id=task.session_id)
+
+
 def make_steps() -> list[PlannedAction]:
     return [
         PlannedAction(tool_name="web_search", arguments={"query": "q1"}, reason="调研公开资料"),
@@ -26,10 +31,10 @@ def make_steps() -> list[PlannedAction]:
     ]
 
 
-async def test_next_action_in_order(task, agent) -> None:
+async def test_next_action_in_order(task, agent, conversation_context) -> None:
     planner = ScriptedPlanner(make_steps())
 
-    first = await planner.next_action(task, agent, [])
+    first = await planner.next_action(task, agent, [], conversation_context)
     assert first is not None
     assert first.tool_name == "web_search"
     assert first.arguments == {"query": "q1"}
@@ -40,15 +45,15 @@ async def test_next_action_in_order(task, agent) -> None:
     assert not hasattr(first, "agent_id")
     assert not hasattr(first, "task_context")
 
-    second = await planner.next_action(task, agent, [])
+    second = await planner.next_action(task, agent, [], conversation_context)
     assert second is not None
     assert second.tool_name == "send_email"
 
     # 序列耗尽 → None（任务完成）
-    assert await planner.next_action(task, agent, []) is None
+    assert await planner.next_action(task, agent, [], conversation_context) is None
 
 
-async def test_from_yaml(tmp_path, task, agent) -> None:
+async def test_from_yaml(tmp_path, task, agent, conversation_context) -> None:
     plan_file = tmp_path / "plan.yaml"
     plan_file.write_text(
         "steps:\n"
@@ -59,8 +64,8 @@ async def test_from_yaml(tmp_path, task, agent) -> None:
     )
 
     planner = ScriptedPlanner.from_yaml(plan_file)
-    action = await planner.next_action(task, agent, [])
+    action = await planner.next_action(task, agent, [], conversation_context)
 
     assert action is not None
     assert action.tool_name == "web_search"
-    assert await planner.next_action(task, agent, []) is None
+    assert await planner.next_action(task, agent, [], conversation_context) is None

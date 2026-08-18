@@ -13,6 +13,8 @@
 - **防重放授权**：Decision 单次使用、限期有效、跨重启持久化；
 - **可检测篡改的审计**：JSONL 全量日志 + 默认 HMAC-SHA256 哈希链 + seal 记录 + event/seal key 域分离 + 参数分级掩码；
 - **会话级风险记忆**：同一 session 内的异常动作会累积风险分，高 session risk 自动将 allow/modify 升级为 require_approval；
+- **动态会话上下文**：`ConversationContext` 保存当前 Task 的用户/Agent 多轮消息，`build_governance_context` 确定性拼装进 R2 input，让策略看到完整意图；
+- **ask_user 暂停态**：Planner 可返回 `UserQuestion`，`run_task` 返回 `needs_user_input`，外部补充输入后 `resume_task` 继续执行；
 - **预算控制**：按工具计费的 token 预算，超支即拒。
 
 ## 架构
@@ -66,6 +68,8 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
            print(JsonlAuditStore(cfg.audit_log_path, hash_algo='hmac-sha256', hmac_key=key).verify_chain())"
 ```
 
+会话上下文持久化路径默认是 `./data/conversations.jsonl`，可在 `config/` 下新增 `conversation.yaml`（或环境变量 `LOOP_CONTROLLER_CONVERSATION_PATH`）覆盖；Planner 通过 `UserQuestion` 请求用户补充后，外部调用方写入 `runtime.add_user_message(...)` 并调用 `resume_task` 继续。
+
 ## 配置
 
 所有治理行为由 `config/` 下的文件定义，改配置 = 重启进程：
@@ -82,7 +86,7 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 
 ## 已知局限
 
-**本项目当前为 v0.2.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链需配合 seal/WORM、HMAC-SHA256 为默认、多轮对话上下文尚未进入 R2、单进程 asyncio 假设、外部 Agent 直接接入尚不支持。
+**本项目当前为 v0.3.0-iteration4，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链需配合 seal/WORM、HMAC-SHA256 为默认、单进程 asyncio 假设、外部 Agent 直接接入尚不支持。
 
 ## 文档
 

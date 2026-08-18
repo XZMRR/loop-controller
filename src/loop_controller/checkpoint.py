@@ -27,10 +27,12 @@ from loop_controller.models import (
     ApprovalRequest,
     BudgetCost,
     CapabilityProfile,
+    ConversationContext,
     Decision,
     Task,
     ToolResult,
 )
+from loop_controller.governance_context import build_context_meta, build_governance_context
 from loop_controller.policy_engine import PolicyEngine, build_policy_input
 from loop_controller.risk_state import RiskStateManager
 from loop_controller.session import SessionManager
@@ -215,10 +217,24 @@ class Checkpoint:
 
     # -- evaluate：判定流水线（§6.1） ----------------------------------------
 
-    async def evaluate(self, task: Task, agent: Agent, proposal: ActionProposal) -> Decision:
+    async def evaluate(
+        self,
+        task: Task,
+        agent: Agent,
+        proposal: ActionProposal,
+        conversation_context: ConversationContext | None = None,
+    ) -> Decision:
         """对一次工具申报给出权威判定。步骤顺序固定，任一失败即短路。"""
         now = self._now()
         policy_version = self._policy_store.current_version()
+
+        # v0.3.0：用框架构建的治理上下文替换 proposal 中的静态 task_context
+        if conversation_context is not None:
+            governance_context = build_governance_context(task, conversation_context)
+            context_meta = build_context_meta(task, conversation_context, governance_context)
+            proposal = proposal.model_copy(update={"task_context": governance_context})
+        else:
+            context_meta = None
 
         # 步骤 0：身份交叉校验（agent 必须来自 IdentityProvider，proposal 与之一致）
         if proposal.agent_id != agent.agent_id:
@@ -266,7 +282,7 @@ class Checkpoint:
         # 步骤 6：主策略查询（OPA/Rego；引擎内部任何异常已 fail-closed 为 deny）
         session_risk = self._risk_manager.get_profile(task.session_id)
         rego_decision = await self._policy_engine.evaluate(
-            _PACKAGE, build_policy_input(proposal, agent, profile, session_risk)
+            _PACKAGE, build_policy_input(proposal, agent, profile, session_risk, context_meta)
         )
         verdict = rego_decision.get("verdict")
         if verdict == "deny":

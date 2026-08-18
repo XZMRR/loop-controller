@@ -25,10 +25,13 @@ from loop_controller.models import (
     AuditEvent,
     BudgetCost,
     CapabilityProfile,
+    ConversationContext,
+    ConversationMessage,
     PlannedAction,
     Task,
     Tool,
     ToolResult,
+    UserQuestion,
 )
 
 
@@ -41,13 +44,15 @@ _SYSTEM_PROMPT = """你是一个企业研究助手，通过调用工具完成用
 规则：
 1. 你的每次输出必须且仅为一个 JSON 对象，格式：
    {"action": "call_tool", "tool_name": "...", "arguments": {...}, "reason": "..."}
+   或 {"action": "ask_user", "question": "..."}
    或 {"action": "finish"}
 2. 你只能使用下方列出的工具。所有工具调用都会被独立的治理层审核，
    可能被修改、拒绝或要求人工审批——这是正常流程。如果被拦截，
    阅读拦截原因，选择合法替代方案继续完成任务。
 3. 工具结果很大时，请在读到内容的下一步立即处理（摘要或写出），
    历史结果之后只保留摘要。
-4. 任务完成或无法继续时，输出 {"action": "finish"}。
+4. 当信息不足、需要用户澄清时，输出 {"action": "ask_user", "question": "..."}。
+5. 任务完成或无法继续时，输出 {"action": "finish"}。
 """
 
 _ASK_SECTION = "请输出下一个动作的 JSON："
@@ -140,6 +145,7 @@ class _LLMOutput(BaseModel):
     tool_name: str | None = None
     arguments: dict[str, Any] | None = None
     reason: str | None = None
+    question: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -212,10 +218,27 @@ def _one_line_summary(obs: ToolResult) -> str:
     return f"状态 {obs.status}"
 
 
-def _build_prompt(task: Task, tools: list[Tool], observations: list[ToolResult]) -> str:
+def _format_conversation(context: ConversationContext) -> str:
+    """把会话上下文格式化为 prompt 段落。"""
+    if not context.messages:
+        return "（无）"
+    lines: list[str] = []
+    for msg in context.messages:
+        role = "用户" if msg.role == "user" else "Agent"
+        lines.append(f"[{role}] {msg.content}")
+    return "\n".join(lines)
+
+
+def _build_prompt(
+    task: Task,
+    tools: list[Tool],
+    observations: list[ToolResult],
+    conversation_context: ConversationContext,
+) -> str:
     """按五段结构组装 prompt。"""
     sections = [
-        f"[context]\n{task.description}",
+        f"[task]\n{task.description}",
+        f"[conversation]\n{_format_conversation(conversation_context)}",
         f"[tools]\n{_format_tools(tools)}",
         f"[history]\n{_format_history(observations)}",
         f"[ask]\n{_ASK_SECTION}",
@@ -254,10 +277,12 @@ def _extract_first_json(text: str) -> str | None:
     return None
 
 
-def _parse_response(content: str, allowed_tools: list[str]) -> tuple[PlannedAction | None, dict[str, Any] | None]:
+def _parse_response(
+    content: str, allowed_tools: list[str]
+) -> tuple[PlannedAction | UserQuestion | None, dict[str, Any] | None]:
     """解析 LLM 输出。
 
-    返回 (PlannedAction, None) 或 (None, None) 表示 finish；
+    返回 (PlannedAction, None) 或 (UserQuestion, None) 或 (None, None) 表示 finish；
     返回 (None, error_dict) 表示失败原因（含原始输出预览）。
     """
     raw_json = _extract_first_json(content)
@@ -274,14 +299,22 @@ def _parse_response(content: str, allowed_tools: list[str]) -> tuple[PlannedActi
     except ValidationError as exc:
         return None, {"reason": f"Schema 校验失败：{exc}", "raw_preview": content[:_RAW_PREVIEW_LEN]}
 
-    if parsed.action not in ("call_tool", "finish"):
+    if parsed.action not in ("call_tool", "ask_user", "finish"):
         return None, {
-            "reason": f"action 必须是 call_tool 或 finish，得到 {parsed.action!r}",
+            "reason": f"action 必须是 call_tool/ask_user/finish，得到 {parsed.action!r}",
             "raw_preview": content[:_RAW_PREVIEW_LEN],
         }
 
     if parsed.action == "finish":
         return None, None
+
+    if parsed.action == "ask_user":
+        if not parsed.question:
+            return None, {
+                "reason": "ask_user 时 question 必须存在",
+                "raw_preview": content[:_RAW_PREVIEW_LEN],
+            }
+        return UserQuestion(question=parsed.question, reason=parsed.reason), None
 
     # call_tool 必须字段
     if not parsed.tool_name or parsed.arguments is None or not parsed.reason:
@@ -351,7 +384,8 @@ class LLMPlanner:
         task: Task,
         agent: Agent,
         observations: list[ToolResult],
-    ) -> PlannedAction | None:
+        conversation_context: ConversationContext,
+    ) -> PlannedAction | UserQuestion | None:
         """调用 LLM 获取下一步动作；失败时写审计并返回 None。"""
         profile = self._profiles.get(agent.profile_id)
         if profile is None:
@@ -373,7 +407,7 @@ class LLMPlanner:
             )
             return None
 
-        prompt = _build_prompt(task, tools, observations)
+        prompt = _build_prompt(task, tools, observations, conversation_context)
         estimated = _estimate_prompt_tokens(prompt) + self._config.max_tokens
 
         # 设置 per-task 预算上限（与 Checkpoint 共用同一个 ledger）

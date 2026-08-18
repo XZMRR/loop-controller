@@ -17,12 +17,18 @@ from loop_controller.models import (
     Agent,
     AuditEvent,
     CapabilityProfile,
+    ConversationContext,
     PlannedAction,
     Task,
     Tool,
     ToolPermission,
     ToolResult,
 )
+
+
+@pytest.fixture
+def conversation_context(task) -> ConversationContext:
+    return ConversationContext(session_id=task.session_id)
 
 
 @pytest.fixture
@@ -117,7 +123,7 @@ def _planner(
     )
 
 
-async def test_valid_json_returns_planned_action(task, agent, profile, tmp_path) -> None:
+async def test_valid_json_returns_planned_action(task, conversation_context, agent, profile, tmp_path) -> None:
     """合法 JSON 输出 → 返回 PlannedAction。"""
     response = LLMResponse(
         content=json.dumps(
@@ -133,7 +139,7 @@ async def test_valid_json_returns_planned_action(task, agent, profile, tmp_path)
     client = _RecordingFakeClient(response)
     planner = _planner(client, profile, tmp_path / "audit.jsonl")
 
-    action = await planner.next_action(task, agent, [])
+    action = await planner.next_action(task, agent, [], conversation_context)
 
     assert isinstance(action, PlannedAction)
     assert action.tool_name == "web_search"
@@ -141,7 +147,7 @@ async def test_valid_json_returns_planned_action(task, agent, profile, tmp_path)
     assert action.reason == "搜索资料"
 
 
-async def test_markdown_wrapped_json_parsed(task, agent, profile, tmp_path) -> None:
+async def test_markdown_wrapped_json_parsed(task, conversation_context, agent, profile, tmp_path) -> None:
     """markdown 代码块包裹的 JSON → 正确解析。"""
     response = LLMResponse(
         content="```json\n"
@@ -154,30 +160,30 @@ async def test_markdown_wrapped_json_parsed(task, agent, profile, tmp_path) -> N
     client = _RecordingFakeClient(response)
     planner = _planner(client, profile, tmp_path / "audit.jsonl")
 
-    action = await planner.next_action(task, agent, [])
+    action = await planner.next_action(task, agent, [], conversation_context)
 
     assert action is not None
     assert action.tool_name == "read_file"
     assert action.arguments == {"path": "/data/kb/a.md"}
 
 
-async def test_finish_action_returns_none(task, agent, profile, tmp_path) -> None:
+async def test_finish_action_returns_none(task, conversation_context, agent, profile, tmp_path) -> None:
     """action=finish → 返回 None。"""
     response = LLMResponse(content='{"action": "finish"}')
     client = _RecordingFakeClient(response)
     planner = _planner(client, profile, tmp_path / "audit.jsonl")
 
-    assert await planner.next_action(task, agent, []) is None
+    assert await planner.next_action(task, agent, [], conversation_context) is None
 
 
-async def test_missing_field_records_planner_error(task, agent, profile, tmp_path) -> None:
+async def test_missing_field_records_planner_error(task, conversation_context, agent, profile, tmp_path) -> None:
     """缺字段 → 返回 None 且审计带 metadata.planner_error。"""
     response = LLMResponse(content='{"action": "call_tool", "tool_name": "web_search"}')
     client = _RecordingFakeClient(response)
     audit_path = tmp_path / "audit.jsonl"
     planner = _planner(client, profile, audit_path)
 
-    assert await planner.next_action(task, agent, []) is None
+    assert await planner.next_action(task, agent, [], conversation_context) is None
 
     events = _events(audit_path, task.task_id)
     assert len(events) == 1
@@ -186,21 +192,21 @@ async def test_missing_field_records_planner_error(task, agent, profile, tmp_pat
     assert "tool_name/arguments/reason 必须存在" in events[0].metadata["planner_error"]["reason"]
 
 
-async def test_non_json_records_planner_error(task, agent, profile, tmp_path) -> None:
+async def test_non_json_records_planner_error(task, conversation_context, agent, profile, tmp_path) -> None:
     """非 JSON → 返回 None 且审计带 metadata.planner_error。"""
     response = LLMResponse(content="我认为应该搜索")
     client = _RecordingFakeClient(response)
     audit_path = tmp_path / "audit.jsonl"
     planner = _planner(client, profile, audit_path)
 
-    assert await planner.next_action(task, agent, []) is None
+    assert await planner.next_action(task, agent, [], conversation_context) is None
 
     events = _events(audit_path, task.task_id)
     assert events[0].action == "planner_error"
     assert "未找到合法 JSON 对象" in events[0].metadata["planner_error"]["reason"]
 
 
-async def test_unauthorized_tool_records_planner_error(task, agent, profile, tmp_path) -> None:
+async def test_unauthorized_tool_records_planner_error(task, conversation_context, agent, profile, tmp_path) -> None:
     """未授权工具名 → 返回 None 且审计带 metadata.planner_error。"""
     response = LLMResponse(
         content=json.dumps(
@@ -212,14 +218,14 @@ async def test_unauthorized_tool_records_planner_error(task, agent, profile, tmp
     audit_path = tmp_path / "audit.jsonl"
     planner = _planner(client, profile, audit_path)
 
-    assert await planner.next_action(task, agent, []) is None
+    assert await planner.next_action(task, agent, [], conversation_context) is None
 
     events = _events(audit_path, task.task_id)
     assert events[0].action == "planner_error"
     assert "delete_database" in events[0].metadata["planner_error"]["reason"]
 
 
-async def test_history_summarized_after_three_steps(task, agent, profile, tmp_path) -> None:
+async def test_history_summarized_after_three_steps(task, conversation_context, agent, profile, tmp_path) -> None:
     """三步以上历史 → 早期步骤被摘要，最近一步保留全文（并截断）。"""
     observations = [
         ToolResult(call_id="c1", task_id=task.task_id, tool_name="web_search", status="success", content="A" * 3000),
@@ -233,7 +239,7 @@ async def test_history_summarized_after_three_steps(task, agent, profile, tmp_pa
     client = _RecordingFakeClient(response)
     planner = _planner(client, profile, tmp_path / "audit.jsonl")
 
-    await planner.next_action(task, agent, observations)
+    await planner.next_action(task, agent, observations, conversation_context)
 
     assert client.messages is not None
     user_prompt = client.messages[1]["content"]
@@ -247,7 +253,7 @@ async def test_history_summarized_after_three_steps(task, agent, profile, tmp_pa
     assert "被治理层拦截：路径未授权" in user_prompt
 
 
-async def test_budget_exceeded_records_planner_budget_exceeded(task, agent, profile, tmp_path) -> None:
+async def test_budget_exceeded_records_planner_budget_exceeded(task, conversation_context, agent, profile, tmp_path) -> None:
     """预算耗尽 → 返回 None 且 metadata.planner_budget_exceeded。"""
     response = LLMResponse(content='{"action": "finish"}')
     client = _RecordingFakeClient(response)
@@ -255,14 +261,14 @@ async def test_budget_exceeded_records_planner_budget_exceeded(task, agent, prof
     # max_tokens=1000 加上 prompt 估算必然超过 100
     planner = _planner(client, profile, audit_path, max_budget_token=100)
 
-    assert await planner.next_action(task, agent, []) is None
+    assert await planner.next_action(task, agent, [], conversation_context) is None
 
     events = _events(audit_path, task.task_id)
     assert events[0].action == "planner_error"
     assert events[0].metadata.get("planner_budget_exceeded") is True
 
 
-async def test_usage_commit_and_refund(task, agent, profile, tmp_path) -> None:
+async def test_usage_commit_and_refund(task, conversation_context, agent, profile, tmp_path) -> None:
     """真实 usage commit/refund 正确：reserved=0、committed=actual。"""
     response = LLMResponse(
         content=json.dumps({"action": "finish"}, ensure_ascii=False),
@@ -273,7 +279,7 @@ async def test_usage_commit_and_refund(task, agent, profile, tmp_path) -> None:
     audit_path = tmp_path / "audit.jsonl"
     planner = _planner(client, profile, audit_path)
 
-    await planner.next_action(task, agent, [])
+    await planner.next_action(task, agent, [], conversation_context)
 
     ledger = planner._budget_ledger
     assert ledger is not None
@@ -281,7 +287,7 @@ async def test_usage_commit_and_refund(task, agent, profile, tmp_path) -> None:
     assert ledger._committed[task.task_id] == 15
 
 
-async def test_api_key_not_in_audit_log(task, agent, profile, tmp_path, monkeypatch) -> None:
+async def test_api_key_not_in_audit_log(task, conversation_context, agent, profile, tmp_path, monkeypatch) -> None:
     """密钥纪律：planner_error 审计事件中也不含 API key。"""
     secret = "sk-test-12345-not-in-audit-log"
     monkeypatch.setenv("LLM_API_KEY", secret)
@@ -292,7 +298,7 @@ async def test_api_key_not_in_audit_log(task, agent, profile, tmp_path, monkeypa
     audit_path = tmp_path / "audit.jsonl"
     planner = _planner(client, profile, audit_path)
 
-    assert await planner.next_action(task, agent, []) is None
+    assert await planner.next_action(task, agent, [], conversation_context) is None
 
     raw = audit_path.read_text(encoding="utf-8")
     assert "planner_error" in raw

@@ -9,6 +9,7 @@ from loop_controller.budget import InMemoryBudgetLedger
 from loop_controller.checkpoint import Checkpoint, InMemoryDecisionStore
 from loop_controller.classifier import RuleBasedClassifier
 from loop_controller.infra.audit_store import JsonlAuditStore
+from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.config_loader import MaskingRules, ValuePattern
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import PolicyStore
@@ -118,6 +119,7 @@ def _build_runtime(audit_path: Path, steps: list) -> Runtime:
         ),
     )
     audit_store = JsonlAuditStore(audit_path)
+    conversation_store = JsonlConversationStore(audit_path.parent / "conversations.jsonl")
     planner: Planner = ScriptedPlanner(steps)
     r0 = ConfigR0Delegate(
         ApprovalConfig(
@@ -136,6 +138,7 @@ def _build_runtime(audit_path: Path, steps: list) -> Runtime:
         profiles={profile.profile_id: profile},
         session_manager=session_manager,
         risk_manager=risk_manager,
+        conversation_store=conversation_store,
     )
 
 

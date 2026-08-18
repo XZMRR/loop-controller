@@ -11,7 +11,14 @@ from typing import Protocol, runtime_checkable
 
 import yaml
 
-from loop_controller.models import Agent, PlannedAction, Task, ToolResult
+from loop_controller.models import (
+    Agent,
+    ConversationContext,
+    PlannedAction,
+    Task,
+    ToolResult,
+    UserQuestion,
+)
 
 
 @runtime_checkable
@@ -22,6 +29,9 @@ class Planner(Protocol):
     agent_id——这些身份字段由 run_task 框架统一生成/填充，Planner 无权自定。
 
     T3.5：``next_action`` 改为 async，以便 LLMPlanner 调用 ``MCPGateway.list_tools``。
+
+    v0.3.0 Iteration 4：新增 ``conversation_context``；返回类型扩展为
+    ``PlannedAction | UserQuestion | None``，显式表达需要用户补充输入。
     """
 
     async def next_action(
@@ -29,7 +39,8 @@ class Planner(Protocol):
         task: Task,
         agent: Agent,
         observations: list[ToolResult],
-    ) -> PlannedAction | None: ...
+        conversation_context: ConversationContext,
+    ) -> PlannedAction | UserQuestion | None: ...
 
 
 class ScriptedPlanner:
@@ -56,7 +67,8 @@ class ScriptedPlanner:
         task: Task,
         agent: Agent,
         observations: list[ToolResult],
-    ) -> PlannedAction | None:
+        conversation_context: ConversationContext,
+    ) -> PlannedAction | UserQuestion | None:
         if self._index >= len(self._steps):
             return None
         step = self._steps[self._index]
