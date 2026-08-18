@@ -136,6 +136,7 @@ def build_runtime(
     *,
     opa_url: str = "http://127.0.0.1:8181",
     planner_yaml: str | Path | None = None,
+    env_extra: dict[str, str] | None = None,
 ) -> Runtime:
     """从 ``AppConfig`` 组装 Runtime。
 
@@ -143,16 +144,20 @@ def build_runtime(
         config: 经 ``ConfigLoader.load`` 加载并校验后的配置。
         opa_url: OPA sidecar HTTP 地址。
         planner_yaml: ScriptedPlanner 脚本路径；缺省使用 ``config/scriptured_plan.yaml``。
+        env_extra: 传递给 MCP 子进程的额外环境变量；默认会注入 ``PYTHONPATH`` 指向项目 ``src``。
     """
     identity = ConfigIdentityProvider(config.agents, config.users)
     policy_store = FilePolicyStore(config.policy_dir)
     policy_engine = OPAPolicyEngine(base_url=opa_url, timeout=2.0)
 
     project_root = Path(config.policy_dir).parent
+    mcp_env = {"PYTHONPATH": str(project_root / "src")}
+    if env_extra is not None:
+        mcp_env.update(env_extra)
     gateway = MCPGateway(
         mcp_servers=dict(config.mcp_servers),
         tool_mapping=config.tool_mapping,
-        env_extra={"PYTHONPATH": str(project_root / "src")},
+        env_extra=mcp_env,
         cwd=str(project_root),
     )
     masker = Masker(config.masking_rules)

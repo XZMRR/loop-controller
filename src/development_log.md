@@ -321,12 +321,13 @@
 
 ### 测试
 
-- `tests/test_r0_delegate.py` 改为测试 `AsyncApprovalManager`；
-- `tests/test_cli.py` 覆盖 `lc approvals list/approve/deny`、审批人冲突校验、deny 必填 reason；
-- `tests/test_e2e_research_agent.py` 覆盖 approve/deny 路径完整事件序列，以及审批超时 `approval_expired` 事件；
-- `tests/test_audit_events.py` 更新事件序列以包含 `approval_consumed`；
-- `tests/test_config_loader.py` 移除 `behavior` 字段；
-- 全量 201 用例通过。
+- `tests/test_r0_delegate.py` 改为测试 `AsyncApprovalManager`;
+- `tests/test_cli.py` 覆盖 `lc approvals list/approve/deny`、审批人冲突校验、deny 必填 reason;
+- `tests/test_e2e_research_agent.py` 覆盖 approve/deny 路径完整事件序列，以及审批超时 `approval_expired` 事件;
+- `tests/test_audit_events.py` 更新事件序列以包含 `approval_consumed`;
+- `tests/test_config_loader.py` 移除 `behavior` 字段;
+- `tests/test_e2e_real_mcp.py` 新增真实 MCP 组件 E2E：使用 `build_runtime()` + 真实 `MCPGateway` + 本地 `email_mock`，验证邮件真实发出;
+- 全量 205 用例通过。
 
 ### 踩坑记录
 
@@ -334,6 +335,17 @@
 - **mcp SDK 版本差异**：当前环境 mcp SDK 使用装饰器式 handler（`@server.list_tools()` / `@server.call_tool()`）与 camelCase 字段（`inputSchema` / `isError`）；`mcp_gateway.py` 与 `mocks/email_server.py` 已做兼容处理。
 - **测试目录隔离**：`tmp_path_factory.mktemp("cli-config")` 会导致 `approvals.jsonl` 跨测试污染，改为 `tmp_path / "project"`。
 - **`ended` 标志误写 task_end**：resume 后 `ScriptedPlanner` 再次返回 send_email，循环体中错误设置 `ended=True` 导致暂停态写入了 `task_end`，已修正。
+
+### 审查阻塞项修复（reports/develop_mvp_review_for_team.md）
+
+| 优先级 | 问题 | 修复方式 | 自动化位置 |
+|---|---|---|---|
+| P0 | 拒绝路径预算未返还 | `evaluate()` 所有 `deny` / `require_approval` 路径 `refund()`；`forward()` modify 复核失败 `refund()`；resume 时重新预留 | `tests/test_checkpoint.py::test_evaluate_refund_on_policy_deny` |
+| P0 | 审批记录缺少强绑定验证 | `finalize_after_approval()` 校验 decision_id、request_id、approver_id、过期、重复应用；deny 必须带 reason | `tests/test_checkpoint.py::test_finalize_after_approval_binding_validation` |
+| P1 | DecisionStore 损坏日志 fail-open | `JsonlDecisionStore._load()` 遇到非法 JSON / 非法 Decision 直接抛 `DecisionStoreError` 并报告行号 | `tests/test_decision_store.py::test_corrupt_log_fail_closed` |
+| P1 | CI OPA 路径不一致 | `tests/conftest.py` 新增 `resolve_opa_bin()`：按 `OPA_PATH` -> `tools/opa` -> `tools/opa.exe` 解析 | 所有 OPA fixture 统一调用 |
+| P1 | 工程质量门禁未闭合 | CI 新增 `lint` job：ruff + mypy；test job 增加 OPA 可用性校验；修复 5 处 mypy error | `.github/workflows/ci.yml` |
+| P2 | E2E 仍用 FakeGateway | 新增 `tests/test_e2e_real_mcp.py`：使用 `build_runtime()` + 真实 `MCPGateway` + `email_mock` | `tests/test_e2e_real_mcp.py` |
 
 ### 验收状态更新
 

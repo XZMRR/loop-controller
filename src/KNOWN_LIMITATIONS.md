@@ -65,4 +65,4 @@ Rego 策略文件为明文，仅依赖文件系统权限保护。恶意 Agent �
 ## 环境备注
 
 - **Windows 开发机**：关闭 MCP stdio 子进程时会打 anyio cancel-scope 的 WARNING 日志（mcp SDK 2.x 已知行为），不影响主链路；CI（Linux）下不应出现，出现即说明容错逻辑误吞了正常路径。
-- **CI 的 e2e 测试**使用 FakeGateway 替代真实 MCP server；真实链路（stdio 转发）由发布前手动 gate 覆盖（见发布检查清单）。
+- **CI 的 e2e 测试**：`tests/test_e2e_research_agent.py` 仍使用 FakeGateway 以快速回归；`tests/test_e2e_real_mcp.py` 使用 `build_runtime()` + 真实 `MCPGateway` + 本地 `email_mock` server，作为发布前真实组件 gate。
