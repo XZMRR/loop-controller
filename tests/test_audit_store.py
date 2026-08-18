@@ -176,7 +176,7 @@ def _other_key() -> bytes:
 
 def test_hmac_chain_passes(tmp_path) -> None:
     path = tmp_path / "audit.jsonl"
-    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test")
     store.append(_make_event())
     store.append(_make_event(trace_id="t2"))
     assert store.verify_chain()
@@ -187,18 +187,18 @@ def test_hmac_chain_passes(tmp_path) -> None:
 def test_hmac_detects_wrong_key_on_resume(tmp_path) -> None:
     """用错误 key 恢复 store 后，verify_chain 应失败（HMAC 不匹配）。"""
     path = tmp_path / "audit.jsonl"
-    first = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+    first = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test")
     first.append(_make_event())
     first.append(_make_event())
 
-    evil = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_other_key())
+    evil = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_other_key(), key_id="test")
     assert not evil.verify_chain()
 
 
 def test_seal_detects_deletion_before_seal(tmp_path) -> None:
     """seal 之后删除 seal 之前的事件行，校验应失败。"""
     path = tmp_path / "audit.jsonl"
-    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test")
     store.append(_make_event())
     store.append(_make_event())
     store.append(_make_event())
@@ -209,13 +209,13 @@ def test_seal_detects_deletion_before_seal(tmp_path) -> None:
     del lines[-2]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key()).verify_chain()
+    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test").verify_chain()
 
 
 def test_seal_signature_domain_separation(tmp_path) -> None:
     """seal_signature 使用 seal_key，与 event hash 不同。"""
     path = tmp_path / "audit.jsonl"
-    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test")
     store.append(_make_event())
     store.seal()
 
@@ -228,7 +228,7 @@ def test_seal_signature_domain_separation(tmp_path) -> None:
     lines[-1] = json.dumps(seal_record, sort_keys=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key()).verify_chain()
+    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test").verify_chain()
 
 
 def test_hmac_requires_key(tmp_path) -> None:
@@ -253,7 +253,7 @@ def test_hmac_refuses_mixed_algo_file(tmp_path) -> None:
     legacy.append(_make_event())
 
     with pytest.raises(ValueError, match="请先归档"):
-        JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+        JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test")
 
 
 def test_sha256_can_verify_legacy_file(tmp_path) -> None:
@@ -271,7 +271,7 @@ def test_hmac_key_not_in_audit_log(tmp_path) -> None:
     """HMAC key 不能出现在审计日志文件中。"""
     path = tmp_path / "audit.jsonl"
     key = _hmac_key()
-    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=key)
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=key, key_id="test")
     store.append(_make_event())
     store.seal()
     raw = path.read_text(encoding="utf-8")
@@ -282,19 +282,19 @@ def test_hmac_key_not_in_audit_log(tmp_path) -> None:
 def test_truncated_file_fails_verification(tmp_path) -> None:
     """文件末尾被截断成不完整 JSON 行时，verify_chain 应失败。"""
     path = tmp_path / "audit.jsonl"
-    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test")
     store.append(_make_event())
     store.append(_make_event())
 
     raw = path.read_bytes()
     path.write_bytes(raw[:-10])  # 截断最后 10 字节
-    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key()).verify_chain()
+    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test").verify_chain()
 
 
 def test_forged_seal_metadata_fails(tmp_path) -> None:
     """伪造 seal 的 chain_hash 或 seal_signature 都应导致校验失败。"""
     path = tmp_path / "audit.jsonl"
-    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test")
     store.append(_make_event())
     store.seal()
 
@@ -304,13 +304,13 @@ def test_forged_seal_metadata_fails(tmp_path) -> None:
     lines[-1] = json.dumps(seal_record, sort_keys=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key()).verify_chain()
+    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test").verify_chain()
 
 
 def test_reordering_events_fails_hmac(tmp_path) -> None:
     """HMAC 模式下交换事件顺序也应导致 verify_chain 失败。"""
     path = tmp_path / "audit.jsonl"
-    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key())
+    store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test")
     store.append(_make_event(trace_id="t1"))
     store.append(_make_event(trace_id="t2"))
     store.append(_make_event(trace_id="t3"))
@@ -319,4 +319,4 @@ def test_reordering_events_fails_hmac(tmp_path) -> None:
     lines[0], lines[1] = lines[1], lines[0]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key()).verify_chain()
+    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test").verify_chain()

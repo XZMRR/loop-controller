@@ -143,6 +143,7 @@ class AppConfig:
     llm_planner: LLMPlannerConfig | None = None
     audit_hash_algo: Literal["sha256", "hmac-sha256"] = "sha256"
     audit_hmac_key_env: str = "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
+    audit_key_id: str = "default"  # HMAC key 标识，为密钥轮换留口
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +182,12 @@ class ConfigLoader:
                 f"当前值：{audit_hash_algo}"
             )
 
+        audit_key_id = os.environ.get("LOOP_CONTROLLER_AUDIT_KEY_ID", "default").strip()
+        if not audit_key_id:
+            raise ConfigValidationError(
+                "环境变量 LOOP_CONTROLLER_AUDIT_KEY_ID 不能为空（HMAC 模式下 key_id 用于轮换识别）"
+            )
+
         app_config = AppConfig(
             agents=agents,
             users=users,
@@ -196,6 +203,7 @@ class ConfigLoader:
             risk_state_path=str(root / "data" / "risk_state.jsonl"),
             llm_planner=llm_planner,
             audit_hash_algo=audit_hash_algo,
+            audit_key_id=audit_key_id,
         )
 
         self._check_profile_exists(app_config)

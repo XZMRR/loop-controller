@@ -145,6 +145,7 @@ def build_runtime(
         config.audit_log_path,
         hash_algo=config.audit_hash_algo,
         hmac_key=audit_key,
+        key_id=config.audit_key_id,
     )
 
     if config.llm_planner is not None and config.llm_planner.enabled:

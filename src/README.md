@@ -1,6 +1,6 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（MVP）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 策略判定 → 审批 → 授权转发 → 审计"的完整闭环。
+企业级 AI Agent 治理层（v0.2.0 可信执行基线）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 策略判定 → 审批 → 授权转发 → 审计"的完整闭环；v0.2.0 额外引入会话级风险记忆与 HMAC 审计链。
 
 **核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为 MCP Client Policy Gateway，是所有工具调用的**唯一授权出口**。
 
@@ -11,7 +11,8 @@
 - **人工审批链路**：高风险动作路由 R0-delegate 审批，deny 永远优先于 require_approval；
 - **权限组合分析**：静态规则表检测"A 权限 + B 权限 = C 风险"的组合（如读取知识库后外发邮件）；
 - **防重放授权**：Decision 单次使用、限期有效、跨重启持久化；
-- **可检测篡改的审计**：JSONL 全量日志 + HMAC-SHA256 哈希链 + seal 记录 + 参数分级掩码；
+- **可检测篡改的审计**：JSONL 全量日志 + 默认 HMAC-SHA256 哈希链 + seal 记录 + event/seal key 域分离 + 参数分级掩码；
+- **会话级风险记忆**：同一 session 内的异常动作会累积风险分，高 session risk 自动将 allow/modify 升级为 require_approval；
 - **预算控制**：按工具计费的 token 预算，超支即拒。
 
 ## 架构
@@ -45,6 +46,8 @@ echo "# AI 合规 checklist" > /data/kb/ai_compliance_checklist.md
 
 # 3. 配置审计 HMAC key（32 字节随机熵，hex 或 base64；生产环境应从密钥管理注入）
 export LOOP_CONTROLLER_AUDIT_HMAC_KEY=$(openssl rand -hex 32)
+# 可选：配置 key_id，用于未来密钥轮换识别（默认为 "default"）
+export LOOP_CONTROLLER_AUDIT_KEY_ID="default"
 
 # 4. 启动 OPA sidecar
 opa run --server --addr localhost:8181 policies/
@@ -79,7 +82,7 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 
 ## 已知局限
 
-**本项目是 MVP，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链不能防御整体重写、args_hash 使用 SHA-256、单进程 asyncio 假设、策略明文存储、token 预算为估算值。
+**本项目当前为 v0.2.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链需配合 seal/WORM、HMAC-SHA256 为默认、多轮对话上下文尚未进入 R2、单进程 asyncio 假设、外部 Agent 直接接入尚不支持。
 
 ## 文档
 
@@ -87,7 +90,8 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `Loop_Controller_MVP开发指南_v1.0.md`——三迭代开发计划与踩坑清单
 - `development_log.md`——开发记录与决策追溯
 - `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
-- `发布检查清单_v0.1.0.md`——发布前手动 gate 与自动化回归清单
+- `发布检查清单_v0.1.0.md`——v0.1.0 发布前手动 gate 与自动化回归清单
+- `发布检查清单_v0.2.0.md`——v0.2.0 发布前手动 gate 与自动化回归清单
 
 ## 许可与边界
 

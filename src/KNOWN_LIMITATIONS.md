@@ -1,6 +1,6 @@
 # 已知局限（Known Limitations）
 
-> 本文件列出 Loop Controller MVP（v0.1.0）**明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
+> 本文件列出 Loop Controller v0.2.0 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
 
 ---
 
@@ -10,7 +10,7 @@
 
 哈希链中，第 N 行的完整性由第 N+1 行的 `prev_hash` 承诺。文件末尾的最后一行没有后继，删除或篡改它无法被 `verify_chain()` 直接检出；但若此前写过 seal 记录，则删除 seal 之后的事件会破坏 seal 的 `chain_hash` 校验，删除 seal 之前的事件会破坏 seal 的 `prev_hash` 链接。
 
-- **当前缓解**：`JsonlAuditStore.seal()` 可手动或周期性调用；启用 HMAC-SHA256 时 seal 记录还受 `seal_key` 域分离签名保护；
+- **当前缓解**：`JsonlAuditStore.seal()` 可手动或周期性调用；启用 HMAC-SHA256 时 seal 记录还受 `seal_key` 域分离签名保护；审计事件与 seal 记录均带 `key_id` 用于密钥轮换识别；
 - **生产路径**：定期写 seal 记录 + WORM 存储 + 签名日志（post-MVP）。
 
 ### L2. 若显式回退 `sha256` 模式，低熵参数可被字典攻击
@@ -47,13 +47,16 @@ Rego 策略文件为明文，仅依赖文件系统权限保护。恶意 Agent �
 
 | # | 边界 | 说明 |
 |---|---|---|
-| F1 | 审批为配置打桩 | `ConfigR0Delegate` 按 `approval.yaml` 固定返回 approve/deny，无真实人类通知与 UI |
+| F1 | 审批为配置打桩 | `ConfigR0Delegate` 按 `approval.yaml` 固定返回 approve/deny，无真实人类通知与 UI；v0.3.0 将替换为异步审批 CLI |
 | F2 | 无 Agent 间交互治理 | 只治理 `tool_call`；多 Agent 委托、inter_agent 均未实现 |
 | F3 | 无 Earned Authority | 权限固定，无任务后临时提权；`fixed_ceiling` 保留为空 |
 | F4 | ~~LLMPlanner 未实现~~ 已实现（T3.5） | 默认仍关闭（`config/llm_planner.yaml`），开启后由 LLM 动态规划；密钥仅来自环境变量，失败不重试 |
 | F5 | 权限组合规则为静态 YAML | 无图分析/能力代数；规则需人工维护 |
 | F6 | 审计全量记录无采样 | 高负载场景需自行评估日志量 |
 | F7 | 财务支付预算未启用 | `payment_amount` 恒为 0 |
+| F8 | 多轮对话上下文未进入 R2 | `task_context` 仍主要来自初始 `Task.description`；用户后续澄清不参与治理判定；计划 v0.3.0 通过 `ConversationContext` 解决 |
+| F9 | 外部 Agent 直接接入尚不支持 | 当前仅支持框架内 Planner（Scripted / LLM）；外部 ReAct / Harness / Loop 等 Agent 需通过尚未实现的 MCP Proxy 接入 |
+| F10 | SSE/HTTP MCP transport 未支持 | 当前仅支持 stdio；SSE/HTTP transport 放入 P2 Proxy 阶段统一实现 |
 
 完整演进计划见方案文档 §9.3 post-MVP 路线图。
 

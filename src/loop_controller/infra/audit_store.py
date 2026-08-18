@@ -71,6 +71,8 @@ class JsonlAuditStore:
         if hash_algo == "hmac-sha256":
             if hmac_key is None:
                 raise ValueError("hmac-sha256 必须提供 hmac_key")
+            if not key_id:
+                raise ValueError("hmac-sha256 模式下 key_id 必须非空（用于密钥轮换识别）")
             self._event_key = _derive_key(hmac_key, self._EVENT_LABEL)
             self._seal_key = _derive_key(hmac_key, self._SEAL_LABEL)
         else:
@@ -114,10 +116,10 @@ class JsonlAuditStore:
 
         last = json.loads(valid_lines[-1])
         seq = int(last.get("seq", 0))
-        prev_hash = self._hash(valid_lines[-1])
         last_algo = last.get("hash_algo", "sha256")
 
-        # 重放完整文件恢复 chain_hash。
+        # 重放完整文件恢复 chain_hash；chain_hash 即为最后一行的 hash，
+        # 它同时是下一行的 prev_hash（sha256 与 hmac 模式均一致）。
         chain_hash = self._GENESIS
         for line in valid_lines:
             record = json.loads(line)
@@ -126,7 +128,7 @@ class JsonlAuditStore:
                 chain_hash = self._hash(line, chain_hash)
             else:
                 chain_hash = self._hash(line, chain_hash)
-        return seq, prev_hash, chain_hash, last_algo
+        return seq, chain_hash, chain_hash, last_algo
 
     def _hash(self, text: str, chain_hash: str | None = None) -> str:
         """计算单行文本的哈希。
