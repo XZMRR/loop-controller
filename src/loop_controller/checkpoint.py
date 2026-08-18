@@ -219,6 +219,8 @@ class Checkpoint:
         self._now = now or _utc_now
         # per-task 已成功执行的动作历史（§6.1 步骤 5 / 偏离 D12），任务结束即弃。
         self._history: dict[str, list[ActionProposal]] = {}
+        # 已通过审批转换的 require_approval decision_id，防止同一审批结果重复应用（P0）
+        self._finalized_decisions: set[str] = set()
 
     # -- 生命周期 -----------------------------------------------------------
 
@@ -229,6 +231,14 @@ class Checkpoint:
     def _cost_for(self, proposal: ActionProposal) -> BudgetCost:
         """该工具单次调用的估算成本（v1.1：按工具 cost_per_call；未配置回退默认值）。"""
         return self._tool_costs.get(proposal.tool_name, _DEFAULT_PER_CALL_COST)
+
+    def _refund_for(self, proposal: ActionProposal) -> None:
+        """将当前 proposal 已预留的预算返还（P0：所有非执行路径必须 refund）。"""
+        self._budget_ledger.refund(proposal.task_id, self._cost_for(proposal))
+
+    def reserve_for_execution(self, task_id: str, proposal: ActionProposal) -> bool:
+        """为即将执行的动作预留预算（resume 路径使用）。"""
+        return self._budget_ledger.check_and_reserve(task_id, self._cost_for(proposal))
 
     # -- evaluate：判定流水线（§6.1） ----------------------------------------
 
@@ -290,7 +300,8 @@ class Checkpoint:
         rule = self._permission_analyzer.check(proposal, history)
         if rule is not None:
             if rule.action == "deny":
-                # deny 短路，不进入 Rego
+                # deny 短路，不进入 Rego；返还已预留预算
+                self._refund_for(proposal)
                 return self._deny(proposal, rule.reason, now, policy_version, policy_hits=[rule.id])
             pending_approval = True  # require_approval 不短路，继续走 Rego（deny 优先原则）
 
@@ -302,6 +313,7 @@ class Checkpoint:
         verdict = rego_decision.get("verdict")
         if verdict == "deny":
             self._risk_manager.update(task.session_id, "deny")
+            self._refund_for(proposal)
             return self._deny(
                 proposal,
                 rego_decision.get("reason", "denied by policy"),
@@ -311,6 +323,7 @@ class Checkpoint:
             )
         if verdict not in ("allow", "modify", "require_approval"):
             self._risk_manager.update(task.session_id, "deny")
+            self._refund_for(proposal)
             return self._deny(proposal, "invalid policy verdict", now, policy_version)
 
         # 步骤 7：汇总输出 Decision。
@@ -331,6 +344,8 @@ class Checkpoint:
             self._risk_manager.update(task.session_id, "require_approval")
             if proposal.risk_level == "critical":
                 self._risk_manager.update(task.session_id, "critical")
+            # require_approval 暂停执行，先返还预算；resume 时再重新预留
+            self._refund_for(proposal)
             return self._handle_require_approval(agent, proposal, profile, reason, now, policy_version, hits)
 
         if proposal.risk_level == "critical":
@@ -408,10 +423,32 @@ class Checkpoint:
             approver_id=approver_id,
         )
 
-    def finalize_after_approval(self, decision: Decision, record) -> Decision:
-        """审批通过后生成可执行 Decision（approve→allow；deny→deny）。"""
+    def finalize_after_approval(
+        self, decision: Decision, record, request: ApprovalRequest
+    ) -> Decision:
+        """审批通过后生成可执行 Decision（approve→allow；deny→deny）。
+
+        P0：强绑定校验——审批记录必须与原始 Decision、ApprovalRequest 完全匹配，
+        且审批人必须是 escalation_target；否则抛 CheckpointError。
+        """
         now = self._now()
+        if decision.decision_id != record.decision_id:
+            raise CheckpointError("审批记录 decision_id 与 Decision 不匹配")
+        if request.request_id != record.request_id:
+            raise CheckpointError("审批记录 request_id 与 ApprovalRequest 不匹配")
+        if decision.escalation_target is None or decision.escalation_target != record.approver_id:
+            raise CheckpointError("审批人不是该 Decision 的 escalation_target")
+        if decision.verdict != "require_approval":
+            raise CheckpointError("只有 require_approval 状态的 Decision 才能被审批")
+        if decision.expires_at is not None and decision.expires_at < now:
+            raise CheckpointError("Decision 已过期")
+        if decision.decision_id in self._finalized_decisions:
+            raise CheckpointError("该审批结果已被应用，不可重复执行")
+        self._finalized_decisions.add(decision.decision_id)
+
         if record.verdict == "deny":
+            if not record.comment or not str(record.comment).strip():
+                raise CheckpointError("deny 审批必须提供原因")
             return decision.model_copy(
                 update={
                     "verdict": "deny",
@@ -487,9 +524,11 @@ class Checkpoint:
         effective_args = proposal.arguments
         if decision.verdict == "modify":
             if decision.modified_args is None or set(decision.modified_args) != set(proposal.arguments):
+                self._refund_for(proposal)
                 return self._blocked(proposal, "modified_args 缺失或改动超出参数值范围")
             perm = self._tool_permission_for(proposal)
             if perm is None or not self._args_allowed(perm, decision.modified_args):
+                self._refund_for(proposal)
                 return self._blocked(proposal, "modify 后参数未通过 Profile 白/黑名单复核")
             effective_args = decision.modified_args
 

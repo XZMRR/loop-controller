@@ -29,3 +29,7 @@ class AsyncApprovalManager:
     def check(self, decision_id: str) -> ApprovalRecord | None:
         """查询审批结果；未审批返回 None。"""
         return self._store.get_record(decision_id)
+
+    def get_request(self, decision_id: str) -> ApprovalRequest | None:
+        """查询原始审批请求（用于 resume 时强绑定校验）。"""
+        return self._store.get_request(decision_id)

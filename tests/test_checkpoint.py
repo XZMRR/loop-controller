@@ -26,6 +26,8 @@ from loop_controller.models import (
     ActionProposal,
     Agent,
     ApprovalRecord,
+    ApprovalRequest,
+    BudgetCost,
     CapabilityProfile,
     Decision,
     Task,
@@ -442,6 +444,18 @@ def test_finalize_after_approval(
         profile_version="v",
         expires_at=datetime.now(UTC) + timedelta(minutes=15),
     )
+    request = ApprovalRequest(
+        request_id="r1",
+        decision_id=decision.decision_id,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        agent_id=agent.agent_id,
+        tool_name="send_email",
+        arguments_masked=dict(proposal.arguments),
+        reason="approval",
+        requester_id=task.user_id,
+        approver_id=agent.owner_id,
+    )
 
     approved = cp.finalize_after_approval(
         decision,
@@ -452,22 +466,98 @@ def test_finalize_after_approval(
             approver_id=agent.owner_id,
             comment="ok",
         ),
+        request,
     )
     assert approved.verdict == "allow"
     assert "approval:granted" in approved.policy_hits
 
-    denied = cp.finalize_after_approval(
-        decision,
-        ApprovalRecord(
-            request_id="r1",
-            decision_id=decision.decision_id,
-            verdict="deny",
-            approver_id=agent.owner_id,
-            comment="no",
-        ),
+    # 同一 decision 已被 finalize，再次应用会被拒绝
+    with pytest.raises(CheckpointError):
+        cp.finalize_after_approval(
+            decision,
+            ApprovalRecord(
+                request_id="r1",
+                decision_id=decision.decision_id,
+                verdict="deny",
+                approver_id=agent.owner_id,
+                comment="no",
+            ),
+            request,
+        )
+
+
+def test_finalize_after_approval_binding_validation(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """P0：finalize_after_approval 必须强绑定校验 record / decision / request。"""
+    cp, _, _ = make_checkpoint(profile, identity)
+    proposal = make_proposal(task, agent, tool_name="send_email")
+    decision = Decision(
+        decision_id="d-binding",
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        verdict="require_approval",
+        reason="approval",
+        escalation_target=agent.owner_id,
+        policy_hits=[],
+        policy_version="v",
+        profile_version="v",
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
     )
-    assert denied.verdict == "deny"
-    assert denied.max_uses == 0
+    request = ApprovalRequest(
+        request_id="r-binding",
+        decision_id=decision.decision_id,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        agent_id=agent.agent_id,
+        tool_name="send_email",
+        arguments_masked=dict(proposal.arguments),
+        reason="approval",
+        requester_id=task.user_id,
+        approver_id=agent.owner_id,
+    )
+
+    # wrong approver
+    with pytest.raises(CheckpointError):
+        cp.finalize_after_approval(
+            decision,
+            ApprovalRecord(
+                request_id=request.request_id,
+                decision_id=decision.decision_id,
+                verdict="approve",
+                approver_id="someone_else",
+                comment="ok",
+            ),
+            request,
+        )
+
+    # mismatched request_id
+    with pytest.raises(CheckpointError):
+        cp.finalize_after_approval(
+            decision,
+            ApprovalRecord(
+                request_id="wrong-request",
+                decision_id=decision.decision_id,
+                verdict="approve",
+                approver_id=agent.owner_id,
+                comment="ok",
+            ),
+            request,
+        )
+
+    # deny without comment
+    with pytest.raises(CheckpointError):
+        cp.finalize_after_approval(
+            decision,
+            ApprovalRecord(
+                request_id=request.request_id,
+                decision_id=decision.decision_id,
+                verdict="deny",
+                approver_id=agent.owner_id,
+                comment="",
+            ),
+            request,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -497,15 +587,17 @@ async def test_evaluate_call_limit_exceeded(
     decision1 = await cp.evaluate(task, agent, proposal1)
     assert decision1.verdict == "require_approval"
 
+    request1 = cp.build_approval_request(decision1, proposal1, task)
     allowed = cp.finalize_after_approval(
         decision1,
         ApprovalRecord(
-            request_id="r1",
+            request_id=request1.request_id,
             decision_id=decision1.decision_id,
             verdict="approve",
             approver_id=agent.owner_id,
             comment="ok",
         ),
+        request1,
     )
     await cp.forward(proposal1, allowed)
 
@@ -539,8 +631,6 @@ async def test_evaluate_budget_cost_per_call(
     task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
 ) -> None:
     """v1.1（评审#3）：按工具 cost_per_call 计费——大成本工具被拒、小成本工具放行。"""
-    from loop_controller.models import BudgetCost
-
     tight_profile = profile.model_copy(update={"max_budget_token": 400})
     cp, engine, _ = make_checkpoint(
         tight_profile,
@@ -559,6 +649,30 @@ async def test_evaluate_budget_cost_per_call(
     assert dear.reason == "budget exceeded"
     # 低成本工具照常发起 OPA 查询；高成本工具在步骤 4 短路
     assert [c["tool_name"] for c in engine.calls] == ["web_search"]
+
+
+async def test_evaluate_refund_on_policy_deny(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """P0：策略 deny 路径必须返还已预留预算，否则第二次同样调用会被误判为预算耗尽。"""
+    tight_profile = profile.model_copy(update={"max_budget_token": 300})
+    cp, engine, _ = make_checkpoint(
+        tight_profile,
+        identity,
+        tool_costs={"send_email": BudgetCost(token_count=200)},
+        engine_by_tool={"send_email": {"verdict": "deny", "reason": "sensitive tool"}},
+    )
+
+    # 第一次：预留 200，策略 deny，应返还预算
+    first = await cp.evaluate(task, agent, make_proposal(task, agent, tool_name="send_email"))
+    assert first.verdict == "deny"
+    assert first.reason == "sensitive tool"
+
+    # 第二次：如果预算未返还，再次预留 200 会超过 300；返还后则能正常 deny
+    second = await cp.evaluate(task, agent, make_proposal(task, agent, tool_name="send_email"))
+    assert second.verdict == "deny"
+    assert second.reason == "sensitive tool"
+    assert len(engine.calls) == 2
 
 
 async def test_permission_interaction_deny_short_circuit(

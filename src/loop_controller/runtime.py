@@ -359,6 +359,11 @@ async def _run_task_loop(
                 return pending
 
             decision = _finalize_after_approval(runtime, task, proposal, decision, record, audit)
+            # v0.3.0：require_approval 路径在 evaluate() 已返还预算，执行前需重新预留
+            if decision.verdict in ("allow", "modify") and not runtime.checkpoint.reserve_for_execution(
+                task.task_id, proposal
+            ):
+                raise CheckpointError(f"resume 时预算不足：{proposal.tool_name}")
             await _execute_decision(task, runtime, proposal, decision, audit, observations)
             ended = True
 
@@ -531,7 +536,11 @@ def _finalize_after_approval(
             masker=runtime.masker,
         )
     )
-    decision = runtime.checkpoint.finalize_after_approval(decision, record)
+    # P0：强绑定校验需要原始 ApprovalRequest
+    request = runtime.approval_manager.get_request(decision.decision_id)
+    if request is None:
+        raise CheckpointError(f"找不到 decision_id={decision.decision_id} 的审批请求")
+    decision = runtime.checkpoint.finalize_after_approval(decision, record, request)
     # v1.2：审批结果进入会话风险状态
     if record.verdict == "approve":
         runtime.risk_manager.update(task.session_id, "approval_granted")
