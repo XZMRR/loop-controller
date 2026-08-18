@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import socket
 import subprocess
@@ -45,9 +44,10 @@ from loop_controller.policy_engine import OPAPolicyEngine
 from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
 from loop_controller.runtime import Runtime, resume_task, run_task
 from loop_controller.session import SessionManager
+from tests.conftest import resolve_opa_bin
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-OPA_BIN = Path(os.environ.get("OPA_PATH", REPO_ROOT / "tools" / "opa.exe"))
+OPA_BIN = resolve_opa_bin(REPO_ROOT)
 
 
 class _FakeGateway(MCPGateway):

@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import dataclasses
-import os
 import shutil
 import socket
 import subprocess
@@ -21,9 +20,10 @@ import pytest
 import yaml
 
 from loop_controller.infra.config_loader import ConfigLoader, ConfigValidationError
+from tests.conftest import resolve_opa_bin
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-OPA_BIN = Path(os.environ.get("OPA_PATH", REPO_ROOT / "tools" / "opa.exe"))
+OPA_BIN = resolve_opa_bin(REPO_ROOT)
 
 MINIMAL_REGO = (
     "package loop_controller.tool_permission\n"
