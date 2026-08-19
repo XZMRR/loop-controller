@@ -384,20 +384,34 @@
 
 ---
 
-## v0.5.0：MCP Proxy / 外来 Agent 接入（规划中）
+## v0.5.0：MCP Proxy / 外来 Agent 接入
 
 目标：把 Loop Controller 同时暴露为一个 MCP Server，使未安装 Loop Controller SDK 的第三方 Agent 也能被 R2/R3 治理。
 
-### 规划要点
+### 完成内容
 
-- 新增 `src/loop_controller/proxy_server.py`，基于 `mcp.server.Server` 实现；
-- 外部 Agent 作为 MCP Client 连接，每次 tool call 映射为一个 `ActionProposal`；
-- 复用 `Runtime`、`Checkpoint`、`MCPGateway`，不使用 `Planner`；
-- 支持 stdio 和 SSE 两种传输；
-- CLI 入口 `lc proxy --agent-id xxx --user-id alice [--transport sse --port 8080]`；
-- SSE 模式通过 HTTP header 透传 agent/user/session；
-- `require_approval` 在 v0.5.0 直接 deny（MCP tool call 同步，无法暂停等待人工审批）；
-- 同一连接内多次 tool call 共享 Session，v0.4.0 风险累计生效。
+- **`src/loop_controller/proxy_server.py`**：新增 `LoopControllerProxyServer`；
+  - 低层 MCP Server 注册 `tools/list` 与 `tools/call` 处理器；
+  - stdio 传输用于本地子进程/CLI 集成；
+  - SSE 传输基于 Starlette + `SseServerTransport`，支持 HTTP header 身份覆盖；
+  - 每次 tool call 映射为一个 `ActionProposal`，经 `Checkpoint.evaluate()` + `forward()` 治理后转发到真实 MCP Server；
+  - `require_approval` 直接返回 `BLOCKED: requires human approval` 并附带 `decision_id`。
+- **CLI 入口**：`lc proxy --agent-id <id> --user-id <id> [--transport sse --host ... --port ...]`；
+- **Mock server 适配**：把 `email_server.py` 从旧版低层 `Server` 装饰器 API 迁移到 `mcp.server.mcpserver.MCPServer`，兼容当前 `mcp>=1.0`；
+- **测试**：新增 `tests/test_proxy_server.py`，覆盖工具列表透传、allow 执行、deny 拒绝、审批阻塞、连续拒绝 Session 熔断。
+
+### 关键决策
+
+- **不使用 Planner**：外部 Agent 自行决定调用什么工具，Loop Controller 只负责单次 tool call 的治理；
+- **同步调用限制**：MCP tool call 是请求-响应模式，v0.5.0 不实现长轮询等待人工审批；
+- **身份映射**：stdio 使用 CLI 参数；SSE 可被 header 覆盖，但默认仍以 CLI 身份兜底；
+- **Session 复用**：同一 SSE 连接内多次 tool call 共享 Session，v0.4.0 的 `consecutive_deny_count` 和 `cumulative_risk_score` 自然生效。
+
+### 验收状态
+
+- `pytest tests/`：**217 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：**Success**
 
 ### 设计文档
 
