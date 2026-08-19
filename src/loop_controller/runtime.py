@@ -10,12 +10,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from loop_controller.approval_manager import AsyncApprovalManager
-from loop_controller.budget import InMemoryBudgetLedger
+from loop_controller.budget import JsonlBudgetLedger
 from loop_controller.checkpoint import Checkpoint, CheckpointError
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
 from loop_controller.infra.approval_store import JsonlApprovalStore
@@ -25,6 +25,7 @@ from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.decision_store import JsonlDecisionStore
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import FilePolicyStore
+from loop_controller.infra.task_store import InMemoryTaskStore, JsonlTaskStore, TaskStore
 from loop_controller.llm_planner import HttpxLLMClient, LLMPlanner
 from loop_controller.masker import Masker
 from loop_controller.mcp_gateway import MCPGateway
@@ -73,7 +74,8 @@ class Runtime:
     profiles: dict[str, Any]  # CapabilityProfile
     session_manager: SessionManager  # v1.2 会话分配与校验
     risk_manager: RiskStateManager  # v1.2 会话级风险状态
-    conversation_store: JsonlConversationStore  # v0.3.0 会话上下文
+    conversation_store: JsonlConversationStore  # v0.3.0 会话上下文持久化
+    task_store: TaskStore = field(default_factory=InMemoryTaskStore)  # v0.6.0 Task 持久化
 
     def create_task(
         self,
@@ -109,8 +111,14 @@ class Runtime:
             user_id=user_id,
             agent_id=agent_id,
             description=description,
+            status="created",
         )
+        self.task_store.save(task)
         return task, session
+
+    def get_task(self, task_id: str) -> Task | None:
+        """v0.6.0：从持久化 TaskStore 读取 Task。"""
+        return self.task_store.get(task_id)
 
     def add_user_message(self, session_id: str, task_id: str, content: str) -> ConversationMessage:
         """记录一条用户消息；供外部调用方在收到 ``needs_user_input`` 后写入回复。"""
@@ -186,13 +194,14 @@ def build_runtime(
         cwd=str(project_root),
     )
     masker = Masker(config.masking_rules)
-    budget_ledger = InMemoryBudgetLedger()
+    budget_ledger = JsonlBudgetLedger(config.budget_ledger_path)
     session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
     risk_manager = RiskStateManager(JsonlRiskStateStore(config.risk_state_path))
     conversation_store = JsonlConversationStore(
         config.conversation_path,
         max_messages_per_session=config.conversation_max_messages_per_session,
     )
+    task_store = JsonlTaskStore(config.task_store_path)
     checkpoint = Checkpoint(
         profiles=config.profiles,
         policy_engine=policy_engine,
@@ -249,6 +258,7 @@ def build_runtime(
         session_manager=session_manager,
         risk_manager=risk_manager,
         conversation_store=conversation_store,
+        task_store=task_store,
     )
 
 
@@ -485,6 +495,7 @@ async def _run_task_loop(
         if ended:
             audit.append(_audit_event(task, action="task_end", masker=runtime.masker))
             runtime.checkpoint.forget_task(task.task_id)
+            runtime.task_store.complete(task.task_id)
 
     return TaskRunResult(
         status="completed",

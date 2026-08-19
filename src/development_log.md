@@ -465,6 +465,59 @@
 
 ---
 
+## v0.6.0：持久化基础设施（TaskStore + BudgetLedger）
+
+目标：消除 v0.5.1 已知的 Proxy 重启后审批重试失败问题，并让预算状态在生产环境可持久化。
+
+### 完成内容
+
+- **`Task` 模型扩展**：新增 `status: Literal["created", "completed"]`（默认 `created`）和 `completed_at: datetime | None`，支持生命周期持久化；向后兼容，默认值不影响已有测试。
+- **`JsonlTaskStore`**（`src/loop_controller/infra/task_store.py`）：
+  - append-only JSONL，记录 `{"type": "task"}` 和 `{"type": "task_complete"}`；
+  - `get(task_id)` 从尾部向前扫描返回最新状态；遇到 `task_complete` 返回 `None`；
+  - 损坏文件 fail-closed，抛 `TaskStoreError`；
+  - 提供 `InMemoryTaskStore` 作为测试默认实现。
+- **`Runtime` 集成**：
+  - 新增 `task_store: TaskStore = field(default_factory=InMemoryTaskStore)`；
+  - `create_task()` 构造 Task 后立即 `task_store.save(task)`；
+  - 新增 `get_task(task_id)` 从 Store 读取；
+  - `run_task()` 任务结束时调用 `task_store.complete(task.task_id)`。
+- **`JsonlBudgetLedger`**（`src/loop_controller/budget.py`）：
+  - append-only JSONL，记录 `set_budget` / `reserve` / `commit` / `refund` 事件；
+  - 启动时重放所有事件恢复内存状态；
+  - 损坏文件 fail-closed，抛 `BudgetLedgerError`；
+  - 保留 `InMemoryBudgetLedger` 供测试和旧代码使用。
+- **`build_runtime()` 默认使用持久化实现**：
+  - `JsonlBudgetLedger(config.budget_ledger_path)`；
+  - `JsonlTaskStore(config.task_store_path)`；
+- **配置扩展**：`AppConfig` 新增 `task_store_path` / `budget_ledger_path`，支持环境变量覆盖；
+- **`ProxyServer` 重试恢复**：v0.6.0 起不再依赖进程内存 `_tasks` 缓存，改从持久化 `Runtime.get_task()` 恢复原始 Task；v0.5.1 的已知限制解除。
+
+### 关键决策
+
+- **向后兼容**：`Runtime.task_store` 默认 `InMemoryTaskStore`，所有已有测试无需改动；生产环境由 `build_runtime()` 注入 `JsonlTaskStore`。
+- **最小改动**：没有引入 `BudgetReservation` 状态机，只是让 `BudgetLedger` 持久化；`BudgetLedger` Protocol 方法签名保持不变。
+- **fail-closed**：TaskStore / BudgetLedger 文件损坏直接抛异常，拒绝启动，与 `DecisionStore` 行为一致。
+- **Windows 测试限制**：完整"关闭 Runtime A 并立即重启 Runtime B"会触发 anyio stdio 子进程取消竞态，因此集成测试保持 A 不关闭、用 B 读取同一数据目录来验证持久化恢复；生产环境真实进程重启不受此限制。
+
+### 新增/更新测试
+
+- `tests/test_task_store.py`：6 个 JsonlTaskStore 测试；
+- `tests/test_budget.py`：4 个 JsonlBudgetLedger 持久化测试；
+- `tests/test_proxy_server.py`：`test_proxy_retry_survives_runtime_restart` 验证新 Runtime 读取持久化数据后成功重试。
+
+### 验收状态
+
+- `pytest tests/`：**231 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误（`planner.py`、`config_loader.py`），与本次改动无关。
+
+### 设计文档
+
+- `src/loop_controller_v0.6.0_development.md`
+
+---
+
 ## 后续可选工作
 
 - **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。

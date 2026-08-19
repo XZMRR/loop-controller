@@ -152,6 +152,8 @@ class AppConfig:
     conversation_path: str = "./data/conversations.jsonl"  # v0.3.0 会话上下文持久化路径
     conversation_max_messages_per_session: int = 100  # v0.3.0 每个 session 保留消息数
     approval_store_path: str = "./data/approvals.jsonl"  # v0.3.0 审批请求/结果持久化路径
+    task_store_path: str = "./data/tasks.jsonl"  # v0.6.0 Task 持久化路径
+    budget_ledger_path: str = "./data/budget.jsonl"  # v0.6.0 预算事件持久化路径
     llm_planner: LLMPlannerConfig | None = None
     audit_hash_algo: AuditHashAlgorithm = "sha256"
     audit_hmac_key_env: str = "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
@@ -212,6 +214,12 @@ class ConfigLoader:
         session_path = os.environ.get(
             "LOOP_CONTROLLER_SESSION_PATH", str(root / "data" / "sessions.jsonl")
         )
+        task_store_path = os.environ.get(
+            "LOOP_CONTROLLER_TASK_STORE_PATH", str(root / "data" / "tasks.jsonl")
+        )
+        budget_ledger_path = os.environ.get(
+            "LOOP_CONTROLLER_BUDGET_LEDGER_PATH", str(root / "data" / "budget.jsonl")
+        )
 
         app_config = AppConfig(
             agents=agents,
@@ -229,6 +237,8 @@ class ConfigLoader:
             session_path=session_path,
             conversation_path=conversation_path,
             approval_store_path=approval_store_path,
+            task_store_path=task_store_path,
+            budget_ledger_path=budget_ledger_path,
             llm_planner=llm_planner,
             audit_hash_algo=audit_hash_algo,
             audit_key_id=audit_key_id,

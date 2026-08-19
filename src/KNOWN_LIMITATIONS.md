@@ -57,7 +57,7 @@ Rego 策略文件为明文，仅依赖文件系统权限保护。恶意 Agent �
 | F8 | ~~多轮对话上下文未进入 R2~~ 已实现 | v0.3.0 Iteration 4 通过 `ConversationContext` + `build_governance_context` 让当前 Task 的最近用户/Agent 消息进入 R2；跨 Task 同 session 消息暂未混入 |
 | F9 | ~~外部 Agent 直接接入尚不支持~~ 已实现 MCP Proxy | v0.5.0 起 `LoopControllerProxyServer` 通过 stdio/SSE 把 Loop Controller 暴露为 MCP Server；v0.5.1 完成 `require_approval` 结构化响应与审批后重试 |
 | F10 | ~~SSE/HTTP MCP transport 未支持~~ 已实现 | v0.5.0 起同时支持 stdio 与 SSE transport |
-| F11 | MCP Proxy 审批重试依赖 Proxy 进程存活 | v0.5.1 为简化实现，Task 仅缓存在 Proxy 进程内存；Proxy 重启后无法恢复 pending Task，审批通过后的重试会失败；v0.6.0 引入持久化 `TaskStore` 后解除 |
+| F11 | ~~MCP Proxy 审批重试依赖 Proxy 进程存活~~ 已解决 | v0.6.0 引入 `JsonlTaskStore`，`Runtime.get_task()` 可从持久化存储恢复 Task，新 Runtime 读取同一数据目录即可完成审批后重试 |
 
 完整演进计划见方案文档 §9.3 post-MVP 路线图。
 

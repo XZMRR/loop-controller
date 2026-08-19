@@ -333,6 +333,97 @@ async def test_proxy_session_block_after_consecutive_denies(
     assert "session blocked" in text.lower() or "consecutive" in text.lower()
 
 
+@pytest.mark.asyncio
+async def test_proxy_retry_survives_runtime_restart(
+    workdir: Path,
+    sent_emails_path: Path,
+    opa_server: str,
+) -> None:
+    """v0.6.0：新 Runtime 使用同一数据目录时，能恢复 Task 并完成审批后重试。
+
+    注：Windows 上完整关闭并立即重启 MCP stdio 子进程会触发 anyio cancel scope
+    竞态，因此本测试保持 Runtime A 不关闭，用 Runtime B 模拟"新进程读取持久化数据"的场景。
+    """
+    config = ConfigLoader().load(workdir / "config", opa_base_url=opa_server)
+
+    runtime_a = build_runtime(
+        config,
+        opa_url=opa_server,
+        env_extra={
+            "PYTHONPATH": str(REPO_ROOT / "src"),
+            "SENT_EMAILS_PATH": str(sent_emails_path),
+        },
+    )
+    await runtime_a.start()
+    try:
+        proxy_a = LoopControllerProxyServer(
+            runtime_a,
+            ProxyIdentity(agent_id="researcher_001", user_id="alice"),
+        )
+        first = await proxy_a._handle_call_tool(
+            _fake_request_context(),
+            CallToolRequestParams(
+                name="send_email",
+                arguments={
+                    "to": "boss@company.com",
+                    "subject": "report",
+                    "body": "please review",
+                },
+            ),
+        )
+        assert first.is_error
+        pending = json.loads(first.content[0].text)
+        decision_id = pending["decision_id"]
+        request_id = pending["request_id"]
+
+        # 在 Runtime A 内审批通过
+        from loop_controller.models import ApprovalRecord
+
+        runtime_a.approval_manager._store.record_response(
+            ApprovalRecord(
+                request_id=request_id,
+                decision_id=decision_id,
+                verdict="approve",
+                approver_id="zhang_manager",
+                comment="approved",
+            )
+        )
+
+        # Runtime B 使用同一数据目录启动；Proxy B 重试
+        runtime_b = build_runtime(
+            config,
+            opa_url=opa_server,
+            env_extra={
+                "PYTHONPATH": str(REPO_ROOT / "src"),
+                "SENT_EMAILS_PATH": str(sent_emails_path),
+            },
+        )
+        await runtime_b.start()
+        try:
+            proxy_b = LoopControllerProxyServer(
+                runtime_b,
+                ProxyIdentity(agent_id="researcher_001", user_id="alice"),
+            )
+            retry = await proxy_b._handle_call_tool(
+                _fake_request_context(),
+                CallToolRequestParams(
+                    name="send_email",
+                    arguments={
+                        "_loop_controller_decision_id": decision_id,
+                        "to": "boss@company.com",
+                        "subject": "report",
+                        "body": "please review",
+                    },
+                ),
+            )
+            assert not retry.is_error
+            assert "queued" in retry.content[0].text.lower()
+        finally:
+            await runtime_b.aclose()
+    finally:
+        await runtime_a.aclose()
+
+
 def _fake_request_context() -> Any:
     """stdio 模式下 _resolve_identity 不使用 ctx.request，返回 None 即可。"""
     return None

@@ -40,7 +40,6 @@ from loop_controller.models import (
     ApprovalRequest,
     CapabilityProfile,
     Decision,
-    Task,
     ToolResult,
 )
 from loop_controller.runtime import Runtime
@@ -75,9 +74,6 @@ class LoopControllerProxyServer:
         if profile is None:
             raise ValueError(f"profile {self._agent.profile_id!r} 不存在")
         self._profile = cast(CapabilityProfile, profile)
-        # v0.5.1：内存缓存本 Proxy 进程创建的 Task，供重试时恢复。
-        # Proxy 进程重启后缓存丢失，是已知限制。
-        self._tasks: dict[str, Task] = {}
 
     # -- 公共入口 -----------------------------------------------------------
 
@@ -225,12 +221,11 @@ class LoopControllerProxyServer:
                 f"original decision not recorded for decision_id={decision_id}"
             )
 
-        task = self._tasks.get(request.task_id)
+        # v0.6.0：通过持久化 TaskStore 恢复原始 Task。
+        task = self._runtime.get_task(request.task_id)
         if task is None:
-            # Proxy 进程重启后缓存丢失，尝试重建 Task（Session 可能也已丢失）
             return self._error_result(
-                "original task not available; please retry without decision_id "
-                "or keep Proxy process alive"
+                "original task not available; please retry without decision_id"
             )
 
         # 将原始 require_approval Decision 转换为可执行的 allow/deny Decision。
@@ -288,8 +283,6 @@ class LoopControllerProxyServer:
             )
         except ValueError as exc:
             return self._error_result(str(exc))
-
-        self._tasks[task.task_id] = task
 
         proposal = ActionProposal(
             task_id=task.task_id,

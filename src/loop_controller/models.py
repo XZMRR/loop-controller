@@ -57,6 +57,8 @@ class Task(BaseModel):
     v1.2 起废除 ``session_id == task_id`` 约定：session 为同一 ``(user_id, agent_id)``
     的连续任务流，由 ``SessionManager`` 分配与复用。
     ``description`` 原文不进入 Rego input，仅用于 R1 规划与 R3 审计。
+
+    v0.6.0 新增 ``status`` 与 ``completed_at``，支持 ``JsonlTaskStore`` 持久化生命周期。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -66,7 +68,9 @@ class Task(BaseModel):
     user_id: str
     agent_id: str
     description: str
+    status: Literal["created", "completed"] = "created"
     created_at: datetime = Field(default_factory=_utc_now)
+    completed_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------
