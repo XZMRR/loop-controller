@@ -1,6 +1,6 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.3.0-iter5）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 策略判定 → 审批 → 授权转发 → 审计"的完整闭环；v0.3.0 额外引入动态会话上下文与异步人工审批 CLI。
+企业级 AI Agent 治理层（v0.4.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 策略判定 → 审批 → 授权转发 → 审计"的完整闭环；v0.3.0 引入异步人工审批 CLI 与动态会话上下文，v0.4.0 实现跨 Task Session 风险状态持久化与连续拒绝熔断。
 
 **核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为 MCP Client Policy Gateway，是所有工具调用的**唯一授权出口**。
 
@@ -98,6 +98,8 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 ### 当前有效
 
 - `Loop_Controller_下一阶段开发方案_v0.3.0.md`——v0.3.0 开发方案与 Iteration 4/5 验收标准
+- `loop_controller_v0.4.0_development.md`——v0.4.0 跨 Task Session 风险状态持久化方案
+- `loop_controller_v0.5.0_development.md`——v0.5.0 MCP Proxy / 外来 Agent 接入方案
 - `development_log.md`——开发记录与决策追溯
 - `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
 - `answer.md`——MVP 审查分析与修复状态追踪

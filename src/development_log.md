@@ -354,6 +354,57 @@
 | A5 | 通过 | `tests/test_e2e_research_agent.py` approve/deny 路径 |
 | F1 | 已实现 | `AsyncApprovalManager` + `JsonlApprovalStore` + `lc approvals` |
 
+## v0.4.0：跨 Task Session 风险状态持久化
+
+目标：把治理粒度从单次任务提升到会话级，连续越权行为触发会话级熔断，服务重启后 Session 和风险状态不丢失。
+
+### 完成内容
+
+- **`JsonlSessionBackend`**：新增 `src/loop_controller/session.py` 持久化后端，追加写 + 启动重放，中间行损坏 fail-closed；
+- **`SessionManager` 扩展**：新增 `get_session()`、`touch_session()`、`is_session_active()`/`is_session_expired()`；
+- **`RiskProfile` 扩展**：新增 `consecutive_deny_count`；
+- **`RiskStateManager` 扩展**：`deny`/`approval_denied` 累加 `consecutive_deny_count`，`allow`/`approval_granted`/`low_risk_success` 归零；
+- **`CapabilityProfile` 扩展**：新增 `session_block_threshold: int = 5`；
+- **Checkpoint 硬熔断**：`evaluate()` 在 Profile 校验后检查 `consecutive_deny_count >= session_block_threshold`，满足则直接 deny；
+- **`Runtime.create_task` 复用 Session**：签名改为 `create_task(..., session_id=None) -> tuple[Task, Session]`，支持显式复用已有 Session；
+- **配置层**：`AppConfig` 新增 `session_path`，`ConfigLoader` 支持 `LOOP_CONTROLLER_SESSION_PATH` 环境变量；
+- **测试**：新增 `tests/test_session_v040.py`，覆盖 S1-S8 验收标准。
+
+### 关键决策
+
+- Session 持久化与风险持久化分离：Session 写 `sessions.jsonl`，风险事件写 `risk_state.jsonl`；
+- 连续拒绝熔断放在 Checkpoint Python 代码而非 Rego：这是全局安全策略，失败更早，且不扩展 Rego input schema；
+- `create_task` 返回 `(Task, Session)` 元组：调用方需要知道本次 task 落在哪个 Session 上，便于日志、调试和后续复用。
+
+### 验收状态
+
+- `pytest tests/`：**212 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：**Success**
+
+---
+
+## v0.5.0：MCP Proxy / 外来 Agent 接入（规划中）
+
+目标：把 Loop Controller 同时暴露为一个 MCP Server，使未安装 Loop Controller SDK 的第三方 Agent 也能被 R2/R3 治理。
+
+### 规划要点
+
+- 新增 `src/loop_controller/proxy_server.py`，基于 `mcp.server.Server` 实现；
+- 外部 Agent 作为 MCP Client 连接，每次 tool call 映射为一个 `ActionProposal`；
+- 复用 `Runtime`、`Checkpoint`、`MCPGateway`，不使用 `Planner`；
+- 支持 stdio 和 SSE 两种传输；
+- CLI 入口 `lc proxy --agent-id xxx --user-id alice [--transport sse --port 8080]`；
+- SSE 模式通过 HTTP header 透传 agent/user/session；
+- `require_approval` 在 v0.5.0 直接 deny（MCP tool call 同步，无法暂停等待人工审批）；
+- 同一连接内多次 tool call 共享 Session，v0.4.0 风险累计生效。
+
+### 设计文档
+
+- `src/loop_controller_v0.5.0_development.md`
+
+---
+
 ## 后续可选工作
 
 - **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。
@@ -361,3 +412,4 @@
 - **HMAC 升级**：`AuditEvent.hash_algo` 字段已预留，涉及真实 PII 时触发升级。
 - **多 worker 原子 DecisionStore**：当前单进程 asyncio 假设下检查+记账原子；多 worker 时需要原子语义。
 - **CLI 通知扩展**：当前 CLI 依赖轮询文件；未来可扩展为 SSE/HTTP webhook 推送审批请求。
+- **BudgetReservation 状态机**：当前预算预留/返还逻辑分散在 Checkpoint 各分支，未来可抽象为显式状态机。
