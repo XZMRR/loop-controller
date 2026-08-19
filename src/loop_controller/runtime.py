@@ -399,11 +399,13 @@ async def _run_task_loop(
                 return pending
 
             decision = _finalize_after_approval(runtime, task, proposal, decision, record, audit)
-            # v0.3.0：require_approval 路径在 evaluate() 已返还预算，执行前需重新预留
-            if decision.verdict in ("allow", "modify") and not runtime.checkpoint.reserve_for_execution(
-                task.task_id, proposal
-            ):
-                raise CheckpointError(f"resume 时预算不足：{proposal.tool_name}")
+            # v0.6.1：require_approval 路径在 evaluate() 已创建 pending_approval reservation，
+            # 审批通过后 reservation 已转回 pending，执行前检查是否存在；不存在时回退到重新预留
+            if decision.verdict in ("allow", "modify"):
+                reservation = runtime.checkpoint.get_pending_reservation(proposal.call_id)
+                if reservation is None:
+                    if not runtime.checkpoint.reserve_for_execution(task.task_id, proposal):
+                        raise CheckpointError(f"resume 时预算不足：{proposal.tool_name}")
             await _execute_decision(task, runtime, proposal, decision, audit, observations)
             ended = True
 

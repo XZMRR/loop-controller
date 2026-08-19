@@ -22,12 +22,14 @@ from loop_controller.governance_context import build_context_meta, build_governa
 from loop_controller.infra.config_loader import PermissionRule
 from loop_controller.infra.identity import IdentityProvider
 from loop_controller.infra.policy_store import PolicyStore
+from loop_controller.infra.reservation_store import InMemoryReservationStore, ReservationStore
 from loop_controller.mcp_gateway import MCPGateway
 from loop_controller.models import (
     ActionProposal,
     Agent,
     ApprovalRequest,
     BudgetCost,
+    BudgetReservation,
     CapabilityProfile,
     ConversationContext,
     Decision,
@@ -199,6 +201,7 @@ class Checkpoint:
         risk_manager: RiskStateManager | None = None,  # v1.2 风险状态管理
         decision_store: DecisionStore | None = None,
         budget_ledger: BudgetLedger | None = None,
+        reservation_store: ReservationStore | None = None,  # v0.6.1 预算预留状态机
         permission_analyzer: PermissionInteractionAnalyzer | None = None,
         tool_costs: dict[str, BudgetCost] | None = None,  # v1.1：tool_name -> 单次调用成本
         masker=None,  # Masker（T3.2 接入 build_approval_request）
@@ -213,6 +216,7 @@ class Checkpoint:
         self._risk_manager = risk_manager or RiskStateManager()  # 默认内存实现
         self._decision_store = decision_store or InMemoryDecisionStore()
         self._budget_ledger = budget_ledger or InfiniteBudgetLedger()
+        self._reservation_store = reservation_store or InMemoryReservationStore()
         self._permission_analyzer = permission_analyzer or NoopPermissionInteractionAnalyzer()
         self._tool_costs = tool_costs or {}
         self._masker = masker
@@ -237,8 +241,97 @@ class Checkpoint:
         self._budget_ledger.refund(proposal.task_id, self._cost_for(proposal))
 
     def reserve_for_execution(self, task_id: str, proposal: ActionProposal) -> bool:
-        """为即将执行的动作预留预算（resume 路径使用）。"""
-        return self._budget_ledger.check_and_reserve(task_id, self._cost_for(proposal))
+        """为即将执行的动作预留预算（resume 路径使用）。
+
+        v0.6.1：若预留成功，同时创建 pending BudgetReservation。
+        """
+        cost = self._cost_for(proposal)
+        if not self._budget_ledger.check_and_reserve(task_id, cost):
+            return False
+        now = self._now()
+        reservation = BudgetReservation(
+            reservation_id=uuid.uuid4().hex,
+            task_id=task_id,
+            call_id=proposal.call_id,
+            tool_name=proposal.tool_name,
+            cost=cost,
+            state="pending",
+            created_at=now,
+            expires_at=now + _ALLOW_MODIFY_DELTA,
+        )
+        self._save_reservation(reservation)
+        return True
+
+    # v0.6.1：BudgetReservation 状态机辅助方法 ---------------------------------
+
+    def _create_reservation(self, proposal: ActionProposal, now: datetime) -> BudgetReservation:
+        """为成功预留预算的 proposal 创建 pending reservation。"""
+        return BudgetReservation(
+            reservation_id=uuid.uuid4().hex,
+            task_id=proposal.task_id,
+            call_id=proposal.call_id,
+            tool_name=proposal.tool_name,
+            cost=self._cost_for(proposal),
+            state="pending",
+            created_at=now,
+            expires_at=now + _ALLOW_MODIFY_DELTA,
+        )
+
+    def _save_reservation(self, reservation: BudgetReservation) -> None:
+        """保存 reservation 到 store。"""
+        self._reservation_store.save(reservation)
+
+    def _transition_reservation(
+        self,
+        reservation: BudgetReservation,
+        state: str,
+        *,
+        expires_at: datetime | None = None,
+    ) -> BudgetReservation:
+        """转换 reservation 状态并持久化。"""
+        update: dict = {"state": state}
+        if expires_at is not None:
+            update["expires_at"] = expires_at
+        updated = reservation.model_copy(update=update)
+        self._save_reservation(updated)
+        return updated
+
+    def _refund_reservation(self, reservation: BudgetReservation) -> BudgetReservation:
+        """返还 reservation 对应预算并标记为 refunded。"""
+        self._budget_ledger.refund(reservation.task_id, reservation.cost)
+        return self._transition_reservation(reservation, "refunded")
+
+    def _commit_reservation(self, reservation: BudgetReservation) -> BudgetReservation:
+        """确认 reservation 对应预算消耗并标记为 committed。"""
+        self._budget_ledger.commit(reservation.task_id, reservation.cost)
+        return self._transition_reservation(reservation, "committed")
+
+    def _to_pending_approval(
+        self, reservation: BudgetReservation, now: datetime
+    ) -> BudgetReservation:
+        """将 reservation 转为 pending_approval，保持预算预留。"""
+        return self._transition_reservation(
+            reservation, "pending_approval", expires_at=now + _APPROVAL_DELTA
+        )
+
+    def _expire_reservation(self, reservation: BudgetReservation) -> BudgetReservation:
+        """将 reservation 标记为 expired（不自动 refund，由调用方决定是否返还）。"""
+        return self._transition_reservation(reservation, "expired")
+
+    def get_pending_reservation(self, call_id: str) -> BudgetReservation | None:
+        """v0.6.1：查询指定 call_id 的 pending / pending_approval reservation。"""
+        reservation = self._reservation_store.get_by_call_id(call_id)
+        if reservation is not None and reservation.state in ("pending", "pending_approval"):
+            return reservation
+        return None
+
+    def get_pending_reservations(self, task_id: str) -> list[BudgetReservation]:
+        """v0.6.1：查询指定 task 下所有 pending / pending_approval reservation。"""
+        return [
+            r
+            for r in self._reservation_store.list_by_task(task_id)
+            if r.state in ("pending", "pending_approval")
+        ]
 
     # -- evaluate：判定流水线（§6.1） ----------------------------------------
 
@@ -305,6 +398,10 @@ class Checkpoint:
         if not self._budget_ledger.check_and_reserve(task.task_id, self._cost_for(proposal)):
             return self._deny(proposal, "budget exceeded", now, policy_version)
 
+        # v0.6.1：预算预留成功后创建显式 reservation，后续所有路径统一流转状态
+        reservation = self._create_reservation(proposal, now)
+        self._save_reservation(reservation)
+
         # 步骤 5：权限组合分析（T2.3 换真实现；当前占位恒 None）
         history = self._history.get(task.task_id, [])
         pending_approval = False
@@ -312,7 +409,7 @@ class Checkpoint:
         if rule is not None:
             if rule.action == "deny":
                 # deny 短路，不进入 Rego；返还已预留预算
-                self._refund_for(proposal)
+                self._refund_reservation(reservation)
                 return self._deny(proposal, rule.reason, now, policy_version, policy_hits=[rule.id])
             pending_approval = True  # require_approval 不短路，继续走 Rego（deny 优先原则）
 
@@ -324,7 +421,7 @@ class Checkpoint:
         verdict = rego_decision.get("verdict")
         if verdict == "deny":
             self._risk_manager.update(task.session_id, "deny")
-            self._refund_for(proposal)
+            self._refund_reservation(reservation)
             return self._deny(
                 proposal,
                 rego_decision.get("reason", "denied by policy"),
@@ -334,7 +431,7 @@ class Checkpoint:
             )
         if verdict not in ("allow", "modify", "require_approval"):
             self._risk_manager.update(task.session_id, "deny")
-            self._refund_for(proposal)
+            self._refund_reservation(reservation)
             return self._deny(proposal, "invalid policy verdict", now, policy_version)
 
         # 步骤 7：汇总输出 Decision。
@@ -355,8 +452,8 @@ class Checkpoint:
             self._risk_manager.update(task.session_id, "require_approval")
             if proposal.risk_level == "critical":
                 self._risk_manager.update(task.session_id, "critical")
-            # require_approval 暂停执行，先返还预算；resume 时再重新预留
-            self._refund_for(proposal)
+            # v0.6.1：require_approval 保持预算预留，审批通过后直接 commit，无需二次 reserve
+            reservation = self._to_pending_approval(reservation, now)
             return self._handle_require_approval(agent, proposal, profile, reason, now, policy_version, hits)
 
         if proposal.risk_level == "critical":
@@ -443,6 +540,9 @@ class Checkpoint:
 
         P0：强绑定校验——审批记录必须与原始 Decision、ApprovalRequest 完全匹配，
         且审批人必须是 escalation_target；否则抛 CheckpointError。
+
+        v0.6.1：同时流转对应的 BudgetReservation 状态；审批 deny 时 refund，
+        approve 时 reservation 保持 pending 供 forward commit。
         """
         now = self._now()
         if decision.decision_id != record.decision_id:
@@ -459,9 +559,14 @@ class Checkpoint:
             raise CheckpointError("该审批结果已被应用，不可重复执行")
         self._finalized_decisions.add(decision.decision_id)
 
+        # v0.6.1：找到对应 reservation
+        reservation = self._reservation_store.get_by_call_id(decision.call_id)
+
         if record.verdict == "deny":
             if not record.comment or not str(record.comment).strip():
                 raise CheckpointError("deny 审批必须提供原因")
+            if reservation is not None:
+                self._refund_reservation(reservation)
             return decision.model_copy(
                 update={
                     "verdict": "deny",
@@ -470,6 +575,10 @@ class Checkpoint:
                     "max_uses": 0,
                 }
             )
+
+        # approve：reservation 保持 pending，forward 执行时 commit
+        if reservation is not None and reservation.state == "pending_approval":
+            self._transition_reservation(reservation, "pending", expires_at=now + _ALLOW_MODIFY_DELTA)
         return decision.model_copy(
             update={
                 "verdict": "allow",
@@ -526,6 +635,16 @@ class Checkpoint:
         if self._now() >= decision.expires_at:
             raise CheckpointError("decision 已过期（授权作废）")
 
+        # v0.6.1：找到对应预算预留；allow/modify 必须存在 pending / pending_approval reservation。
+        # 若不存在（如测试直接调用 forward 或旧数据兼容），尝试现场预留。
+        reservation = self.get_pending_reservation(proposal.call_id)
+        if reservation is None:
+            if not self.reserve_for_execution(proposal.task_id, proposal):
+                raise CheckpointError("找不到对应预算预留且无法现场预留（预算不足）")
+            reservation = self.get_pending_reservation(proposal.call_id)
+            if reservation is None:
+                raise CheckpointError("现场预留后仍找不到预算预留")
+
         # 校验 4-5：防重放——原子检查决策是否存在、未过期、未超次数并记账。
         # 运行时假设（v1.1 显式声明，评审#2）：MVP 为单进程 asyncio 事件循环，
         # 同一时刻不存在并行的 forward 调用，因此 use_decision 内部检查+记账原子。
@@ -537,11 +656,11 @@ class Checkpoint:
         effective_args = proposal.arguments
         if decision.verdict == "modify":
             if decision.modified_args is None or set(decision.modified_args) != set(proposal.arguments):
-                self._refund_for(proposal)
+                self._refund_reservation(reservation)
                 return self._blocked(proposal, "modified_args 缺失或改动超出参数值范围")
             perm = self._tool_permission_for(proposal)
             if perm is None or not self._args_allowed(perm, decision.modified_args):
-                self._refund_for(proposal)
+                self._refund_reservation(reservation)
                 return self._blocked(proposal, "modify 后参数未通过 Profile 白/黑名单复核")
             effective_args = decision.modified_args
 
@@ -551,9 +670,9 @@ class Checkpoint:
                 proposal.tool_name, effective_args, proposal.call_id, proposal.task_id
             )
         except Exception:
-            self._budget_ledger.refund(proposal.task_id, self._cost_for(proposal))
+            self._refund_reservation(reservation)
             raise
-        self._budget_ledger.commit(proposal.task_id, self._cost_for(proposal))
+        self._commit_reservation(reservation)
         if result.status == "success":
             self._history.setdefault(proposal.task_id, []).append(proposal)
             # v1.2：allow 且风险低时按低风险成功衰减会话风险分

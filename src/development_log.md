@@ -518,6 +518,52 @@
 
 ---
 
+## v0.6.1：BudgetReservation 状态机
+
+目标：把分散在 `Checkpoint.evaluate()` / `forward()` 中的预算预留/返还逻辑，抽象为显式的 `BudgetReservation` 状态机，消除二次预留、过期不释放、无法查询 pending 等隐患。
+
+### 完成内容
+
+- **`BudgetReservation` 模型**（`src/loop_controller/models.py`）：
+  - 字段：`reservation_id`、`task_id`、`call_id`、`tool_name`、`cost`、`state`、``created_at`、`expires_at`；
+  - 状态：`pending` / `pending_approval` / `committed` / `refunded` / `expired`。
+- **`ReservationStore` Protocol + `InMemoryReservationStore`**（`src/loop_controller/infra/reservation_store.py`）：
+  - `save` / `get` / `get_by_call_id` / `list_by_task`；
+  - 默认内存实现，适合测试与单进程；未实现 `JsonlReservationStore`（P1，可在 v0.6.2 补充）。
+- **`Checkpoint` 集成**：
+  - `evaluate()` 预算预留成功后创建 `pending` reservation；
+  - deny / invalid verdict 路径统一 `_refund_reservation()`；
+  - `require_approval` 路径保留预算，reservation 转为 `pending_approval`；
+  - `forward()` 查找 pending reservation，modify 复核失败 / 执行异常 refund，成功 commit；
+  - `finalize_after_approval()` 审批 deny 时 refund，approve 时 reservation 转回 `pending` 供 forward commit；
+  - 新增查询接口 `get_pending_reservation(call_id)` 和 `get_pending_reservations(task_id)`。
+- **`reserve_for_execution()` 增强**：预留成功时同时创建 `pending` reservation，与 `forward()` 的检查逻辑对齐。
+- **`Runtime.resume_task()` 改动**：审批通过后优先复用已有 reservation，不再无条件二次 `reserve_for_execution`；找不到 reservation 时仍保留 fallback 重新预留。
+
+### 关键决策
+
+- **向后兼容**：`Checkpoint` 新增 `reservation_store` 参数，默认 `InMemoryReservationStore`，所有已有测试无需改动；`forward()` 兼容测试直接调用：若找不到 reservation 会尝试现场预留。
+- **BudgetLedger Protocol 不变**：状态机建立在 Ledger 之上，不破坏 `check_and_reserve` / `commit` / `refund` 三方法签名。
+- **不引入持久化**：v0.6.1 只做状态机抽象；`JsonlReservationStore` 延后，因为当前 v0.6.0 的 `JsonlBudgetLedger` 已经能恢复预算余额，reservation 状态丢失在单进程重启场景下可接受。
+- **审批超时被动检查**：reservation 有过期时间，但当前不做异步扫描；过期后再次 forward 会按 Checkpoint 的 decision 过期检查拦截。
+
+### 新增/更新测试
+
+- `tests/test_reservation.py`：7 个 BudgetReservation / ReservationStore 单元测试；
+- 所有已有 `test_checkpoint.py`、`test_e2e_real_mcp.py`、`test_proxy_server.py` 等审批/执行路径测试均通过，验证状态机未破坏既有行为。
+
+### 验收状态
+
+- `pytest tests/`：**238 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.6.1_development.md`
+
+---
+
 ## 后续可选工作
 
 - **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。

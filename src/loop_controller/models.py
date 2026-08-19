@@ -246,6 +246,34 @@ class BudgetCost(BaseModel):
     currency: str = "USD"
 
 
+ReservationState = Literal[
+    "pending",
+    "pending_approval",
+    "committed",
+    "refunded",
+    "expired",
+]
+
+
+class BudgetReservation(BaseModel):
+    """v0.6.1：预算预留状态机实体。
+
+    由 ``Checkpoint`` 在 ``evaluate()`` 成功后创建，并在执行/拒绝/审批/异常路径上
+    统一流转状态。``reservation_id`` 与 ``call_id`` 一一对应。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    reservation_id: str
+    task_id: str
+    call_id: str
+    tool_name: str
+    cost: BudgetCost
+    state: ReservationState
+    created_at: datetime = Field(default_factory=_utc_now)
+    expires_at: datetime | None = None
+
+
 # ---------------------------------------------------------------------------
 # §3.9 RiskProfile
 # ---------------------------------------------------------------------------
