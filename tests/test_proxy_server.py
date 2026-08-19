@@ -103,13 +103,13 @@ async def proxy_ctx(workdir: Path, sent_emails_path: Path, opa_server: str):
 
 @pytest.mark.asyncio
 async def test_proxy_list_tools(proxy_ctx: LoopControllerProxyServer) -> None:
-    """tools/list 返回按 Profile 过滤后的工具。"""
+    """tools/list 返回按 Profile 过滤后的工具，并注入内部工具。"""
     result = await proxy_ctx._handle_list_tools(
         _fake_request_context(),  # type: ignore[arg-type]
         PaginatedRequestParams(),
     )
     names = {tool.name for tool in result.tools}
-    assert names == {"web_search", "send_email"}
+    assert names == {"web_search", "send_email", "loop_controller_approval_status"}
 
 
 @pytest.mark.asyncio
@@ -306,6 +306,148 @@ async def test_proxy_retry_not_approved_still_blocked(
     )
     assert retry.is_error
     assert "not approved" in retry.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_proxy_approval_status_pending(
+    proxy_ctx: LoopControllerProxyServer,
+) -> None:
+    """v0.7.0：未审批时查询返回 pending。"""
+    first = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="send_email",
+            arguments={
+                "to": "boss@company.com",
+                "subject": "report",
+                "body": "please review",
+            },
+        ),
+    )
+    pending = json.loads(first.content[0].text)
+    decision_id = pending["decision_id"]
+
+    result = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="loop_controller_approval_status",
+            arguments={"decision_id": decision_id},
+        ),
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["status"] == "pending"
+    assert payload["can_retry"] is False
+
+
+@pytest.mark.asyncio
+async def test_proxy_approval_status_approved(
+    proxy_ctx: LoopControllerProxyServer,
+) -> None:
+    """v0.7.0：审批后查询返回 approved。"""
+    first = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="send_email",
+            arguments={
+                "to": "boss@company.com",
+                "subject": "report",
+                "body": "please review",
+            },
+        ),
+    )
+    pending = json.loads(first.content[0].text)
+    decision_id = pending["decision_id"]
+    request_id = pending["request_id"]
+
+    from loop_controller.models import ApprovalRecord
+
+    runtime = proxy_ctx._runtime
+    runtime.approval_manager._store.record_response(
+        ApprovalRecord(
+            request_id=request_id,
+            decision_id=decision_id,
+            verdict="approve",
+            approver_id="zhang_manager",
+            comment="approved",
+        )
+    )
+
+    result = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="loop_controller_approval_status",
+            arguments={"decision_id": decision_id},
+        ),
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["status"] == "approved"
+    assert payload["can_retry"] is True
+
+
+@pytest.mark.asyncio
+async def test_proxy_approval_status_denied(
+    proxy_ctx: LoopControllerProxyServer,
+) -> None:
+    """v0.7.0：审批拒绝后查询返回 denied。"""
+    first = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="send_email",
+            arguments={
+                "to": "boss@company.com",
+                "subject": "report",
+                "body": "please review",
+            },
+        ),
+    )
+    pending = json.loads(first.content[0].text)
+    decision_id = pending["decision_id"]
+    request_id = pending["request_id"]
+
+    from loop_controller.models import ApprovalRecord
+
+    runtime = proxy_ctx._runtime
+    runtime.approval_manager._store.record_response(
+        ApprovalRecord(
+            request_id=request_id,
+            decision_id=decision_id,
+            verdict="deny",
+            approver_id="zhang_manager",
+            comment="denied",
+        )
+    )
+
+    result = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="loop_controller_approval_status",
+            arguments={"decision_id": decision_id},
+        ),
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["status"] == "denied"
+    assert payload["can_retry"] is False
+
+
+@pytest.mark.asyncio
+async def test_proxy_approval_status_not_found(
+    proxy_ctx: LoopControllerProxyServer,
+) -> None:
+    """v0.7.0：不存在的 decision_id 返回 not_found。"""
+    result = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="loop_controller_approval_status",
+            arguments={"decision_id": "nonexistent"},
+        ),
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["status"] == "not_found"
+    assert payload["can_retry"] is False
 
 
 @pytest.mark.asyncio

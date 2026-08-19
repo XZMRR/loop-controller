@@ -564,6 +564,56 @@
 
 ---
 
+## v0.7.0：MCP Proxy `approval_status` 查询工具
+
+目标：让外部 Agent 能主动查询某个 `decision_id` 的审批状态，降低对 Agent LLM 解析结构化响应的依赖，避免在审批完成前盲目重试。
+
+### 完成内容
+
+- **新增内部 MCP 工具 `loop_controller_approval_status`**：
+  - 输入参数：`decision_id`；
+  - 返回 JSON：`{"status": "pending|approved|denied|expired|not_found", "decision_id": "...", "can_retry": true|false}`；
+  - `can_retry=true` 只在 `approved` 时返回。
+- **`tools/list` 注入内部工具**：
+  - `LoopControllerProxyServer._handle_list_tools()` 在返回 Profile 过滤的真实工具后，额外追加 `loop_controller_approval_status`；
+  - 工具名带 `loop_controller_` 前缀，避免与真实工具冲突。
+- **`tools/call` 优先路由内部工具**：
+  - 在重试决策和普通治理流程之前，先判断 `params.name == "loop_controller_approval_status"`；
+  - 内部工具不创建 Task、不经过 Checkpoint，只读审批状态。
+- **状态判定逻辑**：
+  - `approval_manager.check(decision_id)` 返回 `ApprovalRecord`：
+    - `verdict == "approve"` → `approved`；
+    - `verdict == "deny"` → `denied`；
+  - 无记录但 `get_decision(decision_id)` 返回 `Decision`：
+    - 当前时间 >= `expires_at` → `expired`；
+    - 否则 → `pending`；
+  - 无 Decision → `not_found`。
+
+### 关键决策
+
+- **只读无副作用**：`approval_status` 不修改任何 store，可被 Agent 高频查询；
+- **不替代重试路径**：查询到 `approved` 后，Agent 仍需带 `decision_id` 重试原 tool call；
+- **身份校验最小化**：decision_id 是随机 UUID，MVP 阶段不强制绑定 agent_id；
+- **不实现 Server 推送**：遵循 v0.5.0 的设计哲学，Agent 自己决定何时查询/重试。
+
+### 新增/更新测试
+
+- `tests/test_proxy_server.py`：
+  - 更新 `test_proxy_list_tools`，断言工具列表包含 `loop_controller_approval_status`；
+  - 新增 `test_proxy_approval_status_pending` / `approved` / `denied` / `not_found`。
+
+### 验收状态
+
+- `pytest tests/`：**242 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.7.0_development.md`
+
+---
+
 ## 后续可选工作
 
 - **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。

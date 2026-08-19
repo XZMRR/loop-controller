@@ -12,6 +12,9 @@ v0.5.1 变更：
 - ``require_approval`` 返回结构化 JSON，便于 Agent 解析；
 - 审批通过后 Agent 可携带 ``decision_id`` 重试，Proxy 会执行原调用；
 - 重试时校验 tool 参数与原始审批请求一致，防止 decision_id 被复用于不同调用。
+
+v0.7.0 变更：
+- 新增 ``loop_controller_approval_status`` 内部工具，Agent 可主动查询审批状态。
 """
 
 from __future__ import annotations
@@ -45,6 +48,20 @@ from loop_controller.models import (
 from loop_controller.runtime import Runtime
 
 logger = logging.getLogger(__name__)
+
+# v0.7.0：内部 MCP 工具名，用于查询审批状态。
+_APPROVAL_STATUS_TOOL_NAME = "loop_controller_approval_status"
+
+_APPROVAL_STATUS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision_id": {
+            "type": "string",
+            "description": "require_approval 响应中的 decision_id",
+        }
+    },
+    "required": ["decision_id"],
+}
 
 
 @dataclass(frozen=True)
@@ -141,18 +158,25 @@ class LoopControllerProxyServer:
         ctx: ServerRequestContext[Any, Any],
         params: types.PaginatedRequestParams | None,
     ) -> types.ListToolsResult:
-        """返回按 Profile 过滤后的工具列表。"""
+        """返回按 Profile 过滤后的工具列表，并注入 Loop Controller 内部工具。"""
         tools = await self._runtime.gateway.list_tools(self._profile)
-        return types.ListToolsResult(
-            tools=[
-                types.Tool(
-                    name=tool.canonical_name,
-                    description=tool.description,
-                    input_schema=tool.input_schema,
-                )
-                for tool in tools
-            ]
+        mcp_tools = [
+            types.Tool(
+                name=tool.canonical_name,
+                description=tool.description,
+                input_schema=tool.input_schema,
+            )
+            for tool in tools
+        ]
+        # v0.7.0：注入审批状态查询工具
+        mcp_tools.append(
+            types.Tool(
+                name=_APPROVAL_STATUS_TOOL_NAME,
+                description="查询 Loop Controller 审批状态。返回 pending / approved / denied / expired / not_found。",
+                input_schema=_APPROVAL_STATUS_SCHEMA,
+            )
         )
+        return types.ListToolsResult(tools=mcp_tools)
 
     async def _handle_call_tool(
         self,
@@ -166,6 +190,11 @@ class LoopControllerProxyServer:
             return self._error_result(f"unknown agent_id: {identity.agent_id}")
 
         raw_arguments = dict(params.arguments or {})
+
+        # v0.7.0：内部工具优先路由，不进入治理流程。
+        if params.name == _APPROVAL_STATUS_TOOL_NAME:
+            return self._handle_approval_status(raw_arguments)
+
         retry_decision_id = self._extract_retry_decision_id(ctx, raw_arguments)
 
         # v0.5.1：如果携带 decision_id，走重试恢复路径。
@@ -397,6 +426,57 @@ class LoopControllerProxyServer:
                 content=[types.TextContent(type="text", text=str(result.content))]
             )
         return self._error_result(str(result.content))
+
+    def _handle_approval_status(self, arguments: dict[str, Any]) -> types.CallToolResult:
+        """v0.7.0：查询指定 decision_id 的审批状态。"""
+        decision_id = arguments.get("decision_id")
+        if not isinstance(decision_id, str) or not decision_id:
+            return self._error_result("argument 'decision_id' is required and must be a string")
+
+        record = self._runtime.approval_manager.check(decision_id)
+        decision = self._runtime.approval_manager.get_decision(decision_id)
+
+        # 先判断审批记录（approve / deny）
+        if record is not None:
+            status = "approved" if record.verdict == "approve" else "denied"
+            payload = {
+                "status": status,
+                "decision_id": decision_id,
+                "can_retry": status == "approved",
+            }
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+            )
+
+        # 无审批记录时，检查 Decision 是否过期
+        if decision is None:
+            payload = {
+                "status": "not_found",
+                "decision_id": decision_id,
+                "can_retry": False,
+            }
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+            )
+
+        if self._runtime.checkpoint._now() >= decision.expires_at:
+            payload = {
+                "status": "expired",
+                "decision_id": decision_id,
+                "can_retry": False,
+            }
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+            )
+
+        payload = {
+            "status": "pending",
+            "decision_id": decision_id,
+            "can_retry": False,
+        }
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+        )
 
     @staticmethod
     def _error_result(message: str) -> types.CallToolResult:
