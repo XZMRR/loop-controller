@@ -20,35 +20,28 @@ def _utc_now() -> datetime:
 
 
 def _serialize_request(request: ApprovalRequest) -> dict:
-    data = request.model_dump()
+    # v0.5.1：使用 mode="json" 递归序列化嵌套模型（Decision）和 datetime。
+    data = request.model_dump(mode="json")
     data["type"] = "request"
-    data["created_at"] = request.created_at.isoformat()
     return data
 
 
 def _serialize_record(record: ApprovalRecord) -> dict:
-    data = record.model_dump()
+    data = record.model_dump(mode="json")
     data["type"] = "response"
-    data["decided_at"] = record.decided_at.isoformat()
     return data
 
 
 def _deserialize_request(record: dict) -> ApprovalRequest:
     record = dict(record)
     record.pop("type", None)
-    created = record.get("created_at")
-    if isinstance(created, str):
-        record["created_at"] = datetime.fromisoformat(created)
-    return ApprovalRequest(**record)
+    return ApprovalRequest.model_validate(record)
 
 
 def _deserialize_record(record: dict) -> ApprovalRecord:
     record = dict(record)
     record.pop("type", None)
-    decided = record.get("decided_at")
-    if isinstance(decided, str):
-        record["decided_at"] = datetime.fromisoformat(decided)
-    return ApprovalRecord(**record)
+    return ApprovalRecord.model_validate(record)
 
 
 @runtime_checkable

@@ -419,6 +419,52 @@
 
 ---
 
+## v0.5.1：MCP Proxy 审批恢复与结构化响应
+
+目标：让外部 Agent 收到 `require_approval` 后能够解析响应，并在人工审批通过后携带凭证重试，完成原 tool 调用。
+
+### 完成内容
+
+- **`ApprovalRequest` 模型扩展**：
+  - 新增 `tool_arguments: dict[str, Any]`，保存原始未掩码参数；
+  - 新增 `original_decision: Decision | None`，保存触发审批的原始 Decision，供重试时恢复。
+- **`Checkpoint.build_approval_request()`**：填充 `tool_arguments` 与 `original_decision`。
+- **`AsyncApprovalManager.get_decision()`**：v0.5.1 新增，按 `decision_id` 查询原始 Decision。
+- **`JsonlApprovalStore` 序列化修复**：
+  - `_serialize_request` / `_serialize_record` 改用 `model_dump(mode="json")`，解决嵌套 `Decision` 中的 `datetime` 无法 JSON 序列化的问题；
+  - `_deserialize_request` / `_deserialize_record` 改用 `model_validate()`，自动解析 ISO datetime 和嵌套模型。
+- **`LoopControllerProxyServer` 重写**（`src/loop_controller/proxy_server.py`）：
+  - `require_approval` 返回结构化 JSON，包含 `status` / `decision_id` / `request_id` / `tool_name` / `reason` / `expires_at` / `retry_instruction`；
+  - 支持通过 SSE header `x-loop-controller-decision-id` 或 stdio 保留参数 `_loop_controller_decision_id` 重试；
+  - 重试时校验当前参数与 `ApprovalRequest.tool_arguments` 一致，防止 decision_id 被复用于不同调用；
+  - 重试时调用 `Checkpoint.finalize_after_approval()` 将原始 `require_approval` Decision 转换为可执行的 `allow` Decision；
+  - 重试时复用原始 `call_id`，保证 `Checkpoint.forward()` 的 call_id 一致性校验通过；
+  - Proxy 进程内维护 `_tasks` 内存缓存，重试时恢复原始 Task。
+- **测试更新**：
+  - 更新 `test_proxy_require_approval_blocked` 断言结构化 JSON；
+  - 新增 `test_proxy_retry_approved_executes`：审批通过后重试成功执行；
+  - 新增 `test_proxy_retry_param_mismatch_denied`：参数不一致被拒绝；
+  - 新增 `test_proxy_retry_not_approved_still_blocked`：未审批时重试仍被阻塞。
+
+### 关键决策
+
+- **Agent 不阻塞**：MCP tool call 保持同步请求-响应，Proxy 立即返回审批状态，由 Agent 决定如何向用户展示或何时重试；
+- **审批凭证显式传递**：用 `decision_id` 作为重试凭证，不依赖隐式缓存或参数匹配，安全且可审计；
+- **原始 Decision 持久化在 ApprovalRequest 中**：避免引入新的存储接口，复用现有 `JsonlApprovalStore`；
+- **Proxy 进程重启后重试会失败**：Task 缓存丢失，写入错误响应；这是已知限制，v0.6.0 引入 `TaskStore` 后可解决。
+
+### 验收状态
+
+- `pytest tests/`：**220 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误（`planner.py`、`config_loader.py`），与本次改动无关。
+
+### 设计文档
+
+- `src/loop_controller_v0.5.1_development.md`
+
+---
+
 ## 后续可选工作
 
 - **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。

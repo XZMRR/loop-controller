@@ -429,6 +429,8 @@ class Checkpoint:
                 if self._masker is not None
                 else dict(proposal.arguments)
             ),
+            tool_arguments=dict(proposal.arguments),
+            original_decision=decision,
             reason=decision.reason,
             requester_id=task.user_id,
             approver_id=approver_id,

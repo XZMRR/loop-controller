@@ -55,8 +55,9 @@ Rego 策略文件为明文，仅依赖文件系统权限保护。恶意 Agent �
 | F6 | 审计全量记录无采样 | 高负载场景需自行评估日志量 |
 | F7 | 财务支付预算未启用 | `payment_amount` 恒为 0 |
 | F8 | ~~多轮对话上下文未进入 R2~~ 已实现 | v0.3.0 Iteration 4 通过 `ConversationContext` + `build_governance_context` 让当前 Task 的最近用户/Agent 消息进入 R2；跨 Task 同 session 消息暂未混入 |
-| F9 | 外部 Agent 直接接入尚不支持 | 当前仅支持框架内 Planner（Scripted / LLM）；外部 ReAct / Harness / Loop 等 Agent 需通过尚未实现的 MCP Proxy 接入 |
-| F10 | SSE/HTTP MCP transport 未支持 | 当前仅支持 stdio；SSE/HTTP transport 放入 P2 Proxy 阶段统一实现 |
+| F9 | ~~外部 Agent 直接接入尚不支持~~ 已实现 MCP Proxy | v0.5.0 起 `LoopControllerProxyServer` 通过 stdio/SSE 把 Loop Controller 暴露为 MCP Server；v0.5.1 完成 `require_approval` 结构化响应与审批后重试 |
+| F10 | ~~SSE/HTTP MCP transport 未支持~~ 已实现 | v0.5.0 起同时支持 stdio 与 SSE transport |
+| F11 | MCP Proxy 审批重试依赖 Proxy 进程存活 | v0.5.1 为简化实现，Task 仅缓存在 Proxy 进程内存；Proxy 重启后无法恢复 pending Task，审批通过后的重试会失败；v0.6.0 引入持久化 `TaskStore` 后解除 |
 
 完整演进计划见方案文档 §9.3 post-MVP 路线图。
 

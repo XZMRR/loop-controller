@@ -148,7 +148,7 @@ async def test_proxy_deny_tool_rejected(proxy_ctx: LoopControllerProxyServer) ->
 
 @pytest.mark.asyncio
 async def test_proxy_require_approval_blocked(proxy_ctx: LoopControllerProxyServer) -> None:
-    """send_email 收件人合法但仍需审批；v0.5.0 直接 BLOCKED 并返回 decision_id。"""
+    """send_email 收件人合法但仍需审批；v0.5.1 返回结构化 JSON。"""
     result = await proxy_ctx._handle_call_tool(
         _fake_request_context(),
         CallToolRequestParams(
@@ -161,9 +161,151 @@ async def test_proxy_require_approval_blocked(proxy_ctx: LoopControllerProxyServ
         ),
     )
     assert result.is_error
-    text = result.content[0].text
-    assert text.startswith("[loop-controller] BLOCKED: requires human approval")
-    assert "decision_id=" in text
+    payload = json.loads(result.content[0].text)
+    assert payload["status"] == "require_approval"
+    assert payload["tool_name"] == "send_email"
+    assert "decision_id" in payload
+    assert "request_id" in payload
+    assert "retry_instruction" in payload
+
+
+@pytest.mark.asyncio
+async def test_proxy_retry_approved_executes(
+    proxy_ctx: LoopControllerProxyServer,
+    sent_emails_path: Path,
+) -> None:
+    """审批通过后携带 decision_id 重试，应成功执行原工具调用。"""
+    # 1. 第一次调用：require_approval
+    first = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="send_email",
+            arguments={
+                "to": "boss@company.com",
+                "subject": "report",
+                "body": "please review",
+            },
+        ),
+    )
+    assert first.is_error
+    pending = json.loads(first.content[0].text)
+    decision_id = pending["decision_id"]
+    request_id = pending["request_id"]
+
+    # 2. 人工审批通过
+    from loop_controller.models import ApprovalRecord
+
+    runtime = proxy_ctx._runtime
+    runtime.approval_manager._store.record_response(
+        ApprovalRecord(
+            request_id=request_id,
+            decision_id=decision_id,
+            verdict="approve",
+            approver_id="zhang_manager",
+            comment="approved",
+        )
+    )
+
+    # 3. 携带 decision_id 重试
+    retry = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="send_email",
+            arguments={
+                "_loop_controller_decision_id": decision_id,
+                "to": "boss@company.com",
+                "subject": "report",
+                "body": "please review",
+            },
+        ),
+    )
+    assert not retry.is_error
+    text = retry.content[0].text
+    assert "queued" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_proxy_retry_param_mismatch_denied(
+    proxy_ctx: LoopControllerProxyServer,
+) -> None:
+    """携带 decision_id 但参数不一致，应被拒绝。"""
+    first = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="send_email",
+            arguments={
+                "to": "boss@company.com",
+                "subject": "report",
+                "body": "please review",
+            },
+        ),
+    )
+    pending = json.loads(first.content[0].text)
+    decision_id = pending["decision_id"]
+    request_id = pending["request_id"]
+
+    from loop_controller.models import ApprovalRecord
+
+    runtime = proxy_ctx._runtime
+    runtime.approval_manager._store.record_response(
+        ApprovalRecord(
+            request_id=request_id,
+            decision_id=decision_id,
+            verdict="approve",
+            approver_id="zhang_manager",
+            comment="approved",
+        )
+    )
+
+    retry = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="send_email",
+            arguments={
+                "_loop_controller_decision_id": decision_id,
+                "to": "other@company.com",  # 参数不一致
+                "subject": "report",
+                "body": "please review",
+            },
+        ),
+    )
+    assert retry.is_error
+    assert "mismatch" in retry.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_proxy_retry_not_approved_still_blocked(
+    proxy_ctx: LoopControllerProxyServer,
+) -> None:
+    """未审批时携带 decision_id 重试，仍返回 require_approval。"""
+    first = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="send_email",
+            arguments={
+                "to": "boss@company.com",
+                "subject": "report",
+                "body": "please review",
+            },
+        ),
+    )
+    pending = json.loads(first.content[0].text)
+    decision_id = pending["decision_id"]
+
+    retry = await proxy_ctx._handle_call_tool(
+        _fake_request_context(),
+        CallToolRequestParams(
+            name="send_email",
+            arguments={
+                "_loop_controller_decision_id": decision_id,
+                "to": "boss@company.com",
+                "subject": "report",
+                "body": "please review",
+            },
+        ),
+    )
+    assert retry.is_error
+    assert "not approved" in retry.content[0].text.lower()
 
 
 @pytest.mark.asyncio

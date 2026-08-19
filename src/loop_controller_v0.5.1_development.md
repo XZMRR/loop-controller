@@ -1,5 +1,10 @@
 # Loop Controller v0.5.1 开发指南：MCP Proxy 审批恢复与结构化响应
 
+> **状态**：已完成（220 tests passed, ruff clean）。
+> **完成提交**：`feat(v0.5.1): structured require_approval response and decision_id retry for MCP proxy`。
+>
+> 本文件保留为设计记录，具体实现细节以 `src/development_log.md` v0.5.1 章节为准。
+
 ## 1. 背景与目标
 
 v0.5.0 实现了 MCP Proxy 模式：外部 Agent 通过标准 MCP 协议接入 Loop Controller，每个 `tools/call` 都会经过 R2 Checkpoint 判定。但当前实现遇到 `require_approval` 时直接返回一段文本：

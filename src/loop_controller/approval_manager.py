@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from loop_controller.infra.approval_store import ApprovalStore
-from loop_controller.models import ApprovalRecord, ApprovalRequest
+from loop_controller.models import ApprovalRecord, ApprovalRequest, Decision
 
 
 class AsyncApprovalManager:
@@ -33,3 +33,8 @@ class AsyncApprovalManager:
     def get_request(self, decision_id: str) -> ApprovalRequest | None:
         """查询原始审批请求（用于 resume 时强绑定校验）。"""
         return self._store.get_request(decision_id)
+
+    def get_decision(self, decision_id: str) -> Decision | None:
+        """v0.5.1：查询审批请求绑定的原始 Decision（MCP Proxy 重试用）。"""
+        request = self._store.get_request(decision_id)
+        return request.original_decision if request is not None else None

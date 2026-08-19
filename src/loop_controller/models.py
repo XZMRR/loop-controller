@@ -270,6 +270,9 @@ class ApprovalRequest(BaseModel):
 
     ``decision_id`` 强绑定触发审批的 Decision，不允许为空。
     审批人看到的是掩码后参数（``arguments_masked``）。
+
+    v0.5.1 新增：``tool_arguments`` 保存原始未掩码参数，``original_decision``
+    保存触发审批的原始 Decision，用于 MCP Proxy 审批通过后重试时恢复执行。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -281,6 +284,8 @@ class ApprovalRequest(BaseModel):
     agent_id: str
     tool_name: str
     arguments_masked: dict
+    tool_arguments: dict[str, Any] = Field(default_factory=dict)
+    original_decision: Decision | None = None
     reason: str  # R2 给出的升级理由
     requester_id: str  # 任务发起者 user_id
     approver_id: str  # 被指派的审批人
