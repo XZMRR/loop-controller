@@ -104,3 +104,30 @@ v1.0 文档 §1.2 明确将"跨 turn 风险累积"移出 MVP，§3.9 规定 `Ris
 ## 五、一句话总结
 
 > **这份审查的 P0 和 P1 项应被视为开发阻塞项（blockers），必须修复；P2 和工程门禁应在 MVP 冻结前完成；Main 分支的 Session 风险状态是优质增强，但建议作为 v1.1 引入，避免扩大 MVP 范围。审查整体值得团队逐条对照执行。**
+
+---
+
+## 六、修复状态（v0.3.0 develop 分支）
+
+> 以下修复全部在 `develop` 分支完成，`main` 分支保留为历史参考，不再向 `main` 做 merge/rebase。
+
+| 优先级 | 问题 | 状态 | 关键提交 | 自动化验证 |
+|---|---|---|---|---|
+| P0 | 拒绝路径预算未返还 | ✅ 已修复 | `b162e89` | `tests/test_checkpoint.py::test_evaluate_refund_on_policy_deny` |
+| P0 | 审批记录强绑定验证 | ✅ 已修复 | `b162e89` | `tests/test_checkpoint.py::test_finalize_after_approval_binding_validation` |
+| P1 | DecisionStore 损坏 fail-open | ✅ 已修复 | `260f544` | `tests/test_decision_store.py::test_corrupt_log_fail_closed` |
+| P1 | CI OPA 路径不一致 | ✅ 已修复 | `ef30cd7` | `.github/workflows/ci.yml` + `tests/conftest.py::resolve_opa_bin` |
+| P1 | 工程质量门禁 | ✅ 已修复 | `5d30257` | CI lint job（ruff + mypy）+ OPA 可用性校验 |
+| P2 | 完整 E2E 用真实组件 | ✅ 已修复 | `e9ce095` | `tests/test_e2e_real_mcp.py` |
+| P2 | 旧示例清理 | ✅ 已修复 | `ba74a07` | 删除过期的 `examples/research_assistant_example.py` |
+
+### 当前基线验证
+
+- `python -m pytest tests/`：**205 passed**
+- `python -m ruff check src tests`：**All checks passed**
+- `python -m mypy src`：**Success**
+
+### 未纳入本次修复（v1.1 或后续）
+
+- **Main 的跨任务 Session 风险状态**：按 §四 建议，作为 v1.1 增强，不阻塞 MVP 冻结。
+- **Main 的编排边界/文档**：有价值的纯文档内容，可后续以 cherry-pick/手动拷贝方式进入 `develop`，不 merge 历史。
