@@ -95,12 +95,23 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 
 ## 文档
 
-- `Loop_Controller_MVP方案_纯工具调用_v1.1.md`——架构与接口的唯一权威依据
-- `Loop_Controller_MVP开发指南_v1.0.md`——三迭代开发计划与踩坑清单
+### 当前有效
+
+- `Loop_Controller_下一阶段开发方案_v0.3.0.md`——v0.3.0 开发方案与 Iteration 4/5 验收标准
 - `development_log.md`——开发记录与决策追溯
 - `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
-- `发布检查清单_v0.1.0.md`——v0.1.0 发布前手动 gate 与自动化回归清单
-- `发布检查清单_v0.2.0.md`——v0.2.0 发布前手动 gate 与自动化回归清单
+- `answer.md`——MVP 审查分析与修复状态追踪
+
+### 历史归档
+
+- `history/Loop_Controller_MVP方案_纯工具调用_v1.1.md`——v1.1 架构与接口方案
+- `history/Loop_Controller_MVP开发指南_v1.0.md`——v1.0 三迭代开发计划
+- `history/发布检查清单_v0.1.0.md`——v0.1.0 发布前 gate 清单
+- `history/发布检查清单_v0.2.0.md`——v0.2.0 发布前 gate 清单
+- `history/Loop_Controller方案_v1.2增补.md`——v1.2 能力增补方案
+- `history/LLMPlanner设计补充_v1.0.md`——v1.0 LLMPlanner 设计补充
+- `history/ask.md`——v0.3.0 前规划问题清单
+- `history/discussion_summary_for_planning_agent.md`——代码/规划 agent 讨论摘要
 
 ## 许可与边界
 
