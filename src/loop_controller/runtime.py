@@ -48,7 +48,7 @@ from loop_controller.permission_interaction import ConfigPermissionInteractionAn
 from loop_controller.planner import Planner, ScriptedPlanner
 from loop_controller.policy_engine import OPAPolicyEngine
 from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
-from loop_controller.session import SessionManager
+from loop_controller.session import JsonlSessionBackend, Session, SessionManager
 from loop_controller.utils.canonical import canonical_json
 
 logger = logging.getLogger(__name__)
@@ -75,17 +75,42 @@ class Runtime:
     risk_manager: RiskStateManager  # v1.2 会话级风险状态
     conversation_store: JsonlConversationStore  # v0.3.0 会话上下文
 
-    def create_task(self, user_id: str, agent_id: str, description: str) -> Task:
-        """通过 SessionManager 分配/复用 session，构造 Task（v1.2 推荐入口）。"""
-        session = self.session_manager.get_or_create_session(user_id, agent_id)
+    def create_task(
+        self,
+        user_id: str,
+        agent_id: str,
+        description: str,
+        session_id: str | None = None,
+    ) -> tuple[Task, Session]:
+        """通过 SessionManager 分配/复用 session，构造 Task（v1.2/v0.4.0 推荐入口）。
+
+        Args:
+            session_id: 显式指定复用已有 Session；为 None 时按 (user_id, agent_id) 自动分配。
+
+        Returns:
+            (Task, Session) 元组。
+        """
+        if session_id is not None:
+            session = self.session_manager.get_session(session_id)
+            if session is None or self.session_manager.is_session_expired(session_id):
+                raise ValueError(f"session {session_id} not found or expired")
+            if session.user_id != user_id:
+                raise ValueError(
+                    f"session {session_id} user_id mismatch: {session.user_id} != {user_id}"
+                )
+            session = self.session_manager.touch_session(session_id)
+        else:
+            session = self.session_manager.get_or_create_session(user_id, agent_id)
+
         task_id = uuid.uuid4().hex
-        return Task(
+        task = Task(
             task_id=task_id,
             session_id=session.session_id,
             user_id=user_id,
             agent_id=agent_id,
             description=description,
         )
+        return task, session
 
     def add_user_message(self, session_id: str, task_id: str, content: str) -> ConversationMessage:
         """记录一条用户消息；供外部调用方在收到 ``needs_user_input`` 后写入回复。"""
@@ -162,7 +187,7 @@ def build_runtime(
     )
     masker = Masker(config.masking_rules)
     budget_ledger = InMemoryBudgetLedger()
-    session_manager = SessionManager()
+    session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
     risk_manager = RiskStateManager(JsonlRiskStateStore(config.risk_state_path))
     conversation_store = JsonlConversationStore(
         config.conversation_path,

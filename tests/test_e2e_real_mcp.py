@@ -107,7 +107,7 @@ async def test_real_mcp_email_sent_after_approval(
 
     await runtime.start()
     try:
-        task = runtime.create_task(
+        task, _session = runtime.create_task(
             user_id="alice",
             agent_id=agent.agent_id,
             description="真实 MCP E2E：搜索并发送邮件",

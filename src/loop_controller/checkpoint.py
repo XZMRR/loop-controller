@@ -280,6 +280,17 @@ class Checkpoint:
         if perm is None or not perm.allowed:
             return self._deny(proposal, "tool not permitted", now, policy_version)
 
+        # 步骤 2.5：Session 连续拒绝硬熔断（v0.4.0）
+        session_risk = self._risk_manager.get_profile(task.session_id)
+        if session_risk.consecutive_deny_count >= profile.session_block_threshold:
+            return self._deny(
+                proposal,
+                f"session blocked: consecutive deny count {session_risk.consecutive_deny_count}",
+                now,
+                policy_version,
+                policy_hits=["session_consecutive_deny_block"],
+            )
+
         # 步骤 3：调用次数上限（per-task 成功执行历史计数 vs max_calls_per_task）
         if perm.max_calls_per_task is not None:
             call_count = sum(

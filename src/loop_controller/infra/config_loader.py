@@ -148,6 +148,7 @@ class AppConfig:
     audit_log_path: str
     decision_log_path: str
     risk_state_path: str = "./data/risk_state.jsonl"  # v1.2 会话级风险状态持久化路径
+    session_path: str = "./data/sessions.jsonl"  # v0.4.0 Session 持久化路径
     conversation_path: str = "./data/conversations.jsonl"  # v0.3.0 会话上下文持久化路径
     conversation_max_messages_per_session: int = 100  # v0.3.0 每个 session 保留消息数
     approval_store_path: str = "./data/approvals.jsonl"  # v0.3.0 审批请求/结果持久化路径
@@ -208,6 +209,9 @@ class ConfigLoader:
         approval_store_path = os.environ.get(
             "LOOP_CONTROLLER_APPROVAL_STORE_PATH", str(root / "data" / "approvals.jsonl")
         )
+        session_path = os.environ.get(
+            "LOOP_CONTROLLER_SESSION_PATH", str(root / "data" / "sessions.jsonl")
+        )
 
         app_config = AppConfig(
             agents=agents,
@@ -222,6 +226,7 @@ class ConfigLoader:
             audit_log_path=str(root / "data" / "audit.jsonl"),
             decision_log_path=str(root / "data" / "decisions.jsonl"),
             risk_state_path=str(root / "data" / "risk_state.jsonl"),
+            session_path=session_path,
             conversation_path=conversation_path,
             approval_store_path=approval_store_path,
             llm_planner=llm_planner,

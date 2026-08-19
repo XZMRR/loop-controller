@@ -122,6 +122,7 @@ class CapabilityProfile(BaseModel):
     max_budget_payment: float = 0.0
     fixed_ceiling: dict[str, Any] = Field(default_factory=dict)  # Earned Authority post-MVP
     session_risk_threshold: float = Field(default=0.6, ge=0.0, le=1.0)  # v1.2 会话级风险门控阈值
+    session_block_threshold: int = Field(default=5, ge=1)  # v0.4.0 连续 deny 熔断阈值
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +248,7 @@ class BudgetCost(BaseModel):
 
 
 class RiskProfile(BaseModel):
-    """Session 级风险画像（MVP 打桩：仅统计计数供审计引用，不参与判定）。"""
+    """Session 级风险画像。"""
 
     model_config = ConfigDict(frozen=True)
 
@@ -256,6 +257,7 @@ class RiskProfile(BaseModel):
     recent_tags: list[str] = Field(default_factory=list)
     denied_count: int = 0
     approval_count: int = 0
+    consecutive_deny_count: int = 0  # v0.4.0：连续 deny 计数，用于会话级硬熔断
 
 
 # ---------------------------------------------------------------------------

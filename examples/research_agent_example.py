@@ -71,7 +71,7 @@ async def main() -> None:
     agent = config.agents["researcher_001"]
 
     runtime = build_runtime(config, opa_url=OPA_URL)
-    task = runtime.create_task(
+    task, _session = runtime.create_task(
         user_id="alice",
         agent_id=agent.agent_id,
         description="调研 AI 合规问题并发送摘要邮件给张经理",

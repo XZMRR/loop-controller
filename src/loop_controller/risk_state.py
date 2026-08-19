@@ -200,16 +200,23 @@ class RiskStateManager:
         # 4. 统计计数
         denied_count = profile.denied_count
         approval_count = profile.approval_count
+        consecutive_deny_count = profile.consecutive_deny_count
         if event.event_type == "deny" or event.event_type == "approval_denied":
             denied_count += 1
-        if event.event_type == "approval_granted":
+            consecutive_deny_count += 1
+        elif event.event_type == "approval_granted":
             approval_count += 1
+            consecutive_deny_count = 0
+        elif event.event_type == "low_risk_success":
+            consecutive_deny_count = 0
+        # require_approval / critical 不改变 consecutive_deny_count
         self._profiles[event.session_id] = RiskProfile(
             session_id=event.session_id,
             cumulative_risk_score=round(score, 6),
             recent_tags=tags,
             denied_count=denied_count,
             approval_count=approval_count,
+            consecutive_deny_count=consecutive_deny_count,
         )
 
     def update(self, session_id: str, event_type: str, risk_level: str | None = None) -> None:
