@@ -50,7 +50,11 @@ from loop_controller.models import (
     ToolResult,
     UserQuestion,
 )
-from loop_controller.permission_interaction import ConfigPermissionInteractionAnalyzer
+from loop_controller.permission_interaction import (
+    CapabilityBasedPermissionAnalyzer,
+    CompositePermissionInteractionAnalyzer,
+    ConfigPermissionInteractionAnalyzer,
+)
 from loop_controller.planner import Planner, ScriptedPlanner
 from loop_controller.policy_engine import OPAPolicyEngine
 from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
@@ -220,7 +224,10 @@ def build_runtime(
         decision_store=JsonlDecisionStore(config.decision_log_path),
         budget_ledger=budget_ledger,
         reservation_store=reservation_store,
-        permission_analyzer=ConfigPermissionInteractionAnalyzer(config.permission_rules),
+        permission_analyzer=CompositePermissionInteractionAnalyzer(
+            ConfigPermissionInteractionAnalyzer(config.permission_rules),
+            CapabilityBasedPermissionAnalyzer(config.capability_rules),
+        ),
         tool_costs={
             name: BudgetCost(token_count=entry.cost_per_call)
             for name, entry in config.tool_mapping.items()

@@ -96,6 +96,10 @@ def build_policy_input(
         "risk_level": proposal.risk_level,
         "risk_tags": proposal.risk_tags,
         "task_context": proposal.task_context,
+        "action": {
+            "combination_risk_tags": proposal.combination_risk_tags,
+            "combination_risk_score": proposal.combination_risk_score,
+        },  # v0.10.0：能力组合风险字段进入 Rego input
         "agent": {
             "agent_id": agent.agent_id,
             "owner_id": agent.owner_id,

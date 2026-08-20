@@ -11,6 +11,21 @@ decision := {"verdict": "require_approval", "reason": "critical risk signal requ
     input.risk_level == "critical"
 }
 
+# ---- v0.10.0 能力组合风险门控：A+B>C ----
+# input.action.combination_risk_tags 不存在时规则自然失败，兼容旧 input。
+
+decision := {"verdict": "deny", "reason": "detected data exfil pattern: read + external email",
+             "policy_hits": ["capability_data_exfil_deny"]} if {
+    some tag in input.action.combination_risk_tags
+    tag == "data_exfil"
+}
+
+decision := {"verdict": "require_approval", "reason": "detected data upload pattern: read + external http",
+             "escalation_target": input.agent.owner_id, "policy_hits": ["capability_data_exfil_http_approval"]} if {
+    some tag in input.action.combination_risk_tags
+    tag == "data_exfil_http"
+}
+
 # ---- 会话风险门控：异常累积 → 一律升级人工审批 ----
 # input.session_risk 不存在时规则自然失败，不会崩溃（兼容旧日志/测试）
 decision := {"verdict": "require_approval", "reason": "session risk score above threshold",

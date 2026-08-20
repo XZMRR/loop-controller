@@ -151,6 +151,8 @@ class ActionProposal(BaseModel):
     task_context: str  # 由 Task.description 纯截断（前 200 字符）生成
     risk_level: RiskLevel = "low"
     risk_tags: list[str] = Field(default_factory=list)
+    combination_risk_tags: list[str] = Field(default_factory=list)  # v0.10.0：能力组合风险标签
+    combination_risk_score: int = 0  # v0.10.0：能力组合风险分数
     reason: str = ""  # R1 认为需要此动作的理由，供审批人与审计阅读
 
 

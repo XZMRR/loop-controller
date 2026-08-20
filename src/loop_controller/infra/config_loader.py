@@ -98,6 +98,52 @@ class PermissionRule:
     when_all: list[PermissionCondition]
     action: Literal["deny", "require_approval"]
     reason: str
+    risk_tags: list[str] = field(default_factory=list)  # v0.10.0：能力组合风险标签
+    score: int = 0  # v0.10.0：组合风险分数
+
+
+# ---------------------------------------------------------------------------
+# v0.10.0 Capability-Based Permission Interaction Analyzer 配置类型
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CapabilityProducer:
+    """工具调用 → 能力的产生条件。"""
+
+    tool: str
+    arg_match: dict[str, str] | None = None
+    arg_not_match: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class CapabilityDef:
+    """能力定义：一组产生条件，任一条件满足即产生该能力。"""
+
+    name: str
+    produced_by: list[CapabilityProducer]
+
+
+@dataclass(frozen=True)
+class CapabilityCombinationRule:
+    """能力组合规则：历史能力 + 当前能力 → 风险标签与裁决建议。"""
+
+    id: str
+    description: str
+    requires_any: list[str]
+    triggers_any: list[str]
+    action: Literal["deny", "require_approval"]
+    reason: str
+    risk_tags: list[str]
+    score: int
+
+
+@dataclass(frozen=True)
+class CapabilityRules:
+    """能力规则配置容器。"""
+
+    capabilities: dict[str, CapabilityDef]
+    combination_rules: list[CapabilityCombinationRule]
 
 
 @dataclass(frozen=True)
@@ -142,6 +188,7 @@ class AppConfig:
     mcp_servers: dict[str, MCPServerConfig]
     tool_mapping: dict[str, ToolMappingEntry]
     permission_rules: list[PermissionRule]
+    capability_rules: CapabilityRules  # v0.10.0
     masking_rules: MaskingRules
     approval: ApprovalConfig
     policy_dir: str
@@ -186,6 +233,7 @@ class ConfigLoader:
         profiles = self._load_profiles(config_dir / "profiles.yaml")
         mcp_servers, tool_mapping = self._load_mcp_servers(config_dir / "mcp_servers.yaml")
         permission_rules = self._load_permission_rules(config_dir / "permission_rules.yaml")
+        capability_rules = self._load_capability_rules(config_dir / "capability_rules.yaml")
         masking_rules = self._load_masking_rules(config_dir / "masking_rules.yaml")
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
@@ -232,6 +280,7 @@ class ConfigLoader:
             mcp_servers=mcp_servers,
             tool_mapping=tool_mapping,
             permission_rules=permission_rules,
+            capability_rules=capability_rules,
             masking_rules=masking_rules,
             approval=approval,
             policy_dir=str(root / "policies"),
@@ -311,9 +360,43 @@ class ConfigLoader:
                     when_all=conditions,
                     action=item["action"],
                     reason=item.get("reason", ""),
+                    risk_tags=item.get("risk_tags", []),
+                    score=item.get("score", 0),
                 )
             )
         return rules
+
+    def _load_capability_rules(self, path: Path) -> CapabilityRules:
+        """加载能力规则配置；文件缺失时返回空规则（向后兼容）。"""
+        if not path.exists():
+            return CapabilityRules(capabilities={}, combination_rules=[])
+        data = self._read_yaml(path)
+        capabilities: dict[str, CapabilityDef] = {}
+        for name, cap in (data.get("capabilities") or {}).items():
+            producers = [
+                CapabilityProducer(
+                    tool=p["tool"],
+                    arg_match=p.get("arg_match"),
+                    arg_not_match=p.get("arg_not_match"),
+                )
+                for p in cap.get("produced_by", [])
+            ]
+            capabilities[name] = CapabilityDef(name=name, produced_by=producers)
+        combination_rules: list[CapabilityCombinationRule] = []
+        for item in data.get("combination_rules", []):
+            combination_rules.append(
+                CapabilityCombinationRule(
+                    id=item["id"],
+                    description=item.get("description", ""),
+                    requires_any=list(item.get("requires_any", [])),
+                    triggers_any=list(item.get("triggers_any", [])),
+                    action=item["action"],
+                    reason=item.get("reason", ""),
+                    risk_tags=list(item.get("risk_tags", [])),
+                    score=item.get("score", 0),
+                )
+            )
+        return CapabilityRules(capabilities=capabilities, combination_rules=combination_rules)
 
     def _load_masking_rules(self, path: Path) -> MaskingRules:
         data = self._read_yaml(path)
@@ -420,6 +503,12 @@ class ConfigLoader:
                     patterns.extend(cond.history_arg_match.values())
                 if cond.current_arg_not_match:
                     patterns.extend(cond.current_arg_not_match.values())
+        for cap in config.capability_rules.capabilities.values():
+            for producer in cap.produced_by:
+                if producer.arg_match:
+                    patterns.extend(producer.arg_match.values())
+                if producer.arg_not_match:
+                    patterns.extend(producer.arg_not_match.values())
         for pattern in patterns:
             try:
                 compile_glob(pattern)

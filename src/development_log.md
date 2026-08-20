@@ -749,10 +749,59 @@
 
 ---
 
+## v0.10.0：Capability-Based Permission Interaction Analyzer（组合风险 A+B>C）
+
+目标：将 R2 的权限组合分析从静态 YAML 规则升级为基于"能力集合"的动态组合风险检测，实现 A+B>C 的自动发现，同时保持 Rego 作为最终裁决者。
+
+### 完成内容
+
+- **核心抽象**：
+  - 新增 `src/loop_controller/capability.py`：
+    - `Capability` / `CapabilityGraph`：能力实例与会话级能力集合（不可变）；
+    - `CapabilityGraphAnalyzer`：从动作中提取能力、构建历史能力图、匹配组合规则；
+    - 支持 `arg_match` / `arg_not_match` 的 POSIX glob 匹配。
+  - `ActionProposal` 扩展 `combination_risk_tags` 与 `combination_risk_score` 字段，供审计与 Rego 使用。
+- **配置层**：
+  - `ConfigLoader` 新增 `CapabilityProducer`、`CapabilityDef`、`CapabilityCombinationRule`、`CapabilityRules` 配置类；
+  - 加载 `config/capability_rules.yaml`；文件缺失时返回空规则（向后兼容）；
+  - `PermissionRule` 扩展 `risk_tags` / `score` 字段，用于承载能力分析结果；
+  - 启动校验纳入能力规则中的 glob 模式。
+- **组合分析器**：
+  - 新增 `CapabilityBasedPermissionAnalyzer`：基于能力集合返回 `PermissionRule`；
+  - 新增 `CompositePermissionInteractionAnalyzer`：同时保留静态 YAML 规则与能力规则，deny 优先，合并风险标签/分数。
+- **治理链路集成**：
+  - `Checkpoint.evaluate()` 在步骤 5 调用 analyzer，命中时将风险标签/分数写入 `ActionProposal`；
+  - `build_policy_input()` 将 `combination_risk_tags` / `combination_risk_score` 透传给 Rego；
+  - `policies/default.rego` 新增基于 `input.action.combination_risk_tags` 的 deny / require_approval 规则；
+  - `build_runtime()` 注入 `CompositePermissionInteractionAnalyzer`。
+- **规则配置**：
+  - 新增 `config/capability_rules.yaml`，声明 `data_read` / `email_external` / `network_external` 三种能力，以及 `data_exfil_via_email`（deny）和 `data_exfil_via_http`（require_approval）两条组合规则。
+- **测试**：
+  - 新建 `tests/test_capability.py`：覆盖单工具能力提取、arg_not_match、历史图构建、email/http 组合风险、误报控制；
+  - 更新 `tests/test_permission_interaction.py`：验证 `CapabilityBasedPermissionAnalyzer` 与 `CompositePermissionInteractionAnalyzer`。
+
+### 关键决策
+
+- **Python 图分析 + Rego 最终裁决**：Python 负责能力图构建与 A+B>C 检测，Rego 根据风险标签做最终判定，保持策略最终裁决权在 Rego。
+- **向后兼容**：静态 `permission_rules.yaml` 继续生效；能力规则配置缺失时返回空规则，不破坏旧配置树。
+- **组合分析结果归并**：多个规则命中时 deny 优先，风险标签取并集，分数取最大值，统一返回单个 `PermissionRule`。
+- **审计可解释性**：组合风险标签写入 `ActionProposal`，进入审计与 Rego input，便于事后追溯。
+
+### 验收状态
+
+- `pytest tests/`：**260 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.10.0_development.md`
+
+---
+
 ## 后续可选工作
 
-- **Earned Authority Manager**：v0.10.0 实现 R2 动态权限提升子系统。
-- **Permission Interaction Analyzer 升级**：v0.11.0 用图分析/能力代数检测 A+B>C 组合风险。
+- **Earned Authority Manager**：实现 R2 动态权限提升子系统。
 - **R3 异步审计分析**：用 LLM/规则对审计日志做异常检测。
 - **签名/WORM 存储**：当前哈希链只能检测篡改，不能防御整体重写；生产环境需要签名或 WORM 存储。
 - **多 worker 原子 DecisionStore**：当前单进程 asyncio 假设下检查+记账原子；多 worker 时需要原子语义。

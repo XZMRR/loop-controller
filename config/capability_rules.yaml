@@ -1,0 +1,40 @@
+# v0.10.0 Capability-Based Permission Interaction Analyzer
+# 把工具调用抽象为能力，检测 A+B>C 的组合风险。
+
+capabilities:
+  data_read:
+    produced_by:
+      - tool: read_file
+        arg_match: {path: "data/kb/**"}
+      - tool: query_database
+        arg_match: {sql: "SELECT*"}
+
+  email_external:
+    produced_by:
+      - tool: send_email
+        arg_match: {to: "*@*.com"}
+        arg_not_match: {to: "*@company.com"}
+
+  network_external:
+    produced_by:
+      - tool: fetch_url
+        arg_match: {url: "https://*"}
+
+combination_rules:
+  - id: data_exfil_via_email
+    description: "读取敏感数据后向外部邮箱发邮件"
+    requires_any: [data_read]
+    triggers_any: [email_external]
+    action: deny
+    reason: "detected data exfil pattern: read + external email"
+    risk_tags: [data_exfil]
+    score: 90
+
+  - id: data_exfil_via_http
+    description: "读取敏感数据后通过 HTTP 外发"
+    requires_any: [data_read]
+    triggers_any: [network_external]
+    action: require_approval
+    reason: "detected data upload pattern: read + external http"
+    risk_tags: [data_exfil_http]
+    score: 80

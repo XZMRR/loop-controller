@@ -402,11 +402,18 @@ class Checkpoint:
         reservation = self._create_reservation(proposal, now)
         self._save_reservation(reservation)
 
-        # 步骤 5：权限组合分析（T2.3 换真实现；当前占位恒 None）
+        # 步骤 5：权限组合分析（v0.10.0 Capability-Based Analyzer）
         history = self._history.get(task.task_id, [])
         pending_approval = False
         rule = self._permission_analyzer.check(proposal, history)
         if rule is not None:
+            # 把组合风险标签/分数写入 proposal，供 Rego 与审计使用
+            proposal = proposal.model_copy(
+                update={
+                    "combination_risk_tags": list(rule.risk_tags),
+                    "combination_risk_score": rule.score,
+                }
+            )
             if rule.action == "deny":
                 # deny 短路，不进入 Rego；返还已预留预算
                 self._refund_reservation(reservation)
