@@ -110,16 +110,17 @@ class CapabilityBasedPermissionAnalyzer:
         current: ActionProposal,
         history: list[ActionProposal],
     ) -> PermissionRule | None:
-        risk_tags, score, matched = self._analyzer.analyze(current, history)
+        risk_tags, score, matched, triggered = self._analyzer.analyze(current, history)
         if not matched:
             return None
-        return self._build_rule(matched, risk_tags, score)
+        return self._build_rule(matched, risk_tags, score, triggered)
 
     @staticmethod
     def _build_rule(
         matched: list[CapabilityCombinationRule],
         risk_tags: list[str],
         score: int,
+        triggered_capabilities: list[str],
     ) -> PermissionRule:
         """把命中的能力组合规则归并为单个 PermissionRule。"""
         action: Literal["deny", "require_approval"] = "require_approval"
@@ -133,6 +134,7 @@ class CapabilityBasedPermissionAnalyzer:
             reason="; ".join(rule.reason for rule in matched),
             risk_tags=list(risk_tags),
             score=score,
+            triggered_capabilities=list(triggered_capabilities),
         )
 
 
@@ -149,6 +151,7 @@ def _merge_rules(a: PermissionRule, b: PermissionRule) -> PermissionRule:
     unique_descs = list(dict.fromkeys(descriptions))
     unique_reasons = list(dict.fromkeys(reasons))
     tags = sorted(set(a.risk_tags) | set(b.risk_tags))
+    triggered = sorted(set(a.triggered_capabilities) | set(b.triggered_capabilities))
     return PermissionRule(
         id=" + ".join(unique_ids),
         description=" + ".join(unique_descs),
@@ -157,6 +160,7 @@ def _merge_rules(a: PermissionRule, b: PermissionRule) -> PermissionRule:
         reason="; ".join(unique_reasons),
         risk_tags=tags,
         score=max(a.score, b.score),
+        triggered_capabilities=triggered,
     )
 
 

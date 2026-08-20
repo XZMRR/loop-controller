@@ -35,6 +35,10 @@ AuditAction = Literal[
     "planner_error",
     "approval_expired",
     "approval_consumed",
+    "authority_granted",  # v0.11.0：动态权限提升授予
+    "authority_used",  # v0.11.0：动态权限提升使用
+    "authority_revoked",  # v0.11.0：动态权限提升撤销
+    "authority_expired",  # v0.11.0：动态权限提升过期
 ]
 ApprovalVerdict = Literal["approve", "deny"]
 ConversationRole = Literal["user", "agent"]
@@ -153,6 +157,7 @@ class ActionProposal(BaseModel):
     risk_tags: list[str] = Field(default_factory=list)
     combination_risk_tags: list[str] = Field(default_factory=list)  # v0.10.0：能力组合风险标签
     combination_risk_score: int = 0  # v0.10.0：能力组合风险分数
+    authority_token_ids: list[str] = Field(default_factory=list)  # v0.11.0：持有的动态权限令牌
     reason: str = ""  # R1 认为需要此动作的理由，供审批人与审计阅读
 
 
@@ -448,3 +453,82 @@ class TaskRunResult(BaseModel):
     request_id: str | None = None  # status == "needs_approval" 时非空
     pending_decision: Decision | None = None  # needs_approval 时保存完整 Decision
     pending_proposal: ActionProposal | None = None  # needs_approval 时保存完整 ActionProposal
+
+
+# ---------------------------------------------------------------------------
+# v0.11.0 Earned Authority Manager（动态权限提升）
+# ---------------------------------------------------------------------------
+
+
+class AuthorityRequest(BaseModel):
+    """Agent 向治理系统申请临时能力的请求。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    request_id: str
+    agent_id: str
+    task_id: str
+    requested_capabilities: list[str]
+    reason: str
+    user_confirmation: bool = False
+
+
+class AuthorityToken(BaseModel):
+    """治理系统签发的临时能力令牌。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    token_id: str
+    request_id: str
+    agent_id: str
+    task_id: str
+    granted_capabilities: list[str]
+    budget: BudgetCost  # 令牌预算上限
+    remaining_budget: BudgetCost  # 剩余预算
+    expires_at: datetime
+    created_at: datetime = Field(default_factory=_utc_now)
+    revoked_at: datetime | None = None
+    audit_record_id: str
+
+
+class AuthorityConditions(BaseModel):
+    """动态权限授予条件（声明式）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    user_confirmation: bool = False
+    budget_remaining: int | None = None  # 任务剩余预算阈值
+    no_recent_denials_within_steps: int | None = None
+    require_task_context_regex: str | None = None
+
+
+class AuthorityGrantRule(BaseModel):
+    """单个能力的动态授予规则。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    capability: str
+    description: str
+    conditions: AuthorityConditions
+    max_duration_seconds: int
+    budget_limit: BudgetCost
+
+
+class AuthorityRules(BaseModel):
+    """动态权限规则配置容器。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = True
+    grants: dict[str, AuthorityGrantRule] = Field(default_factory=dict)
+
+
+class AuthorityEvaluationContext(BaseModel):
+    """评估动态权限提升请求时的上下文信息。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    task_budget_remaining: int = 0
+    recent_denial_count: int = 0
+    task_context: str = ""
+    history: list[ActionProposal] = Field(default_factory=list)

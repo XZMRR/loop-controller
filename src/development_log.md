@@ -799,9 +799,64 @@
 
 ---
 
+## v0.11.0：Earned Authority Manager（动态权限提升）
+
+目标：在静态 CapabilityProfile 天花板之上，引入受控的动态权限提升机制。Agent 可在任务执行过程中申请临时能力（AuthorityToken），经治理系统评估条件后签发；Checkpoint 在裁决时识别有效 Token，将原本 deny/require_approval 的动作降级为 allow/require_approval（取决于公司 Rego 策略）。
+
+### 完成内容
+
+- **核心抽象**：
+  - 新增 `src/loop_controller/authority.py`：
+    - `AuthorityManager` / `NoopAuthorityManager` / `EarnedAuthorityManager`；
+    - `request_authority()` 按声明式条件评估并签发 `AuthorityToken`；
+    - `validate_for_proposal()` 验证 token 是否覆盖触发能力；
+    - `consume()` / `revoke_token()` / `revoke_expired_tokens()` 管理 token 生命周期。
+  - 新增 `src/loop_controller/infra/authority_store.py`：
+    - `AuthorityStore` Protocol；
+    - `InMemoryAuthorityStore` 与 `JsonlAuthorityStore`（append-only JSONL，事件重放恢复）。
+  - `models.py` 扩展：
+    - 新增 `AuthorityRequest`、`AuthorityToken`、`AuthorityConditions`、`AuthorityGrantRule`、`AuthorityRules`、`AuthorityEvaluationContext`；
+    - `ActionProposal` 扩展 `authority_token_ids`；
+    - `AuditAction` 扩展 `authority_granted/used/revoked/expired`；
+    - `PermissionRule` 扩展 `triggered_capabilities`（v0.11.0 用于判断 token 覆盖）。
+- **配置层**：
+  - `ConfigLoader` 加载 `config/authority_rules.yaml`；文件缺失时返回 `enabled=false`（向后兼容）；
+  - `AppConfig` 新增 `authority_rules` 与 `authority_log_path`；
+  - 启动校验纳入 `require_task_context_regex` 正则编译。
+- **治理链路集成**：
+  - `Checkpoint.evaluate()` 步骤 5 检测组合风险后，若 deny 规则触发且 proposal 携带覆盖触发能力的有效 token，则不短路 deny，把裁决权交给 Rego；
+  - 步骤 5.5 防御性校验 proposal 声明的 token；
+  - `build_policy_input()` 将 `authority_token_ids` 透传给 Rego；
+  - `policies/default.rego` 新增规则：有 token 的 `data_exfil` 从 deny 降级为 `require_approval`；
+  - `forward()` 成功后调用 `authority_manager.consume()` 扣减 token 预算；
+  - `build_runtime()` 注入 `EarnedAuthorityManager` 与 `JsonlAuthorityStore`。
+- **规则配置**：
+  - 新增 `config/authority_rules.yaml`，声明 `email_external` 与 `network_external` 两种可动态授予能力，条件包含用户确认、预算、近期无拒绝。
+- **测试**：
+  - 新建 `tests/test_authority.py`：覆盖 grant/deny、条件评估、token 验证、消费、撤销、过期清理、多能力合并。
+
+### 关键决策
+
+- **Rego 保留最终裁决权**：token 只改变 input 事实，是否 allow/require_approval/deny 由 Rego 决定。
+- **向后兼容**：`authority_rules.yaml` 缺失时 `AuthorityRules(enabled=false)`，所有调用返回 deny，不破坏旧配置树。
+- **Token 不可伪造**：token_id 由 `EarnedAuthorityManager` 生成并持久化，`Checkpoint` 只信任 store 中的记录。
+- **用户确认必须外部注入**：`user_confirmation` 字段不由 Agent 自行设置，必须由 R0 审批或显式用户输入设置。
+- **Token 预算软限制**：token 剩余预算在 `forward` 成功后扣减；预算耗尽时 token 失效，但不阻止已执行动作（记录 warning）。
+
+### 验收状态
+
+- `pytest tests/`：**274 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.11.0_development.md`
+
+---
+
 ## 后续可选工作
 
-- **Earned Authority Manager**：实现 R2 动态权限提升子系统。
 - **R3 异步审计分析**：用 LLM/规则对审计日志做异常检测。
 - **签名/WORM 存储**：当前哈希链只能检测篡改，不能防御整体重写；生产环境需要签名或 WORM 存储。
 - **多 worker 原子 DecisionStore**：当前单进程 asyncio 假设下检查+记账原子；多 worker 时需要原子语义。

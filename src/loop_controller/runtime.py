@@ -15,11 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from loop_controller.approval_manager import AsyncApprovalManager
+from loop_controller.authority import EarnedAuthorityManager
 from loop_controller.budget import JsonlBudgetLedger
 from loop_controller.checkpoint import Checkpoint, CheckpointError
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import AuditStore, JsonlAuditStore
+from loop_controller.infra.authority_store import JsonlAuthorityStore
 from loop_controller.infra.config_loader import AppConfig, ConfigLoader
 from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.decision_store import JsonlDecisionStore
@@ -213,6 +215,10 @@ def build_runtime(
     )
     task_store = JsonlTaskStore(config.task_store_path)
     reservation_store = JsonlReservationStore(config.reservation_store_path)
+    authority_manager = EarnedAuthorityManager(
+        rules=config.authority_rules,
+        store=JsonlAuthorityStore(config.authority_log_path),
+    )
     checkpoint = Checkpoint(
         profiles=config.profiles,
         policy_engine=policy_engine,
@@ -228,6 +234,7 @@ def build_runtime(
             ConfigPermissionInteractionAnalyzer(config.permission_rules),
             CapabilityBasedPermissionAnalyzer(config.capability_rules),
         ),
+        authority_manager=authority_manager,
         tool_costs={
             name: BudgetCost(token_count=entry.cost_per_call)
             for name, entry in config.tool_mapping.items()

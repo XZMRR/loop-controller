@@ -79,11 +79,11 @@ class CapabilityGraphAnalyzer:
         self,
         current: ActionProposal,
         history: list[ActionProposal],
-    ) -> tuple[list[str], int, list[CapabilityCombinationRule]]:
+    ) -> tuple[list[str], int, list[CapabilityCombinationRule], list[str]]:
         """分析当前动作与历史动作的组合风险。
 
         Returns:
-            (risk_tags, max_score, matched_rules)
+            (risk_tags, max_score, matched_rules, triggered_capabilities)
         """
         history_graph = self.build_graph(history)
         current_caps = self.extract_capabilities(current)
@@ -97,15 +97,17 @@ class CapabilityGraphAnalyzer:
                 matched.append(rule)
 
         if not matched:
-            return [], 0, []
+            return [], 0, [], []
 
         tags: set[str] = set()
+        triggered: set[str] = set()
         max_score = 0
         for rule in matched:
             tags.update(rule.risk_tags)
+            triggered.update(rule.triggers_any)
             if rule.score > max_score:
                 max_score = rule.score
-        return sorted(tags), max_score, matched
+        return sorted(tags), max_score, matched, sorted(triggered)
 
 
 def _args_match_patterns(args: dict[str, Any], patterns: dict[str, str]) -> bool:

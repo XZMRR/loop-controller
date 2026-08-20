@@ -18,6 +18,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
 
+from loop_controller.authority import AuthorityManager, NoopAuthorityManager
 from loop_controller.governance_context import build_context_meta, build_governance_context
 from loop_controller.infra.config_loader import PermissionRule
 from loop_controller.infra.identity import IdentityProvider
@@ -203,6 +204,7 @@ class Checkpoint:
         budget_ledger: BudgetLedger | None = None,
         reservation_store: ReservationStore | None = None,  # v0.6.1 预算预留状态机
         permission_analyzer: PermissionInteractionAnalyzer | None = None,
+        authority_manager: AuthorityManager | None = None,  # v0.11.0 动态权限提升
         tool_costs: dict[str, BudgetCost] | None = None,  # v1.1：tool_name -> 单次调用成本
         masker=None,  # Masker（T3.2 接入 build_approval_request）
         now: Callable[[], datetime] | None = None,
@@ -218,6 +220,7 @@ class Checkpoint:
         self._budget_ledger = budget_ledger or InfiniteBudgetLedger()
         self._reservation_store = reservation_store or InMemoryReservationStore()
         self._permission_analyzer = permission_analyzer or NoopPermissionInteractionAnalyzer()
+        self._authority_manager = authority_manager or NoopAuthorityManager()
         self._tool_costs = tool_costs or {}
         self._masker = masker
         self._now = now or _utc_now
@@ -235,6 +238,14 @@ class Checkpoint:
     def _cost_for(self, proposal: ActionProposal) -> BudgetCost:
         """该工具单次调用的估算成本（v1.1：按工具 cost_per_call；未配置回退默认值）。"""
         return self._tool_costs.get(proposal.tool_name, _DEFAULT_PER_CALL_COST)
+
+    def _consume_authority_tokens(self, proposal: ActionProposal) -> None:
+        """v0.11.0：动作成功执行后消费 token 预算；失败仅记录日志。"""
+        cost = self._cost_for(proposal)
+        for token_id in proposal.authority_token_ids:
+            updated = self._authority_manager.consume(token_id, cost)
+            if updated is None:
+                logger.warning("Authority token %s budget exhausted or invalid", token_id)
 
     def _refund_for(self, proposal: ActionProposal) -> None:
         """将当前 proposal 已预留的预算返还（P0：所有非执行路径必须 refund）。"""
@@ -405,6 +416,7 @@ class Checkpoint:
         # 步骤 5：权限组合分析（v0.10.0 Capability-Based Analyzer）
         history = self._history.get(task.task_id, [])
         pending_approval = False
+        authority_override = False  # v0.11.0：有效 token 覆盖了 deny
         rule = self._permission_analyzer.check(proposal, history)
         if rule is not None:
             # 把组合风险标签/分数写入 proposal，供 Rego 与审计使用
@@ -415,10 +427,40 @@ class Checkpoint:
                 }
             )
             if rule.action == "deny":
-                # deny 短路，不进入 Rego；返还已预留预算
-                self._refund_reservation(reservation)
-                return self._deny(proposal, rule.reason, now, policy_version, policy_hits=[rule.id])
-            pending_approval = True  # require_approval 不短路，继续走 Rego（deny 优先原则）
+                # v0.11.0：若持有覆盖触发能力的有效 token，把裁决权交给 Rego；否则短路 deny
+                if rule.triggered_capabilities:
+                    valid_tokens = self._authority_manager.validate_for_proposal(
+                        proposal, rule.triggered_capabilities
+                    )
+                    if valid_tokens:
+                        proposal = proposal.model_copy(
+                            update={
+                                "authority_token_ids": [t.token_id for t in valid_tokens]
+                            }
+                        )
+                        authority_override = True
+                    else:
+                        self._refund_reservation(reservation)
+                        return self._deny(
+                            proposal, rule.reason, now, policy_version, policy_hits=[rule.id]
+                        )
+                else:
+                    self._refund_reservation(reservation)
+                    return self._deny(
+                        proposal, rule.reason, now, policy_version, policy_hits=[rule.id]
+                    )
+            else:
+                pending_approval = True  # require_approval 不短路，继续走 Rego（deny 优先原则）
+
+        # 步骤 5.5：防御性校验 proposal 中声明的 token（无论组合规则是否命中）
+        if proposal.authority_token_ids and not authority_override:
+            # 仅校验 token 仍然有效；不影响已有 rule 决策
+            valid_tokens = self._authority_manager.validate_for_proposal(
+                proposal, []
+            )
+            proposal = proposal.model_copy(
+                update={"authority_token_ids": [t.token_id for t in valid_tokens]}
+            )
 
         # 步骤 6：主策略查询（OPA/Rego；引擎内部任何异常已 fail-closed 为 deny）
         session_risk = self._risk_manager.get_profile(task.session_id)
@@ -682,6 +724,8 @@ class Checkpoint:
         self._commit_reservation(reservation)
         if result.status == "success":
             self._history.setdefault(proposal.task_id, []).append(proposal)
+            # v0.11.0：动作成功后消费 token 预算
+            self._consume_authority_tokens(proposal)
             # v1.2：allow 且风险低时按低风险成功衰减会话风险分
             if (
                 session_id is not None

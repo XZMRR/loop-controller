@@ -1,0 +1,25 @@
+# v0.11.0 Earned Authority Manager（动态权限提升）
+# 在静态 CapabilityProfile 天花板之上，按条件授予临时能力。
+
+enabled: true
+
+authority_grants:
+  email_external:
+    description: "允许在用户确认后向外部邮箱发邮件"
+    conditions:
+      user_confirmation: true
+      budget_remaining: 10
+      no_recent_denials_within_steps: 5
+    max_duration_seconds: 300
+    budget_limit:
+      token_count: 5
+
+  network_external:
+    description: "允许在用户确认后通过 HTTP 外发数据"
+    conditions:
+      user_confirmation: true
+      budget_remaining: 10
+      no_recent_denials_within_steps: 5
+    max_duration_seconds: 300
+    budget_limit:
+      token_count: 5

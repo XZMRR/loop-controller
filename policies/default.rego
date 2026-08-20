@@ -18,6 +18,15 @@ decision := {"verdict": "deny", "reason": "detected data exfil pattern: read + e
              "policy_hits": ["capability_data_exfil_deny"]} if {
     some tag in input.action.combination_risk_tags
     tag == "data_exfil"
+    count(input.action.authority_token_ids) == 0
+}
+
+# v0.11.0：持有有效 AuthorityToken 的 data_exfil 从 deny 降级为 require_approval
+decision := {"verdict": "require_approval", "reason": "data exfil with authority token requires final approval",
+             "escalation_target": input.agent.owner_id, "policy_hits": ["capability_data_exfil_token_approval"]} if {
+    some tag in input.action.combination_risk_tags
+    tag == "data_exfil"
+    count(input.action.authority_token_ids) > 0
 }
 
 decision := {"verdict": "require_approval", "reason": "detected data upload pattern: read + external http",

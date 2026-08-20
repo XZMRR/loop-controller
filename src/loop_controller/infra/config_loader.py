@@ -30,6 +30,10 @@ import yaml
 
 from loop_controller.models import (
     Agent,
+    AuthorityConditions,
+    AuthorityGrantRule,
+    AuthorityRules,
+    BudgetCost,
     CapabilityProfile,
     ToolPermission,
 )
@@ -100,6 +104,7 @@ class PermissionRule:
     reason: str
     risk_tags: list[str] = field(default_factory=list)  # v0.10.0：能力组合风险标签
     score: int = 0  # v0.10.0：组合风险分数
+    triggered_capabilities: list[str] = field(default_factory=list)  # v0.11.0：命中规则时触发的当前能力
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +194,7 @@ class AppConfig:
     tool_mapping: dict[str, ToolMappingEntry]
     permission_rules: list[PermissionRule]
     capability_rules: CapabilityRules  # v0.10.0
+    authority_rules: AuthorityRules  # v0.11.0
     masking_rules: MaskingRules
     approval: ApprovalConfig
     policy_dir: str
@@ -202,6 +208,7 @@ class AppConfig:
     task_store_path: str = "./data/tasks.jsonl"  # v0.6.0 Task 持久化路径
     budget_ledger_path: str = "./data/budget.jsonl"  # v0.6.0 预算事件持久化路径
     reservation_store_path: str = "./data/reservations.jsonl"  # v0.8.0 reservation 持久化路径
+    authority_log_path: str = "./data/authority.jsonl"  # v0.11.0 authority token 持久化路径
     llm_planner: LLMPlannerConfig | None = None
     audit_hash_algo: AuditHashAlgorithm = "sha256"
     audit_hmac_key_env: str = "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
@@ -234,6 +241,7 @@ class ConfigLoader:
         mcp_servers, tool_mapping = self._load_mcp_servers(config_dir / "mcp_servers.yaml")
         permission_rules = self._load_permission_rules(config_dir / "permission_rules.yaml")
         capability_rules = self._load_capability_rules(config_dir / "capability_rules.yaml")
+        authority_rules = self._load_authority_rules(config_dir / "authority_rules.yaml")
         masking_rules = self._load_masking_rules(config_dir / "masking_rules.yaml")
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
@@ -281,6 +289,7 @@ class ConfigLoader:
             tool_mapping=tool_mapping,
             permission_rules=permission_rules,
             capability_rules=capability_rules,
+            authority_rules=authority_rules,
             masking_rules=masking_rules,
             approval=approval,
             policy_dir=str(root / "policies"),
@@ -397,6 +406,31 @@ class ConfigLoader:
                 )
             )
         return CapabilityRules(capabilities=capabilities, combination_rules=combination_rules)
+
+    def _load_authority_rules(self, path: Path) -> AuthorityRules:
+        """加载动态权限规则配置；文件缺失时返回空规则（向后兼容）。"""
+        if not path.exists():
+            return AuthorityRules(enabled=False)
+        data = self._read_yaml(path)
+        grants: dict[str, AuthorityGrantRule] = {}
+        for capability, item in (data.get("authority_grants") or {}).items():
+            cond = item.get("conditions", {})
+            grants[capability] = AuthorityGrantRule(
+                capability=capability,
+                description=item.get("description", ""),
+                conditions=AuthorityConditions(
+                    user_confirmation=cond.get("user_confirmation", False),
+                    budget_remaining=cond.get("budget_remaining"),
+                    no_recent_denials_within_steps=cond.get("no_recent_denials_within_steps"),
+                    require_task_context_regex=cond.get("require_task_context_regex"),
+                ),
+                max_duration_seconds=item.get("max_duration_seconds", 300),
+                budget_limit=BudgetCost(**item.get("budget_limit", {"token_count": 0})),
+            )
+        return AuthorityRules(
+            enabled=data.get("enabled", True),
+            grants=grants,
+        )
 
     def _load_masking_rules(self, path: Path) -> MaskingRules:
         data = self._read_yaml(path)
@@ -523,6 +557,14 @@ class ConfigLoader:
                 raise ConfigValidationError(
                     f"非法掩码正则 {vp.pattern!r}：{exc}"
                 ) from exc
+        for rule in config.authority_rules.grants.values():
+            if rule.conditions.require_task_context_regex:
+                try:
+                    re.compile(rule.conditions.require_task_context_regex)
+                except re.error as exc:
+                    raise ConfigValidationError(
+                        f"非法 authority 正则 {rule.conditions.require_task_context_regex!r}：{exc}"
+                    ) from exc
 
     def _check_approver_exists(self, config: AppConfig) -> None:
         """v1.1（评审#9）校验 7：approver 存在于 users 且不等于任何 agent_id。"""
