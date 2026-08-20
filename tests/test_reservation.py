@@ -1,10 +1,16 @@
-"""BudgetReservation 状态机测试（v0.6.1）。"""
+"""BudgetReservation 状态机测试（v0.6.1 / v0.8.0）。"""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from loop_controller.infra.reservation_store import InMemoryReservationStore
+import pytest
+
+from loop_controller.infra.reservation_store import (
+    InMemoryReservationStore,
+    JsonlReservationStore,
+    ReservationStoreError,
+)
 from loop_controller.models import (
     ActionProposal,
     Agent,
@@ -190,3 +196,105 @@ def test_get_pending_reservation_only_active() -> None:
     refunded = cp._refund_reservation(reservation)
     assert refunded.state == "refunded"
     assert cp.get_pending_reservation(proposal.call_id) is None
+
+
+# v0.8.0：JsonlReservationStore 持久化测试
+
+
+def _make_reservation(reservation_id="r1", task_id="t1", call_id="c1", state="pending"):
+    return BudgetReservation(
+        reservation_id=reservation_id,
+        task_id=task_id,
+        call_id=call_id,
+        tool_name="web_search",
+        cost=BudgetCost(token_count=10),
+        state=state,
+    )
+
+
+def test_jsonl_store_save_and_get(tmp_path) -> None:
+    """JsonlReservationStore 保存后按 id / call_id 读取。"""
+    store = JsonlReservationStore(tmp_path / "reservations.jsonl")
+    r = _make_reservation()
+    store.save(r)
+
+    got = store.get("r1")
+    assert got is not None
+    assert got.state == "pending"
+
+    by_call = store.get_by_call_id("c1")
+    assert by_call is not None
+    assert by_call.reservation_id == "r1"
+
+
+def test_jsonl_store_transition_overwrite(tmp_path) -> None:
+    """多次 save 返回最新状态。"""
+    store = JsonlReservationStore(tmp_path / "reservations.jsonl")
+    r = _make_reservation()
+    store.save(r)
+    r2 = r.model_copy(update={"state": "pending_approval", "expires_at": datetime.now(UTC) + timedelta(minutes=15)})
+    store.save(r2)
+
+    got = store.get("r1")
+    assert got is not None
+    assert got.state == "pending_approval"
+    assert got.expires_at is not None
+
+
+def test_jsonl_store_list_by_task(tmp_path) -> None:
+    """按 task_id 过滤 reservation。"""
+    store = JsonlReservationStore(tmp_path / "reservations.jsonl")
+    store.save(_make_reservation(reservation_id="r1", task_id="t1", call_id="c1"))
+    store.save(_make_reservation(reservation_id="r2", task_id="t1", call_id="c2"))
+    store.save(_make_reservation(reservation_id="r3", task_id="t2", call_id="c3"))
+
+    assert len(store.list_by_task("t1")) == 2
+    assert len(store.list_by_task("t2")) == 1
+
+
+def test_jsonl_store_persistence_across_reconstruction(tmp_path) -> None:
+    """重建 store 对象后状态恢复。"""
+    path = tmp_path / "reservations.jsonl"
+    store1 = JsonlReservationStore(path)
+    r = _make_reservation()
+    store1.save(r)
+    r2 = r.model_copy(update={"state": "committed"})
+    store1.save(r2)
+
+    store2 = JsonlReservationStore(path)
+    got = store2.get("r1")
+    assert got is not None
+    assert got.state == "committed"
+    assert store2.get_by_call_id("c1") is not None
+    assert len(store2.list_by_task("t1")) == 1
+
+
+def test_jsonl_store_corrupted_file_fail_closed(tmp_path) -> None:
+    """损坏文件 fail-closed。"""
+    path = tmp_path / "reservations.jsonl"
+    path.write_text("not json\n", encoding="utf-8")
+    with pytest.raises(ReservationStoreError):  # noqa: PT012
+        JsonlReservationStore(path)
+
+
+def test_jsonl_store_datetime_roundtrip(tmp_path) -> None:
+    """datetime 字段正确序列化/反序列化。"""
+    created = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    expires = datetime(2026, 1, 1, 13, 0, 0, tzinfo=UTC)
+    r = BudgetReservation(
+        reservation_id="r1",
+        task_id="t1",
+        call_id="c1",
+        tool_name="web_search",
+        cost=BudgetCost(token_count=10),
+        state="pending",
+        created_at=created,
+        expires_at=expires,
+    )
+    store = JsonlReservationStore(tmp_path / "reservations.jsonl")
+    store.save(r)
+
+    got = store.get("r1")
+    assert got is not None
+    assert got.created_at == created
+    assert got.expires_at == expires

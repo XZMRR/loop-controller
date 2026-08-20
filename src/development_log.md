@@ -614,6 +614,50 @@
 
 ---
 
+## v0.8.0：持久化 BudgetReservation 存储
+
+目标：把 v0.6.1 中仍为内存实现的 `ReservationStore` 升级为持久化 JSONL 实现，让 BudgetReservation 状态机在 Runtime/Proxy 重启后可恢复。
+
+### 完成内容
+
+- **`JsonlReservationStore` 实现**（`src/loop_controller/infra/reservation_store.py`）：
+  - append-only JSONL，事件类型 `reservation_created` / `reservation_transitioned`；
+  - 启动时重放所有事件恢复内存索引；
+  - 损坏文件 fail-closed，抛 `ReservationStoreError`；
+  - `InMemoryReservationStore` 保留为测试默认实现。
+- **配置扩展**：
+  - `AppConfig` 新增 `reservation_store_path`；
+  - `ConfigLoader` 支持环境变量 `LOOP_CONTROLLER_RESERVATION_STORE_PATH`；
+  - 默认路径 `data/reservations.jsonl`。
+- **Runtime 集成**：
+  - `Runtime` 新增 `reservation_store: ReservationStore` 字段，默认 `InMemoryReservationStore`；
+  - `build_runtime()` 创建 `JsonlReservationStore` 并注入 `Checkpoint` 和 `Runtime`；
+  - `Checkpoint` 从 `Runtime` 接收持久化 store，生产环境统一走 JSONL。
+
+### 关键决策
+
+- **向后兼容**：`Runtime` 和 `Checkpoint` 都保留默认内存实现，测试代码无需改动；生产由 `build_runtime()` 注入持久化实现。
+- **事件化持久化**：只记录创建和状态流转事件，不重写全量状态；恢复时重放到内存索引，与 `JsonlBudgetLedger`、`JsonlTaskStore` 风格一致。
+- **不解决多 worker 并发**：仍明确单进程 asyncio 假设；多进程写 JSONL 的竞态不在本版本范围内。
+
+### 新增/更新测试
+
+- `tests/test_reservation.py`：新增 6 个 `JsonlReservationStore` 测试（save/get、transition overwrite、list_by_task、跨对象恢复、损坏 fail-closed、datetime roundtrip）；
+- 文件标题更新为 `v0.6.1 / v0.8.0`；
+- 所有已有测试通过，验证集成未破坏。
+
+### 验收状态
+
+- `pytest tests/`：**248 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.8.0_development.md`
+
+---
+
 ## 后续可选工作
 
 - **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。

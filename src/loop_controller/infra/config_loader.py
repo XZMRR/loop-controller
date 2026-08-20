@@ -154,6 +154,7 @@ class AppConfig:
     approval_store_path: str = "./data/approvals.jsonl"  # v0.3.0 审批请求/结果持久化路径
     task_store_path: str = "./data/tasks.jsonl"  # v0.6.0 Task 持久化路径
     budget_ledger_path: str = "./data/budget.jsonl"  # v0.6.0 预算事件持久化路径
+    reservation_store_path: str = "./data/reservations.jsonl"  # v0.8.0 reservation 持久化路径
     llm_planner: LLMPlannerConfig | None = None
     audit_hash_algo: AuditHashAlgorithm = "sha256"
     audit_hmac_key_env: str = "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
@@ -220,6 +221,9 @@ class ConfigLoader:
         budget_ledger_path = os.environ.get(
             "LOOP_CONTROLLER_BUDGET_LEDGER_PATH", str(root / "data" / "budget.jsonl")
         )
+        reservation_store_path = os.environ.get(
+            "LOOP_CONTROLLER_RESERVATION_STORE_PATH", str(root / "data" / "reservations.jsonl")
+        )
 
         app_config = AppConfig(
             agents=agents,
@@ -239,6 +243,7 @@ class ConfigLoader:
             approval_store_path=approval_store_path,
             task_store_path=task_store_path,
             budget_ledger_path=budget_ledger_path,
+            reservation_store_path=reservation_store_path,
             llm_planner=llm_planner,
             audit_hash_algo=audit_hash_algo,
             audit_key_id=audit_key_id,

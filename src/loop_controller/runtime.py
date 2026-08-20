@@ -25,6 +25,11 @@ from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.decision_store import JsonlDecisionStore
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import FilePolicyStore
+from loop_controller.infra.reservation_store import (
+    InMemoryReservationStore,
+    JsonlReservationStore,
+    ReservationStore,
+)
 from loop_controller.infra.task_store import InMemoryTaskStore, JsonlTaskStore, TaskStore
 from loop_controller.llm_planner import HttpxLLMClient, LLMPlanner
 from loop_controller.masker import Masker
@@ -76,6 +81,7 @@ class Runtime:
     risk_manager: RiskStateManager  # v1.2 会话级风险状态
     conversation_store: JsonlConversationStore  # v0.3.0 会话上下文持久化
     task_store: TaskStore = field(default_factory=InMemoryTaskStore)  # v0.6.0 Task 持久化
+    reservation_store: ReservationStore = field(default_factory=InMemoryReservationStore)  # v0.8.0 reservation 持久化
 
     def create_task(
         self,
@@ -202,6 +208,7 @@ def build_runtime(
         max_messages_per_session=config.conversation_max_messages_per_session,
     )
     task_store = JsonlTaskStore(config.task_store_path)
+    reservation_store = JsonlReservationStore(config.reservation_store_path)
     checkpoint = Checkpoint(
         profiles=config.profiles,
         policy_engine=policy_engine,
@@ -212,6 +219,7 @@ def build_runtime(
         risk_manager=risk_manager,
         decision_store=JsonlDecisionStore(config.decision_log_path),
         budget_ledger=budget_ledger,
+        reservation_store=reservation_store,
         permission_analyzer=ConfigPermissionInteractionAnalyzer(config.permission_rules),
         tool_costs={
             name: BudgetCost(token_count=entry.cost_per_call)
@@ -259,6 +267,7 @@ def build_runtime(
         risk_manager=risk_manager,
         conversation_store=conversation_store,
         task_store=task_store,
+        reservation_store=reservation_store,
     )
 
 
