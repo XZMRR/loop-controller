@@ -164,7 +164,7 @@ def _cmd_proxy(config: AppConfig, args: argparse.Namespace) -> int:
                 ),
             )
             if args.transport == "stdio":
-                proxy.run_stdio()
+                await proxy.run_stdio()
             else:
                 proxy.run_sse(host=args.host, port=args.port)
         finally:

@@ -3,23 +3,42 @@
 # allowed_args / denied_args 的值支持 POSIX glob。
 profiles:
   - profile_id: research_assistant_v1
-    description: 研究助手岗位说明书
+    description: 研究助手岗位说明书（v0.9.0 生产验证版）
     max_budget_token: 100000
     max_budget_payment: 0.0
     tools:
       web_search:
         allowed: true
         max_calls_per_task: 10
+      fetch_url:
+        allowed: true
+        max_calls_per_task: 5
       read_file:
         allowed: true
         allowed_args:
-          path: ["/data/kb/**"]
+          path: ["data/kb/**"]
         max_calls_per_task: 20
+      list_directory:
+        allowed: true
+        allowed_args:
+          path: ["data/**"]
+        max_calls_per_task: 10
       write_file:
         allowed: true
         allowed_args:
-          path: ["/data/output/**"]
+          path: ["data/output/**"]
         max_calls_per_task: 5
+      query_database:
+        allowed: true
+        allowed_args:
+          sql: ["SELECT*"]
+        max_calls_per_task: 10
+      update_database:
+        allowed: true
+        require_approval: true
+        allowed_args:
+          sql: ["INSERT*", "UPDATE*"]
+        max_calls_per_task: 1
       send_email:
         allowed: true
         require_approval: true

@@ -31,12 +31,28 @@ decision := {"verdict": "allow", "reason": "web search allowed", "policy_hits": 
     not session_risk_above_threshold
 }
 
+# ---- fetch_url：允许访问公开 HTTP 资源 ----
+decision := {"verdict": "allow", "reason": "fetch_url allowed", "policy_hits": ["fetch_url_allow"]} if {
+    input.tool_name == "fetch_url"
+    input.risk_level != "critical"
+    not session_risk_above_threshold
+}
+
 # ---- read_file：限目录 ----
 decision := {"verdict": "allow", "reason": "read within allowed directories", "policy_hits": ["read_file_allow"]} if {
     input.tool_name == "read_file"
     input.risk_level != "critical"
     not session_risk_above_threshold
     some pattern in input.profile.tools.read_file.allowed_args.path
+    glob.match(pattern, ["/"], input.arguments.path)
+}
+
+# ---- list_directory：限目录 ----
+decision := {"verdict": "allow", "reason": "list within allowed directories", "policy_hits": ["list_directory_allow"]} if {
+    input.tool_name == "list_directory"
+    input.risk_level != "critical"
+    not session_risk_above_threshold
+    some pattern in input.profile.tools.list_directory.allowed_args.path
     glob.match(pattern, ["/"], input.arguments.path)
 }
 
@@ -47,6 +63,26 @@ decision := {"verdict": "allow", "reason": "write within allowed directories", "
     not session_risk_above_threshold
     some pattern in input.profile.tools.write_file.allowed_args.path
     glob.match(pattern, ["/"], input.arguments.path)
+}
+
+# ---- query_database：只允许 SELECT ----
+decision := {"verdict": "allow", "reason": "read-only database query allowed", "policy_hits": ["query_database_allow"]} if {
+    input.tool_name == "query_database"
+    input.risk_level != "critical"
+    not session_risk_above_threshold
+    startswith(upper(trim_space(input.arguments.sql)), "SELECT")
+}
+
+decision := {"verdict": "deny", "reason": "query_database only supports SELECT", "policy_hits": ["query_database_deny_non_select"]} if {
+    input.tool_name == "query_database"
+    not startswith(upper(trim_space(input.arguments.sql)), "SELECT")
+}
+
+# ---- update_database：涉及写数据，强制审批 ----
+decision := {"verdict": "require_approval", "reason": "update_database requires human approval",
+             "escalation_target": input.agent.owner_id, "policy_hits": ["update_database_approval"]} if {
+    input.tool_name == "update_database"
+    input.risk_level != "critical"
 }
 
 # ---- send_email：白名单内收件人 → 按 Profile 决定是否审批；白名单外 → deny ----

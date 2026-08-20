@@ -1,10 +1,18 @@
 # MCP Server 发现与工具映射（§6.5，硬编码配置）
 # filesystem：真实官方 filesystem MCP server（Node/npx）。
+# fetch：Loop Controller 自带 fetch MCP server（Python/httpx）。
+# sqlite：Loop Controller 自带 sqlite MCP server（Python/sqlite3）。
 # email_mock：Loop Controller 自带 mock server（send_email 只记录、web_search 返回固定结果，
 #              保证 A14 断网可运行）。
 servers:
   filesystem:
-    command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/data/kb", "/data/output"]
+    command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
+    transport: stdio
+  fetch:
+    command: ["python", "-m", "loop_controller.mcp_servers.fetch_server"]
+    transport: stdio
+  sqlite:
+    command: ["python", "-m", "loop_controller.mcp_servers.sqlite_server", "data/company.db"]
     transport: stdio
   email_mock:
     command: ["python", "-m", "loop_controller.mocks.email_server"]
@@ -13,5 +21,9 @@ servers:
 tool_mapping:
   read_file:   {server: filesystem, mcp_name: read_text_file, cost_per_call: 500}
   write_file:  {server: filesystem, mcp_name: write_file, cost_per_call: 300}
+  list_directory: {server: filesystem, mcp_name: list_directory, cost_per_call: 200}
+  fetch_url:   {server: fetch, mcp_name: fetch, cost_per_call: 400}
+  query_database: {server: sqlite, mcp_name: query, cost_per_call: 300}
+  update_database: {server: sqlite, mcp_name: execute, cost_per_call: 800}
   web_search:  {server: email_mock, mcp_name: web_search, cost_per_call: 200}
   send_email:  {server: email_mock, mcp_name: send_email, cost_per_call: 800}

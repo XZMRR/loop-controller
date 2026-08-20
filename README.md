@@ -1,6 +1,6 @@
 # Loop Controller — 面向企业内控的 Agent 运行框架
 
-> **项目阶段**：MVP 已完成（迭代 1/2/3 结束），R0-R3 四层治理模型可运行
+> **项目阶段**：MVP 已完成（迭代 1/2/3 结束），v0.9.0 真实 Agent + 真实 MCP server 生产验证已完成，R0-R3 四层治理模型可运行
 > **首选语言**：Python（Agent 生态最丰富，社区传播友好）
 > **文档语言**：中文为主，代码与核心 API 文档以英文为主，便于国际化开源
 
@@ -127,7 +127,7 @@ $env:PYTHONPATH="src"
 .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
-当前已通过 **110+ 个测试**，覆盖：
+当前已通过 **249 个测试**，覆盖：
 - 配置加载与 7 条启动校验
 - R1 `RuleBasedClassifier` 风险分类
 - R2 `Checkpoint` 判定流水线、审批、权限组合、预算、调用次数上限
@@ -150,6 +150,29 @@ $env:PYTHONPATH="src"
 4. 发送邮件给张经理。
 
 每个动作都会经过 **R1 风险分类 → R2 策略判定 → R2 代理转发执行 → R3 审计日志** 的完整闭环。
+
+### 运行真实 MCP server 示例（v0.9.0）
+
+v0.9.0 引入了两个基于 Python 的真实 MCP server（fetch / sqlite），并提供了独立 Agent 示例：
+
+```powershell
+# 1. 启动 OPA
+.venv\Scripts\lc opa-start
+
+# 2. 初始化演示数据库
+.venv\Scripts\python.exe scripts\init_demo_db.py
+
+# 3. 运行真实 Agent 场景
+$env:PYTHONPATH="src"
+.venv\Scripts\python.exe examples\research_agent.py --scenario research
+.venv\Scripts\python.exe examples\research_agent.py --scenario query
+.venv\Scripts\python.exe examples\research_agent.py --scenario update
+.venv\Scripts\python.exe examples\research_agent.py --scenario notify
+.venv\Scripts\python.exe examples\research_agent.py --scenario exfil
+.venv\Scripts\python.exe examples\research_agent.py --scenario write-attack
+```
+
+`research_agent.py` 不调用 Loop Controller 内部 API，仅以标准 MCP client 身份启动 `lc proxy`，因此可代表外部 Agent。它会真实读取文件、查询 sqlite、写入文件、尝试外发邮件，并被 R2 治理。
 
 ---
 

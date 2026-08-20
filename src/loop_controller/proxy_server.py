@@ -25,7 +25,6 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, cast
 
-import anyio
 import mcp_types as types  # type: ignore[import-not-found]
 import uvicorn
 from mcp.server import Server  # type: ignore[import-untyped]
@@ -94,9 +93,9 @@ class LoopControllerProxyServer:
 
     # -- 公共入口 -----------------------------------------------------------
 
-    def run_stdio(self) -> None:
+    async def run_stdio(self) -> None:
         """以 stdio 传输启动 MCP Proxy。"""
-        anyio.run(self._run_stdio_async)
+        await self._run_stdio_async()
 
     def run_sse(self, host: str = "127.0.0.1", port: int = 8080) -> None:
         """以 SSE 传输启动 MCP Proxy。"""

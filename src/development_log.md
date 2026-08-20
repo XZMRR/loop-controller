@@ -658,11 +658,62 @@
 
 ---
 
+## v0.9.0：生产环境考研（真实 Agent + 真实工具）
+
+目标：不引入新治理架构能力，而是用真实 MCP server、真实 Python Agent 对当前 v0.8.0 架构进行端到端压测，暴露真实生产环境下的问题并修复。
+
+### 完成内容
+
+- **新增真实 MCP server（Python 实现）**：
+  - `src/loop_controller/mcp_servers/fetch_server.py`：基于 httpx 的 HTTP GET server；
+  - `src/loop_controller/mcp_servers/sqlite_server.py`：基于 sqlite3 的 `query`（只读 SELECT）和 `execute`（写操作）server；
+  - 两者均使用与 Proxy 一致的 lowlevel MCP SDK 构造函数式 API。
+- **配置扩展**：
+  - `config/mcp_servers.yaml` 新增 `fetch`、`sqlite` server 和 `fetch_url`、`query_database`、`update_database`、`list_directory` 工具映射；
+  - `config/profiles.yaml` 扩展 `research_assistant_v1`，覆盖新工具权限；
+  - `policies/default.rego` 新增 `fetch_url`、`list_directory`、`query_database`、`update_database` 策略规则。
+- **真实 Agent 示例**：
+  - `examples/research_agent.py`：作为独立 MCP client 启动 `lc proxy`，运行 6 个真实场景（research/query/update/notify/exfil/write-attack）。
+- **Bug 修复**：
+  - `LoopControllerProxyServer.run_stdio()` 原实现调用 `anyio.run()`，但在 CLI 的 asyncio 事件循环内会抛 "Already running asyncio"；改为 `async def run_stdio()`，由 `cli.py` 直接 await；移除无用 `anyio` 导入；
+  - 示例脚本补齐 `LOOP_CONTROLLER_AUDIT_HMAC_KEY` 默认测试 key，避免手动设置。
+- **自动化测试**：
+  - `tests/test_e2e_sqlite.py`：验证真实 sqlite MCP server 下 SELECT 直接执行、INSERT 触发 require_approval，审批后真实写入数据库。
+
+### 关键决策
+
+- **自研 fetch/sqlite server 而非依赖 npm**：官方 `@modelcontextprotocol/server-fetch` / `server-sqlite` 包在 npm 不存在；自研 Python server 行为可控、可离线运行，且与项目技术栈一致。
+- **filesystem server 允许目录设为项目根**：在 Windows 下使用绝对路径 `/data/kb` 会映射到 `C:\data\kb`，跨平台困难；改为允许项目根目录 `.`，由 R2 的 glob 策略负责路径限制。MCP server 只是执行通道，治理仍在 R2。
+- **不新增架构组件**：本次只做集成、配置、示例和 bugfix，Earned Authority / Permission Interaction Analyzer 等 R2 子系统延后。
+
+### 手动场景验证结果
+
+| 场景 | 结果 |
+|---|---|
+| `research`：fetch_url + read_file + write_file | allow |
+| `query`：SELECT 返回 / DELETE 被 deny | allow + deny |
+| `update`：INSERT 触发 require_approval | require_approval |
+| `notify`：send_email 触发 require_approval | require_approval |
+| `exfil`：外部收件人 deny | deny |
+| `write-attack`：路径越界 deny | deny |
+
+### 验收状态
+
+- `pytest tests/`：**249 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.9.0_development.md`
+
+---
+
 ## 后续可选工作
 
-- **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。
+- **Earned Authority Manager**：v0.10.0 实现 R2 动态权限提升子系统。
+- **Permission Interaction Analyzer 升级**：v0.11.0 用图分析/能力代数检测 A+B>C 组合风险。
+- **R3 异步审计分析**：用 LLM/规则对审计日志做异常检测。
 - **签名/WORM 存储**：当前哈希链只能检测篡改，不能防御整体重写；生产环境需要签名或 WORM 存储。
-- **HMAC 升级**：`AuditEvent.hash_algo` 字段已预留，涉及真实 PII 时触发升级。
 - **多 worker 原子 DecisionStore**：当前单进程 asyncio 假设下检查+记账原子；多 worker 时需要原子语义。
 - **CLI 通知扩展**：当前 CLI 依赖轮询文件；未来可扩展为 SSE/HTTP webhook 推送审批请求。
-- **BudgetReservation 状态机**：当前预算预留/返还逻辑分散在 Checkpoint 各分支，未来可抽象为显式状态机。
