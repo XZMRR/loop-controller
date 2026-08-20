@@ -39,18 +39,26 @@ from loop_controller.models import (
 
 _SYSTEM_PROMPT = """你是一个企业研究助手，通过调用工具完成用户任务。
 
-规则：
-1. 你的每次输出必须且仅为一个 JSON 对象，格式：
-   {"action": "call_tool", "tool_name": "...", "arguments": {...}, "reason": "..."}
-   或 {"action": "ask_user", "question": "..."}
-   或 {"action": "finish"}
-2. 你只能使用下方列出的工具。所有工具调用都会被独立的治理层审核，
-   可能被修改、拒绝或要求人工审批——这是正常流程。如果被拦截，
-   阅读拦截原因，选择合法替代方案继续完成任务。
-3. 工具结果很大时，请在读到内容的下一步立即处理（摘要或写出），
-   历史结果之后只保留摘要。
-4. 当信息不足、需要用户澄清时，输出 {"action": "ask_user", "question": "..."}。
-5. 任务完成或无法继续时，输出 {"action": "finish"}。
+输出格式（必须且仅为一个 JSON 对象，不要有任何解释或 Markdown 代码块）：
+
+1. 调用工具时：
+   {"action": "call_tool", "tool_name": "<工具名>", "arguments": {<参数>}, "reason": "<原因>"}
+   注意："action" 字段必须是字符串 "call_tool"，不是工具名。工具名放在 "tool_name" 字段。
+
+2. 需要用户补充信息时：
+   {"action": "ask_user", "question": "<问题>"}
+
+3. 任务完成或无法继续时：
+   {"action": "finish"}
+
+关键约束：
+- "action" 字段只允许这三个字符串之一："call_tool"、"ask_user"、"finish"。
+- 永远不要把工具名（如 "web_search"、"read_file"、"send_email"）写入 "action" 字段。
+- 你只能使用下方列出的工具。所有工具调用都会被独立的治理层审核，
+  可能被修改、拒绝或要求人工审批——这是正常流程。如果被拦截，
+  阅读拦截原因，选择合法替代方案继续完成任务。
+- 工具结果很大时，请在读到内容的下一步立即处理（摘要或写出），
+  历史结果之后只保留摘要。
 """
 
 _ASK_SECTION = "请输出下一个动作的 JSON："
@@ -296,6 +304,11 @@ def _parse_response(
         parsed = _LLMOutput(**obj)
     except ValidationError as exc:
         return None, {"reason": f"Schema 校验失败：{exc}", "raw_preview": content[:_RAW_PREVIEW_LEN]}
+
+    # 容错：LLM 有时会把工具名写进 action 字段。如果 action 是已授权工具名
+    # 且 tool_name 为空，则自动归一化为 call_tool。
+    if parsed.action in allowed_tools and parsed.tool_name is None:
+        parsed = parsed.model_copy(update={"action": "call_tool", "tool_name": parsed.action})
 
     if parsed.action not in ("call_tool", "ask_user", "finish"):
         return None, {

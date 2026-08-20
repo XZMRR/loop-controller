@@ -1,6 +1,6 @@
 # Loop Controller — 面向企业内控的 Agent 运行框架
 
-> **项目阶段**：MVP 已完成（迭代 1/2/3 结束），v0.9.0 真实 Agent + 真实 MCP server 生产验证已完成，R0-R3 四层治理模型可运行
+> **项目阶段**：MVP 已完成（迭代 1/2/3 结束），v0.9.0 真实 Agent + 真实 MCP server 生产验证已完成，v0.9.1 真实 LLM（DeepSeek）驱动 Agent 端到端验证已完成，R0-R3 四层治理模型可运行
 > **首选语言**：Python（Agent 生态最丰富，社区传播友好）
 > **文档语言**：中文为主，代码与核心 API 文档以英文为主，便于国际化开源
 
@@ -173,6 +173,26 @@ $env:PYTHONPATH="src"
 ```
 
 `research_agent.py` 不调用 Loop Controller 内部 API，仅以标准 MCP client 身份启动 `lc proxy`，因此可代表外部 Agent。它会真实读取文件、查询 sqlite、写入文件、尝试外发邮件，并被 R2 治理。
+
+### 真实 LLM Agent 验证（v0.9.1）
+
+v0.9.1 使用真实 LLM（DeepSeek）驱动 `LLMPlanner`，让 Agent 自主规划工具调用。API key 只通过环境变量 `LLM_API_KEY` 传入，不落盘：
+
+```powershell
+$env:LLM_API_KEY="sk-..."
+$env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
+.venv\Scripts\python.exe examples\llm_agent_demo.py --scenario research
+.venv\Scripts\python.exe examples\llm_agent_demo.py --scenario notify
+.venv\Scripts\python.exe examples\llm_agent_demo.py --scenario exfil
+```
+
+验证结果：
+
+| 场景 | 结果 |
+|---|---|
+| `research` | LLM 自主完成 web_search → read_file → fetch_url → write_file，均 allow |
+| `notify` | query_database allow，send_email 触发 require_approval，审批后发送成功 |
+| `exfil` | read_file allow，send_email 到外部地址被 R2 deny |
 
 ---
 
