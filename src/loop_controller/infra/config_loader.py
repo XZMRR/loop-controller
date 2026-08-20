@@ -30,6 +30,9 @@ import yaml
 
 from loop_controller.models import (
     Agent,
+    AuditRule,
+    AuditRuleConditions,
+    AuditRules,
     AuthorityConditions,
     AuthorityGrantRule,
     AuthorityRules,
@@ -195,6 +198,7 @@ class AppConfig:
     permission_rules: list[PermissionRule]
     capability_rules: CapabilityRules  # v0.10.0
     authority_rules: AuthorityRules  # v0.11.0
+    audit_rules: AuditRules  # v0.12.0
     masking_rules: MaskingRules
     approval: ApprovalConfig
     policy_dir: str
@@ -209,6 +213,7 @@ class AppConfig:
     budget_ledger_path: str = "./data/budget.jsonl"  # v0.6.0 预算事件持久化路径
     reservation_store_path: str = "./data/reservations.jsonl"  # v0.8.0 reservation 持久化路径
     authority_log_path: str = "./data/authority.jsonl"  # v0.11.0 authority token 持久化路径
+    alert_store_path: str = "./data/alerts.jsonl"  # v0.12.0 alert/report 持久化路径
     llm_planner: LLMPlannerConfig | None = None
     audit_hash_algo: AuditHashAlgorithm = "sha256"
     audit_hmac_key_env: str = "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
@@ -239,12 +244,13 @@ class ConfigLoader:
         agents, users = self._load_agents(config_dir / "agents.yaml")
         profiles = self._load_profiles(config_dir / "profiles.yaml")
         mcp_servers, tool_mapping = self._load_mcp_servers(config_dir / "mcp_servers.yaml")
+        approval = self._load_approval(config_dir / "approval.yaml")
+        llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
         permission_rules = self._load_permission_rules(config_dir / "permission_rules.yaml")
         capability_rules = self._load_capability_rules(config_dir / "capability_rules.yaml")
         authority_rules = self._load_authority_rules(config_dir / "authority_rules.yaml")
+        audit_rules = self._load_audit_rules(config_dir / "audit_rules.yaml")
         masking_rules = self._load_masking_rules(config_dir / "masking_rules.yaml")
-        approval = self._load_approval(config_dir / "approval.yaml")
-        llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
 
         audit_hash_algo = cast(
             AuditHashAlgorithm,
@@ -290,6 +296,7 @@ class ConfigLoader:
             permission_rules=permission_rules,
             capability_rules=capability_rules,
             authority_rules=authority_rules,
+            audit_rules=audit_rules,
             masking_rules=masking_rules,
             approval=approval,
             policy_dir=str(root / "policies"),
@@ -302,6 +309,8 @@ class ConfigLoader:
             task_store_path=task_store_path,
             budget_ledger_path=budget_ledger_path,
             reservation_store_path=reservation_store_path,
+            authority_log_path=str(root / "data" / "authority.jsonl"),
+            alert_store_path=str(root / "data" / "alerts.jsonl"),
             llm_planner=llm_planner,
             audit_hash_algo=audit_hash_algo,
             audit_key_id=audit_key_id,
@@ -431,6 +440,32 @@ class ConfigLoader:
             enabled=data.get("enabled", True),
             grants=grants,
         )
+
+    def _load_audit_rules(self, path: Path) -> AuditRules:
+        """加载审计分析规则；文件缺失时返回空规则（向后兼容）。"""
+        if not path.exists():
+            return AuditRules(enabled=False)
+        data = self._read_yaml(path)
+        rules: list[AuditRule] = []
+        for item in data.get("rules", []):
+            cond = item.get("conditions", {})
+            rules.append(
+                AuditRule(
+                    rule_id=item["id"],
+                    description=item.get("description", ""),
+                    severity=item.get("severity", "medium"),
+                    conditions=AuditRuleConditions(
+                        min_denies_count=cond.get("min_denies_count"),
+                        min_denies_within_seconds=cond.get("min_denies_within_seconds"),
+                        consecutive_denies=cond.get("consecutive_denies"),
+                        action_sequence=cond.get("action_sequence"),
+                        has_any_action=cond.get("has_any_action"),
+                        has_all_actions=cond.get("has_all_actions"),
+                        authority_token_exhausted=cond.get("authority_token_exhausted", False),
+                    ),
+                )
+            )
+        return AuditRules(enabled=data.get("enabled", True), rules=rules)
 
     def _load_masking_rules(self, path: Path) -> MaskingRules:
         data = self._read_yaml(path)

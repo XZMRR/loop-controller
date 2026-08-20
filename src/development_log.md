@@ -855,9 +855,62 @@
 
 ---
 
+## v0.12.0：R3 Asynchronous Audit Analyzer（异步审计分析器）
+
+目标：补齐 R3 审计层，让 Loop Controller 在记录审计日志之外，能够异步分析日志、识别异常模式并生成告警/报告。分析器不阻塞主治理链路（R0-R2），在 task_end 后或独立触发。
+
+### 完成内容
+
+- **核心抽象**：
+  - 新增 `src/loop_controller/audit_analyzer.py`：
+    - `AuditAnalyzer` Protocol 与 `NoopAuditAnalyzer` 占位；
+    - `RuleBasedAuditAnalyzer`：基于声明式规则消费审计日志，生成 `AuditAlert` 与 `AuditReport`；
+    - 规则类型：rapid_denies、consecutive_denies、action_sequence、has_any_action、has_all_actions、authority_token_exhausted。
+  - 新增 `src/loop_controller/infra/alert_store.py`：
+    - `AlertStore` Protocol；
+    - `InMemoryAlertStore` 与 `JsonlAlertStore`（单 JSONL 文件，按 `type` 区分 alert/report，启动重放恢复）。
+  - `models.py` 扩展：
+    - 新增 `AuditAlert`、`AuditReport`、`AuditRule`、`AuditRuleConditions`、`AuditRules`。
+  - `infra/audit_store.py` 扩展：
+    - 新增 `query_by_session()` 与 `query_by_task()`，供分析器读取。
+- **配置层**：
+  - `ConfigLoader` 加载 `config/audit_rules.yaml`；文件缺失时返回 `enabled=false`（向后兼容）；
+  - `AppConfig` 新增 `audit_rules` 与 `alert_store_path`。
+- **治理链路集成**：
+  - `Runtime` 新增 `audit_analyzer` 字段；
+  - `build_runtime()` 创建 `RuleBasedAuditAnalyzer` + `JsonlAlertStore`；
+  - `run_task()` 在 `task_end` 后通过 `asyncio.create_task()` 异步触发 `audit_analyzer.analyze_task()`，不阻塞返回。
+- **CLI 集成**：
+  - `src/loop_controller/cli.py` 新增 `lc audit analyze --task-id/--session-id`；
+  - 新增 `lc audit list-alerts --task-id/--session-id`。
+- **规则配置**：
+  - 新增 `config/audit_rules.yaml`，声明 rapid_denies、consecutive_denies、authority_token_exhausted 三条规则。
+- **测试**：
+  - 新建 `tests/test_audit_analyzer.py`：覆盖 disabled、rapid_denies、consecutive_denies、has_any_action、action_sequence、session 分析、token 耗尽。
+
+### 关键决策
+
+- **异步不阻塞**：分析器在 task_end 后通过 `asyncio.create_task` 触发，不影响主链路延迟与返回结果。
+- **只读消费**：分析器只读取审计日志，不修改已有哈希链。
+- **分析器内部 catch 所有异常**：避免审计分析失败拖垮事件循环或主任务。
+- **告警允许重复**：多个规则可能同时命中同一事件集，每条命中独立生成 alert，便于运营归因。
+- **CLI 不启动 Runtime**：直接构造 `JsonlAuditStore` + `RuleBasedAuditAnalyzer`，避免拉起 MCP server 等不必要开销。
+
+### 验收状态
+
+- `pytest tests/`：**281 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.12.0_development.md`
+
+---
+
 ## 后续可选工作
 
-- **R3 异步审计分析**：用 LLM/规则对审计日志做异常检测。
 - **签名/WORM 存储**：当前哈希链只能检测篡改，不能防御整体重写；生产环境需要签名或 WORM 存储。
 - **多 worker 原子 DecisionStore**：当前单进程 asyncio 假设下检查+记账原子；多 worker 时需要原子语义。
 - **CLI 通知扩展**：当前 CLI 依赖轮询文件；未来可扩展为 SSE/HTTP webhook 推送审批请求。
+- **LLM-based 审计摘要**：在 `RuleBasedAuditAnalyzer` 基础上扩展 `LLMAuditAnalyzer`，生成自然语言风险摘要。

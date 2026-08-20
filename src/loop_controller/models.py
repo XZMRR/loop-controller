@@ -532,3 +532,74 @@ class AuthorityEvaluationContext(BaseModel):
     recent_denial_count: int = 0
     task_context: str = ""
     history: list[ActionProposal] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# v0.12.0 R3 Asynchronous Audit Analyzer
+# ---------------------------------------------------------------------------
+
+
+class AuditAlert(BaseModel):
+    """审计分析器生成的风险告警。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    alert_id: str
+    session_id: str
+    task_id: str | None = None
+    rule_id: str
+    severity: Literal["low", "medium", "high", "critical"]
+    title: str
+    description: str
+    evidence: list[str] = Field(default_factory=list)  # event_id 列表
+    created_at: datetime = Field(default_factory=_utc_now)
+
+
+class AuditReport(BaseModel):
+    """审计分析报告。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    report_id: str
+    session_id: str
+    task_id: str | None = None
+    generated_at: datetime = Field(default_factory=_utc_now)
+    summary: str
+    alert_ids: list[str] = Field(default_factory=list)
+    event_count: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuditRuleConditions(BaseModel):
+    """审计规则条件（声明式）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    min_denies_count: int | None = None
+    min_denies_within_seconds: int | None = None
+    consecutive_denies: int | None = None
+    action_sequence: list[str] | None = None
+    has_any_action: list[str] | None = None
+    has_all_actions: list[str] | None = None
+    authority_token_exhausted: bool = False
+
+
+class AuditRule(BaseModel):
+    """单条审计分析规则。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    rule_id: str
+    description: str
+    severity: Literal["low", "medium", "high", "critical"]
+    conditions: AuditRuleConditions
+
+
+class AuditRules(BaseModel):
+    """审计规则配置容器。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = True
+    rules: list[AuditRule] = Field(default_factory=list)
+

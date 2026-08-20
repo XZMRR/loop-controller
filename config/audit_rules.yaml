@@ -1,0 +1,24 @@
+# v0.12.0 R3 Asynchronous Audit Analyzer
+# 声明式审计分析规则：任务结束后异步扫描审计日志，命中则生成 AuditAlert。
+
+enabled: true
+
+rules:
+  - id: rapid_denies
+    description: "5 分钟内出现 3 次 deny"
+    severity: medium
+    conditions:
+      min_denies_count: 3
+      min_denies_within_seconds: 300
+
+  - id: consecutive_denies
+    description: "连续 3 次 deny，可能为暴力探测"
+    severity: high
+    conditions:
+      consecutive_denies: 3
+
+  - id: authority_token_exhausted
+    description: "Authority token 预算被耗尽"
+    severity: low
+    conditions:
+      authority_token_exhausted: true

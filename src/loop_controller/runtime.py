@@ -7,6 +7,7 @@ T3.1/T3.2 补全哈希链、args_hash/args_mask 与分级掩码。
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import uuid
@@ -15,10 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from loop_controller.approval_manager import AsyncApprovalManager
+from loop_controller.audit_analyzer import AuditAnalyzer, RuleBasedAuditAnalyzer
 from loop_controller.authority import EarnedAuthorityManager
 from loop_controller.budget import JsonlBudgetLedger
 from loop_controller.checkpoint import Checkpoint, CheckpointError
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
+from loop_controller.infra.alert_store import JsonlAlertStore
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import AuditStore, JsonlAuditStore
 from loop_controller.infra.authority_store import JsonlAuthorityStore
@@ -88,6 +91,7 @@ class Runtime:
     conversation_store: JsonlConversationStore  # v0.3.0 会话上下文持久化
     task_store: TaskStore = field(default_factory=InMemoryTaskStore)  # v0.6.0 Task 持久化
     reservation_store: ReservationStore = field(default_factory=InMemoryReservationStore)  # v0.8.0 reservation 持久化
+    audit_analyzer: AuditAnalyzer | None = None  # v0.12.0 R3 审计分析器
 
     def create_task(
         self,
@@ -253,6 +257,12 @@ def build_runtime(
     approval_manager = AsyncApprovalManager(
         JsonlApprovalStore(config.approval_store_path)
     )
+    alert_store = JsonlAlertStore(config.alert_store_path)
+    audit_analyzer = RuleBasedAuditAnalyzer(
+        rules=config.audit_rules,
+        audit_store=audit_store,
+        alert_store=alert_store,
+    )
 
     if config.llm_planner is not None and config.llm_planner.enabled:
         planner: Planner = LLMPlanner(
@@ -282,6 +292,7 @@ def build_runtime(
         conversation_store=conversation_store,
         task_store=task_store,
         reservation_store=reservation_store,
+        audit_analyzer=audit_analyzer,
     )
 
 
@@ -521,6 +532,12 @@ async def _run_task_loop(
             audit.append(_audit_event(task, action="task_end", masker=runtime.masker))
             runtime.checkpoint.forget_task(task.task_id)
             runtime.task_store.complete(task.task_id)
+            # v0.12.0：异步触发 R3 审计分析，不阻塞返回
+            if runtime.audit_analyzer is not None:
+                asyncio.create_task(
+                    runtime.audit_analyzer.analyze_task(task.task_id),
+                    name=f"audit-analyze-{task.task_id}",
+                )
 
     return TaskRunResult(
         status="completed",

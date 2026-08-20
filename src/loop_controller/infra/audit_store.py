@@ -30,6 +30,8 @@ class AuditStore(Protocol):
     def append(self, event: AuditEvent) -> None: ...
     def verify_chain(self) -> bool: ...
     def query_by_trace(self, trace_id: str) -> list[AuditEvent]: ...
+    def query_by_session(self, session_id: str) -> list[AuditEvent]: ...  # v0.12.0
+    def query_by_task(self, task_id: str) -> list[AuditEvent]: ...  # v0.12.0
 
 
 def _derive_key(root_key: bytes, label: bytes) -> bytes:
@@ -233,6 +235,18 @@ class JsonlAuditStore:
 
     def query_by_trace(self, trace_id: str) -> list[AuditEvent]:
         """按 trace_id 全文件扫描并返回 AuditEvent 列表（MVP 数据量小，可接受）。"""
+        return self._query_by_field("trace_id", trace_id)
+
+    def query_by_session(self, session_id: str) -> list[AuditEvent]:
+        """按 session_id 全文件扫描并返回 AuditEvent 列表（v0.12.0）。"""
+        return self._query_by_field("session_id", session_id)
+
+    def query_by_task(self, task_id: str) -> list[AuditEvent]:
+        """按 task_id 全文件扫描并返回 AuditEvent 列表（v0.12.0）。"""
+        return self._query_by_field("task_id", task_id)
+
+    def _query_by_field(self, field: str, value: str) -> list[AuditEvent]:
+        """通用全文件扫描查询。"""
         results: list[AuditEvent] = []
         if not self._path.exists():
             return results
@@ -245,6 +259,6 @@ class JsonlAuditStore:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if record.get("trace_id") == trace_id:
+                if record.get(field) == value:
                     results.append(AuditEvent(**record))
         return results

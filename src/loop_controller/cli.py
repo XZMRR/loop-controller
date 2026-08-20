@@ -6,6 +6,13 @@
     lc approvals approve <decision_id> --approver <id> [--comment <text>]
     lc approvals deny <decision_id> --approver <id> [--comment <text>]
 
+审计分析入口（v0.12.0）：
+
+    lc audit analyze --task-id <id>
+    lc audit analyze --session-id <id>
+    lc audit list-alerts --task-id <id>
+    lc audit list-alerts --session-id <id>
+
 Proxy 入口（v0.5.0）：
 
     lc proxy --agent-id <id> --user-id <id> [--transport stdio|sse] [--port 8080]
@@ -20,7 +27,10 @@ import asyncio
 import sys
 from datetime import UTC, datetime
 
+from loop_controller.audit_analyzer import RuleBasedAuditAnalyzer
+from loop_controller.infra.alert_store import JsonlAlertStore
 from loop_controller.infra.approval_store import JsonlApprovalStore
+from loop_controller.infra.audit_store import JsonlAuditStore
 from loop_controller.infra.config_loader import AppConfig, ConfigLoader
 from loop_controller.models import ApprovalRecord
 from loop_controller.proxy_server import LoopControllerProxyServer, ProxyIdentity
@@ -60,6 +70,23 @@ def _build_parser() -> argparse.ArgumentParser:
     deny_cmd.add_argument("decision_id", help="需要审批的 decision_id")
     deny_cmd.add_argument("--approver", required=True, help="审批人 ID")
     deny_cmd.add_argument("--comment", default="", help="审批意见")
+
+    audit = subparsers.add_parser("audit", help="审计分析（v0.12.0）")
+    audit_sub = audit.add_subparsers(dest="audit_cmd", required=True)
+
+    analyze_cmd = audit_sub.add_parser("analyze", help="分析指定 task/session 的审计日志")
+    analyze_cmd.add_argument("--task-id", default=None, help="Task ID")
+    analyze_cmd.add_argument("--session-id", default=None, help="Session ID")
+
+    alerts_cmd = audit_sub.add_parser("list-alerts", help="列出告警")
+    alerts_cmd.add_argument("--task-id", default=None, help="Task ID")
+    alerts_cmd.add_argument("--session-id", default=None, help="Session ID")
+    alerts_cmd.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="输出格式",
+    )
 
     proxy = subparsers.add_parser("proxy", help="启动 MCP Proxy（v0.5.0）")
     proxy.add_argument("--agent-id", required=True, help="映射到 agents.yaml 的 agent_id")
@@ -148,6 +175,58 @@ def _cmd_approve_or_deny(
     return 0
 
 
+def _build_audit_analyzer(config: AppConfig) -> RuleBasedAuditAnalyzer:
+    """构造基于配置的 RuleBasedAuditAnalyzer（不启动 Runtime）。"""
+    audit_key: bytes | None = None
+    if config.audit_hash_algo == "hmac-sha256":
+        audit_key = ConfigLoader.resolve_audit_key(config)
+    audit_store = JsonlAuditStore(
+        config.audit_log_path,
+        hash_algo=config.audit_hash_algo,
+        hmac_key=audit_key,
+        key_id=config.audit_key_id,
+    )
+    alert_store = JsonlAlertStore(config.alert_store_path)
+    return RuleBasedAuditAnalyzer(
+        rules=config.audit_rules,
+        audit_store=audit_store,
+        alert_store=alert_store,
+    )
+
+
+async def _cmd_audit_analyze(config: AppConfig, args: argparse.Namespace) -> int:
+    if not args.task_id and not args.session_id:
+        print("错误：必须指定 --task-id 或 --session-id", file=sys.stderr)
+        return 1
+    analyzer = _build_audit_analyzer(config)
+    if args.task_id:
+        report = await analyzer.analyze_task(args.task_id)
+    else:
+        report = await analyzer.analyze_session(args.session_id)
+    print(report.model_dump_json(indent=2))
+    return 0
+
+
+def _cmd_audit_list_alerts(config: AppConfig, args: argparse.Namespace) -> int:
+    alert_store = JsonlAlertStore(config.alert_store_path)
+    alerts = alert_store.list_alerts(
+        session_id=args.session_id,
+        task_id=args.task_id,
+    )
+    if not alerts:
+        print("没有告警")
+        return 0
+    if args.format == "json":
+        for alert in alerts:
+            print(alert.model_dump_json())
+        return 0
+    print(f"{'alert_id':<32} {'rule_id':<24} {'severity':<10} {'description'}")
+    print("-" * 100)
+    for alert in alerts:
+        print(f"{alert.alert_id:<32} {alert.rule_id:<24} {alert.severity:<10} {alert.description}")
+    return 0
+
+
 def _cmd_proxy(config: AppConfig, args: argparse.Namespace) -> int:
     """启动 MCP Proxy。"""
     runtime = build_runtime(config)
@@ -185,6 +264,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "proxy":
         return _cmd_proxy(config, args)
+
+    if args.command == "audit":
+        if args.audit_cmd == "analyze":
+            return asyncio.run(_cmd_audit_analyze(config, args))
+        if args.audit_cmd == "list-alerts":
+            return _cmd_audit_list_alerts(config, args)
+        parser.print_help()
+        return 1
 
     store = JsonlApprovalStore(config.approval_store_path)
 
