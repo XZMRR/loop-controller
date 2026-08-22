@@ -1,4 +1,4 @@
-"""sqlite MCP server 集成测试（v0.9.0 生产验证）。
+"""sqlite MCP server 集成测试（v0.14.0）。
 
 验证 query_database / update_database 在真实 sqlite3 后端 + R2 治理下的行为。
 不启动 filesystem（避免 npx），只使用 Python sqlite + email_mock server。
@@ -13,9 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.models import ApprovalRecord
-from loop_controller.runtime import build_runtime, resume_task, run_task
+from tests.controller_helpers import controller_for
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -84,19 +83,6 @@ profiles:
 """,
         encoding="utf-8",
     )
-    plan = root / "config" / "sqlite_plan.yaml"
-    plan.write_text(
-        """
-steps:
-  - tool_name: query_database
-    arguments: {sql: "SELECT * FROM customers"}
-    reason: query
-  - tool_name: update_database
-    arguments: {sql: "INSERT INTO customers (name, email, region) VALUES ('Carol', 'carol@company.com', 'cn')"}
-    reason: insert
-""",
-        encoding="utf-8",
-    )
     return root
 
 
@@ -107,46 +93,46 @@ async def test_sqlite_select_and_update_requires_approval(
 ) -> None:
     """SELECT 直接返回，INSERT 触发 require_approval，审批后真实写入数据库。"""
     os.environ["LOOP_CONTROLLER_AUDIT_HMAC_KEY"] = "a" * 64
-    config = ConfigLoader().load(workdir / "config", opa_base_url=opa_server)
-    agent = config.agents["researcher_001"]
+    controller = await controller_for(workdir, opa_server)
 
-    runtime = build_runtime(
-        config,
-        opa_url=opa_server,
-        planner_yaml=workdir / "config" / "sqlite_plan.yaml",
-        env_extra={"PYTHONPATH": str(REPO_ROOT / "src")},
-    )
-
-    await runtime.start()
     try:
-        task, _session = runtime.create_task(
+        select_result = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
             user_id="alice",
-            agent_id=agent.agent_id,
-            description="sqlite e2e",
+            tool_name="query_database",
+            arguments={"sql": "SELECT * FROM customers"},
+            task_context="sqlite e2e",
         )
-        result = await run_task(task, agent, runtime)
+        assert select_result.status == "allow"
 
-        # 第一个 SELECT 允许，第二个 INSERT 触发审批
-        assert result.status == "needs_approval"
-        assert result.pending_decision is not None
-        assert result.pending_proposal is not None
-        assert result.pending_proposal.tool_name == "update_database"
-        decision = result.pending_decision
+        insert_result = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
+            user_id="alice",
+            tool_name="update_database",
+            arguments={
+                "sql": "INSERT INTO customers (name, email, region) VALUES ('Carol', 'carol@company.com', 'cn')"
+            },
+            task_context="sqlite e2e",
+        )
+        assert insert_result.status == "require_approval"
+        assert insert_result.decision is not None
 
-        runtime.approval_manager._store.record_response(
+        store = controller._runtime.approval_manager._store
+        request = store.get_request(insert_result.decision.decision_id)
+        store.record_response(
             ApprovalRecord(
-                request_id=result.request_id,
-                decision_id=decision.decision_id,
+                request_id=request.request_id,
+                decision_id=insert_result.decision.decision_id,
                 verdict="approve",
                 approver_id="zhang_manager",
                 comment="approved",
             )
         )
 
-        final = await resume_task(task, agent, runtime, pending=result)
-        assert final.status == "completed"
+        final = await controller.resume_after_approval(insert_result.request_id)
+        assert final.status == "allow"
     finally:
-        await runtime.aclose()
+        await controller.aclose()
 
     # 验证数据库真的写入了 Carol
     conn = sqlite3.connect(str(workdir / "data" / "company.db"))

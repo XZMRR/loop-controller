@@ -1,9 +1,7 @@
-"""真实 MCP 组件的端到端测试（P2 / MVP 发布前 gate）。
+"""真实 MCP 组件的端到端测试（v0.14.0）。
 
-与 test_e2e_research_agent.py 的区别：
-- 使用 ``build_runtime()`` 而非手动装配；
-- 使用真实 ``MCPGateway`` 拉起本地 ``email_mock`` server；
-- 验证邮件真的通过 MCP 工具发出并持久化到 ``sent_emails.jsonl``。
+使用 ``LoopController`` + 真实 ``MCPGateway`` 拉起本地 ``email_mock`` server，
+验证邮件真的通过 MCP 工具发出并持久化到 ``sent_emails.jsonl``。
 """
 
 from __future__ import annotations
@@ -14,9 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.models import ApprovalRecord
-from loop_controller.runtime import build_runtime, resume_task, run_task
+from tests.controller_helpers import controller_for
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -28,20 +25,6 @@ def workdir(tmp_path: Path) -> Path:
     shutil.copytree(REPO_ROOT / "config", root / "config")
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     (root / "data").mkdir()
-    # 仅使用 email_mock 的脚本，避免 CI 依赖 filesystem npx server
-    plan = root / "config" / "real_mcp_plan.yaml"
-    plan.write_text(
-        """
-steps:
-  - tool_name: web_search
-    arguments: {query: "AI compliance"}
-    reason: "调研公开资料"
-  - tool_name: send_email
-    arguments: {to: "zhang@company.com", subject: "摘要", body: "请查收"}
-    reason: "发送报告"
-""",
-        encoding="utf-8",
-    )
     # 覆盖 mcp_servers.yaml：只保留本地 email_mock，移除需要 npx 的 filesystem server
     (root / "config" / "mcp_servers.yaml").write_text(
         """
@@ -92,46 +75,47 @@ async def test_real_mcp_email_sent_after_approval(
     opa_server: str,
 ) -> None:
     """真实 MCP 链路：web_search 直接执行，send_email 需审批，审批后真实发出。"""
-    config = ConfigLoader().load(workdir / "config", opa_base_url=opa_server)
-    agent = config.agents["researcher_001"]
-
-    runtime = build_runtime(
-        config,
-        opa_url=opa_server,
-        planner_yaml=workdir / "config" / "real_mcp_plan.yaml",
-        env_extra={
-            "PYTHONPATH": str(REPO_ROOT / "src"),
-            "SENT_EMAILS_PATH": str(sent_emails_path),
-        },
+    controller = await controller_for(
+        workdir,
+        opa_server,
+        extra_env={"SENT_EMAILS_PATH": str(sent_emails_path)},
     )
 
-    await runtime.start()
     try:
-        task, _session = runtime.create_task(
+        search_result = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
             user_id="alice",
-            agent_id=agent.agent_id,
-            description="真实 MCP E2E：搜索并发送邮件",
+            tool_name="web_search",
+            arguments={"query": "AI compliance"},
+            task_context="真实 MCP E2E：搜索并发送邮件",
         )
+        assert search_result.status == "allow"
 
-        result = await run_task(task, agent, runtime)
-        assert result.status == "needs_approval"
-        assert result.pending_decision is not None
-        decision = result.pending_decision
+        email_result = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
+            user_id="alice",
+            tool_name="send_email",
+            arguments={"to": "zhang@company.com", "subject": "摘要", "body": "请查收"},
+            task_context="真实 MCP E2E：搜索并发送邮件",
+        )
+        assert email_result.status == "require_approval"
+        assert email_result.decision is not None
 
-        assert result.request_id is not None
+        store = controller._runtime.approval_manager._store
+        request = store.get_request(email_result.decision.decision_id)
         record = ApprovalRecord(
-            request_id=result.request_id,
-            decision_id=decision.decision_id,
+            request_id=request.request_id,
+            decision_id=email_result.decision.decision_id,
             verdict="approve",
-            approver_id=decision.escalation_target or "zhang_manager",
+            approver_id=request.approver_id or "zhang_manager",
             comment="approved for real mcp e2e",
         )
-        runtime.approval_manager._store.record_response(record)
+        store.record_response(record)
 
-        final = await resume_task(task, agent, runtime, pending=result)
-        assert final.status == "completed"
+        final = await controller.resume_after_approval(email_result.request_id)
+        assert final.status == "allow"
     finally:
-        await runtime.aclose()
+        await controller.aclose()
 
     # 验证 email_mock 真的写入了发出邮件
     assert sent_emails_path.exists()

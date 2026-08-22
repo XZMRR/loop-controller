@@ -1,8 +1,8 @@
-r"""真实 LLM Agent 端到端演示（v0.9.1）。
+r"""真实 LLM Agent 端到端演示（v0.14.0）。
 
 使用 ``LLMPlanner`` 驱动 Loop Controller，通过 DeepSeek API 让 Agent 自主规划工具调用。
-本脚本不调用 Loop Controller 内部 API，只通过 ``run_task`` / ``resume_task`` 走标准治理闭环，
-因此可以代表外部真实 LLM Agent 的行为。
+Agent 自己掌握主循环，每一步通过 ``LoopController.evaluate_and_execute`` 提交工具调用，
+触发 require_approval 时由脚本模拟审批通过。
 
 前置条件：
     1. 启动 OPA：
@@ -26,16 +26,18 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # 让脚本在未安装包时也能运行
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from loop_controller.infra.config_loader import ConfigLoader
-from loop_controller.models import ApprovalRecord
-from loop_controller.runtime import build_runtime, resume_task, run_task
+from _demo_helpers.llm_planner import HttpxLLMClient, LLMPlanner  # noqa: E402
+
+from loop_controller.controller import build_controller  # noqa: E402
+from loop_controller.infra.config_loader import ConfigLoader  # noqa: E402
+from loop_controller.models import ApprovalRecord, ToolResult  # noqa: E402
 
 CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = PROJECT_ROOT / "data"
@@ -91,8 +93,16 @@ async def main() -> None:
         raise ValueError(f"未找到 agent_id={args.agent_id}")
     agent = config.agents[args.agent_id]
 
-    runtime = build_runtime(config, opa_url=OPA_URL)
-    await runtime.start()
+    controller = await build_controller(config, opa_url=OPA_URL)
+    runtime = controller._runtime
+    planner = LLMPlanner(
+        client=HttpxLLMClient(),
+        config=config.llm_planner,
+        gateway=runtime.gateway,
+        budget_ledger=runtime.checkpoint.budget_ledger,
+        audit_store=runtime.audit_store,
+        profiles=runtime.profiles,
+    )
     try:
         task, _session = runtime.create_task(
             user_id="alice",
@@ -100,43 +110,95 @@ async def main() -> None:
             description=SCENARIOS[args.scenario],
         )
 
-        result = await run_task(task, agent, runtime)
+        observations: list[ToolResult] = []
         steps = 0
-        while result.status == "needs_approval" and steps < args.max_steps:
+        while steps < args.max_steps:
             steps += 1
-            logger.info(
-                "[%s] 工具 %s 需要审批。decision_id=%s request_id=%s",
-                args.scenario,
-                result.pending_proposal.tool_name if result.pending_proposal else "?",
-                result.decision_id,
-                result.request_id,
+            planned = await planner.next_action(
+                task, agent, observations, runtime.get_conversation_context(task.session_id)
             )
-            logger.info(
-                "生产环境请执行：lc approvals approve %s --approver zhang_manager",
-                result.decision_id,
-            )
-            logger.info("演示模式：自动审批通过...")
-            assert result.decision_id is not None and result.request_id is not None
-            runtime.approval_manager._store.record_response(
-                ApprovalRecord(
-                    request_id=result.request_id,
-                    decision_id=result.decision_id,
-                    verdict="approve",
-                    approver_id="zhang_manager",
-                    comment="auto-approved by llm demo",
-                    decided_at=datetime.now(timezone.utc),
-                )
-            )
-            result = await resume_task(task, agent, runtime, pending=result)
+            if planned is None:
+                logger.info("[%s] Agent 结束任务", args.scenario)
+                break
 
-        if result.status == "completed":
-            logger.info("[%s] 任务完成，审计日志：%s", args.scenario, config.audit_log_path)
-        elif result.status == "needs_approval":
-            logger.warning("[%s] 达到最大步数，任务仍暂停在审批态", args.scenario)
-        else:
-            logger.info("[%s] 任务结果：%s", args.scenario, result.status)
+            if hasattr(planned, "question"):
+                logger.info("[%s] Agent 需要用户补充: %s", args.scenario, planned.question)
+                break
+
+            logger.info("[%s] Agent 计划调用 %s", args.scenario, planned.tool_name)
+            result = await controller.evaluate_and_execute(
+                agent_id=agent.agent_id,
+                user_id=task.user_id,
+                tool_name=planned.tool_name,
+                arguments=planned.arguments,
+                task_id=task.task_id,
+                task_context=task.description,
+            )
+
+            if result.status == "require_approval":
+                logger.info(
+                    "[%s] 工具 %s 需要审批。decision_id=%s request_id=%s",
+                    args.scenario,
+                    planned.tool_name,
+                    result.decision.decision_id if result.decision else "?",
+                    result.request_id,
+                )
+                logger.info(
+                    "生产环境请执行：lc approvals approve %s --approver zhang_manager",
+                    result.decision.decision_id if result.decision else "?",
+                )
+                logger.info("演示模式：自动审批通过...")
+                assert result.request_id is not None
+                store = runtime.approval_manager._store
+                request = store.get_request(result.decision.decision_id)
+                store.record_response(
+                    ApprovalRecord(
+                        request_id=request.request_id,
+                        decision_id=result.decision.decision_id,
+                        verdict="approve",
+                        approver_id="zhang_manager",
+                        comment="auto-approved by llm demo",
+                        decided_at=datetime.now(UTC),
+                    )
+                )
+                result = await controller.resume_after_approval(result.request_id)
+
+            if result.status in ("allow",):
+                observations.append(
+                    ToolResult(
+                        call_id=result.call_id,
+                        task_id=task.task_id,
+                        tool_name=result.tool_name,
+                        status="success",
+                        content=result.content,
+                    )
+                )
+            elif result.status == "deny":
+                observations.append(
+                    ToolResult(
+                        call_id=result.call_id,
+                        task_id=task.task_id,
+                        tool_name=result.tool_name,
+                        status="blocked",
+                        content=result.reason or "denied",
+                        error_code="denied_by_checkpoint",
+                    )
+                )
+            else:
+                observations.append(
+                    ToolResult(
+                        call_id=result.call_id,
+                        task_id=task.task_id,
+                        tool_name=result.tool_name,
+                        status="error",
+                        content=result.reason or result.status,
+                        error_code=result.error_code or result.status,
+                    )
+                )
+
+        logger.info("[%s] 任务执行完成，审计日志：%s", args.scenario, config.audit_log_path)
     finally:
-        await runtime.aclose()
+        await controller.aclose()
 
 
 if __name__ == "__main__":

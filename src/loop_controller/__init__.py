@@ -7,6 +7,7 @@
 from loop_controller.approval_manager import AsyncApprovalManager
 from loop_controller.checkpoint import Checkpoint, CheckpointError
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
+from loop_controller.controller import LoopController, build_controller
 from loop_controller.mcp_gateway import MCPGateway, MCPGatewayError
 from loop_controller.models import (
     ActionProposal,
@@ -27,7 +28,7 @@ from loop_controller.models import (
     ToolResult,
     Verdict,
 )
-from loop_controller.planner import Planner, ScriptedPlanner
+from loop_controller.tool_governor import ToolGovernor
 
 __all__ = [
     "ActionProposal",
@@ -37,22 +38,23 @@ __all__ = [
     "AsyncApprovalManager",
     "AuditEvent",
     "BudgetCost",
+    "build_controller",
     "CapabilityProfile",
     "Checkpoint",
     "CheckpointError",
     "Decision",
     "LightweightClassifier",
+    "LoopController",
     "MCPGateway",
     "MCPGatewayError",
     "PlannedAction",
-    "Planner",
     "RiskLevel",
     "RiskProfile",
     "RiskSignal",
     "RuleBasedClassifier",
-    "ScriptedPlanner",
     "Task",
     "Tool",
+    "ToolGovernor",
     "ToolPermission",
     "ToolResult",
     "Verdict",

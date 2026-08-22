@@ -914,3 +914,437 @@
 - **多 worker 原子 DecisionStore**：当前单进程 asyncio 假设下检查+记账原子；多 worker 时需要原子语义。
 - **CLI 通知扩展**：当前 CLI 依赖轮询文件；未来可扩展为 SSE/HTTP webhook 推送审批请求。
 - **LLM-based 审计摘要**：在 `RuleBasedAuditAnalyzer` 基础上扩展 `LLMAuditAnalyzer`，生成自然语言风险摘要。
+
+---
+
+## v0.13.0：Agent 驱动治理接口与 LangChain 适配器
+
+### 完成内容
+
+- **项目定位澄清**：Loop Controller 是企业内部 Agent 的工具调用治理基础设施，不是 Agent 大脑，也不是面向陌生 Agent 的开放网关。
+- **新增 `LoopController` 核心类**（`src/loop_controller/controller.py`）：
+  - `evaluate()`：R1 + R2 判定，不执行；
+  - `evaluate_and_execute()`：判定+执行一键完成；
+  - `resume_after_approval()`：CLI/管理员 approve 后恢复执行；
+  - `build_controller()`：从 `AppConfig` 快速构造控制器。
+- **新增模型**（`src/loop_controller/models.py`）：
+  - `EvaluationResult`：R1 + R2 判定结果；
+  - `GovernanceResult`：单次工具调用治理完整响应。
+- **ApprovalStore 扩展**（`src/loop_controller/infra/approval_store.py`）：
+  - `get_request_by_id()` 按 `request_id` 查找原始审批请求，支持 `resume_after_approval`。
+- **LangChain 适配器**（`src/loop_controller/adapters/langchain.py`）：
+  - `govern_tool()` / `GovernedTool`：把 Loop Controller 治理下的工具包装成 LangChain / LangGraph Tool；
+  - 使用 LangGraph `create_react_agent` 演示企业内部 Agent 接入完整 R0-R3。
+- **新增示例**：
+  - `examples/loop_controller_demo.py`：直接调用 `LoopController`；
+  - `examples/langchain_agent_demo.py`：LangGraph Agent 接入。
+- **测试**：新建 `tests/test_controller.py`，覆盖 evaluate allow/deny、evaluate_and_execute allow、require_approval + resume。
+- **弃用声明**：
+  - `src/loop_controller/planner.py` 和 `src/loop_controller/llm_planner.py` 已加弃用警告，并复制到 `examples/_demo_helpers/`。
+
+### 关键决策
+
+- **Agent 驱动框架**：企业 Agent 自己决定计划，Loop Controller 只治理工具调用；框架不再替 Agent 思考。
+- **不删除 `run_task`**：保留作为兼容/测试入口，但不再是主要产品 API。
+- **MCP Proxy 保留但边缘化**：继续作为边界兼容协议，但主要接入方式改为 Runtime API / SDK。
+- **LangChain 适配器可选依赖**：通过 `pip install loop-controller[langchain]` 安装，不污染核心包。
+
+### 验收状态
+
+- `pytest tests/`：**285 passed**
+- `ruff check src tests examples`：**All checks passed**
+- 实际示例验证：
+  - `examples/research_agent_example.py`（旧 run_task 路径）成功运行；
+  - `examples/loop_controller_demo.py`（新 LoopController 路径）成功触发 allow / require_approval / resume_after_approval；
+  - `examples/langchain_agent_demo.py` 成功创建 `GovernedTool`，LangGraph Agent 待设置 OPENAI_API_KEY 后可运行。
+
+### 设计文档
+
+- `src/loop_controller_v0.13.0_development.md`
+
+### 后续工作
+
+- 把 `ScriptedPlanner` / `LLMPlanner` 彻底移出核心包（当前仍为弃用转发）；
+- 重写依赖 `run_task` 的测试为 `LoopController` 测试（v0.13.1 先迁移到 `_run_task_compat`）；
+- 开发 AutoGen / OpenAI Agents SDK 适配器；
+- 设计企业内部多 Agent 委托协议。
+
+---
+
+## v0.13.1：彻底移除核心 Planner，run_task 迁出核心包
+
+### 完成内容
+
+- **从 `Runtime` 移除 `planner` 字段**（`src/loop_controller/runtime.py`）：
+  - `Runtime` dataclass 不再包含 `planner`；
+  - `build_runtime()` 删除 `planner_yaml` 参数；
+  - `Runtime` 只保留依赖容器方法（`create_task`、`get_task`、`add_user_message`、`add_agent_message`、`get_conversation_context`、`start`、`aclose`）。
+- **创建兼容层**（`src/loop_controller/_run_task_compat.py`）：
+  - 将原 `run_task()` / `resume_task()` 及内部辅助函数整体迁出 `runtime.py`；
+  - `run_task()` / `resume_task()` 改为必须显式传入 `planner` 参数；
+  - 保留到 v0.14.0 后彻底删除。
+- **核心包 Planner 模块标记弃用**：
+  - `src/loop_controller/planner.py` 和 `src/loop_controller/llm_planner.py` 保留为转发/弃用 shim；
+  - 实际实现已复制到 `examples/_demo_helpers/`。
+- **测试迁移**（先迁移到兼容层）：
+  - `tests/test_e2e_research_agent.py`
+  - `tests/test_e2e_sqlite.py`
+  - `tests/test_e2e_real_mcp.py`
+  - `tests/test_runtime_conversation.py`
+  - `tests/test_audit_events.py`
+  - 全部改为从 `loop_controller._run_task_compat` 导入 `run_task` / `resume_task`，并显式构造 `ScriptedPlanner` 传入。
+- **示例调整**：
+  - `examples/research_agent_example.py` 和 `examples/llm_agent_demo.py` 改为使用 `_run_task_compat`，并显式传入 `ScriptedPlanner` / `LLMPlanner`。
+- **Runtime 内部修复**：
+  - 修正 `Session` 导入来源；
+  - `task_store.add` 改为 `task_store.save`；
+  - `ConversationMessage` 构造补充 `message_id` / `session_id`；
+  - `conversation_store` 使用 `append_message`。
+
+### 关键决策
+
+- **核心包不再依赖 Planner**：`runtime.py` 不再 import `loop_controller.planner` / `loop_controller.llm_planner`，核心包与 Agent 大脑完全解耦。
+- **兼容层保留旧入口**：已有示例和测试暂时不改成 `LoopController`，降低一次性改动风险。
+- **显式传入 planner**：`run_task(..., planner=...)` 的签名变化强制调用方意识到 Planner 已迁出核心包。
+
+### 验收状态
+
+- `pytest tests/`：**285 passed**
+- `ruff check src tests examples`：**All checks passed**
+- 预期出现的 `DeprecationWarning`：
+  - `loop_controller.planner` / `loop_controller.llm_planner` 弃用；
+  - `loop_controller._run_task_compat` 的 `run_task` / `resume_task` 弃用。
+
+### 设计文档
+
+- `src/loop_controller_v0.13.1_development.md`
+
+### 后续工作
+
+- 开发 AutoGen / OpenAI Agents SDK 适配器；
+- 设计企业内部多 Agent 委托协议。
+
+---
+
+## v0.14.0：彻底删除旧入口，全部测试改为 LoopController 驱动
+
+### 完成内容
+
+- **彻底删除旧入口**：
+  - 删除 `src/loop_controller/planner.py`；
+  - 删除 `src/loop_controller/llm_planner.py`；
+  - 删除 `src/loop_controller/_run_task_compat.py`。
+- **核心包导出清理**：`src/loop_controller/__init__.py` 不再导出 `Planner`、`ScriptedPlanner`、`LLMPlanner`、`TaskRunResult`、`UserQuestion`。
+- **LoopController 审计补全**：`controller.py` 的 `_audit_event` 现在正确写入 `args_mask`，与旧 `run_task` 路径一致。
+- **新增测试辅助**：`tests/controller_helpers.py` 提供 `controller_for()`，统一构造并启动 `LoopController`。
+- **测试全部改为 LoopController 驱动**：
+  - 重写 `tests/test_e2e_research_agent.py`：手动调用 `evaluate_and_execute` 覆盖 web_search/read_file/write_file/send_email 路径，审批后 `resume_after_approval`。
+  - 重写 `tests/test_e2e_sqlite.py`：SELECT 直接 allow，INSERT 触发 `require_approval`，审批后真实写入数据库。
+  - 重写 `tests/test_e2e_real_mcp.py`：真实 `MCPGateway` + `email_mock`，验证邮件真实发出。
+  - 重写 `tests/test_runtime_conversation.py`：同一 `session_id` 多次调用，验证 Session 复用与对话历史维护。
+  - 重写 `tests/test_audit_events.py`：断言 `propose/evaluate/execute` 事件序列、`args_hash`、`args_mask`、policy/profile 版本及审计链完整性。
+  - 删除 `tests/test_planner.py` 与 `tests/test_llm_planner.py`（被测组件已迁出核心包）。
+- **示例更新**：
+  - 删除 `examples/research_agent_example.py`（功能由 `examples/loop_controller_demo.py` 覆盖）。
+  - 重写 `examples/llm_agent_demo.py`：Agent 自己掌握主循环，通过 `LoopController.evaluate_and_execute` 提交每一步，仍然用 `examples/_demo_helpers/llm_planner.py` 做 LLM 规划演示。
+
+### 关键决策
+
+- **核心包只剩 `LoopController`**：所有 Agent 计划/主循环逻辑完全外置，Loop Controller 只负责单次工具调用治理。
+- **审计事件不再包含 `task_start/task_end/approval_consumed/approve`**：`LoopController` 只写 `propose/evaluate/execute`；旧 `run_task` 的生命周期事件随兼容层一起移除，测试断言同步调整。
+- **`args_mask` 回归**：修复 `LoopController` 之前未调用 `Masker` 的遗漏，保证审计日志仍满足 A13 掩码验收。
+
+### 验收状态
+
+- `pytest tests/`：**271 passed**
+- `pytest -W error::DeprecationWarning tests/`：**271 passed，无弃用警告报错**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**无新增错误**（仅余 2 个预存在的 PyYAML / langchain_core stub 缺失错误）
+
+### v0.14.0 补充修复
+
+- **`LoopController.execute_with_proposal`**：新增公共方法，支持 Agent 先调用 `evaluate` 拿到 `allow` Decision，再单独调用执行；`execute(decision)` 明确提示需使用 `execute_with_proposal` 或 `evaluate_and_execute`。
+- **`resume_after_approval` 审计补全**：审批恢复链路现在写入 `approve` 与 `approval_consumed` 事件，审计链与旧 `_run_task_compat.py` 语义一致。
+- **`_audit_event` 扩展**：支持显式指定 `actor_type` / `actor_id` / `decision_verdict`，用于审批人动作等非 checkpoint 事件。
+- **测试覆盖**：
+  - `test_execute_without_arguments_raises`：验证 `execute(decision)` 抛 `NotImplementedError`。
+  - `test_execute_with_proposal`：验证两段式 evaluate + execute_with_proposal 路径。
+  - `test_audit_event_sequence_and_fields` 与各 e2e 测试同步更新，断言 `approve` / `approval_consumed` 事件及 actor 信息。
+
+### 验收状态（补充修复后）
+
+- `pytest tests/`：**273 passed**
+- `pytest -W error::DeprecationWarning tests/`：**273 passed，无弃用警告报错**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**无新增错误**（仅余 2 个预存在的 PyYAML / langchain_core stub 缺失错误）
+
+### 设计文档
+
+- `src/loop_controller_v0.14.0_development.md`
+
+---
+
+## v0.15.0：接入更多 Agent 框架
+
+### 完成内容
+
+- **新增 OpenAI Agents SDK 适配器**：
+  - `src/loop_controller/adapters/openai_agents.py`
+  - 提供 `govern_function_tool` 工厂函数，将被 `@function_tool` 装饰的函数转发到 `LoopController.evaluate_and_execute`。
+- **新增 AutoGen 适配器**：
+  - `src/loop_controller/adapters/autogen.py`
+  - 提供 `govern_tool` 装饰器，把任意函数包装成受治理的 AutoGen 工具函数，保留签名与 docstring。
+- **适配器共享辅助**：
+  - 新增 `src/loop_controller/adapters/_shared.py`，统一把 `GovernanceResult` 转成给 Agent 阅读的自然语言字符串。
+  - `src/loop_controller/adapters/langchain.py` 改为复用 `_shared.format_governance_result`，消除重复代码。
+- **新增示例**：
+  - `examples/openai_agents_demo.py`
+  - `examples/autogen_agent_demo.py`
+- **新增可选依赖**：
+  - `pyproject.toml` 增加 `[openai-agents]`、`[autogen]` 和 `[all-adapters]` 可选依赖组。
+  - mypy 配置增加 `agents.*` 与 `langchain_core.*` 的 `ignore_missing_imports`，避免未安装可选框架时报错。
+- **新增测试**：
+  - `tests/test_adapters_shared.py`：覆盖 `format_governance_result` 所有状态分支。
+  - `tests/test_adapter_autogen.py`：mock `LoopController` 验证签名保留与调用转发。
+  - `tests/test_adapter_openai_agents.py`：安装 `openai-agents` 后自动运行；未安装时 skip。
+
+### 关键决策
+
+- **可选依赖不进核心包**：适配器只在安装对应 extras 后可用，保证核心包轻量。
+- **Agent 仍掌握主循环**：适配器只治理单次 tool call，与 LangChain 适配器保持同一设计范式。
+- **未安装框架时优雅降级**：示例在未安装依赖或缺少 API key 时仅打印已创建的治理工具列表。
+
+### 验收状态
+
+- `pytest tests/`：**281 passed, 1 skipped**（跳过未安装 `openai-agents` 的测试）
+- `pytest -W error::DeprecationWarning tests/`：**281 passed, 1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**无新增错误**（仅余 1 个预存在的 PyYAML stub 缺失错误）
+
+### 设计文档
+
+- `src/loop_controller_v0.15.0_development.md`
+
+---
+
+## v0.16.0：通用 Python 治理层 + 适配器重构
+
+### 完成内容
+
+- **新增 `ToolGovernor` 通用治理层**：
+  - `src/loop_controller/tool_governor.py`
+  - 与具体 Agent 框架无关，构造时固定 `agent_id` / `user_id` / `default_task_context`
+  - `call(tool_name, arguments)` 直接转发给 `LoopController.evaluate_and_execute`，返回自然语言结果
+  - 在 `src/loop_controller/__init__.py` 中导出，成为一级公共 API
+
+- **重构所有适配器使用 `ToolGovernor`**：
+  - `src/loop_controller/adapters/langchain.py`
+  - `src/loop_controller/adapters/openai_agents.py`
+  - `src/loop_controller/adapters/autogen.py`
+  - 三个适配器签名与行为完全向后兼容，内部不再重复 `evaluate_and_execute + format_governance_result`
+
+- **新增裸 Python Agent 示例**：
+  - `examples/raw_python_agent_demo.py`
+  - 展示不使用任何 Agent 框架，直接调用 `ToolGovernor` 的用法
+
+- **新增测试**：
+  - `tests/test_tool_governor.py`：mock `LoopController` 验证参数转发、`default_task_context` 覆盖、结果格式化
+
+### 关键决策
+
+- **通用层放在核心包**：`ToolGovernor` 不是适配器扩展，而是和 `LoopController` 同级别的 Python API，所以导出到 `loop_controller` 根命名空间。
+- **适配器只做框架胶水**：保留函数签名、docstring、框架注册方式，实际治理逻辑全部下沉到 `ToolGovernor`。
+- **为服务化打基础**：后续 HTTP/gRPC 服务可以直接在 endpoint 内部调用 `ToolGovernor.call(...)`。
+
+### 验收状态
+
+- `pytest tests/`：**284 passed, 1 skipped**
+- `pytest -W error::DeprecationWarning tests/`：**284 passed, 1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**无新增错误**（仅余 1 个预存在的 PyYAML stub 缺失错误）
+
+### 设计文档
+
+- `src/loop_controller_v0.16.0_development.md`
+
+---
+
+## v0.17.0：Loop Controller HTTP 服务化
+
+### 完成内容
+
+- **新增 HTTP 治理服务**：
+  - `src/loop_controller/server.py`
+  - 提供 `build_app(controller, api_key=None)` 工厂函数，返回 Starlette ASGI 应用
+  - 启动时自动调用 `controller.start()`，关闭时调用 `controller.aclose()`
+  - 内部直接调用 `LoopController.evaluate_and_execute` / `resume_after_approval`
+
+- **新增请求/响应模型**：
+  - `src/loop_controller/server_models.py`
+  - `GovernToolRequest` / `ResumeApprovalRequest` / `GovernResponse`
+
+- **新增 API**：
+  - `POST /v1/govern/tool-call`：提交工具调用治理
+  - `POST /v1/govern/resume-after-approval`：审批后恢复执行
+  - `GET /health`：健康检查
+
+- **认证**：
+  - 支持 `X-API-Key` header 或 `Authorization: Bearer <token>`
+  - 从 `LOOP_CONTROLLER_API_KEY` 环境变量读取；未设置时允许所有请求（开发模式）
+
+- **新增 CLI 命令**：
+  - `lc server --host 127.0.0.1 --port 8080 --opa-url ...`
+
+- **新增示例**：
+  - `examples/http_agent_demo.py`：用 `httpx` 通过 HTTP 调用 Loop Controller
+
+- **新增依赖**：
+  - `pyproject.toml` 增加 `[server]` 可选依赖：`starlette>=0.40`、`uvicorn>=0.30`
+  - `all-adapters` 扩展为包含 `server`
+
+- **新增测试**：
+  - `tests/test_server.py`：使用 Starlette `TestClient` 覆盖 health、tool-call、resume-after-approval、参数校验、API key 认证、lifespan 生命周期
+
+### 关键决策
+
+- **服务依赖可选**：`starlette` / `uvicorn` 不进核心依赖，保持核心包轻量。
+- **服务内部直接调用 `LoopController`**：不经过 `ToolGovernor`，因为 HTTP 请求本身已携带 `agent_id` / `user_id`。
+- **最小可用**：只暴露两个核心治理 endpoint + health，不为生产级完整服务。
+- **向后兼容**：现有 `ToolGovernor`、适配器、示例全部保留不变。
+
+### 验收状态
+
+- `pytest tests/`：**292 passed, 1 skipped**
+- `pytest -W error::DeprecationWarning tests/`：**292 passed, 1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**无新增错误**（仅余 1 个预存在的 PyYAML stub 缺失错误）
+
+### 设计文档
+
+- `src/loop_controller_v0.17.0_development.md`
+
+---
+
+## v0.18.0：事件驱动审批 + 可观测性
+
+### 完成内容
+
+- **事件驱动审批（long-polling）**：
+  - `src/loop_controller/server.py` 新增 `GET /v1/wait-for-approval`
+  - Agent 在收到 `require_approval` 后，可用返回的 `request_id` 长轮询等待审批结果
+  - 超时后返回 `pending`，审批完成则返回最终 `allow/deny/error` 结果
+  - 新增 `examples/http_agent_event_demo.py` 演示后台模拟审批 + 长轮询恢复
+
+- **Prometheus 可观测性**：
+  - 新建 `src/loop_controller/metrics.py`
+  - 定义 `loop_controller_requests_total`、`loop_controller_request_duration_seconds`、`loop_controller_tool_calls_total`、`loop_controller_approval_pending_total`
+  - `GET /metrics` 导出 Prometheus 格式指标
+  - `MetricsMiddleware` 为每个请求注入 trace_id 并统计耗时
+
+- **结构化日志与 trace_id**：
+  - 新建 `src/loop_controller/logging_config.py`
+  - 提供 `JsonFormatter` / `ColoredFormatter` 与 `configure_logging()`
+  - 每个 HTTP 请求通过 `x-trace-id` header 或自动生成 trace_id，写入响应头 `X-Trace-ID`
+
+- **增强 health check**：
+  - `GET /health` 新增 `opa_reachable`、`gateway_ready`、`uptime_seconds`
+
+- **Admin 管理 API**：
+  - `GET /v1/admin/approvals/pending`：列出待审批请求
+  - `GET /v1/admin/audit`：按 `session_id` / `task_id` 过滤审计事件
+
+- **AuditStore 扩展**：
+  - `src/loop_controller/infra/audit_store.py` 的 `AuditStore` 协议与 `JsonlAuditStore` 新增 `iter_events()` 异步迭代器
+
+- **依赖**：
+  - `pyproject.toml` `[server]` 可选依赖增加 `prometheus-client>=0.20`
+  - 开发依赖增加 `types-PyYAML`
+
+- **测试**：
+  - 重写 `tests/test_server.py`，新增 wait-for-approval、metrics、admin pending/audit、API key 保护新端点等用例
+  - 更新 `tests/test_adapter_openai_agents.py` 以兼容 `openai-agents>=0.22` 的 `FunctionTool` 返回类型
+
+### 关键决策
+
+- **long-polling 而非 webhook**：降低 Agent 侧实现复杂度，避免内网穿透，适合企业内部同步等待场景。
+- **metrics 与日志分离**：metrics 走 Prometheus 用于监控告警；日志走 stdout/JSON 用于问题追踪；两者共用 trace_id 可关联。
+- **admin API 与治理 API 同端口**：简化部署，生产环境通过 API key 统一保护。
+- **事件驱动不替代审批 CLI**：`/v1/wait-for-approval` 只是消费侧阻塞等待，审批动作仍由 `lc approvals approve/deny` 写入。
+
+### 踩坑记录
+
+- **Starlette middleware 格式**：`middleware=[(Cls, {})]` 在新版 Starlette 会触发 `ValueError: not enough values to unpack`，必须改用 `Middleware(Cls)` 实例。
+- **mypy async generator Protocol**：`async def iter_events(...) -> AsyncIterator[T]` 在 Protocol 中会被解释为 Coroutine；协议声明改为普通方法 `def iter_events(...) -> AsyncIterator[T]` 后实现用 async generator 可正常匹配。
+- **OpenAI Agents SDK 0.22 返回 FunctionTool**：`@function_tool` 现在返回 `FunctionTool` 实例而非可调用对象；测试改为验证 `FunctionTool` 字段并通过 `__wrapped__` 直接调用被治理函数。
+
+### 验收状态
+
+- `pytest tests/`：**299 passed**
+- `pytest -W error::DeprecationWarning tests/`：**299 passed**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.18.0_development.md`
+
+---
+
+## v0.19.0：实时审批通道 + gRPC 边界
+
+### 完成内容
+
+- **实时审批通道（SSE）**：
+  - 新建 `src/loop_controller/approval_watcher.py`
+  - 基于 `asyncio.Event` 实现按 `request_id` 等待/通知抽象
+  - `src/loop_controller/server.py` 新增 `GET /v1/wait-for-approval/sse`
+  - SSE 立即推送 `pending` 心跳，审批完成后推送 `result` 事件
+  - 长轮询 `/v1/wait-for-approval` 也改用 watcher 等待，可被同进程通知立即唤醒
+
+- **gRPC 服务边界**：
+  - 新建 `proto/loop_controller/v1/governance.proto`
+  - 生成 `src/loop_controller/v1/governance_pb2.py` / `governance_pb2_grpc.py`
+  - 新建 `src/loop_controller/grpc_server.py`，暴露 `EvaluateToolCall`、`ResumeAfterApproval`、`WaitForApproval`、`GetHealth`、`ListPendingApprovals`、`QueryAuditEvents`
+  - 新建 `src/loop_controller/grpc_client.py`，提供 `ToolGovernanceClient` Python 客户端
+  - `src/loop_controller/cli.py` 新增 `lc grpc-server` 子命令
+
+- **示例**：
+  - `examples/sse_agent_demo.py`：通过 SSE 实时等待审批
+  - `examples/grpc_agent_demo.py`：通过 gRPC 调用治理服务
+
+- **测试**：
+  - `tests/test_approval_watcher.py`：watcher 通知、超时、多 waiter
+  - `tests/test_server.py`：新增 SSE endpoint 测试
+  - `tests/test_grpc_server.py`：gRPC 全接口测试（in-process server）
+
+- **依赖与配置**：
+  - `pyproject.toml` 新增 `[grpc]` 可选依赖：`grpcio>=1.68`、`grpcio-tools>=1.68`
+  - 开发依赖增加 `grpcio-tools`、`mypy-protobuf`、`types-protobuf`
+  - `all-adapters` 包含 `grpc`
+  - ruff 排除生成代码目录 `src/loop_controller/v1/`
+  - mypy 排除生成代码与 grpc 扩展模块
+
+### 关键决策
+
+- **gRPC 与 HTTP 共存**：gRPC 面向内部服务间/未来 Go 交互内核调用；HTTP 面向 Agent 与外部集成。
+- **SSE 而非 WebSocket**：SSE 更简单、单向推送足够、与现有 HTTP 基础设施兼容。
+- **watcher 只做同进程通知**：CLI 审批在另一个进程时，SSE/gRPC 退化为每秒轮询 `ApprovalStore`。未来多副本场景需要 Redis/消息队列共享 watcher。
+- **生成代码提交仓库**：避免 CI 依赖 protoc，但 ruff/mypy 都排除该目录。
+
+### 踩坑记录
+
+- **protoc 输出目录**：proto 文件路径决定生成代码路径，本例生成到 `src/loop_controller/v1/` 而非 `src/loop_controller/proto/v1/`。
+- **mypy 与 protobuf 生成代码**：动态生成的 message 属性 mypy 无法识别；最终用 mypy exclude 跳过 `v1/`、`grpc_server.py`、`grpc_client.py`。
+- **Starlette TestClient 与 SSE**：`iter_lines()` 返回字符串；测试需在正确时机停止读取，避免等待到超时。
+- **gRPC server-streaming 测试**：使用 `grpc.aio.server` + `add_insecure_port("localhost:0")` 启动 in-process server，再用同一事件循环的 async client 访问。
+
+### 验收状态
+
+- `pytest tests/`：**312 passed**
+- `pytest -W error::DeprecationWarning tests/`：**312 passed**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.19.0_development.md`

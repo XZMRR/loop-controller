@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package loop_controller.proto.v1;
+
+service ToolGovernance {
+  rpc EvaluateToolCall(EvaluateToolCallRequest) returns (EvaluateToolCallResponse);
+  rpc ResumeAfterApproval(ResumeAfterApprovalRequest) returns (EvaluateToolCallResponse);
+  rpc WaitForApproval(WaitForApprovalRequest) returns (stream EvaluateToolCallResponse);
+  rpc GetHealth(HealthRequest) returns (HealthResponse);
+  rpc ListPendingApprovals(ListPendingApprovalsRequest) returns (ListPendingApprovalsResponse);
+  rpc QueryAuditEvents(QueryAuditEventsRequest) returns (stream AuditEvent);
+}
+
+message EvaluateToolCallRequest {
+  string agent_id = 1;
+  string user_id = 2;
+  string tool_name = 3;
+  string arguments_json = 4;
+  string task_context = 5;
+  string session_id = 6;
+  string task_id = 7;
+}
+
+message EvaluateToolCallResponse {
+  string status = 1;
+  string result = 2;
+  string request_id = 3;
+  string error_code = 4;
+}
+
+message ResumeAfterApprovalRequest {
+  string request_id = 1;
+}
+
+message WaitForApprovalRequest {
+  string request_id = 1;
+  int32 max_wait_seconds = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  bool opa_reachable = 2;
+  bool gateway_ready = 3;
+  float uptime_seconds = 4;
+}
+
+message PendingApproval {
+  string request_id = 1;
+  string decision_id = 2;
+  string tool_name = 3;
+  string requester_id = 4;
+  string reason = 5;
+}
+
+message ListPendingApprovalsRequest {}
+
+message ListPendingApprovalsResponse {
+  repeated PendingApproval approvals = 1;
+}
+
+message QueryAuditEventsRequest {
+  string session_id = 1;
+  string task_id = 2;
+  int32 limit = 3;
+}
+
+message AuditEvent {
+  string event_id = 1;
+  string trace_id = 2;
+  string session_id = 3;
+  string action = 4;
+  string actor_type = 5;
+  string actor_id = 6;
+  string target = 7;
+  string decision = 8;
+  string reason = 9;
+  string timestamp = 10;
+  string payload_json = 11;
+}

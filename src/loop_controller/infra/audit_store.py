@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -32,6 +33,7 @@ class AuditStore(Protocol):
     def query_by_trace(self, trace_id: str) -> list[AuditEvent]: ...
     def query_by_session(self, session_id: str) -> list[AuditEvent]: ...  # v0.12.0
     def query_by_task(self, task_id: str) -> list[AuditEvent]: ...  # v0.12.0
+    def iter_events(self) -> AsyncIterator[AuditEvent]: ...  # v0.18.0
 
 
 def _derive_key(root_key: bytes, label: bytes) -> bytes:
@@ -262,3 +264,18 @@ class JsonlAuditStore:
                 if record.get(field) == value:
                     results.append(AuditEvent(**record))
         return results
+
+    async def iter_events(self) -> AsyncIterator[AuditEvent]:
+        """按写入顺序异步迭代所有审计事件（v0.18.0）。"""
+        if not self._path.exists():
+            return
+        with self._path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                yield AuditEvent(**record)

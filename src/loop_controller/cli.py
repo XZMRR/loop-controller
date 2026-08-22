@@ -17,6 +17,10 @@ Proxy 入口（v0.5.0）：
 
     lc proxy --agent-id <id> --user-id <id> [--transport stdio|sse] [--port 8080]
 
+HTTP 服务入口（v0.17.0）：
+
+    lc server [--host 127.0.0.1] [--port 8080] [--opa-url http://127.0.0.1:8181]
+
 CLI 直接读写 ``JsonlApprovalStore``，不经过 Runtime，确保审批人与执行进程解耦。
 """
 
@@ -35,6 +39,8 @@ from loop_controller.infra.config_loader import AppConfig, ConfigLoader
 from loop_controller.models import ApprovalRecord
 from loop_controller.proxy_server import LoopControllerProxyServer, ProxyIdentity
 from loop_controller.runtime import build_runtime
+
+# v0.17.0：server 依赖是可选的，导入延迟到命令执行时
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -100,6 +106,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     proxy.add_argument("--host", default="127.0.0.1", help="SSE 模式 host（默认 127.0.0.1）")
     proxy.add_argument("--port", type=int, default=8080, help="SSE 模式端口（默认 8080）")
+
+    server = subparsers.add_parser("server", help="启动 HTTP 治理服务（v0.17.0）")
+    server.add_argument("--host", default="127.0.0.1", help="监听 host（默认 127.0.0.1）")
+    server.add_argument("--port", type=int, default=8080, help="监听端口（默认 8080）")
+    server.add_argument(
+        "--opa-url",
+        default="http://127.0.0.1:8181",
+        help="OPA 服务地址（默认 http://127.0.0.1:8181）",
+    )
+
+    grpc_server = subparsers.add_parser("grpc-server", help="启动 gRPC 治理服务（v0.19.0）")
+    grpc_server.add_argument("--port", type=int, default=50051, help="监听端口（默认 50051）")
+    grpc_server.add_argument(
+        "--opa-url",
+        default="http://127.0.0.1:8181",
+        help="OPA 服务地址（默认 http://127.0.0.1:8181）",
+    )
 
     return parser
 
@@ -256,14 +279,72 @@ def _cmd_proxy(config: AppConfig, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_server(config_dir: str, args: argparse.Namespace) -> int:
+    """启动 HTTP 治理服务。"""
+    try:
+        import uvicorn
+
+        from loop_controller.controller import build_controller
+        from loop_controller.server import build_app, load_api_key
+    except ImportError:
+        print(
+            "错误：启动 server 需要安装 server 依赖：uv pip install 'loop-controller[server]'",
+            file=sys.stderr,
+        )
+        return 1
+
+    async def run() -> None:
+        config = ConfigLoader().load(config_dir, opa_base_url=args.opa_url)
+        controller = await build_controller(config, opa_url=args.opa_url)
+        app = build_app(controller, api_key=load_api_key())
+        server = uvicorn.Server(
+            uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+        )
+        await server.serve()
+
+    asyncio.run(run())
+    return 0
+
+
+def _cmd_grpc_server(config_dir: str, args: argparse.Namespace) -> int:
+    """启动 gRPC 治理服务。"""
+    try:
+        from loop_controller.controller import build_controller
+        from loop_controller.grpc_server import serve
+    except ImportError:
+        print(
+            "错误：启动 grpc-server 需要安装 grpc 依赖：uv pip install 'loop-controller[grpc]'",
+            file=sys.stderr,
+        )
+        return 1
+
+    async def run() -> None:
+        config = ConfigLoader().load(config_dir, opa_base_url=args.opa_url)
+        controller = await build_controller(config, opa_url=args.opa_url)
+        server = await serve(controller, port=args.port)
+        await server.wait_for_termination()
+
+    asyncio.run(run())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    config = ConfigLoader().load(args.config_dir)
+    config_dir = args.config_dir
 
     if args.command == "proxy":
+        config = ConfigLoader().load(config_dir)
         return _cmd_proxy(config, args)
+
+    if args.command == "server":
+        return _cmd_server(config_dir, args)
+
+    if args.command == "grpc-server":
+        return _cmd_grpc_server(config_dir, args)
+
+    config = ConfigLoader().load(config_dir)
 
     if args.command == "audit":
         if args.audit_cmd == "analyze":

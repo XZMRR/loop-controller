@@ -1,6 +1,6 @@
-# Loop Controller — 面向企业内控的 Agent 运行框架
+# Loop Controller — 企业内部 Agent 工具调用治理基础设施
 
-> **项目阶段**：MVP 已完成（迭代 1/2/3 结束），v0.9.0 真实 Agent + 真实 MCP server 生产验证已完成，v0.9.1 真实 LLM（DeepSeek）驱动 Agent 端到端验证已完成，R0-R3 四层治理模型可运行
+> **项目阶段**：MVP 已完成（迭代 1/2/3 结束），v0.9.0 真实 Agent + 真实 MCP server 生产验证已完成，v0.9.1 真实 LLM（DeepSeek）驱动 Agent 端到端验证已完成，v0.13.0 Agent 驱动治理接口 + LangChain 适配器已完成
 > **首选语言**：Python（Agent 生态最丰富，社区传播友好）
 > **文档语言**：中文为主，代码与核心 API 文档以英文为主，便于国际化开源
 
@@ -8,7 +8,7 @@
 
 ## 1. 项目愿景
 
-**Loop Controller** 是一个开源的 Agent 运行框架，其设计灵感来自企业内控（Internal Control）部门的运作方式。我们相信：
+**Loop Controller** 是企业内部 Agent 的工具调用治理基础设施，其设计灵感来自企业内控（Internal Control）部门的运作方式。我们相信：
 
 > 当 Agent 被赋予越来越多的自主权和工具访问能力时，它不应该被当作一个无限制调用的函数，而应该被当作一名需要被 **聘用、授权、监督、审计** 的数字员工。
 
@@ -18,9 +18,11 @@
 
 Loop Controller 的核心使命是：
 
-- 为 Agent 组织提供一套 **数字化的“规章制度”基础设施**；
+- 为企业内部各种 Agent（自研、LangChain、AutoGen、OpenAI Agents SDK 等）提供统一的 **工具调用治理层**；
 - 将企业内控中的 "三道防线"、COSO 五要素、风险评估、控制活动、监督闭环等思想，转化为 Agent 框架中的 **一等设计原语**；
-- 在保持 Agent 自主性的同时，通过 **制度设计、环境塑造和智能保护**，降低风险发生的概率，而不是只在事后追责。
+- **不替 Agent 思考，只在 Agent 调用工具时把关**：Agent 自己决定计划，Loop Controller 负责 R0 审批、R1 风险评估、R2 策略判定、R3 审计。
+
+Loop Controller **不是** Agent 开发框架，也**不是**面向陌生 Agent 的开放网关；它是企业内部 Agent 的 **安全运行时**。
 
 ---
 
@@ -150,6 +152,36 @@ $env:PYTHONPATH="src"
 4. 发送邮件给张经理。
 
 每个动作都会经过 **R1 风险分类 → R2 策略判定 → R2 代理转发执行 → R3 审计日志** 的完整闭环。
+
+### 企业内部 Agent 接入（v0.13.0）
+
+v0.13.0 起，推荐用 `LoopController` 治理企业内部 Agent 的工具调用。Agent 自己掌握主循环，只在每次调工具时把请求发给 Loop Controller：
+
+```python
+from loop_controller.controller import build_controller
+
+controller = await build_controller(config)
+result = await controller.evaluate_and_execute(
+    agent_id="researcher_001",
+    user_id="alice",
+    tool_name="send_email",
+    arguments={"to": "zhang@company.com", "subject": "摘要", "body": "请查收"},
+)
+
+if result.status == "require_approval":
+    # 人工审批后继续
+    final = await controller.resume_after_approval(result.request_id)
+```
+
+如果用 LangChain，可以直接使用 `GovernedTool` 包装：
+
+```powershell
+uv pip install -e ".[langchain]"
+$env:PYTHONPATH="src"
+.venv\Scripts\python.exe examples\langchain_agent_demo.py
+```
+
+`GovernedTool` 会把每个 tool call 转发到 Loop Controller，Agent 完全不知道治理细节。
 
 ### 运行真实 MCP server 示例（v0.9.0）
 

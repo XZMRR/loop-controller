@@ -1,19 +1,23 @@
-"""Runtime 多轮对话 e2e 测试（v0.3.0 Iteration 4）。"""
+"""Runtime 会话与对话上下文测试（v0.14.0）。
+
+验证 LoopController 在多次工具调用中复用 Session，并正确维护对话历史。
+"""
 
 from __future__ import annotations
 
-import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from loop_controller.approval_manager import AsyncApprovalManager
 from loop_controller.budget import InMemoryBudgetLedger
 from loop_controller.checkpoint import Checkpoint, InMemoryDecisionStore
 from loop_controller.classifier import RuleBasedClassifier
+from loop_controller.controller import LoopController
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import JsonlAuditStore
-from loop_controller.infra.config_loader import (
-    MaskingRules,
-)
+from loop_controller.infra.config_loader import MaskingRules
 from loop_controller.infra.conversation_store import JsonlConversationStore
 from loop_controller.infra.identity import ConfigIdentityProvider
 from loop_controller.infra.policy_store import PolicyStore
@@ -23,17 +27,12 @@ from loop_controller.models import (
     Agent,
     BudgetCost,
     CapabilityProfile,
-    ConversationContext,
-    PlannedAction,
-    Task,
     ToolPermission,
     ToolResult,
-    UserQuestion,
 )
-from loop_controller.planner import Planner
 from loop_controller.risk_state import RiskStateManager
-from loop_controller.runtime import Runtime, resume_task, run_task
-from loop_controller.session import SessionManager
+from loop_controller.runtime import Runtime
+from loop_controller.session import Session, SessionManager
 
 
 class _FakePolicyEngine:
@@ -75,32 +74,7 @@ class _FakeGateway(MCPGateway):
         )
 
 
-class _AskThenSearchPlanner:
-    """先 ask_user，第二次调用时执行 web_search。"""
-
-    def __init__(self) -> None:
-        self._calls = 0
-
-    async def next_action(
-        self,
-        task: Task,
-        agent: Agent,
-        observations: list[ToolResult],
-        conversation_context: ConversationContext,
-    ) -> PlannedAction | UserQuestion | None:
-        self._calls += 1
-        if self._calls == 1:
-            return UserQuestion(question="需要什么主题的合规报告？")
-        if self._calls == 2:
-            # 验证 conversation 已包含用户回复
-            user_msgs = [m for m in conversation_context.messages if m.role == "user"]
-            assert len(user_msgs) == 1, "resume 后应能看到用户补充消息"
-            assert user_msgs[0].content == "GDPR"
-            return PlannedAction(tool_name="web_search", arguments={"query": "GDPR"}, reason="按用户补充搜索")
-        return None
-
-
-def _build_runtime(audit_path: Path, planner: Planner) -> Runtime:
+def _build_controller(audit_path: Path) -> LoopController:
     agent = Agent(
         agent_id="researcher_001",
         name="RA",
@@ -144,8 +118,7 @@ def _build_runtime(audit_path: Path, planner: Planner) -> Runtime:
     conversation_store = JsonlConversationStore(audit_path.parent / "conversations.jsonl")
     approval_store_path = audit_path.parent / "approvals.jsonl"
     r0 = AsyncApprovalManager(JsonlApprovalStore(approval_store_path))
-    return Runtime(
-        planner=planner,
+    runtime = Runtime(
         classifier=RuleBasedClassifier(),
         checkpoint=checkpoint,
         gateway=gateway,
@@ -157,40 +130,68 @@ def _build_runtime(audit_path: Path, planner: Planner) -> Runtime:
         risk_manager=risk_manager,
         conversation_store=conversation_store,
     )
+    return LoopController(runtime)
 
 
-def test_multi_turn_conversation(tmp_path: Path) -> None:
-    """Planner ask_user → Runtime 暂停 → 用户回复 → resume → 任务完成。"""
+@pytest.mark.asyncio
+async def test_multi_turn_conversation_reuses_session(tmp_path: Path) -> None:
+    """同一 session_id 的多次工具调用共享 Session 与对话历史。"""
     audit_path = tmp_path / "audit.jsonl"
-    runtime = _build_runtime(audit_path, _AskThenSearchPlanner())
-    agent = runtime.checkpoint._identity.get_agent("researcher_001")
-    task = Task(
-        task_id="trace-001",
-        session_id=runtime.session_manager.get_or_create_session("alice", agent.agent_id).session_id,
-        user_id="alice",
-        agent_id=agent.agent_id,
-        description="写合规报告",
-    )
+    controller = _build_controller(audit_path)
+    await controller.start()
+    try:
+        session_id = "session-001"
+        now = datetime.now(UTC)
+        controller._runtime.session_manager._backend.put(
+            Session(
+                session_id=session_id,
+                user_id="alice",
+                agent_id="researcher_001",
+                created_at=now,
+                last_task_at=now,
+                active=True,
+            )
+        )
 
-    # 第一轮：Planner 请求用户补充
-    result = asyncio.run(run_task(task, agent, runtime))
-    assert result.status == "needs_user_input"
-    assert result.question == "需要什么主题的合规报告？"
+        # 第一轮：Agent 调用 web_search，复用已创建的 Session
+        result1 = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
+            user_id="alice",
+            tool_name="web_search",
+            arguments={"query": "GDPR"},
+            session_id=session_id,
+            task_context="写合规报告",
+        )
+        assert result1.status == "allow"
 
-    # conversation_store 应写入一条 agent 消息
-    ctx = runtime.get_conversation_context(task.session_id)
-    assert len(ctx.messages) == 1
-    assert ctx.messages[0].role == "agent"
-    assert "请求用户补充" in ctx.messages[0].content
+        session = controller._runtime.session_manager.get_session(session_id)
+        assert session is not None
+        assert session.user_id == "alice"
+        assert session.agent_id == "researcher_001"
 
-    # 外部调用方写入用户回复
-    runtime.add_user_message(task.session_id, task.task_id, "GDPR")
+        # 模拟 Agent 向用户报告初步结果，以及用户补充输入
+        controller._runtime.add_agent_message(session_id, result1.call_id or "", "已找到 GDPR 相关摘要")
+        controller._runtime.add_user_message(session_id, result1.call_id or "", "请再查一下 AI 合规")
 
-    # 第二轮：resume 后继续并完成任务
-    result2 = asyncio.run(resume_task(task, agent, runtime))
-    assert result2.status == "completed"
+        # 第二轮：同一 Session 再次调用，对话历史应保留
+        result2 = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
+            user_id="alice",
+            tool_name="web_search",
+            arguments={"query": "AI compliance"},
+            session_id=session_id,
+            task_context="继续写合规报告",
+        )
+        assert result2.status == "allow"
 
-    # 审计链完整
-    events = runtime.audit_store.query_by_trace(task.task_id)
-    actions = [e.action for e in events]
-    assert actions == ["task_start", "task_start", "propose", "evaluate", "execute", "task_end"]
+        ctx = controller._runtime.get_conversation_context(session_id)
+        assert len(ctx.messages) == 4
+        assert ctx.messages[0].role == "user"
+        assert "写合规报告" in ctx.messages[0].content
+        assert ctx.messages[1].role == "agent"
+        assert ctx.messages[2].role == "user"
+        assert ctx.messages[2].content == "请再查一下 AI 合规"
+        assert ctx.messages[3].role == "user"
+        assert "继续写合规报告" in ctx.messages[3].content
+    finally:
+        await controller.aclose()

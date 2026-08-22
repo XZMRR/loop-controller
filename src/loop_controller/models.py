@@ -456,6 +456,39 @@ class TaskRunResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# v0.13.0 Agent 驱动治理接口
+# ---------------------------------------------------------------------------
+
+
+class EvaluationResult(BaseModel):
+    """R1 + R2 对单次工具调用请求的判定结果，不含执行。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: Literal["allow", "deny", "require_approval", "blocked"]
+    decision: Decision | None = None
+    request_id: str | None = None
+    reason: str = ""
+    risk_signal: RiskSignal | None = None
+
+
+class GovernanceResult(BaseModel):
+    """Agent 驱动模式下，Loop Controller 对单次工具调用的完整响应。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: Literal["allow", "deny", "require_approval", "blocked", "error"]
+    call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    decision: Decision | None = None  # allow/modify 时有
+    request_id: str | None = None  # require_approval 时有
+    reason: str = ""
+    content: Any = None  # allow 后执行的结果内容
+    error_code: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # v0.11.0 Earned Authority Manager（动态权限提升）
 # ---------------------------------------------------------------------------
 

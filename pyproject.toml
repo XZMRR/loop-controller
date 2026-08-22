@@ -1,12 +1,38 @@
 [project]
 name = "loop-controller"
-version = "0.3.0"
+version = "0.19.0"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.0",
     "httpx>=0.27",
     "pyyaml>=6.0",
     "mcp>=1.0",
+]
+
+[project.optional-dependencies]
+langchain = [
+    "langchain>=0.3",
+    "langchain-openai>=0.2",
+    "langgraph>=0.3",
+]
+openai-agents = [
+    "openai-agents>=0.1",
+    "openai>=1.70",
+]
+autogen = [
+    "autogen-agentchat>=0.4",
+]
+server = [
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+    "prometheus-client>=0.20",
+]
+grpc = [
+    "grpcio>=1.68",
+    "grpcio-tools>=1.68",
+]
+all-adapters = [
+    "loop-controller[langchain,openai-agents,autogen,server,grpc]",
 ]
 
 [project.scripts]
@@ -19,6 +45,9 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=0.23",
     "ruff>=0.16.1",
+    "types-pyyaml>=6.0.12.20260815",
+    "grpcio-tools>=1.68",
+    "mypy-protobuf>=5.1.0",
 ]
 
 [[tool.uv.index]]
@@ -34,12 +63,25 @@ line-length = 100
 # but exclude bandit (`BLE`) rules for early-stage development
 select = ["E", "F", "W", "I", "N", "UP"]
 ignore = ["E501", "ANN", "D", "BLE"]
+exclude = ["src/loop_controller/v1/*"]
+[tool.ruff.lint.per-file-ignores]
+"src/loop_controller/grpc_server.py" = ["N802"]
+"tests/test_grpc_server.py" = ["N802"]
 
 [tool.mypy]
 python_version = "3.13"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
+exclude = ["src/loop_controller/v1/"]
+
+[[tool.mypy.overrides]]
+module = ["agents.*", "langchain_core.*", "grpc.*", "google.protobuf.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["loop_controller.grpc_server", "loop_controller.grpc_client"]
+ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -51,6 +51,7 @@ class ApprovalStore(Protocol):
     def submit_request(self, request: ApprovalRequest) -> None: ...
     def get_pending(self) -> list[ApprovalRequest]: ...
     def get_request(self, decision_id: str) -> ApprovalRequest | None: ...
+    def get_request_by_id(self, request_id: str) -> ApprovalRequest | None: ...
     def record_response(self, record: ApprovalRecord) -> None: ...
     def get_record(self, decision_id: str) -> ApprovalRecord | None: ...
 
@@ -112,6 +113,13 @@ class JsonlApprovalStore:
 
     def get_request(self, decision_id: str) -> ApprovalRequest | None:
         return self._requests.get(decision_id)
+
+    def get_request_by_id(self, request_id: str) -> ApprovalRequest | None:
+        """v0.13.0：按 request_id 查找原始审批请求。"""
+        for req in self._requests.values():
+            if req.request_id == request_id:
+                return req
+        return None
 
     def record_response(self, record: ApprovalRecord) -> None:
         """记录审批结果；覆盖同一 decision_id 的旧结果。"""

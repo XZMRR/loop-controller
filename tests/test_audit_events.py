@@ -1,15 +1,18 @@
-"""审计埋点核对（T3.3）：run_task 产生完整事件序列与字段。"""
+"""审计埋点核对（v0.14.0）：LoopController 产生完整事件序列与字段。"""
 
 from __future__ import annotations
 
-import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from loop_controller.approval_manager import AsyncApprovalManager
 from loop_controller.budget import InMemoryBudgetLedger
 from loop_controller.checkpoint import Checkpoint, InMemoryDecisionStore
 from loop_controller.classifier import RuleBasedClassifier
+from loop_controller.controller import LoopController
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import JsonlAuditStore
 from loop_controller.infra.config_loader import (
@@ -24,16 +27,14 @@ from loop_controller.mcp_gateway import MCPGateway
 from loop_controller.models import (
     Agent,
     ApprovalRecord,
+    AuditEvent,
     BudgetCost,
     CapabilityProfile,
-    PlannedAction,
-    Task,
     ToolPermission,
     ToolResult,
 )
-from loop_controller.planner import Planner, ScriptedPlanner
 from loop_controller.risk_state import RiskStateManager
-from loop_controller.runtime import Runtime, resume_task, run_task
+from loop_controller.runtime import Runtime
 from loop_controller.session import SessionManager
 
 
@@ -78,7 +79,7 @@ class _FakeGateway(MCPGateway):
         )
 
 
-def _build_runtime(audit_path: Path, steps: list) -> Runtime:
+def _build_controller(audit_path: Path) -> LoopController:
     agent = Agent(
         agent_id="researcher_001",
         name="RA",
@@ -125,10 +126,8 @@ def _build_runtime(audit_path: Path, steps: list) -> Runtime:
     audit_store = JsonlAuditStore(audit_path)
     conversation_store = JsonlConversationStore(audit_path.parent / "conversations.jsonl")
     approval_store_path = audit_path.parent / "approvals.jsonl"
-    planner: Planner = ScriptedPlanner(steps)
     r0 = AsyncApprovalManager(JsonlApprovalStore(approval_store_path))
-    return Runtime(
-        planner=planner,
+    runtime = Runtime(
         classifier=RuleBasedClassifier(),
         checkpoint=checkpoint,
         gateway=gateway,
@@ -140,90 +139,91 @@ def _build_runtime(audit_path: Path, steps: list) -> Runtime:
         risk_manager=risk_manager,
         conversation_store=conversation_store,
     )
+    return LoopController(runtime)
 
 
-def test_audit_event_sequence_and_fields(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_audit_event_sequence_and_fields(tmp_path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    runtime = _build_runtime(
-        audit_path,
-        [
-            PlannedAction(
-                tool_name="web_search",
-                arguments={"query": "OpenAI compliance", "password": "secret"},
-                reason="search",
-            ),
-            PlannedAction(
-                tool_name="send_email",
-                arguments={"to": "zhang@company.com", "body": "done"},
-                reason="notify",
-            ),
-        ],
-    )
-    agent = runtime.checkpoint._identity.get_agent("researcher_001")
-    session = runtime.session_manager.get_or_create_session("alice", agent.agent_id)
-    task = Task(
-        task_id="trace-001",
-        session_id=session.session_id,
-        user_id="alice",
-        agent_id=agent.agent_id,
-        description="test audit",
-    )
-
-    result = asyncio.run(run_task(task, agent, runtime))
-    assert result.status == "needs_approval"
-
-    # 模拟 CLI 审批通过
-    runtime.approval_manager._store.record_response(
-        ApprovalRecord(
-            request_id=result.request_id or "",
-            decision_id=result.decision_id or "",
-            verdict="approve",
-            approver_id="zhang_manager",
-            comment="approved by test",
-            decided_at=datetime.now(UTC),
+    controller = _build_controller(audit_path)
+    await controller.start()
+    try:
+        result1 = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
+            user_id="alice",
+            tool_name="web_search",
+            arguments={"query": "OpenAI compliance", "password": "secret"},
+            task_context="test audit",
         )
-    )
+        assert result1.status == "allow"
 
-    resume_result = asyncio.run(resume_task(task, agent, runtime, pending=result))
-    assert resume_result.status == "completed"
+        result2 = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
+            user_id="alice",
+            tool_name="send_email",
+            arguments={"to": "zhang@company.com", "body": "done"},
+            task_context="test audit",
+        )
+        assert result2.status == "require_approval"
+        assert result2.request_id is not None
 
-    events = runtime.audit_store.query_by_trace(task.task_id)
-    actions = [e.action for e in events]
-    assert actions == [
-        "task_start",
-        "propose", "evaluate", "execute",   # web_search
-        "propose", "evaluate",               # send_email 被 require_approval 拦截
-        "task_start",                         # resume_task 再写一次 task_start
-        "approve", "approval_consumed", "execute",  # send_email 审批通过、消费、执行
-        "task_end",
-    ]
+        # 模拟 CLI 审批通过
+        store = controller._runtime.approval_manager._store
+        request = store.get_request(result2.decision.decision_id)
+        store.record_response(
+            ApprovalRecord(
+                request_id=request.request_id,
+                decision_id=result2.decision.decision_id,
+                verdict="approve",
+                approver_id="zhang_manager",
+                comment="approved by test",
+                decided_at=datetime.now(UTC),
+            )
+        )
 
-    # task_start / task_end 无 call_id
-    assert events[0].call_id is None
-    assert events[-1].call_id is None
+        resume_result = await controller.resume_after_approval(result2.request_id)
+        assert resume_result.status == "allow"
 
-    # propose 由 agent 产生
-    propose = events[1]
-    assert propose.actor_type == "agent"
-    assert propose.args_hash is not None
-    assert propose.args_mask is not None
-    assert propose.hash_algo == "sha256"
-    # audit_log 档会掩码邮箱与 password
-    assert propose.args_mask["password"] == "***"
-    assert "@" not in str(propose.args_mask.get("query", ""))
+        events = [
+            AuditEvent(**json.loads(line))
+            for line in controller._runtime.audit_store._path.read_text(encoding="utf-8").strip().split("\n")
+            if line.strip()
+        ]
+        actions = [e.action for e in events]
+        assert actions == [
+            "propose", "evaluate", "execute",  # web_search
+            "propose", "evaluate",             # send_email 被 require_approval 拦截
+            "approve", "approval_consumed", "execute",  # send_email 审批后执行
+        ]
 
-    # evaluate 携带 policy/profile 版本
-    evaluate = events[2]
-    assert evaluate.decision == "allow"
-    assert evaluate.policy_version == "test-policy-v1"
-    assert evaluate.profile_version == "test-profile-v1"
+        # approve 事件由审批人触发（actor_type 使用 r0_delegate）
+        approve_event = events[-3]
+        assert approve_event.action == "approve"
+        assert approve_event.actor_type == "r0_delegate"
+        assert approve_event.actor_id == "zhang_manager"
+        assert approve_event.decision == "allow"
 
-    # send_email 审批路径：approve 事件记录审批结果
-    approve = events[7]
-    assert approve.action == "approve"
-    assert approve.args_mask is not None
-    # 审计事件中的 args_mask 使用 audit_log 档，邮箱也被掩码
-    assert approve.args_mask["to"] == "***@***"
+        # approval_consumed 事件由 checkpoint 触发
+        consumed_event = events[-2]
+        assert consumed_event.action == "approval_consumed"
+        assert consumed_event.actor_type == "checkpoint"
 
-    # 审计链完整
-    assert runtime.audit_store.verify_chain()
+        # propose 由 agent 产生
+        propose = events[0]
+        assert propose.actor_type == "agent"
+        assert propose.args_hash is not None
+        assert propose.args_mask is not None
+        # audit_log 档会掩码邮箱与 password
+        assert propose.args_mask["password"] == "***"
+        assert "@" not in str(propose.args_mask.get("query", ""))
+
+        # evaluate 携带 policy/profile 版本
+        evaluate = events[1]
+        assert evaluate.decision == "allow"
+        assert evaluate.policy_version == "test-policy-v1"
+        assert evaluate.profile_version == "test-profile-v1"
+
+        # 审计链完整
+        assert controller._runtime.audit_store.verify_chain()
+    finally:
+        await controller.aclose()

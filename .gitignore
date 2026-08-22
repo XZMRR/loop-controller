@@ -82,9 +82,14 @@ tools/
 
 # Runtime data (generated)
 data/*.jsonl
+data/output/
 
 # Logs
 *.log
 
 # Temporary
 *.tmp
+
+# Audit artifacts
+.audit_check_config.py
+AUDIT_REPORT.md
