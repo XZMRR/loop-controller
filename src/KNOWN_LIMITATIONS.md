@@ -20,11 +20,23 @@ v0.20.0 核心包仅维护三种官方接入形态：
 `Framework Adapters`（LangChain / OpenAI Agents / AutoGen）已移出核心包，仅保留在
 `examples/contrib/adapters/` 作为迁移示例。
 
-### V20-2. 仅支持 MCP 工具执行
+### V20-2. 仅 MCP / HTTP 协议型工具由 Loop Controller 内部代理执行
 
-v0.20.0 只实现 `MCPExecutor`。所有真实工具调用必须通过 MCP Server 包装。
-HTTP API、本地函数、Shell、浏览器、数据库直连等工具执行能力尚未实现，
-计划通过 `ExecutorRegistry` + `ToolExecutor` 抽象在后续版本扩展。
+v0.20.0 起，Loop Controller 内部只保留两类执行器：
+
+- `MCPExecutor`：把调用转发给外部 MCP Server；
+- `HTTPExecutor`：把调用转发给 REST API。
+
+Shell、SQL、浏览器、文件系统、本地函数等操作系统级或应用级能力，
+**不由 Loop Controller 进程自己执行**。企业应通过以下方式接入治理：
+
+1. **包装成 MCP Server**：见 `examples/contrib/mcp_wrappers/` 下的
+   `shell_mcp_server.py`、`sql_mcp_server.py`、`browser_mcp_server.py`；
+2. **接入 Harness / 沙箱 / 容器**：Loop Controller 做治理决策， Harness
+   在隔离环境中执行，见 `examples/contrib/harness/`。
+
+`LocalFunctionExecutor`（v0.23.0）保留，但仅定位为“不方便包装成 MCP 时的可选辅助”，
+不是核心架构方向。
 
 ### V20-3. 同进程 SDK/Adapter 不提供工具级实时阻断
 
@@ -62,17 +74,22 @@ v0.23.1 已移除 `lc proxy --identity-token` 命令行参数，避免敏感 tok
 
 ## v0.23.0 边界声明
 
-### V23-1. 本地函数沙箱为粗粒度子进程隔离
+### V23-1. 本地函数沙箱为粗粒度可选辅助
 
 v0.23.0 已实现 `LocalFunctionExecutor`，通过子进程 + stdin/stdout JSON 调用本地 Python 函数，并提供超时、`open()` 路径白名单、环境变量白名单等最小沙箱能力。
 v0.23.1 修复后，子进程不再继承完整环境变量，仅保留系统必要变量 + 白名单变量 + `PYTHONPATH`，并额外 hook 了 `os.open`。
-但该隔离仍是**粗粒度**的：
+
+v0.24.0 按架构审计收敛后，`LocalFunctionExecutor` 被重新定位为
+**“不方便包装成 MCP 时的可选辅助”**，不是核心执行器扩展方向。
+Loop Controller 未来不会把 Shell / SQL / Browser 等高危能力做成内置执行器。
+
+该隔离仍是**粗粒度**的：
 
 - 子进程与主进程共享文件系统、网络、CPU/内存等底层资源；
 - 路径白名单基于字符串前缀匹配，复杂路径或编码绕过仍可能生效；
 - 未做 CPU/内存/cgroup、seccomp、chroot、容器级隔离。
 
-高危函数应部署到容器/VM，由部署层提供真正隔离。
+高危函数应部署到容器/VM 或作为独立 MCP Server，由部署层提供真正隔离。
 
 ### V23-2. 本地函数参数与返回结果须 JSON 可序列化
 
@@ -99,10 +116,16 @@ v0.23.1 将 `mcp` 依赖固定为 `<2.0`，因为 mcp 2.0 对服务端 API 做�
 v0.22.0 的热更新仅覆盖 `config/http_tools.yaml` 与 `secrets/` 下的 secret 文件。
 `config/mcp_servers.yaml`、`config/profiles.yaml`、`config/policies/*.rego` 等变更建议重启进程，避免运行时权限漂移或子进程生命周期混乱。
 
-### V22-2. Secret 文件后端默认明文存储
+### V22-2. Secret 文件后端：明文为默认，加密后端已提供
 
-v0.22.0 `FileSecretBackend` 默认以明文 JSON 存储 secret，依赖文件系统权限与进程隔离保护；
-真正加密/KMS/Vault 集成计划在 v0.24+。生产部署应确保 secret 目录的 ACL 严格受限。
+v0.22.0 `FileSecretBackend` 默认以明文 JSON 存储 secret，依赖文件系统权限与进程隔离保护。
+
+v0.24.0 新增 `EncryptedFileSecretBackend`，使用 AES-256-GCM 加密落盘，
+密钥从环境变量 `LC_SECRET_ENCRYPTION_KEY` 读取（32 字节，hex/base64）。
+可在 `config/secrets.yaml` 中设置 `backend.type=encrypted_file` 启用。
+
+生产部署应优先使用加密后端，并确保 secret 目录的 ACL 严格受限。
+KMS / Vault / etcd 等外部密钥/存储集成仍计划在后续版本。
 
 ### V22-3. 多租户仅为命名空间预留
 

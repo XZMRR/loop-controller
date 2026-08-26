@@ -30,8 +30,6 @@ import yaml
 
 from loop_controller.executors.http_models import HTTPToolSpec, resolve_env_refs
 from loop_controller.executors.local_function_models import LocalFunctionSpec
-from loop_controller.executors.shell_models import ShellToolSpec
-from loop_controller.executors.sql_models import DataSourceConfig, SQLToolSpec
 from loop_controller.models import (
     Agent,
     AuditRule,
@@ -201,9 +199,6 @@ class AppConfig:
     tool_mapping: dict[str, ToolMappingEntry]
     http_tool_specs: dict[str, HTTPToolSpec]  # v0.21.0 HTTP 工具规格
     local_function_specs: dict[str, LocalFunctionSpec]  # v0.23.0 本地函数规格
-    shell_tool_specs: dict[str, ShellToolSpec]  # v0.24.0 Shell 工具规格
-    data_sources: dict[str, DataSourceConfig]  # v0.24.0 SQL 数据源
-    sql_tool_specs: dict[str, SQLToolSpec]  # v0.24.0 SQL 工具规格
     permission_rules: list[PermissionRule]
     capability_rules: CapabilityRules  # v0.10.0
     authority_rules: AuthorityRules  # v0.11.0
@@ -259,8 +254,6 @@ class ConfigLoader:
         # mcp_servers.yaml 中的 type: http 条目作为向后兼容补充
         http_tool_specs.update(legacy_http_specs)
         local_function_specs = self._load_local_functions(config_dir / "local_functions.yaml")
-        shell_tool_specs = self._load_shell_tools(config_dir / "shell_tools.yaml")
-        data_sources, sql_tool_specs = self._load_sql_tools(config_dir / "sql_tools.yaml")
         secrets_config = self._load_secrets_config(config_dir / "secrets.yaml", root)
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
@@ -315,9 +308,6 @@ class ConfigLoader:
             tool_mapping=tool_mapping,
             http_tool_specs=http_tool_specs,
             local_function_specs=local_function_specs,
-            shell_tool_specs=shell_tool_specs,
-            data_sources=data_sources,
-            sql_tool_specs=sql_tool_specs,
             permission_rules=permission_rules,
             capability_rules=capability_rules,
             authority_rules=authority_rules,
@@ -452,37 +442,6 @@ class ConfigLoader:
         for canonical, entry in (data.get("tools") or {}).items():
             specs[canonical] = LocalFunctionSpec(tool_name=canonical, **entry)
         return specs
-
-    def _load_shell_tools(self, path: Path) -> dict[str, ShellToolSpec]:
-        """加载 Shell 工具规格（v0.24.0）。
-
-        文件缺失时返回空 dict（向后兼容）。
-        """
-        specs: dict[str, ShellToolSpec] = {}
-        if not path.exists():
-            return specs
-        data = self._read_yaml(path)
-        for canonical, entry in (data.get("tools") or {}).items():
-            specs[canonical] = ShellToolSpec(tool_name=canonical, **entry)
-        return specs
-
-    def _load_sql_tools(
-        self, path: Path
-    ) -> tuple[dict[str, DataSourceConfig], dict[str, SQLToolSpec]]:
-        """加载 SQL 数据源与工具规格（v0.24.0）。
-
-        文件缺失时返回空 dict（向后兼容）。
-        """
-        data_sources: dict[str, DataSourceConfig] = {}
-        specs: dict[str, SQLToolSpec] = {}
-        if not path.exists():
-            return data_sources, specs
-        data = self._read_yaml(path)
-        for name, entry in (data.get("data_sources") or {}).items():
-            data_sources[name] = DataSourceConfig(name=name, **entry)
-        for canonical, entry in (data.get("tools") or {}).items():
-            specs[canonical] = SQLToolSpec(tool_name=canonical, **entry)
-        return data_sources, specs
 
     def reload_http_tools(self, config_dir: str | Path) -> dict[str, HTTPToolSpec]:
         """热更新：仅重新加载 HTTP 工具规格。"""
@@ -652,14 +611,12 @@ class ConfigLoader:
             set(config.tool_mapping)
             | set(config.http_tool_specs)
             | set(config.local_function_specs)
-            | set(config.shell_tool_specs)
-            | set(config.sql_tool_specs)
         )
         for profile_id, profile in config.profiles.items():
             for tool_name in profile.tools:
                 if tool_name not in all_tools:
                     raise ConfigValidationError(
-                        f"Profile {profile_id} 的工具 {tool_name} 不在 tool_mapping / http_tool_specs / local_function_specs / shell_tool_specs / sql_tool_specs 中"
+                        f"Profile {profile_id} 的工具 {tool_name} 不在 tool_mapping / http_tool_specs / local_function_specs 中"
                     )
 
     def _check_policy_loadable(self, opa_base_url: str, config: AppConfig) -> None:

@@ -17,7 +17,8 @@
 - **ask_user 暂停态**：Planner 可返回 `UserQuestion`，`run_task` 返回 `needs_user_input`，外部补充输入后 `resume_task` 继续执行；
 - **预算控制**：按工具计费的 token 预算，超支即拒。
 - **可信身份控制平面**（v0.20.0）：Agent 身份由 JWT / mTLS / 静态 token 验证，`agent_id` 从凭证推导，不可伪造；
-- **可插拔执行器抽象**（v0.20.0）：`ExecutorRegistry` + `ToolExecutor` 让 MCP / HTTP / 本地函数 / 沙箱执行器可统一接入；
+- **可插拔执行器抽象**（v0.20.0）：`ExecutorRegistry` + `ToolExecutor` 让 MCP / HTTP 协议型工具可统一接入；
+  Shell / SQL / 浏览器等能力通过外部 MCP Server 或 Harness 接入，不在 Loop Controller 进程内执行；
 - **网络级治理入口**（v0.20.0）：HTTP、gRPC、MCP Proxy 作为生产入口，Agent 不直接持有工具凭证。
 
 ## 架构
@@ -31,7 +32,11 @@ R2 Checkpoint（身份校验 → 防重放 → Profile → 预算 → 组合规�
          ▼
 ExecutorRegistry ──→ MCPExecutor ──→ MCPGateway ──→ MCP Servers
                                   └─→ HTTP Executor（v0.21+）
-                                  └─→ Sandboxed Executor（v0.23+）
+                                  └─→ LocalFunctionExecutor（v0.23+，可选辅助）
+
+Shell / SQL / Browser 等高危工具通过外部 MCP Server 或 Harness 接入，
+不在 Loop Controller 进程内执行。见 examples/contrib/mcp_wrappers/ 与
+examples/contrib/harness/。
 
 R3 AuditStore：异步全量记录 + 哈希链 + 分级掩码（只读，无指令下发权）
 R0 AsyncApprovalManager：异步审批请求持久化，审批人通过 `lc` CLI 写入结果
@@ -117,7 +122,7 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 
 ## 已知局限
 
-**本项目当前为 v0.20.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链需配合 seal/WORM、HMAC-SHA256 为默认、单进程 asyncio 假设、同进程 SDK/Adapter 不承诺实时阻断、v0.20.0 仅支持 MCP 工具执行。
+**本项目当前为 v0.20.0+，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链需配合 seal/WORM、HMAC-SHA256 为默认、单进程 asyncio 假设、同进程 SDK/Adapter 不承诺实时阻断、Loop Controller 内部仅代理 MCP / HTTP 协议型工具，Shell / SQL / 浏览器等通过外部 MCP Server 或 Harness 接入治理。
 
 ## 文档
 

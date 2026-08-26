@@ -1,226 +1,184 @@
-# v0.24.0 开发文档：ShellExecutor 与 SQLExecutor
+# v0.24.0 开发文档：架构收敛 — MCP 包装 + Harness 接入 + 加密 Secret 后端
 
 ## 1. 目标
 
-v0.23.1 已完成审计修复，governance 核心链路（MCP / HTTP / Local Function）趋于稳定。
-v0.24.0 的目标是把企业 Agent 最高频的两类工具纳入同一套治理闭环：**命令行脚本** 与 **SQL 查询**。
+v0.23.2 已完成 v0.23.1 残留问题的收尾。v0.24.0 的核心任务是根据
+`src/audit_report.md` 的架构审查结论，**把 Loop Controller 从“工具运行时”收敛回“治理控制平面”**：
 
-> **一句话目标**：新增 `ShellExecutor` 与 `SQLExecutor`，用“命令模板 + 参数白名单”和“参数化查询 + 只读角色”替换脆弱的正则白名单，覆盖企业 CLI 与数据库工具。
+> **一句话目标**：删除 Shell/SQL 内置执行器规划，改为提供高危工具的 MCP 包装示例与 Harness 接入规范，并完成 EncryptedFileSecretBackend。
 
-v0.24.0 只做以下两件事：
+v0.24.0 做以下三件事：
 
-1. **ShellExecutor**：让 Agent 在受控条件下调用本地命令/脚本，默认 `default_risk=critical`；
-2. **SQLExecutor**：在声明的数据源上执行参数化 SQL，只读/写分离，敏感密码通过 Secret Broker 注入。
+1. **明确架构边界**：Loop Controller 内部只保留 MCP / HTTP 协议型工具代理；
+2. **提供替代接入方式**：新增 `examples/contrib/mcp_wrappers/` 与 `examples/contrib/harness/`；
+3. **完成加密 Secret 后端**：新增 `EncryptedFileSecretBackend`，secret 落盘 AES-256-GCM 加密。
 
 v0.24.0 **不做**：
 
-- BrowserExecutor（延后至 v0.25.0）；
-- Docker 容器隔离后端（延后至 v0.26.0）；
-- EncryptedFileSecretBackend（延后至 v0.26.0）。
+- 不再新增 `ShellExecutor`、`BrowserExecutor`、`SQLExecutor` 等内置执行器；
+- 不再把容器隔离后端做进 Loop Controller 内部执行器（容器隔离留给 Harness）。
 
 ## 2. 背景与动机
 
-### 2.1 为什么先做 Shell + SQL
+### 2.1 审计报告的核心结论
 
-| 工具类型 | 企业场景 | 治理难点 |
+Loop Controller 的正确边界是统一的治理闭环：
+
+```text
+身份认证 → 工具目录 → 风险分类 → 策略判定 → 审批 → 执行器路由 → 审计
+```
+
+它只应回答三个问题：
+
+1. **谁**在调用？（身份）
+2. **能不能**调用？（策略/风险/审批）
+3. **调用后发生了什么？**（审计/预算/吊销）
+
+具体工具怎么跑，不应由 Loop Controller 内部实现。
+
+| 能力 | 属于 Loop Controller | 不属于 Loop Controller |
 |---|---|---|
-| Shell | kubectl、awscli、legacy CLI、内部脚本 | 命令注入、参数拼接、任意重定向 |
-| SQL | 内部数据库、数据仓库、分析平台 | SQL 注入、越权读写、敏感字段 |
+| 身份认证 | ✅ | ❌ |
+| 策略引擎 | ✅ | ❌ |
+| 审批工作流 | ✅ | ❌ |
+| 审计链 | ✅ | ❌ |
+| MCP 协议代理 | ✅ | ❌ |
+| HTTP API 代理 | ✅ | ❌ |
+| 执行 Python 函数 | ⚠️ 可选辅助 | ❌ 不应成为核心 |
+| 执行 Shell 命令 | ❌ | ✅ 应由工具侧或 Harness 处理 |
+| 执行 SQL | ❌ | ✅ 应由数据库工具或 Harness 处理 |
+| 运行浏览器 | ❌ | ✅ 应由浏览器工具或 Harness 处理 |
 
-Shell 和 SQL 都是“命令/查询字符串 + 参数”的形态，治理模型高度相似：
+### 2.2 替代方案
 
-- 先由管理员声明**固定模板**；
-- 运行时严格校验**参数值**来自白名单或安全类型；
-- 拒绝任何试图拼接、转义、注释的行为。
+对于 Shell / SQL / Browser，推荐两种接入方式：
 
-把这两类放在同一版本，可以复用模板校验、参数白名单、超时、输出限制等基础设施。
+**方式 1：MCP 包装示例**
 
-### 2.2 为什么不先做 Browser
+把工具能力包装成独立的 MCP Server：
 
-BrowserExecutor 需要 Playwright 依赖，二进制体积大，且涉及截图 DOM 信息泄露等独立安全问题。
-单独放到 v0.25.0，可以让 v0.24.0 的测试和交付边界更清晰。
+```text
+examples/contrib/mcp_wrappers/shell_mcp_server.py
+examples/contrib/mcp_wrappers/sql_mcp_server.py
+examples/contrib/mcp_wrappers/browser_mcp_server.py
+```
 
-### 2.3 与现有执行器的关系
+这些 server 作为独立进程运行，Loop Controller 通过 `MCPGateway` 转发调用。
+它们自身可跑在容器/沙箱中，避免把执行能力带入 Loop Controller 进程。
 
-| 执行器 | 隔离级别 | 适用场景 |
-|---|---|---|
-| MCPExecutor | 子进程（外部 MCP Server） | 官方/第三方 MCP 工具 |
-| HTTPExecutor | 网络边界 | REST API 工具 |
-| LocalFunctionExecutor | 子进程 | 企业内部 Python 函数 |
-| **ShellExecutor** | 子进程 | CLI/脚本工具 |
-| **SQLExecutor** | 数据库连接池 | 数据库查询/写入 |
+**方式 2：Harness 接入**
 
-## 3. 设计原则
+Agent 和工具进程跑在受控沙箱/容器中：
 
-1. **默认禁止，显式授权**：Shell / SQL 默认 `default_risk=critical`，需在 Capability Profile 中显式 `allowed: true` 并配置数据源/命令模板。
-2. **模板 + 参数白名单，而非正则**：Shell 使用 `command_template` 与 `allowed_args`；SQL 使用参数化查询与 `allowed_patterns`（仅作为二次校验）。
-3. **fail-closed**：命令/数据源不存在、参数不合法、连接失败、输出超限、执行超时均返回错误 `ToolResult`。
-4. **统一接入 `ExecutorRegistry`**：两类新执行器实现 `ToolExecutor`，`Checkpoint` 无需感知类型。
-5. **向后兼容**：不启用相关配置时，v0.24.0 行为与 v0.23.1 完全一致。
-6. **依赖可选**：数据库驱动作为 `[sql]` extra，未安装时 `SQLExecutor` 优雅不可用；ShellExecutor 仅依赖标准库。
+```text
+examples/contrib/harness/harness_sdk.py
+examples/contrib/harness/docker_harness.py
+examples/contrib/harness/Dockerfile
+examples/contrib/harness/runner.py
+```
 
-## 4. 新增/修改文件
+Harness 拦截调用并交给 Loop Controller 决策；
+决策允许后，Harness 在隔离环境中执行。
+
+### 2.3 LocalFunctionExecutor 的重新定位
+
+`LocalFunctionExecutor`（v0.23.0）保留，但需重新定位：
+
+- 仅作为 **“不方便包装成 MCP 时的可选辅助”**；
+- 不作为核心架构方向；
+- 后续优先推荐企业把函数包装成 MCP Server 或 HTTP API；
+- 如果内部执行，应逐步迁移到可选 Harness/容器后端，而不是 Loop Controller 本进程。
+
+## 3. 新增/修改文件
 
 | 文件 | 操作 | 说明 |
 |---|---|---|
-| `src/loop_controller/executors/shell_executor.py` | 新增 | `ShellExecutor`，命令模板 + 参数白名单 |
-| `src/loop_controller/executors/shell_models.py` | 新增 | `ShellToolSpec`、`ShellCommandConfig` |
-| `src/loop_controller/executors/sql_executor.py` | 新增 | `SQLExecutor`，参数化查询 + 只读/写分离 |
-| `src/loop_controller/executors/sql_models.py` | 新增 | `SQLToolSpec`、`DataSourceConfig` |
-| `src/loop_controller/executors/base.py` | 可能修改 | 如有必要扩展 `ToolExecutor` 协议 |
-| `src/loop_controller/executors/__init__.py` | 修改 | 导出新增执行器与模型 |
-| `src/loop_controller/infra/config_loader.py` | 修改 | 加载 `config/shell_tools.yaml`、`config/sql_tools.yaml` |
-| `src/loop_controller/runtime.py` | 修改 | 构造并注册新执行器 |
-| `config/shell_tools.yaml` | 新增 | 示例 Shell 工具配置 |
-| `config/sql_tools.yaml` | 新增 | 示例 SQL 工具配置 |
-| `tests/test_shell_executor.py` | 新增 | Shell 执行器测试（含注入负向用例） |
-| `tests/test_sql_executor.py` | 新增 | SQL 执行器测试（含注入负向用例） |
-| `src/KNOWN_LIMITATIONS.md` | 修改 | 更新 v0.24.0 边界 |
+| `src/loop_controller/executors/shell_executor.py` | 删除 | 不再内置 Shell 执行器 |
+| `src/loop_controller/executors/shell_models.py` | 删除 | 同上 |
+| `src/loop_controller/executors/sql_executor.py` | 删除 | 不再内置 SQL 执行器 |
+| `src/loop_controller/executors/sql_models.py` | 删除 | 同上 |
+| `src/loop_controller/executors/__init__.py` | 修改 | 移除 Shell/SQL 导出 |
+| `src/loop_controller/infra/config_loader.py` | 修改 | 移除 `shell_tools.yaml` / `sql_tools.yaml` 加载 |
+| `src/loop_controller/runtime.py` | 修改 | 移除 Shell/SQL 执行器构造与注册 |
+| `config/shell_tools.yaml` | 删除 | 不再需要的配置 |
+| `config/sql_tools.yaml` | 删除 | 同上 |
+| `tests/test_shell_executor.py` | 删除 | 同上 |
+| `tests/test_sql_executor.py` | 删除 | 同上 |
+| `examples/contrib/mcp_wrappers/shell_mcp_server.py` | 新增 | Shell MCP 包装示例 |
+| `examples/contrib/mcp_wrappers/sql_mcp_server.py` | 新增 | SQL MCP 包装示例 |
+| `examples/contrib/mcp_wrappers/browser_mcp_server.py` | 新增 | Browser MCP 包装示例（占位） |
+| `examples/contrib/harness/harness_sdk.py` | 新增 | 最小 Harness SDK 示例 |
+| `examples/contrib/harness/docker_harness.py` | 新增 | 容器化 Harness 示例 |
+| `examples/contrib/harness/Dockerfile` | 新增 | Harness 容器镜像 |
+| `examples/contrib/harness/runner.py` | 新增 | 容器内工具执行器 |
+| `src/loop_controller/secrets/encrypted_file_backend.py` | 新增 | AES-256-GCM 加密 Secret 后端 |
+| `src/loop_controller/secrets/__init__.py` | 修改 | 导出 `EncryptedFileSecretBackend` |
+| `src/loop_controller/runtime.py` | 修改 | 支持 `secrets.backend.type=encrypted_file` |
+| `tests/test_encrypted_secret_backend.py` | 新增 | 加密后端测试 |
+| `src/KNOWN_LIMITATIONS.md` | 修改 | 更新 v0.24.0 边界声明 |
+| `src/README.md` | 修改 | 更新架构定位 |
 | `src/development_log.md` | 修改 | 追加 v0.24.0 记录 |
-| `src/loop_controller_v0.24.0_development.md` | 修改 | 本文档 |
+| `pyproject.toml` / `uv.lock` | 修改 | 增加 `cryptography` 依赖 |
 
-## 5. 配置模型
+## 4. EncryptedFileSecretBackend
 
-### 5.1 `config/shell_tools.yaml`
+### 4.1 文件格式
+
+与 `FileSecretBackend` 目录结构相同，但 JSON 文件中的 `value` 字段是密文：
+
+```json
+{
+  "value": "base64(nonce || ciphertext || tag)",
+  "encrypted": true,
+  "version": "1",
+  "expires_at": "2026-12-31T23:59:59Z"
+}
+```
+
+未加密文件仍兼容，按 `encrypted=false` 处理。
+
+### 4.2 密钥来源
+
+- 环境变量 `LC_SECRET_ENCRYPTION_KEY`（默认）；
+- 或在 `config/secrets.yaml` 中指定 `backend.key_env`；
+- 32 字节，支持 hex（64 字符）或 base64 编码。
+
+### 4.3 启用方式
 
 ```yaml
-tools:
-  kubectl_get:
-    description: 在固定命名空间下执行 kubectl get
-    command_template: ["kubectl", "get", "{resource}", "-n", "{namespace}"]
-    allowed_args:
-      resource: ["pods", "services", "deployments"]
-      namespace: ["default", "staging"]
-    default_risk: critical
-    cost_per_call: 100
-    sandbox:
-      timeout_seconds: 30
-      max_output_bytes: 131072
-      env_whitelist: ["KUBECONFIG"]
+# config/secrets.yaml
+backend:
+  type: encrypted_file
+  base_path: ./secrets
+  key_env: LC_SECRET_ENCRYPTION_KEY
 ```
 
-### 5.2 Python 模型：Shell
+### 4.4 加密工具
 
-```python
-class ShellCommandConfig(BaseModel):
-    timeout_seconds: float = Field(default=30.0, ge=0.1, le=300.0)
-    max_output_bytes: int = Field(default=64 * 1024, ge=1024)
-    env_whitelist: list[str] = Field(default_factory=list)
+`EncryptedFileSecretBackend.encrypt(plaintext, key)` 静态方法可供管理脚本使用。
 
-class ShellToolSpec(BaseModel):
-    tool_name: str
-    description: str = ""
-    command_template: list[str]
-    allowed_args: dict[str, list[str]] = Field(default_factory=dict)
-    # 额外元字符黑名单，默认禁止常见 shell 注入字符
-    forbidden_chars: list[str] = Field(default_factory=lambda: [";", "|", "&", "`", "$", "(", ")", ">", "<", "\\"])
-    default_risk: RiskLevel = "critical"
-    cost_per_call: int = 0
-    sandbox: ShellCommandConfig = Field(default_factory=ShellCommandConfig)
-```
+## 5. 关键设计决策
 
-### 5.3 `config/sql_tools.yaml`
+1. **Loop Controller 不再实现非协议型工具执行器**：Shell / SQL / Browser 通过 MCP 包装或 Harness 接入；
+2. **MCP 包装示例独立运行**：它们不依赖 Loop Controller 进程，可部署在容器/沙箱中；
+3. **Harness 示例演示“治理决策 + 隔离执行”的分层**：Harness 先调用 `/v1/govern/tool-call`，获得 allow 后再在本地或 Docker 中执行；
+4. **LocalFunctionExecutor 降级为可选辅助**：保留但不再扩展；
+5. **EncryptedFileSecretBackend 继承 FileSecretBackend**：复用目录扫描、过期校验、权限校验，仅覆写解析逻辑；
+6. **fail-closed**：加密后端缺少密钥、密钥长度错误、密文损坏均抛 `SecretError`，启动拒绝加载该 secret。
 
-```yaml
-data_sources:
-  company_db:
-    driver: postgresql
-    host: db.company.com
-    port: 5432
-    database: analytics
-    read_only_user: analytics_ro
-    secret_ref: {name: db_password}
-
-tools:
-  query_analytics:
-    data_source: company_db
-    description: 只读查询 analytics 数据库
-    read_only: true
-    parameterize: true
-    allowed_patterns:
-      - ^SELECT\s+.*$
-    forbidden_patterns:
-      - ";"
-      - "--"
-    default_risk: high
-    cost_per_call: 100
-```
-
-### 5.4 Python 模型：SQL
-
-```python
-class DataSourceConfig(BaseModel):
-    name: str
-    driver: str  # postgresql | mysql | sqlite 等
-    host: str | None = None
-    port: int | None = None
-    database: str | None = None
-    read_only_user: str | None = None
-    write_user: str | None = None
-    secret_ref: SecretRef | None = None
-
-class SQLToolSpec(BaseModel):
-    tool_name: str
-    data_source: str
-    description: str = ""
-    read_only: bool = True
-    parameterize: bool = True
-    # allowed/forbidden patterns 作为二次语义校验，不替代参数化
-    allowed_patterns: list[str] = Field(default_factory=list)
-    forbidden_patterns: list[str] = Field(default_factory=list)
-    default_risk: RiskLevel = "high"
-    cost_per_call: int = 0
-    timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
-```
-
-## 6. 关键设计决策
-
-### 6.1 ShellExecutor 安全模型
-
-1. **command_template 必为字符串列表**：禁止传入完整命令字符串，Agent 只能填充命名参数；
-2. **allowed_args 严格枚举**：每个 `{placeholder}` 必须有对应的允许值列表；未声明的 placeholder 不允许出现；
-3. **参数值字符黑名单**：默认拒绝 `; | & \` \` $ ( ) > < \\`；允许管理员额外配置；
-4. **Env 变量白名单**：只有 `env_whitelist` 中的变量才会注入子进程；
-5. **禁用 shell=True**：始终使用 `asyncio.create_subprocess_exec` 直接执行，不经过 shell；
-6. **默认 timeout + 输出限制**：和 LocalFunctionExecutor 一样，超限时 kill 子进程。
-
-### 6.2 SQLExecutor 安全模型
-
-1. **参数化查询优先**：SQL 中的变量必须由占位符替换，禁止字符串拼接；
-2. **只读连接隔离**：`read_only=true` 时使用只读数据库用户，且只接受 `SELECT / WITH` 开头；
-3. **禁用分号和注释**：`forbidden_patterns` 默认包含 `;` 和 `--`；命中直接拒绝；
-4. **写操作默认 critical**：`read_only=false` 的工具默认 `default_risk=critical`，强制审批；
-5. **连接密码不落地**：通过 `SecretRef` 从 `SecretBroker` 注入；
-6. **连接池隔离**：每个数据源独立连接池，不同 tenant 不共享连接。
-
-### 6.3 错误码
-
-| 场景 | Shell 错误码 | SQL 错误码 |
-|---|---|---|
-| 命令/SQL 模板不存在 | `shell_command_not_found` | `sql_tool_not_found` |
-| 参数非法/不在白名单 | `shell_arg_not_allowed` | `sql_arg_not_allowed` |
-| 注入字符命中 | `shell_injection_blocked` | `sql_injection_blocked` |
-| 超时 | `shell_timeout` | `sql_timeout` |
-| 输出过大 | `shell_output_too_large` | — |
-| 连接失败 | — | `sql_connect_error` |
-| 写操作被只读拦截 | — | `sql_read_only_violation` |
-
-## 7. 风险与回退
+## 6. 风险与回退
 
 | 风险 | 缓解 |
 |---|---|
-| Shell 命令注入 | command_template + allowed_args + 字符黑名单 + 禁用 shell=True |
-| SQL 注入 | 强制参数化 + 只读连接 + 分号/注释黑名单 |
-| 数据库凭据泄露 | Secret Broker 注入，配置文件只保留 secret_ref |
-| 子进程输出 OOM | 复用 LocalFunctionExecutor 的 `_communicate_with_limit` 逻辑 |
-| 数据库驱动未安装 | `[sql]` extra 可选；未安装时工具返回 `sql_driver_missing` |
-| 多租户越权 | 每个 tenant 独立数据源命名空间；连接字符串按 tenant_id 解析 |
+| 高危工具执行脱离治理 | Harness 示例强制先调 `/v1/govern/tool-call`；MCP 包装 server 由 Loop Controller 的 `MCPGateway` 转发，自然经过 R2 |
+| MCP 包装 server 本身被绕过 | 部署在独立容器/沙箱中，限制网络与文件系统 |
+| 加密密钥泄露 | 密钥只从环境变量读取，不落盘；定期轮换 |
+| 加密后端性能 | 仅启动时加载/热更新时解密，运行期缓存明文 value |
 
-## 8. 验收标准
+## 7. 验收标准
 
-- `pytest tests/`：新增 Shell/SQL 测试通过，整体无回归；
+- `pytest tests/`：全量通过，无回归；
 - `ruff check src tests examples`：通过；
 - `mypy src`：通过；
-- 安全测试：Shell 命令注入、SQL 注入均有负向测试；
-- 未安装 `[sql]` extra 时，SQL 工具优雅失败并返回清晰错误码；
-- 新增工具能在示例配置中注册、治理链路中按风险等级正常审批/执行。
+- 新增 `EncryptedFileSecretBackend` 测试覆盖加密解密、密钥缺失、密钥长度、明文兼容；
+- 文档更新：`src/KNOWN_LIMITATIONS.md`、`src/README.md`、`src/development_log.md` 反映 v0.24.0 方向调整。

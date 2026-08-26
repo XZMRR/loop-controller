@@ -1675,47 +1675,58 @@
 
 ---
 
-## v0.24.0：ShellExecutor 与 SQLExecutor（规划中）
+## v0.24.0：架构收敛 — MCP 包装 + Harness 接入 + 加密 Secret 后端
 
 ### 目标
 
-v0.23.1 已完成审计修复，governance 核心链路（MCP / HTTP / Local Function）趋于稳定。
-v0.24.0 的目标是把企业 Agent 最高频的两类工具纳入同一套治理闭环：**命令行脚本** 与 **SQL 查询**。
+v0.23.2 已完成 v0.23.1 残留问题的收尾。v0.24.0 根据 `src/audit_report.md`
+的架构审查结论，**把 Loop Controller 从“工具运行时”收敛回“治理控制平面”**：
 
-> **一句话目标**：新增 `ShellExecutor` 与 `SQLExecutor`，用“命令模板 + 参数白名单”和“参数化查询 + 只读角色”替换脆弱的正则白名单，覆盖企业 CLI 与数据库工具。
+> **一句话目标**：删除 Shell/SQL 内置执行器规划，改为提供高危工具的 MCP 包装示例与 Harness 接入规范，并完成 EncryptedFileSecretBackend。
 
-### 计划内容
+### 完成内容
 
-1. **ShellExecutor**：让 Agent 在受控条件下调用本地命令/脚本；使用 `command_template` + `allowed_args`，禁用完整命令字符串；默认 `default_risk=critical`。
-2. **SQLExecutor**：在声明数据源上执行参数化 SQL；`read_only=true` 时使用只读数据库角色，并默认禁止分号/注释；写操作默认 `critical`。
+1. **删除内置执行器**：
+   - 删除 `ShellExecutor`、`SQLExecutor` 及对应模型、配置、测试；
+   - 从 `ConfigLoader` / `Runtime` / `executors/__init__.py` 移除相关加载与注册逻辑。
 
-### v0.24.0 不做（已延后）
+2. **新增 MCP 包装示例**（`examples/contrib/mcp_wrappers/`）：
+   - `shell_mcp_server.py`：受控 Shell 命令包装；
+   - `sql_mcp_server.py`：只读/写分离 SQL 查询包装；
+   - `browser_mcp_server.py`：浏览器自动化占位示例（需在独立容器接入 Playwright）。
 
-| 事项 | 延后版本 | 理由 |
-|---|---|---|
-| BrowserExecutor | v0.25.0 | Playwright 依赖体积大，测试独立 |
-| Docker 容器隔离后端 | v0.26.0 | 基础设施，与具体执行器解耦 |
-| EncryptedFileSecretBackend | v0.26.0 | 基础设施，可与容器后端并行 |
+3. **新增 Harness 接入示例**（`examples/contrib/harness/`）：
+   - `harness_sdk.py`：最小 Harness SDK，先调 Loop Controller 治理接口，再在本地沙箱执行；
+   - `docker_harness.py` + `Dockerfile` + `runner.py`：容器化 Harness 示例。
+
+4. **完成 EncryptedFileSecretBackend**：
+   - 新增 `src/loop_controller/secrets/encrypted_file_backend.py`；
+   - AES-256-GCM 加密，密钥从环境变量读取（hex/base64）；
+   - 在 `src/loop_controller/runtime.py` 支持 `config/secrets.yaml` 中 `backend.type=encrypted_file`。
+
+5. **更新文档**：
+   - `src/KNOWN_LIMITATIONS.md`：明确 Loop Controller 内部仅代理 MCP/HTTP 协议型工具；
+   - `src/README.md`：更新架构图与边界声明；
+   - `src/loop_controller_v0.24.0_development.md`：重写为架构收敛文档。
 
 ### 关键决策
 
-- **默认禁止，显式授权**：Shell / SQL 默认 `default_risk=critical/high`，需在 Capability Profile 中显式 `allowed: true`。
-- **模板 + 参数白名单，而非正则**：Shell 使用 `command_template` 与 `allowed_args`；SQL 使用参数化查询与 `forbidden_patterns`（仅作为二次校验）。
-- **fail-closed**：命令/数据源不存在、参数不合法、连接失败、输出超限、执行超时均返回错误 `ToolResult`。
-- **统一接入 `ExecutorRegistry`**：两类新执行器实现 `ToolExecutor`，`Checkpoint` 无需感知类型。
-- **依赖可选**：数据库驱动作为 `[sql]` extra，未安装时 `SQLExecutor` 优雅不可用；ShellExecutor 仅依赖标准库。
+- **Loop Controller 是治理控制平面，不是工具运行时**：Shell / SQL / Browser 等不由本进程执行；
+- **LocalFunctionExecutor 重新定位为“可选辅助”**：保留但不再扩展；
+- **MCP 包装 + Harness 是官方推荐接入方式**：示例代码可直接作为企业参考实现；
+- **加密 Secret 后端作为基础设施完成**：依赖 `cryptography>=44.0`，密钥只走环境变量。
 
 ### 验收标准
 
-- `pytest tests/`：新增 Shell/SQL 测试通过，整体无回归；
+- `pytest tests/`：全量通过，无回归；
 - `ruff check src tests examples`：通过；
 - `mypy src`：通过；
-- 安全测试：Shell 命令注入、SQL 注入均有负向测试；
-- 未安装 `[sql]` extra 时，SQL 工具优雅失败并返回清晰错误码；
-- 新增工具能在示例配置中注册、治理链路中按风险等级正常审批/执行。
+- 新增 `EncryptedFileSecretBackend` 测试覆盖加密解密、密钥缺失、密钥长度、明文兼容；
+- 文档更新到位，明确 v0.24.0 架构边界。
 
 ### 设计文档
 
 - `src/loop_controller_v0.24.0_development.md`
+- `src/audit_report.md`
 
 ---
