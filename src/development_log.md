@@ -1639,3 +1639,41 @@
 - `mypy src`：**Success: no issues found**
 
 ---
+
+## v0.24.0：执行器扩展与生产级隔离（规划中）
+
+### 目标
+
+v0.23.1 已完成审计修复，governance 核心链路（MCP / HTTP / Local Function）趋于稳定。
+v0.24.0 的目标是把剩余常见工具形态纳入同一套治理闭环，并提升生产部署时的隔离能力。
+
+> **一句话目标**：新增 Shell、Browser、SQL 直连三类执行器，并补齐可选的容器级隔离与 Secret 加密后端，让 Loop Controller 覆盖企业最常见的工具调用形态。
+
+### 计划内容
+
+1. **ShellExecutor**：让 Agent 在受控条件下调用本地命令/脚本；默认 `default_risk=critical`，命令必须完整匹配白名单正则；支持超时、输出大小限制、可选容器后端。
+2. **BrowserExecutor**：基于 Playwright 提供 headless 浏览器能力；限制可访问域名；返回 DOM 文本或截图 Base64；不暴露原始 HTML。
+3. **SQLExecutor**：在声明数据源上执行 SQL；只读/写分离，写操作默认需审批；敏感密码通过 Secret Broker 注入。
+4. **容器隔离后端**：定义 `ContainerBackend` 协议与 `DockerContainerBackend`；`LocalFunctionExecutor` 和 `ShellExecutor` 默认子进程，配置 `container_image` 后切换为容器。
+5. **加密 Secret 后端**：`EncryptedFileSecretBackend` 继承 `FileSecretBackend`；通过 `LOOP_CONTROLLER_SECRET_KEY` 或 KMS/Vault 接口加解密；真实 KMS/Vault 集成先提供接口与 mock 测试。
+
+### 关键决策
+
+- **默认禁止，显式授权**：Shell / Browser / SQL 属于高危能力，需在 Capability Profile 中显式 `allowed: true` 并配置白名单/数据源。
+- **依赖可选**：Playwright、数据库驱动、docker SDK 作为可选 extras，未安装时相关工具不可用。
+- **统一接入 ExecutorRegistry**：三类新执行器实现 `ToolExecutor`，`Checkpoint` 无需感知类型。
+- **向后兼容**：不启用相关配置时，v0.24.0 行为与 v0.23.1 完全一致。
+
+### 验收标准
+
+- `pytest tests/`：新增执行器与加密后端测试全部通过，整体无回归；
+- `ruff check src tests examples`：通过；
+- `mypy src`：通过；
+- 新增工具能在示例配置中注册、治理链路中按风险等级正常审批/执行；
+- 未安装 `[browser]`/`[sql]`/`[container]` extras 时，相关工具优雅失败并给出清晰错误码。
+
+### 设计文档
+
+- `src/loop_controller_v0.24.0_development.md`
+
+---
