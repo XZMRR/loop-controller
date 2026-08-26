@@ -19,7 +19,13 @@ from loop_controller.authority import EarnedAuthorityManager
 from loop_controller.budget import JsonlBudgetLedger
 from loop_controller.checkpoint import Checkpoint
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
-from loop_controller.executors import ExecutorRegistry, LocalFunctionExecutor, MCPExecutor
+from loop_controller.executors import (
+    ExecutorRegistry,
+    LocalFunctionExecutor,
+    MCPExecutor,
+    ShellExecutor,
+    SQLExecutor,
+)
 from loop_controller.executors.http_client import HTTPClient
 from loop_controller.executors.http_executor import HTTPExecutor
 from loop_controller.identity import ConfigIdentityProvider, IdentityProvider
@@ -273,6 +279,8 @@ def build_runtime(
         http_client, config.http_tool_specs, secret_broker=secret_broker
     )
     local_executor = LocalFunctionExecutor(config.local_function_specs)
+    shell_executor = ShellExecutor(config.shell_tool_specs)
+    sql_executor = SQLExecutor(config.sql_tool_specs, config.data_sources)
     executor_registry = ExecutorRegistry()
     for canonical_name in config.tool_mapping:
         executor_registry.register(canonical_name, mcp_executor)
@@ -280,6 +288,10 @@ def build_runtime(
         executor_registry.register(canonical_name, http_executor)
     for canonical_name in config.local_function_specs:
         executor_registry.register(canonical_name, local_executor)
+    for canonical_name in config.shell_tool_specs:
+        executor_registry.register(canonical_name, shell_executor)
+    for canonical_name in config.sql_tool_specs:
+        executor_registry.register(canonical_name, sql_executor)
     masker = Masker(config.masking_rules)
     budget_ledger = JsonlBudgetLedger(config.budget_ledger_path)
     session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
@@ -323,6 +335,14 @@ def build_runtime(
             **{
                 name: BudgetCost(token_count=spec.cost_per_call)
                 for name, spec in config.local_function_specs.items()
+            },
+            **{
+                name: BudgetCost(token_count=spec.cost_per_call)
+                for name, spec in config.shell_tool_specs.items()
+            },
+            **{
+                name: BudgetCost(token_count=spec.cost_per_call)
+                for name, spec in config.sql_tool_specs.items()
             },
         },
         masker=masker,

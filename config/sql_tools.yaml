@@ -1,0 +1,18 @@
+# SQL 工具注册配置（v0.24.0）
+#
+# 注意：SQL 工具默认 read_only=true、default_risk=high，
+# 必须在 CapabilityProfile 中显式 allowed: true。
+
+data_sources:
+  sample_sqlite:
+    driver: sqlite
+    database: "./data/sample.db"
+
+tools:
+  query_users:
+    description: 查询用户表（只读示例）
+    data_source: sample_sqlite
+    read_only: true
+    parameterize: true
+    default_risk: high
+    cost_per_call: 5

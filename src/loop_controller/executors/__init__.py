@@ -20,8 +20,13 @@ from loop_controller.executors.local_function_models import (
     LocalFunctionSpec,
 )
 from loop_controller.executors.mcp_executor import MCPExecutor
+from loop_controller.executors.shell_executor import ShellExecutor
+from loop_controller.executors.shell_models import ShellCommandConfig, ShellToolSpec
+from loop_controller.executors.sql_executor import SQLExecutor
+from loop_controller.executors.sql_models import DataSourceConfig, SQLToolSpec
 
 __all__ = [
+    "DataSourceConfig",
     "ExecutionContext",
     "ExecutorRegistry",
     "HTTPAuthConfig",
@@ -33,5 +38,10 @@ __all__ = [
     "LocalFunctionSandboxConfig",
     "LocalFunctionSpec",
     "MCPExecutor",
+    "ShellCommandConfig",
+    "ShellExecutor",
+    "ShellToolSpec",
+    "SQLExecutor",
+    "SQLToolSpec",
     "ToolExecutor",
 ]

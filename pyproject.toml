@@ -1,6 +1,6 @@
 [project]
 name = "loop-controller"
-version = "0.23.2"
+version = "0.24.0"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.0",

@@ -1,0 +1,15 @@
+# Shell 工具注册配置（v0.24.0）
+#
+# 注意：Shell 工具默认 default_risk=critical，必须在 CapabilityProfile 中显式 allowed: true。
+
+tools:
+  echo_greeting:
+    description: 输出问候语（示例工具）
+    command_template: ["python", "-c", "print('hello, {name}')"]
+    allowed_args:
+      name: ["alice", "bob"]
+    default_risk: critical
+    cost_per_call: 10
+    sandbox:
+      timeout_seconds: 5
+      max_output_bytes: 4096
