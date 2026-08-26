@@ -378,6 +378,18 @@ async def serve(
     require_client_cert: bool = False,
 ) -> grpc_aio.Server:
     """启动 gRPC 服务并返回 server 实例。"""
+    grpc_cfg = (entrypoints_config or {}).get("grpc") or {}
+    grpc_auth = grpc_cfg.get("auth")
+    if grpc_auth == "mtls":
+        if not server_key or not server_cert:
+            raise ValueError(
+                "entrypoints.grpc.auth=mtls 时必须提供 server_key 与 server_cert"
+            )
+        if not client_ca_cert:
+            raise ValueError(
+                "entrypoints.grpc.auth=mtls 时必须提供 client_ca_cert 以验证客户端"
+            )
+        require_client_cert = True
     if require_client_cert and (not server_key or not server_cert):
         raise ValueError("require_client_cert=true 时必须提供 server_key 与 server_cert")
     if require_client_cert and not client_ca_cert:

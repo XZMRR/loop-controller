@@ -1640,37 +1640,79 @@
 
 ---
 
-## v0.24.0：执行器扩展与生产级隔离（规划中）
+## v0.23.2：v0.23.1 残留问题收尾
+
+### 完成内容
+
+基于 `src/audit_report.md`（v0.24.0 方案审查报告）对 v0.23.1 的四个残留问题进行收尾：
+
+- **修复 `Checkpoint.forward` modify 后历史仍用原始参数**：
+  - 成功执行后，per-task 历史记录改为 `proposal.model_copy(update={"arguments": decision.modified_args})`；
+  - 新增 `test_checkpoint.py` 回归测试，断言历史中的参数为修改后值。
+
+- **修复本地函数沙箱被 `io.open` / `pathlib` 绕过**：
+  - `local_function_runner.py` 在 hook `builtins.open` 和 `os.open` 基础上，新增 `io.open` 与 `pathlib.Path.open` 的 hook；
+  - 新增 `test_local_function_executor.py` 两个回归测试，分别验证 `io.open` 与 `Path.read_text` 绕过被拦截。
+
+- **修复 gRPC mTLS 配置驱动下可能明文启动**：
+  - `grpc_server.py` 的 `serve()` 在 `entrypoints.grpc.auth=mtls` 时强制要求 `server_key`、`server_cert`、`client_ca_cert`；
+  - 缺少任一凭证时抛出 `ValueError`，拒绝启动明文端口；
+  - 新增 `test_grpc_server.py::test_mtls_config_requires_certs` 回归测试。
+
+- **修复 HTTP 非法 `Content-Length` 抛 `ValueError`**：
+  - `http_client.py` 将 `int(content_length)` 包在 `try/except ValueError` 中，非法值降级为流式读取；
+  - 新增 `test_http_client.py::test_invalid_content_length_falls_back_to_streaming` 回归测试。
+
+### 关键决策
+
+- **不引入新依赖**：v0.23.2 全部为标准库/现有依赖范围内的修复，保持改动最小。
+- **Fail-Close**：gRPC mTLS 缺失凭证时直接拒绝启动；非法响应头不中断治理链路。
+- **审计报告驱动**：修复直接对应 `src/audit_report.md` 的残留问题清单，避免技术债务继续累积。
+
+### 设计文档
+
+- `src/audit_report.md`（v0.24.0 开发方案审查报告）
+
+---
+
+## v0.24.0：ShellExecutor 与 SQLExecutor（规划中）
 
 ### 目标
 
 v0.23.1 已完成审计修复，governance 核心链路（MCP / HTTP / Local Function）趋于稳定。
-v0.24.0 的目标是把剩余常见工具形态纳入同一套治理闭环，并提升生产部署时的隔离能力。
+v0.24.0 的目标是把企业 Agent 最高频的两类工具纳入同一套治理闭环：**命令行脚本** 与 **SQL 查询**。
 
-> **一句话目标**：新增 Shell、Browser、SQL 直连三类执行器，并补齐可选的容器级隔离与 Secret 加密后端，让 Loop Controller 覆盖企业最常见的工具调用形态。
+> **一句话目标**：新增 `ShellExecutor` 与 `SQLExecutor`，用“命令模板 + 参数白名单”和“参数化查询 + 只读角色”替换脆弱的正则白名单，覆盖企业 CLI 与数据库工具。
 
 ### 计划内容
 
-1. **ShellExecutor**：让 Agent 在受控条件下调用本地命令/脚本；默认 `default_risk=critical`，命令必须完整匹配白名单正则；支持超时、输出大小限制、可选容器后端。
-2. **BrowserExecutor**：基于 Playwright 提供 headless 浏览器能力；限制可访问域名；返回 DOM 文本或截图 Base64；不暴露原始 HTML。
-3. **SQLExecutor**：在声明数据源上执行 SQL；只读/写分离，写操作默认需审批；敏感密码通过 Secret Broker 注入。
-4. **容器隔离后端**：定义 `ContainerBackend` 协议与 `DockerContainerBackend`；`LocalFunctionExecutor` 和 `ShellExecutor` 默认子进程，配置 `container_image` 后切换为容器。
-5. **加密 Secret 后端**：`EncryptedFileSecretBackend` 继承 `FileSecretBackend`；通过 `LOOP_CONTROLLER_SECRET_KEY` 或 KMS/Vault 接口加解密；真实 KMS/Vault 集成先提供接口与 mock 测试。
+1. **ShellExecutor**：让 Agent 在受控条件下调用本地命令/脚本；使用 `command_template` + `allowed_args`，禁用完整命令字符串；默认 `default_risk=critical`。
+2. **SQLExecutor**：在声明数据源上执行参数化 SQL；`read_only=true` 时使用只读数据库角色，并默认禁止分号/注释；写操作默认 `critical`。
+
+### v0.24.0 不做（已延后）
+
+| 事项 | 延后版本 | 理由 |
+|---|---|---|
+| BrowserExecutor | v0.25.0 | Playwright 依赖体积大，测试独立 |
+| Docker 容器隔离后端 | v0.26.0 | 基础设施，与具体执行器解耦 |
+| EncryptedFileSecretBackend | v0.26.0 | 基础设施，可与容器后端并行 |
 
 ### 关键决策
 
-- **默认禁止，显式授权**：Shell / Browser / SQL 属于高危能力，需在 Capability Profile 中显式 `allowed: true` 并配置白名单/数据源。
-- **依赖可选**：Playwright、数据库驱动、docker SDK 作为可选 extras，未安装时相关工具不可用。
-- **统一接入 ExecutorRegistry**：三类新执行器实现 `ToolExecutor`，`Checkpoint` 无需感知类型。
-- **向后兼容**：不启用相关配置时，v0.24.0 行为与 v0.23.1 完全一致。
+- **默认禁止，显式授权**：Shell / SQL 默认 `default_risk=critical/high`，需在 Capability Profile 中显式 `allowed: true`。
+- **模板 + 参数白名单，而非正则**：Shell 使用 `command_template` 与 `allowed_args`；SQL 使用参数化查询与 `forbidden_patterns`（仅作为二次校验）。
+- **fail-closed**：命令/数据源不存在、参数不合法、连接失败、输出超限、执行超时均返回错误 `ToolResult`。
+- **统一接入 `ExecutorRegistry`**：两类新执行器实现 `ToolExecutor`，`Checkpoint` 无需感知类型。
+- **依赖可选**：数据库驱动作为 `[sql]` extra，未安装时 `SQLExecutor` 优雅不可用；ShellExecutor 仅依赖标准库。
 
 ### 验收标准
 
-- `pytest tests/`：新增执行器与加密后端测试全部通过，整体无回归；
+- `pytest tests/`：新增 Shell/SQL 测试通过，整体无回归；
 - `ruff check src tests examples`：通过；
 - `mypy src`：通过；
-- 新增工具能在示例配置中注册、治理链路中按风险等级正常审批/执行；
-- 未安装 `[browser]`/`[sql]`/`[container]` extras 时，相关工具优雅失败并给出清晰错误码。
+- 安全测试：Shell 命令注入、SQL 注入均有负向测试；
+- 未安装 `[sql]` extra 时，SQL 工具优雅失败并返回清晰错误码；
+- 新增工具能在示例配置中注册、治理链路中按风险等级正常审批/执行。
 
 ### 设计文档
 

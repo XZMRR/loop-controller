@@ -16,7 +16,11 @@ from grpc import aio as grpc_aio
 
 from loop_controller.controller import LoopController
 from loop_controller.grpc_client import ToolGovernanceClient
-from loop_controller.grpc_server import ToolGovernanceServicer, add_servicer_to_server
+from loop_controller.grpc_server import (
+    ToolGovernanceServicer,
+    add_servicer_to_server,
+    serve,
+)
 from loop_controller.models import GovernanceResult
 
 
@@ -319,3 +323,26 @@ async def test_require_auth_get_health_allows_unauthenticated(
     client, _controller = grpc_client_require_auth
     response = await client.get_health()
     assert response.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_mtls_config_requires_certs() -> None:
+    """v0.23.2：entrypoints.grpc.auth=mtls 但缺少证书时必须拒绝启动。"""
+    controller = _MockController()
+    controller._runtime = _MockRuntime()
+
+    with pytest.raises(ValueError, match="entrypoints.grpc.auth=mtls"):
+        await serve(
+            controller,
+            port=50051,
+            entrypoints_config={"grpc": {"auth": "mtls", "require_auth": True}},
+        )
+
+    with pytest.raises(ValueError, match="entrypoints.grpc.auth=mtls"):
+        await serve(
+            controller,
+            port=50051,
+            server_key="dummy",
+            server_cert="dummy",
+            entrypoints_config={"grpc": {"auth": "mtls", "require_auth": True}},
+        )

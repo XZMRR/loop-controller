@@ -863,6 +863,10 @@ async def test_forward_modify_allowed_value_passes(
     assert result.status == "success"
     # 转发的是修改后的参数
     assert gw.calls[0][1] == {"path": "/data/kb/other.md"}
+    # v0.23.2：per-task 历史应记录实际生效参数，而非原始参数
+    history = cp._history[task.task_id]
+    assert len(history) == 1
+    assert history[0].arguments == {"path": "/data/kb/other.md"}
 
 
 # ---------------------------------------------------------------------------

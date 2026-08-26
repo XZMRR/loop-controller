@@ -9,6 +9,7 @@ from __future__ import annotations
 import builtins
 import importlib
 import inspect
+import io
 import json
 import os
 import sys
@@ -61,6 +62,22 @@ def _make_restricted_os_open(
     return restricted_os_open
 
 
+def _make_restricted_path_open(
+    allowed_patterns: list[str],
+    original_path_open: Callable[..., Any],
+) -> Callable[..., Any]:
+    """包装 pathlib.Path.open，限制可访问路径（封堵 io.open 绕过）。"""
+
+    def restricted_path_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if not _path_allowed(self, allowed_patterns):
+            raise PermissionError(
+                f"local_function_sandbox_violation: path {self} not in allowed_paths"
+            )
+        return original_path_open(self, *args, **kwargs)
+
+    return restricted_path_open
+
+
 def _run_task(payload: dict[str, Any]) -> dict[str, Any]:
     module_name = payload["module"]
     function_name = payload["function"]
@@ -88,9 +105,15 @@ def _run_task(payload: dict[str, Any]) -> dict[str, Any]:
 
     original_open = builtins.open
     original_os_open = os.open
+    original_io_open = io.open
+    original_path_open = Path.open
     if allowed_paths:
-        builtins.open = _make_restricted_open(allowed_paths, original_open)
+        restricted_open = _make_restricted_open(allowed_paths, original_open)
+        builtins.open = restricted_open
+        io.open = restricted_open
         os.open = _make_restricted_os_open(allowed_paths, original_os_open)
+        # 通过 setattr 绕开 mypy 对 classmethod 直接赋值的检查
+        setattr(Path, "open", _make_restricted_path_open(allowed_paths, original_path_open))
 
     try:
         if inspect.iscoroutinefunction(func):
@@ -115,6 +138,8 @@ def _run_task(payload: dict[str, Any]) -> dict[str, Any]:
     finally:
         builtins.open = original_open
         os.open = original_os_open
+        io.open = original_io_open
+        setattr(Path, "open", original_path_open)
 
 
 def main() -> None:

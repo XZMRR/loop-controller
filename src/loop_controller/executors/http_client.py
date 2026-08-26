@@ -150,12 +150,17 @@ class HTTPClient:
 
         # 限制响应大小：优先通过 Content-Length 预检，再流式读取避免一次性加载大响应。
         content_length = response.headers.get("content-length")
-        if content_length and int(content_length) > self._max_response_size:
-            await response.aclose()
-            raise HTTPSecurityError(
-                f"响应体超过 {self._max_response_size} 字节限制",
-                "http_response_too_large",
-            )
+        if content_length:
+            try:
+                parsed_length = int(content_length)
+            except ValueError:
+                parsed_length = None
+            if parsed_length is not None and parsed_length > self._max_response_size:
+                await response.aclose()
+                raise HTTPSecurityError(
+                    f"响应体超过 {self._max_response_size} 字节限制",
+                    "http_response_too_large",
+                )
 
         content_chunks: list[bytes] = []
         total_size = 0

@@ -56,6 +56,19 @@ def read_with_os_open(path: str) -> str:
         os.close(fd)
 
 
+def read_with_io_open(path: str) -> str:
+    import io
+
+    with io.open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def read_with_pathlib(path: str) -> str:
+    from pathlib import Path
+
+    return Path(path).read_text(encoding="utf-8")
+
+
 def huge_output(size: int) -> str:
     return "x" * size
 
@@ -249,6 +262,60 @@ async def test_local_function_os_open_sandbox_bypass(
             tool_name="read_file",
             module="demo_local_tools",
             function="read_with_os_open",
+            sandbox={"allowed_paths": [str(tmp_path / "allowed.txt")]},
+        )
+    }
+    executor = LocalFunctionExecutor(specs)
+    result = await executor.execute(
+        "read_file", {"path": str(blocked_file)}, _fake_context()
+    )
+    assert result.status == "error"
+    assert result.error_code == "local_function_sandbox_violation"
+
+
+@pytest.mark.asyncio
+async def test_local_function_io_open_sandbox_bypass(
+    monkeypatch: pytest.MonkeyPatch,
+    tools_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """io.open 绕过 builtins.open 时仍应被沙箱拦截。"""
+    monkeypatch.setenv("PYTHONPATH", str(tools_dir))
+    blocked_file = tmp_path / "blocked_io_open.txt"
+    blocked_file.write_text("blocked-content", encoding="utf-8")
+
+    specs = {
+        "read_file": LocalFunctionSpec(
+            tool_name="read_file",
+            module="demo_local_tools",
+            function="read_with_io_open",
+            sandbox={"allowed_paths": [str(tmp_path / "allowed.txt")]},
+        )
+    }
+    executor = LocalFunctionExecutor(specs)
+    result = await executor.execute(
+        "read_file", {"path": str(blocked_file)}, _fake_context()
+    )
+    assert result.status == "error"
+    assert result.error_code == "local_function_sandbox_violation"
+
+
+@pytest.mark.asyncio
+async def test_local_function_pathlib_sandbox_bypass(
+    monkeypatch: pytest.MonkeyPatch,
+    tools_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """pathlib.Path.open 绕过 builtins.open 时仍应被沙箱拦截。"""
+    monkeypatch.setenv("PYTHONPATH", str(tools_dir))
+    blocked_file = tmp_path / "blocked_pathlib.txt"
+    blocked_file.write_text("blocked-content", encoding="utf-8")
+
+    specs = {
+        "read_file": LocalFunctionSpec(
+            tool_name="read_file",
+            module="demo_local_tools",
+            function="read_with_pathlib",
             sandbox={"allowed_paths": [str(tmp_path / "allowed.txt")]},
         )
     }

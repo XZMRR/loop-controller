@@ -28,6 +28,19 @@ def _mock_transport_with_chunked_body(body: bytes) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
+def _mock_transport_with_invalid_content_length() -> httpx.MockTransport:
+    """返回非法 Content-Length 头，验证客户端不因此抛未处理 ValueError。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'{"ok": true}',
+            headers={"Content-Length": "not-a-number"},
+        )
+
+    return httpx.MockTransport(handler)
+
+
 @pytest.mark.asyncio
 async def test_streaming_response_size_limit() -> None:
     """流式大响应应在超过 max_response_size 时被截断并抛错。"""
@@ -62,6 +75,21 @@ async def test_small_response_decoded_ok() -> None:
     client = HTTPClient(
         max_response_size=1024,
         transport=_mock_transport_with_body(body),
+    )
+    async with client:
+        status, _headers, text, _elapsed = await client.request(
+            "GET", "https://allowed.example.com/data"
+        )
+    assert status == 200
+    assert text == '{"ok": true}'
+
+
+@pytest.mark.asyncio
+async def test_invalid_content_length_falls_back_to_streaming() -> None:
+    """v0.23.2：非法 Content-Length 不应导致 ValueError，应降级为流式读取。"""
+    client = HTTPClient(
+        max_response_size=1024,
+        transport=_mock_transport_with_invalid_content_length(),
     )
     async with client:
         status, _headers, text, _elapsed = await client.request(

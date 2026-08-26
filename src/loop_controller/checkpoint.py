@@ -747,7 +747,11 @@ class Checkpoint:
             raise
         self._commit_reservation(reservation)
         if result.status == "success":
-            self._history.setdefault(proposal.task_id, []).append(proposal)
+            # v0.23.2：modify 后历史应记录实际生效参数，而非原始参数
+            history_proposal = proposal
+            if decision.verdict == "modify" and decision.modified_args is not None:
+                history_proposal = proposal.model_copy(update={"arguments": decision.modified_args})
+            self._history.setdefault(proposal.task_id, []).append(history_proposal)
             # v0.11.0：动作成功后消费 token 预算
             self._consume_authority_tokens(proposal)
             # v1.2：allow 且风险低时按低风险成功衰减会话风险分
