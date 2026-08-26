@@ -1,133 +1,185 @@
-这是一份**高质量、高信噪比的工程审查**，覆盖了安全边界、状态一致性、工程质量和架构演进四个维度。以下是我的中立分析：
+这些图片共同构成了一份关于 **AI Agent 工具治理** 的技术分析文档。核心论点是：**对 Agent 工具的治理权不自动来自协议（如 MCP），而是来自对凭证、网络、执行环境等基础设施的控制。** 文档将工具分为四类，并提出了三种获取治理权的方法，最后讨论了工具目录的必要性。
 
 ---
 
-## 一、总体评价
+### 一、工具类型与治理方式
 
-**审查者的核心判断是准确的**：当前代码是"可运行治理 MVP"，不是"生产级安全治理系统"。P0/P1/P2 的分级合理，且每个问题都给出了**可执行的修复路径**而非空泛批评。
+#### 1. MCP 工具
+- **原始路径**：Agent → MCP Server → 真实工具。
+- **治理后路径**：Agent → Loop Controller MCP Proxy → 策略/审批 → MCP Gateway → 原始 MCP Server。
+- **治理要点**：
+  - Agent 只能连接代理，原始 MCP Server 不直接暴露。
+  - 下游凭证只交给代理，网络策略禁止绕过。
+  - 治理权来源于：控制 Server 地址 + 控制凭证 + 控制网络，而非 MCP 协议本身。
 
-特别值得肯定的是：
-- **P0 定位精准**：预算不返还和审批绑定缺失都是**可被利用的漏洞**，不是代码风格问题。
-- **对 Main 分支的考古有价值**：审查没有简单要求"合并 main"，而是逐条评估哪些能力值得迁移到 develop 的新 Runtime 架构上。
-- **诚实性审查**（审计链不能声称"不可篡改"）体现了对安全承诺的审慎态度。
+#### 2. HTTP/API 工具
+- **示例**：邮件 API、GitHub API、支付 API、CRM API。
+- **治理后路径**：Agent → Loop Controller → 策略/审批 → Executor（使用真实 API Key）→ 外部 API。
+- **治理要点**：
+  - 凭证从 Agent 环境移走，仅存于 Executor 或 Secret Broker。
+  - Agent 只能提交工具名和参数，由 Executor 代为调用。
+  - 治理权来源于：控制凭证 + 控制网络出口 + 代理执行。若无法控制网络但能移走凭证，仍可管控大部分需认证 API；若 Agent 可自行获取凭证，则无法完全阻断。
 
----
+#### 3. 本地函数/框架内置工具
+- **示例**：LangChain Tool、OpenAI function_tool、AutoGen Function、Python 函数、Cursor/IDE 内置操作。
+- **治理方式**：通过 Adapter（如 LangChain Adapter、OpenAI Agents Adapter）包装成受治理工具，路径为 Agent → Wrapped Tool → ToolGovernor → LoopController。
+- **治理要点**：
+  - 宿主程序必须保证工具列表只有包装后的工具，原始函数和凭证不暴露。
+  - **强治理**：将真实函数移到独立 Executor，Agent 进程只保留远程调用 Stub。
+  - 若函数与 Agent 同进程且 Agent 有任意代码执行能力，则安全边界脆弱。
 
-## 二、按优先级分析：哪些必须参考
-
-### 🔴 必采纳（阻塞级）
-
-#### 1. P0：预算预留在拒绝路径未返还
-**这是实实在在的 DoS 漏洞。**
-
-攻击者只需发送大量越权请求（如读取 `/etc/passwd`），每次都会预留预算但不返还，合法任务的预算将被耗尽。v1.0 文档 §3.8 虽然粗糙（`token_count=1` 占位），但**"拒绝不扣费"是基本语义承诺**，当前实现违背了这一承诺。
-
-**建议立即修复**，且审查给出的"pending/finalized 生命周期"方案比零散补丁更可持续。
-
-#### 2. P0：审批记录缺少强绑定验证
-**这是审批绕过风险。**
-
-v1.0 文档 §3.10 只要求了 `approver_id != requester_id` 的组装期校验，但审查发现 `finalize_after_approval()` 缺少对 `decision_id`、`request_id`、`call_id` 的回指验证。这意味着一个合法的 `ApprovalRecord` 可能被重用到另一个不相关的 Decision 上。
-
-审查列出的 6 条校验规则**应全部采纳**。
-
-#### 3. P1：DecisionStore 损坏偏 fail-open
-**与架构的 fail-closed 原则直接冲突。**
-
-v1.0 文档 §4.1 明确启动校验应 fail-closed，但 DecisionStore 在加载时跳过损坏行，导致防重放状态丢失。审查建议"非法 JSON 阻止 Runtime 启动"**完全符合 v1.0 的设计原则**。
-
----
-
-### 🟡 强烈建议采纳（质量门禁级）
-
-#### 4. P1：CI 中 OPA 路径不一致
-这会导致**测试静默跳过**，使"124 passed"这个数字产生误导——关键集成测试可能根本没跑。审查建议的 `OPA_PATH` 统一优先 + 平台回退 + skip 数量门禁**应立刻实施**。
-
-#### 5. P1：工程质量门禁（Ruff / mypy）
-MVP 阶段代码量小，正是建立门禁的最佳时机。拖到后期修复成本指数上升。建议采纳，但**不必阻塞功能开发**，可以并行推进。
-
-#### 6. P2：完整 E2E 使用真实组件
-当前 FakeGateway 的 E2E 测的是"治理逻辑"，没测"真实 MCP 调用路径"。审查建议的发布前测试（真实 OPA + filesystem MCP + mock email MCP）**是 MVP 对外演示前的最低要求**。
+#### 4. Shell、文件系统、浏览器等内置能力
+- **示例**：Python `open()` 修改文件、`subprocess` 执行 PowerShell、浏览器自动化完成转账、原生网络库调外部接口。
+- **治理方式**：不能仅靠包装工具，必须通过操作系统或运行环境治理。
+- **具体措施**：容器/沙箱、文件系统挂载权限（只读目录）、独立工作目录、OS 用户权限、seccomp/AppArmor、网络 ACL/Egress Proxy、Browser Gateway、Shell Executor、Workspace Snapshot、临时凭证、Harness Runtime 控制。
+- **工具示例**：
+  - **文件工具**：Agent 沙箱只访问临时 Workspace → 高风险写入经 File Executor → 策略/审批 → 快照后写入真实目录。
+  - **Shell 工具**：Agent 提交命令提议 → Shell Executor 解析并执行策略 → 容器内受限执行。
+  - **浏览器工具**：Agent 提交浏览器操作提议 → Browser Gateway → 风险识别/审批 → 受控浏览器会话执行。
+- **治理权来源**：控制运行环境 + OS 权限 + 文件挂载 + 网络出口，需要 Harness 或沙箱配合，非单个 SDK 能解决。
 
 ---
 
-### 🟢 可参考但需权衡（架构演进级）
+### 二、获得治理权的三种方法
 
-#### 7. Main 的跨任务 Session 风险状态
-**这与 v1.0 的 MVP 范围有冲突。**
+无论工具类型，治理权本质上通过以下三种方式获得：
 
-v1.0 文档 §1.2 明确将"跨 turn 风险累积"移出 MVP，§3.9 规定 `RiskStateManager` 纯内存、任务结束即弃。审查建议从 main 吸收 Session 风险状态，本质上是**把 post-MVP 能力提前引入**。
+#### 方法一：拦截（协作式治理权）
+- **路径**：Agent 调工具 → Wrapper/Hook/Adapter → Loop Controller。
+- **优点**：接入简单、开发成本低、适合开源/开发版，能快速覆盖 LangChain、OpenAI Agents、AutoGen。
+- **缺点**：依赖宿主配合，易有漏洞，Agent 有其他执行路径时可绕过，**不适合作为强安全边界**。
 
-**中立建议**：
-- 如果 main 的实现稳定且迁移成本低，可以作为 **v1.1 增强** 吸收，但**不应阻塞 MVP 的冻结和发布**。
-- 如果吸收，必须补充 v1.0 文档中未定义的 Session 过期/衰减规则（审查提到了，但 main 的实现可能也不完整）。
+#### 方法二：代理（代理执行治理权）
+- **路径**：Agent 只提交调用意图 → Loop Controller/Executor 代为执行。
+- **优点**：能绑定批准参数、防止审批后换参数、记录真实执行结果、执行前备份、集中管理凭证。
+- **缺点**：若 Agent 仍持有原始凭证仍可绕过；需为不同类型工具开发 Executor。
+- **当前项目**：`LoopController.evaluate_and_execute()`（`controller.py`）已采用“判断后执行”方向。
 
-#### 8. Main 的拒绝路径预算退款逻辑
-这与 P0 直接呼应，但审查指出 main 的实现"较简单"。**建议以 develop 的新 Runtime 架构为基座重新实现**，而不是移植旧代码。采纳其"拒绝不消耗预算"的语义，而非具体实现。
-
-#### 9. Main 的编排边界文档
-这部分是**纯文档收益**，没有代码风险。建议直接吸收并合入 v1.0 架构文档，明确 Runtime 生成可信 ID、Checkpoint 唯一权威等边界。
-
----
-
-## 三、可以商榷或补充的点
-
-### 1. 审计链完整性表述
-审查建议对外表述为"支持链式篡改检测"而非"不可篡改"。**完全同意**。但可补充：在 MVP 演示中，可以现场运行 `verify_chain()` 并展示"篡改一行后校验失败"的效果，这比文字声明更有说服力。
-
-### 2. MCP 供应链风险（npx -y）
-审查建议固定 Node 版本和 npm 包版本。**合理**，但 MVP 阶段可以退而求其次：在 `mcp_servers.yaml` 中增加 `version` 字段并文档化，不要求锁定到具体 hash。
-
-### 3. 示例中的 `/data/...` 路径问题
-审查指出系统根目录可能有权限问题。**建议改为项目内相对路径**（如 `project_root/data/`），并通过 `ConfigLoader` 解析为绝对路径，这样跨平台演示更稳定。
+#### 方法三：垄断出口（强制性治理权）
+- **条件**：Agent 无凭证 + Agent 无法直连目标 + 所有调用只能经过 Executor。
+- **依赖**：Secret Broker、网络策略、IAM、容器/沙箱、专属工具账户、受控文件系统、受控 Browser/Shell、上游系统只信任 Executor。
+- **效果**：只有这一档能较强地承诺“拒绝后不会从其他路径执行”。
 
 ---
 
-## 四、对"推荐整合顺序"的评价
+### 三、关于工具目录
 
-审查推荐的 9 步顺序**大体合理**，但我建议微调：
-
-| 审查顺序 | 我的建议 | 理由 |
-|---------|---------|------|
-| 1. 修复预算生命周期 | ✅ 保持第 1 | P0 安全漏洞 |
-| 2. 强化审批记录绑定 | ✅ 保持第 2 | P0 安全漏洞 |
-| 3. 修复 DecisionStore | ✅ 保持第 3 | 与 1/2 同属状态一致性 |
-| 4. 统一 OPA_PATH | ✅ 保持第 4 | 否则测试不可信 |
-| 5. 修复 Ruff/mypy | ⚠️ 降至与 6 并行 | 不阻塞功能，可 CI 并行跑 |
-| 6. 迁移 Session 风险 | ⚠️ 明确为 v1.1 | 超出 MVP 范围，不要阻塞发布 |
-| 7. 增加正式 E2E | ✅ 提前到第 5 | 演示前必须完成 |
-| 8. 清理旧示例 | ✅ 保持 | 低优先级 |
-| 9. 合并回主分支 | ❌ 删除此步骤 | develop 应成为新主分支，而非合并回旧 main |
+- **需要可治理范围的工具目录**，但仅有目录不够。
+- 工具目录可通过多种方式产生（具体方式图片未完整展示）。
 
 ---
 
-## 五、一句话总结
+### 总结
 
-> **这份审查的 P0 和 P1 项应被视为开发阻塞项（blockers），必须修复；P2 和工程门禁应在 MVP 冻结前完成；Main 分支的 Session 风险状态是优质增强，但建议作为 v1.1 引入，避免扩大 MVP 范围。审查整体值得团队逐条对照执行。**
+该文档系统性地阐述了 AI Agent 工具治理的架构思路，强调 **治理权的本质是对执行路径和凭证的控制**，而非依赖特定协议或框架。治理强度从“协作式”（拦截）到“强制性”（垄断出口）逐级增强，实际落地需根据工具类型选择合适的治理组合（代理、沙箱、凭证管理、网络控制等）。
 
----
+需要可治理范围的工具目录，但仅有目录不够
+工具目录可以通过以下方式产生：
 
-## 六、修复状态（v0.3.0 develop 分支）
+MCP tools/list 自动发现；
+框架 Adapter 注册；
+OpenAPI/JSON Schema 导入；
+企业 Connector 配置；
+Harness Tool Manifest；
+静态配置；
+管理员登记；
+Agent 启动时声明。
+工具目录至少应记录：
 
-> 以下修复全部在 `develop` 分支完成，`main` 分支保留为历史参考，不再向 `main` 做 merge/rebase。
+text
 
-| 优先级 | 问题 | 状态 | 关键提交 | 自动化验证 |
-|---|---|---|---|---|
-| P0 | 拒绝路径预算未返还 | ✅ 已修复 | `b162e89` | `tests/test_checkpoint.py::test_evaluate_refund_on_policy_deny` |
-| P0 | 审批记录强绑定验证 | ✅ 已修复 | `b162e89` | `tests/test_checkpoint.py::test_finalize_after_approval_binding_validation` |
-| P1 | DecisionStore 损坏 fail-open | ✅ 已修复 | `260f544` | `tests/test_decision_store.py::test_corrupt_log_fail_closed` |
-| P1 | CI OPA 路径不一致 | ✅ 已修复 | `ef30cd7` | `.github/workflows/ci.yml` + `tests/conftest.py::resolve_opa_bin` |
-| P1 | 工程质量门禁 | ✅ 已修复 | `5d30257` | CI lint job（ruff + mypy）+ OPA 可用性校验 |
-| P2 | 完整 E2E 用真实组件 | ✅ 已修复 | `e9ce095` | `tests/test_e2e_real_mcp.py` |
-| P2 | 旧示例清理 | ✅ 已修复 | `ba74a07` | 删除过期的 `examples/research_assistant_example.py` |
 
-### 当前基线验证
 
-- `python -m pytest tests/`：**205 passed**
-- `python -m ruff check src tests`：**All checks passed**
-- `python -m mypy src`：**Success**
+tool_id
+tool_type
+schema
+executor
+credential_ref
+owner
+risk_profile
+data_scope
+allowed_agents
+side_effect_level
+backup_strategy
+但不能依赖 Agent 自己说：
 
-### 未纳入本次修复（v1.1 或后续）
+text
 
-- **Main 的跨任务 Session 风险状态**：按 §四 建议，作为 v1.1 增强，不阻塞 MVP 冻结。
-- **Main 的编排边界/文档**：有价值的纯文档内容，可后续以 cherry-pick/手动拷贝方式进入 `develop`，不 merge 历史。
+
+
+“我只有这些工具。”
+因为 Agent 还可能通过：
+
+Shell；
+Python 代码；
+HTTP Client；
+浏览器；
+文件系统；
+动态插件；
+产生未登记的副作用。
+
+所以企业治理真正要登记的不是所有函数，而是：
+
+所有可能产生重要副作用的能力和出口。
+
+即使不知道 Agent 内部每个函数，只要控制：
+
+text
+
+
+
+网络
+凭证
+文件系统
+Shell
+浏览器
+数据库连接
+云 IAM
+仍然可以控制最终副作用。
+
+反过来，即使知道 Agent 的全部 Tool Schema，但没有控制这些出口，也不能形成强治理。
+
+
+五、针对“外来 Agent”怎么办
+可以分三类处理。
+
+1. 可改造的外部 Agent
+它支持：
+
+MCP；
+HTTP Tool Callback；
+Framework Tool Adapter；
+UHP/Harness；
+自定义 Tool Provider。
+那么可以把工具替换成受治理入口，并将其放入受控运行环境。
+
+这种外部 Agent也可以达到较强治理，不要求必须自研。
+
+2. 不可改代码，但可以控制运行环境
+可以使用：
+
+容器；
+Egress Proxy；
+文件挂载；
+MCP 配置重定向；
+IAM；
+API Gateway；
+Browser Gateway。
+即使无法修改 Agent 内部，也可以在基础设施层控制其副作用。
+
+3. 既不能改造，也不能控制运行环境
+例如：
+
+运行在第三方平台；
+自带凭证；
+自带网络出口；
+不提供 Hook；
+无法获取工具事件。
+这种 Agent 只能：
+
+接收结果；
+观察外部日志；
+做外围风险监控；
+告警；
+事后审计。
+不能承诺工具级实时阻断。

@@ -7,13 +7,13 @@
 
 前置依赖：
 
-    uv pip install langchain langchain-openai langgraph
+    uv pip install loop-controller langchain langchain-openai langgraph
 
 运行方式：
 
     set LOOP_CONTROLLER_AUDIT_HMAC_KEY=0123456789abcdef...
     set OPENAI_API_KEY=sk-...
-    python examples/langchain_agent_demo.py
+    python examples/contrib/adapters/langchain_demo.py
 
 环境变量：
 - ``OPENAI_API_KEY``：LangChain Agent 调用 LLM 所需；
@@ -24,14 +24,18 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
-from loop_controller.adapters.langchain import GovernedTool
+sys.path.insert(0, str(Path(__file__).parent))
+
+from langchain_adapter import GovernedTool
+
 from loop_controller.controller import build_controller
 from loop_controller.infra.config_loader import ConfigLoader
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 OPA_URL = "http://127.0.0.1:8181"
 
 

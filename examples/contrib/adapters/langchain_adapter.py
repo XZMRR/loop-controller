@@ -1,6 +1,7 @@
-"""LangChain 适配器：把 Loop Controller 包装成 LangChain Tool（v0.13.0）。
+"""LangChain 适配器示例：把 Loop Controller 包装成 LangChain Tool（v0.13.0）。
 
-本模块属于框架扩展，需要额外安装 ``langchain`` / ``langchain-core``：
+本模块已从 Loop Controller 核心包移出，仅作为示例和迁移便利。
+需要额外安装 ``langchain`` / ``langchain-core``：
 
     uv pip install langchain langchain-openai
 
@@ -8,7 +9,7 @@
 
     from langchain.agents import create_openai_tools_agent, AgentExecutor
     from langchain_openai import ChatOpenAI
-    from loop_controller.adapters.langchain import govern_tool
+    from langchain_adapter import GovernedTool
     from loop_controller.controller import build_controller
 
     controller = await build_controller(config)

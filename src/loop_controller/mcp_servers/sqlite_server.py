@@ -13,17 +13,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import mcp_types as types
-from mcp.server import Server
-from mcp.server.context import ServerRequestContext
-from mcp.server.stdio import stdio_server
+from mcp import types  # type: ignore[import-untyped]
+from mcp.server import Server  # type: ignore[import-untyped]
+from mcp.server.stdio import stdio_server  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
 _QUERY_TOOL = types.Tool(
     name="query",
     description="Execute a read-only SQL query (SELECT). Returns JSON rows.",
-    input_schema={
+    inputSchema={
         "type": "object",
         "properties": {
             "sql": {
@@ -38,7 +37,7 @@ _QUERY_TOOL = types.Tool(
 _EXECUTE_TOOL = types.Tool(
     name="execute",
     description="Execute a write SQL statement (INSERT/UPDATE/DELETE/DDL). Use with caution.",
-    input_schema={
+    inputSchema={
         "type": "object",
         "properties": {
             "sql": {
@@ -51,60 +50,54 @@ _EXECUTE_TOOL = types.Tool(
 )
 
 
-def _create_server(db_path: Path) -> Server:
-    async def _list_tools(
-        _ctx: ServerRequestContext[Any],
-        _params: types.PaginatedRequestParams | None,
-    ) -> types.ListToolsResult:
+def _create_server(db_path: Path) -> Server[Any]:
+    server: Server[Any] = Server("loop-controller-sqlite")
+
+    @server.list_tools()  # type: ignore[misc]
+    async def _list_tools(_request: types.ListToolsRequest) -> types.ListToolsResult:
         return types.ListToolsResult(tools=[_QUERY_TOOL, _EXECUTE_TOOL])
 
-    async def _call_tool(
-        _ctx: ServerRequestContext[Any],
-        params: types.CallToolRequestParams,
-    ) -> types.CallToolResult:
-        arguments = dict(params.arguments or {})
-        sql = arguments.get("sql", "")
+    @server.call_tool()  # type: ignore[misc]
+    async def _call_tool(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
+        args = dict(arguments or {})
+        sql = args.get("sql", "")
         if not isinstance(sql, str) or not sql:
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text="'sql' is required")],
-                is_error=True,
+                isError=True,
             )
         try:
             conn = sqlite3.connect(str(db_path))
             try:
-                if params.name == "query":
+                if name == "query":
                     sql_upper = sql.strip().upper()
                     if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
                         return types.CallToolResult(
                             content=[types.TextContent(type="text", text="'query' tool only supports SELECT")],
-                            is_error=True,
+                            isError=True,
                         )
                     conn.row_factory = sqlite3.Row
                     rows = [dict(row) for row in conn.execute(sql)]
                     text = json.dumps(rows, ensure_ascii=False, default=str)
-                elif params.name == "execute":
+                elif name == "execute":
                     cur = conn.execute(sql)
                     conn.commit()
                     text = json.dumps({"rows_affected": cur.rowcount}, ensure_ascii=False)
                 else:
                     return types.CallToolResult(
-                        content=[types.TextContent(type="text", text=f"Unknown tool: {params.name}")],
-                        is_error=True,
+                        content=[types.TextContent(type="text", text=f"Unknown tool: {name}")],
+                        isError=True,
                     )
             finally:
                 conn.close()
         except Exception as exc:  # noqa: BLE001
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=f"sqlite error: {exc}")],
-                is_error=True,
+                isError=True,
             )
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
 
-    return Server(
-        "loop-controller-sqlite",
-        on_list_tools=_list_tools,
-        on_call_tool=_call_tool,
-    )
+    return server
 
 
 async def main() -> None:

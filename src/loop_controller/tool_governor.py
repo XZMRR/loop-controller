@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from loop_controller.adapters._shared import format_governance_result
 from loop_controller.controller import LoopController
+from loop_controller.formatting import format_governance_result
 
 
 class ToolGovernor:

@@ -428,6 +428,19 @@ def test_api_key_protects_admin_and_wait_endpoints() -> None:
         assert resp.status_code == 401, path
 
 
+def test_empty_api_key_not_bypassed() -> None:
+    """P1.15：空字符串 api_key 不能被视为未配置，从而放行所有请求。"""
+    client, _controller = _build_client(api_key="")
+    for path in (
+        "/v1/admin/approvals/pending",
+        "/v1/admin/audit",
+    ):
+        resp = client.get(path, headers={"X-API-Key": ""})
+        assert resp.status_code == 401, path
+        resp = client.get(path, headers={"Authorization": "Bearer "})
+        assert resp.status_code == 401, path
+
+
 def test_lifespan_starts_and_closes_controller() -> None:
     client, controller = _build_client()
     with client:

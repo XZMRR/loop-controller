@@ -16,10 +16,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from mcp_types import (  # type: ignore[import-not-found]
-    CallToolRequestParams,
-    PaginatedRequestParams,
-)
 
 from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.proxy_server import LoopControllerProxyServer, ProxyIdentity
@@ -104,10 +100,7 @@ async def proxy_ctx(workdir: Path, sent_emails_path: Path, opa_server: str):
 @pytest.mark.asyncio
 async def test_proxy_list_tools(proxy_ctx: LoopControllerProxyServer) -> None:
     """tools/list 返回按 Profile 过滤后的工具，并注入内部工具。"""
-    result = await proxy_ctx._handle_list_tools(
-        _fake_request_context(),  # type: ignore[arg-type]
-        PaginatedRequestParams(),
-    )
+    result = await proxy_ctx._handle_list_tools_impl()
     names = {tool.name for tool in result.tools}
     assert names == {"web_search", "send_email", "loop_controller_approval_status"}
 
@@ -118,11 +111,10 @@ async def test_proxy_allow_tool_executes(
     sent_emails_path: Path,
 ) -> None:
     """web_search 是低风险工具，Proxy 直接执行并返回结果。"""
-    result = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(name="web_search", arguments={"query": "AI compliance"}),
+    result = await proxy_ctx._handle_call_tool_impl(
+        name="web_search", arguments={"query": "AI compliance"}
     )
-    assert not result.is_error
+    assert not result.isError
     assert len(result.content) == 1
     payload = json.loads(result.content[0].text)
     assert payload["status"] == "ok"
@@ -131,36 +123,30 @@ async def test_proxy_allow_tool_executes(
 @pytest.mark.asyncio
 async def test_proxy_deny_tool_rejected(proxy_ctx: LoopControllerProxyServer) -> None:
     """send_email 收件人不在 allowed_args 范围内，被 deny。"""
-    result = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "to": "attacker@gmail.com",
-                "subject": "test",
-                "body": "body",
-            },
-        ),
+    result = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "to": "attacker@gmail.com",
+            "subject": "test",
+            "body": "body",
+        },
     )
-    assert result.is_error
+    assert result.isError
     assert result.content[0].text.startswith("[loop-controller] DENIED:")
 
 
 @pytest.mark.asyncio
 async def test_proxy_require_approval_blocked(proxy_ctx: LoopControllerProxyServer) -> None:
     """send_email 收件人合法但仍需审批；v0.5.1 返回结构化 JSON。"""
-    result = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "to": "boss@company.com",
-                "subject": "report",
-                "body": "please review",
-            },
-        ),
+    result = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
     )
-    assert result.is_error
+    assert result.isError
     payload = json.loads(result.content[0].text)
     assert payload["status"] == "require_approval"
     assert payload["tool_name"] == "send_email"
@@ -176,18 +162,15 @@ async def test_proxy_retry_approved_executes(
 ) -> None:
     """审批通过后携带 decision_id 重试，应成功执行原工具调用。"""
     # 1. 第一次调用：require_approval
-    first = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "to": "boss@company.com",
-                "subject": "report",
-                "body": "please review",
-            },
-        ),
+    first = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
     )
-    assert first.is_error
+    assert first.isError
     pending = json.loads(first.content[0].text)
     decision_id = pending["decision_id"]
     request_id = pending["request_id"]
@@ -207,19 +190,16 @@ async def test_proxy_retry_approved_executes(
     )
 
     # 3. 携带 decision_id 重试
-    retry = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "_loop_controller_decision_id": decision_id,
-                "to": "boss@company.com",
-                "subject": "report",
-                "body": "please review",
-            },
-        ),
+    retry = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "_loop_controller_decision_id": decision_id,
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
     )
-    assert not retry.is_error
+    assert not retry.isError
     text = retry.content[0].text
     assert "queued" in text.lower()
 
@@ -229,16 +209,13 @@ async def test_proxy_retry_param_mismatch_denied(
     proxy_ctx: LoopControllerProxyServer,
 ) -> None:
     """携带 decision_id 但参数不一致，应被拒绝。"""
-    first = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "to": "boss@company.com",
-                "subject": "report",
-                "body": "please review",
-            },
-        ),
+    first = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
     )
     pending = json.loads(first.content[0].text)
     decision_id = pending["decision_id"]
@@ -257,19 +234,16 @@ async def test_proxy_retry_param_mismatch_denied(
         )
     )
 
-    retry = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "_loop_controller_decision_id": decision_id,
-                "to": "other@company.com",  # 参数不一致
-                "subject": "report",
-                "body": "please review",
-            },
-        ),
+    retry = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "_loop_controller_decision_id": decision_id,
+            "to": "other@company.com",  # 参数不一致
+            "subject": "report",
+            "body": "please review",
+        },
     )
-    assert retry.is_error
+    assert retry.isError
     assert "mismatch" in retry.content[0].text.lower()
 
 
@@ -278,33 +252,27 @@ async def test_proxy_retry_not_approved_still_blocked(
     proxy_ctx: LoopControllerProxyServer,
 ) -> None:
     """未审批时携带 decision_id 重试，仍返回 require_approval。"""
-    first = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "to": "boss@company.com",
-                "subject": "report",
-                "body": "please review",
-            },
-        ),
+    first = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
     )
     pending = json.loads(first.content[0].text)
     decision_id = pending["decision_id"]
 
-    retry = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "_loop_controller_decision_id": decision_id,
-                "to": "boss@company.com",
-                "subject": "report",
-                "body": "please review",
-            },
-        ),
+    retry = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "_loop_controller_decision_id": decision_id,
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
     )
-    assert retry.is_error
+    assert retry.isError
     assert "not approved" in retry.content[0].text.lower()
 
 
@@ -313,28 +281,22 @@ async def test_proxy_approval_status_pending(
     proxy_ctx: LoopControllerProxyServer,
 ) -> None:
     """v0.7.0：未审批时查询返回 pending。"""
-    first = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "to": "boss@company.com",
-                "subject": "report",
-                "body": "please review",
-            },
-        ),
+    first = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
     )
     pending = json.loads(first.content[0].text)
     decision_id = pending["decision_id"]
 
-    result = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="loop_controller_approval_status",
-            arguments={"decision_id": decision_id},
-        ),
+    result = await proxy_ctx._handle_call_tool_impl(
+        name="loop_controller_approval_status",
+        arguments={"decision_id": decision_id},
     )
-    assert not result.is_error
+    assert not result.isError
     payload = json.loads(result.content[0].text)
     assert payload["status"] == "pending"
     assert payload["can_retry"] is False
@@ -345,16 +307,13 @@ async def test_proxy_approval_status_approved(
     proxy_ctx: LoopControllerProxyServer,
 ) -> None:
     """v0.7.0：审批后查询返回 approved。"""
-    first = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "to": "boss@company.com",
-                "subject": "report",
-                "body": "please review",
-            },
-        ),
+    first = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
     )
     pending = json.loads(first.content[0].text)
     decision_id = pending["decision_id"]
@@ -373,14 +332,11 @@ async def test_proxy_approval_status_approved(
         )
     )
 
-    result = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="loop_controller_approval_status",
-            arguments={"decision_id": decision_id},
-        ),
+    result = await proxy_ctx._handle_call_tool_impl(
+        name="loop_controller_approval_status",
+        arguments={"decision_id": decision_id},
     )
-    assert not result.is_error
+    assert not result.isError
     payload = json.loads(result.content[0].text)
     assert payload["status"] == "approved"
     assert payload["can_retry"] is True
@@ -391,16 +347,13 @@ async def test_proxy_approval_status_denied(
     proxy_ctx: LoopControllerProxyServer,
 ) -> None:
     """v0.7.0：审批拒绝后查询返回 denied。"""
-    first = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="send_email",
-            arguments={
-                "to": "boss@company.com",
-                "subject": "report",
-                "body": "please review",
-            },
-        ),
+    first = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
     )
     pending = json.loads(first.content[0].text)
     decision_id = pending["decision_id"]
@@ -419,14 +372,11 @@ async def test_proxy_approval_status_denied(
         )
     )
 
-    result = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="loop_controller_approval_status",
-            arguments={"decision_id": decision_id},
-        ),
+    result = await proxy_ctx._handle_call_tool_impl(
+        name="loop_controller_approval_status",
+        arguments={"decision_id": decision_id},
     )
-    assert not result.is_error
+    assert not result.isError
     payload = json.loads(result.content[0].text)
     assert payload["status"] == "denied"
     assert payload["can_retry"] is False
@@ -437,14 +387,11 @@ async def test_proxy_approval_status_not_found(
     proxy_ctx: LoopControllerProxyServer,
 ) -> None:
     """v0.7.0：不存在的 decision_id 返回 not_found。"""
-    result = await proxy_ctx._handle_call_tool(
-        _fake_request_context(),
-        CallToolRequestParams(
-            name="loop_controller_approval_status",
-            arguments={"decision_id": "nonexistent"},
-        ),
+    result = await proxy_ctx._handle_call_tool_impl(
+        name="loop_controller_approval_status",
+        arguments={"decision_id": "nonexistent"},
     )
-    assert not result.is_error
+    assert not result.isError
     payload = json.loads(result.content[0].text)
     assert payload["status"] == "not_found"
     assert payload["can_retry"] is False
@@ -455,22 +402,19 @@ async def test_proxy_session_block_after_consecutive_denies(
     proxy_ctx: LoopControllerProxyServer,
 ) -> None:
     """同一 Session 连续两次 deny 后，第三次任何调用都被 session 硬熔断 deny。"""
-    params = CallToolRequestParams(
-        name="send_email",
-        arguments={
-            "to": "attacker@gmail.com",
-            "subject": "test",
-            "body": "body",
-        },
-    )
-    first = await proxy_ctx._handle_call_tool(_fake_request_context(), params)
-    assert first.is_error and "DENIED" in first.content[0].text
+    params = {
+        "to": "attacker@gmail.com",
+        "subject": "test",
+        "body": "body",
+    }
+    first = await proxy_ctx._handle_call_tool_impl(name="send_email", arguments=params)
+    assert first.isError and "DENIED" in first.content[0].text
 
-    second = await proxy_ctx._handle_call_tool(_fake_request_context(), params)
-    assert second.is_error and "DENIED" in second.content[0].text
+    second = await proxy_ctx._handle_call_tool_impl(name="send_email", arguments=params)
+    assert second.isError and "DENIED" in second.content[0].text
 
-    third = await proxy_ctx._handle_call_tool(_fake_request_context(), params)
-    assert third.is_error
+    third = await proxy_ctx._handle_call_tool_impl(name="send_email", arguments=params)
+    assert third.isError
     text = third.content[0].text
     assert "session blocked" in text.lower() or "consecutive" in text.lower()
 
@@ -502,18 +446,15 @@ async def test_proxy_retry_survives_runtime_restart(
             runtime_a,
             ProxyIdentity(agent_id="researcher_001", user_id="alice"),
         )
-        first = await proxy_a._handle_call_tool(
-            _fake_request_context(),
-            CallToolRequestParams(
-                name="send_email",
-                arguments={
-                    "to": "boss@company.com",
-                    "subject": "report",
-                    "body": "please review",
-                },
-            ),
+        first = await proxy_a._handle_call_tool_impl(
+            name="send_email",
+            arguments={
+                "to": "boss@company.com",
+                "subject": "report",
+                "body": "please review",
+            },
         )
-        assert first.is_error
+        assert first.isError
         pending = json.loads(first.content[0].text)
         decision_id = pending["decision_id"]
         request_id = pending["request_id"]
@@ -546,19 +487,16 @@ async def test_proxy_retry_survives_runtime_restart(
                 runtime_b,
                 ProxyIdentity(agent_id="researcher_001", user_id="alice"),
             )
-            retry = await proxy_b._handle_call_tool(
-                _fake_request_context(),
-                CallToolRequestParams(
-                    name="send_email",
-                    arguments={
-                        "_loop_controller_decision_id": decision_id,
-                        "to": "boss@company.com",
-                        "subject": "report",
-                        "body": "please review",
-                    },
-                ),
+            retry = await proxy_b._handle_call_tool_impl(
+                name="send_email",
+                arguments={
+                    "_loop_controller_decision_id": decision_id,
+                    "to": "boss@company.com",
+                    "subject": "report",
+                    "body": "please review",
+                },
             )
-            assert not retry.is_error
+            assert not retry.isError
             assert "queued" in retry.content[0].text.lower()
         finally:
             await runtime_b.aclose()

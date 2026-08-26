@@ -72,6 +72,7 @@ class Task(BaseModel):
     user_id: str
     agent_id: str
     description: str
+    tenant_id: str | None = None  # v0.22.0 多租户预留
     status: Literal["created", "completed"] = "created"
     created_at: datetime = Field(default_factory=_utc_now)
     completed_at: datetime | None = None
@@ -91,6 +92,8 @@ class Agent(BaseModel):
     name: str
     profile_id: str  # MVP 一对一静态绑定，不支持运行时切换
     owner_id: str  # 所属人类用户/部门，用于审批路由
+    identity: dict[str, Any] | None = None  # v0.20.0 外部身份元数据
+    tenant_id: str | None = None  # v0.22.0 多租户预留
 
 
 # ---------------------------------------------------------------------------

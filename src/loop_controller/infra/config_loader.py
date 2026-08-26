@@ -28,6 +28,8 @@ from typing import Any, Literal, cast
 import httpx
 import yaml
 
+from loop_controller.executors.http_models import HTTPToolSpec, resolve_env_refs
+from loop_controller.executors.local_function_models import LocalFunctionSpec
 from loop_controller.models import (
     Agent,
     AuditRule,
@@ -195,6 +197,8 @@ class AppConfig:
     profiles: dict[str, CapabilityProfile]
     mcp_servers: dict[str, MCPServerConfig]
     tool_mapping: dict[str, ToolMappingEntry]
+    http_tool_specs: dict[str, HTTPToolSpec]  # v0.21.0 HTTP 工具规格
+    local_function_specs: dict[str, LocalFunctionSpec]  # v0.23.0 本地函数规格
     permission_rules: list[PermissionRule]
     capability_rules: CapabilityRules  # v0.10.0
     authority_rules: AuthorityRules  # v0.11.0
@@ -218,7 +222,9 @@ class AppConfig:
     audit_hash_algo: AuditHashAlgorithm = "sha256"
     audit_hmac_key_env: str = "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
     audit_key_id: str = "default"  # HMAC key 标识，为密钥轮换留口
-
+    identity_config: dict[str, Any] = field(default_factory=dict)  # v0.20.0 身份 Provider 配置
+    entrypoints_config: dict[str, Any] = field(default_factory=dict)  # v0.20.0 入口认证配置
+    secrets_config: dict[str, Any] = field(default_factory=dict)  # v0.22.0 Secret Broker 配置
 
 # ---------------------------------------------------------------------------
 # ConfigLoader
@@ -243,9 +249,16 @@ class ConfigLoader:
 
         agents, users = self._load_agents(config_dir / "agents.yaml")
         profiles = self._load_profiles(config_dir / "profiles.yaml")
-        mcp_servers, tool_mapping = self._load_mcp_servers(config_dir / "mcp_servers.yaml")
+        mcp_servers, tool_mapping, legacy_http_specs = self._load_mcp_servers(config_dir / "mcp_servers.yaml")
+        http_tool_specs = self._load_http_tools(config_dir / "http_tools.yaml")
+        # mcp_servers.yaml 中的 type: http 条目作为向后兼容补充
+        http_tool_specs.update(legacy_http_specs)
+        local_function_specs = self._load_local_functions(config_dir / "local_functions.yaml")
+        secrets_config = self._load_secrets_config(config_dir / "secrets.yaml", root)
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
+        identity_config = self._load_identity_config(config_dir / "identity.yaml")
+        entrypoints_config = self._load_entrypoints_config(config_dir / "entrypoints.yaml")
         permission_rules = self._load_permission_rules(config_dir / "permission_rules.yaml")
         capability_rules = self._load_capability_rules(config_dir / "capability_rules.yaml")
         authority_rules = self._load_authority_rules(config_dir / "authority_rules.yaml")
@@ -293,6 +306,8 @@ class ConfigLoader:
             profiles=profiles,
             mcp_servers=mcp_servers,
             tool_mapping=tool_mapping,
+            http_tool_specs=http_tool_specs,
+            local_function_specs=local_function_specs,
             permission_rules=permission_rules,
             capability_rules=capability_rules,
             authority_rules=authority_rules,
@@ -314,6 +329,9 @@ class ConfigLoader:
             llm_planner=llm_planner,
             audit_hash_algo=audit_hash_algo,
             audit_key_id=audit_key_id,
+            identity_config=identity_config,
+            entrypoints_config=entrypoints_config,
+            secrets_config=secrets_config,
         )
 
         self._check_profile_exists(app_config)
@@ -326,6 +344,8 @@ class ConfigLoader:
         self._check_approver_exists(app_config)
         self._check_llm_planner_api_key(app_config)
         self._check_audit_key(app_config)
+        self._check_identity_config(app_config)
+        self._check_entrypoints_config(app_config)
         return app_config
 
     # -- 各 YAML 解析 -------------------------------------------------------
@@ -356,15 +376,90 @@ class ConfigLoader:
 
     def _load_mcp_servers(
         self, path: Path
-    ) -> tuple[dict[str, MCPServerConfig], dict[str, ToolMappingEntry]]:
+    ) -> tuple[dict[str, MCPServerConfig], dict[str, ToolMappingEntry], dict[str, HTTPToolSpec]]:
         data = self._read_yaml(path)
         servers: dict[str, MCPServerConfig] = {}
         for name, conf in data.get("servers", {}).items():
             servers[name] = MCPServerConfig(name=name, **conf)
         mapping: dict[str, ToolMappingEntry] = {}
+        http_specs: dict[str, HTTPToolSpec] = {}
         for canonical, entry in data.get("tool_mapping", {}).items():
-            mapping[canonical] = ToolMappingEntry(**entry)
-        return servers, mapping
+            entry_type = entry.get("type", "mcp")
+            if entry_type == "http":
+                # 解析 ${ENV} 引用，然后构造 HTTPToolSpec
+                resolved = resolve_env_refs(entry)
+                http_specs[canonical] = HTTPToolSpec(tool_name=canonical, **resolved)
+            else:
+                mapping[canonical] = ToolMappingEntry(**entry)
+        return servers, mapping, http_specs
+
+    def _load_http_tools(self, path: Path) -> dict[str, HTTPToolSpec]:
+        """加载 HTTP 工具规格（v0.22.0 独立配置）。
+
+        文件缺失时返回空 dict（向后兼容）。
+        """
+        specs: dict[str, HTTPToolSpec] = {}
+        if not path.exists():
+            return specs
+        data = self._read_yaml(path)
+        for canonical, entry in (data.get("tools") or {}).items():
+            resolved = resolve_env_refs(entry)
+            specs[canonical] = HTTPToolSpec(tool_name=canonical, **resolved)
+        return specs
+
+    def _load_secrets_config(
+        self, path: Path, root: Path
+    ) -> dict[str, Any]:
+        """加载 Secret Broker 后端配置（v0.22.0）。
+
+        文件缺失时使用默认文件后端：``<root>/secrets``。
+        """
+        if not path.exists():
+            return {
+                "backend": {
+                    "type": "file",
+                    "base_path": str(root / "secrets"),
+                },
+                "hot_reload": {"enabled": True, "poll_interval_seconds": 30},
+            }
+        data = self._read_yaml(path)
+        config = cast(dict[str, Any], data)
+        if "backend" not in config:
+            config["backend"] = {"type": "file", "base_path": str(root / "secrets")}
+        if "hot_reload" not in config:
+            config["hot_reload"] = {"enabled": True, "poll_interval_seconds": 30}
+        return config
+
+    def _load_local_functions(self, path: Path) -> dict[str, LocalFunctionSpec]:
+        """加载本地函数规格（v0.23.0）。
+
+        文件缺失时返回空 dict（向后兼容）。
+        """
+        specs: dict[str, LocalFunctionSpec] = {}
+        if not path.exists():
+            return specs
+        data = self._read_yaml(path)
+        for canonical, entry in (data.get("tools") or {}).items():
+            specs[canonical] = LocalFunctionSpec(tool_name=canonical, **entry)
+        return specs
+
+    def reload_http_tools(self, config_dir: str | Path) -> dict[str, HTTPToolSpec]:
+        """热更新：仅重新加载 HTTP 工具规格。"""
+        config_dir = Path(config_dir)
+        http_specs = self._load_http_tools(config_dir / "http_tools.yaml")
+        mcp_path = config_dir / "mcp_servers.yaml"
+        if mcp_path.exists():
+            _, _, legacy_http_specs = self._load_mcp_servers(mcp_path)
+            http_specs.update(legacy_http_specs)
+        return http_specs
+
+    def reload_secrets_config(
+        self, config_dir: str | Path
+    ) -> dict[str, Any]:
+        """热更新：重新加载 secrets.yaml，返回最新配置。"""
+        config_dir = Path(config_dir)
+        root = config_dir.parent
+        return self._load_secrets_config(config_dir / "secrets.yaml", root)
 
     def _load_permission_rules(self, path: Path) -> list[PermissionRule]:
         data = self._read_yaml(path)
@@ -488,6 +583,20 @@ class ConfigLoader:
         data = self._read_yaml(path)
         return LLMPlannerConfig(**data)
 
+    def _load_identity_config(self, path: Path) -> dict[str, Any]:
+        """加载身份 Provider 配置；文件缺失返回空 dict（向后兼容）。"""
+        if not path.exists():
+            return {}
+        data = self._read_yaml(path)
+        return cast(dict[str, Any], data.get("identity", {}))
+
+    def _load_entrypoints_config(self, path: Path) -> dict[str, Any]:
+        """加载入口认证配置；文件缺失返回空 dict（向后兼容）。"""
+        if not path.exists():
+            return {}
+        data = self._read_yaml(path)
+        return cast(dict[str, Any], data.get("entrypoints", {}))
+
     # -- 7 条启动校验 -------------------------------------------------------
 
     def _check_profile_exists(self, config: AppConfig) -> None:
@@ -498,11 +607,16 @@ class ConfigLoader:
                 )
 
     def _check_tool_mapping(self, config: AppConfig) -> None:
+        all_tools = (
+            set(config.tool_mapping)
+            | set(config.http_tool_specs)
+            | set(config.local_function_specs)
+        )
         for profile_id, profile in config.profiles.items():
             for tool_name in profile.tools:
-                if tool_name not in config.tool_mapping:
+                if tool_name not in all_tools:
                     raise ConfigValidationError(
-                        f"Profile {profile_id} 的工具 {tool_name} 不在 tool_mapping 中"
+                        f"Profile {profile_id} 的工具 {tool_name} 不在 tool_mapping / http_tool_specs / local_function_specs 中"
                     )
 
     def _check_policy_loadable(self, opa_base_url: str, config: AppConfig) -> None:
@@ -659,6 +773,69 @@ class ConfigLoader:
         if len(key) < 32:
             raise ValueError(f"key 长度 {len(key)} 字节，必须 ≥32 字节")
         return key
+
+    def _check_identity_config(self, config: AppConfig) -> None:
+        """校验 identity provider 配置，避免启动后因配置错误才发现问题。"""
+        identity = config.identity_config
+        if not identity:
+            return
+        provider = identity.get("provider", "static")
+        if provider not in {"static", "jwt", "mtls"}:
+            raise ConfigValidationError(
+                f"identity.provider 必须是 static / jwt / mtls 之一，当前值：{provider!r}"
+            )
+
+        if provider == "jwt":
+            jwt_cfg = identity.get("jwt", {})
+            if not jwt_cfg.get("issuer"):
+                raise ConfigValidationError("identity.provider=jwt 时必须配置 jwt.issuer")
+            if not jwt_cfg.get("jwks_url") and not jwt_cfg.get("public_key"):
+                raise ConfigValidationError(
+                    "identity.provider=jwt 时必须配置 jwt.jwks_url 或 jwt.public_key"
+                )
+
+        if provider == "mtls":
+            mtls_cfg = identity.get("mtls", {})
+            if not mtls_cfg.get("cert_subject_template") and not mtls_cfg.get("cert_mappings"):
+                raise ConfigValidationError(
+                    "identity.provider=mtls 时必须配置 mtls.cert_subject_template 或 mtls.cert_mappings"
+                )
+
+        if provider == "static":
+            static_cfg = identity.get("static", {})
+            tokens = static_cfg.get("allowed_tokens", [])
+            if not isinstance(tokens, list):
+                raise ConfigValidationError("identity.static.allowed_tokens 必须是列表")
+            for idx, entry in enumerate(tokens):
+                if not isinstance(entry, dict):
+                    raise ConfigValidationError(
+                        f"identity.static.allowed_tokens[{idx}] 必须是对象"
+                    )
+                for field in ("token", "agent_id", "user_id"):
+                    if not entry.get(field):
+                        raise ConfigValidationError(
+                            f"identity.static.allowed_tokens[{idx}] 缺少或空字段 {field}"
+                        )
+
+    def _check_entrypoints_config(self, config: AppConfig) -> None:
+        """校验入口认证配置，避免未知的 auth 类型或格式错误。"""
+        entrypoints = config.entrypoints_config
+        if not entrypoints:
+            return
+        allowed_auths = {"jwt", "mtls", "static_token", "none"}
+        for name, cfg in entrypoints.items():
+            if not isinstance(cfg, dict):
+                raise ConfigValidationError(f"entrypoints.{name} 必须是对象")
+            auth = cfg.get("auth")
+            if auth is not None and auth not in allowed_auths:
+                raise ConfigValidationError(
+                    f"entrypoints.{name}.auth 必须是 {allowed_auths} 之一，当前值：{auth!r}"
+                )
+            require_auth = cfg.get("require_auth")
+            if require_auth is not None and not isinstance(require_auth, bool):
+                raise ConfigValidationError(
+                    f"entrypoints.{name}.require_auth 必须是布尔值"
+                )
 
     # -- 工具 ---------------------------------------------------------------
 

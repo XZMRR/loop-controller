@@ -1,8 +1,8 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.4.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 策略判定 → 审批 → 授权转发 → 审计"的完整闭环；v0.3.0 引入异步人工审批 CLI 与动态会话上下文，v0.4.0 实现跨 Task Session 风险状态持久化与连续拒绝熔断。
+企业级 AI Agent 治理层（v0.20.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 策略判定 → 审批 → 授权转发 → 审计"的完整闭环；v0.20.0 重点实现可信身份控制平面与可插拔执行器抽象基座。
 
-**核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为 MCP Client Policy Gateway，是所有工具调用的**唯一授权出口**。
+**核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为工具调用治理控制平面，是所有经治理工具调用的**唯一授权出口**。
 
 ## 特性
 
@@ -16,6 +16,9 @@
 - **动态会话上下文**：`ConversationContext` 保存当前 Task 的用户/Agent 多轮消息，`build_governance_context` 确定性拼装进 R2 input，让策略看到完整意图；
 - **ask_user 暂停态**：Planner 可返回 `UserQuestion`，`run_task` 返回 `needs_user_input`，外部补充输入后 `resume_task` 继续执行；
 - **预算控制**：按工具计费的 token 预算，超支即拒。
+- **可信身份控制平面**（v0.20.0）：Agent 身份由 JWT / mTLS / 静态 token 验证，`agent_id` 从凭证推导，不可伪造；
+- **可插拔执行器抽象**（v0.20.0）：`ExecutorRegistry` + `ToolExecutor` 让 MCP / HTTP / 本地函数 / 沙箱执行器可统一接入；
+- **网络级治理入口**（v0.20.0）：HTTP、gRPC、MCP Proxy 作为生产入口，Agent 不直接持有工具凭证。
 
 ## 架构
 
@@ -26,11 +29,23 @@ User → R1 Agent（规划 + 轻量分类器自检）
 R2 Checkpoint（身份校验 → 防重放 → Profile → 预算 → 组合规则 → OPA/Rego）
          │  Decision: allow / deny / modify / require_approval
          ▼
-MCPGateway ──→ MCP Servers（filesystem / email mock / ...）
-         
+ExecutorRegistry ──→ MCPExecutor ──→ MCPGateway ──→ MCP Servers
+                                  └─→ HTTP Executor（v0.21+）
+                                  └─→ Sandboxed Executor（v0.23+）
+
 R3 AuditStore：异步全量记录 + 哈希链 + 分级掩码（只读，无指令下发权）
 R0 AsyncApprovalManager：异步审批请求持久化，审批人通过 `lc` CLI 写入结果
 ```
+
+## 接入形态（v0.20.0）
+
+| 形态 | 定位 | 生产可用性 | 说明 |
+|---|---|---|---|
+| **HTTP 服务** | 生产主推入口 | 是 | Agent 通过 REST API 调用，支持 JWT 认证 |
+| **gRPC 服务** | 生产主推入口（内部服务间） | 是 | 强类型、高性能，支持 mTLS |
+| **MCP Proxy** | 兼容入口（外部标准 MCP Client） | 是 | 对 Agent 透明，生产推荐 SSE + mTLS |
+| **Python SDK / ToolGovernor** | 内部开发/可信 Agent | 协作式 | 同进程，不承诺实时阻断 |
+| **Framework Adapters** | 迁移示例 | 否 | 已移出核心包，见 `examples/contrib/adapters/` |
 
 ## 快速开始
 
@@ -71,6 +86,15 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
            cfg = ConfigLoader().load('config'); \
            key = ConfigLoader.resolve_audit_key(cfg); \
            print(JsonlAuditStore(cfg.audit_log_path, hash_algo='hmac-sha256', hmac_key=key).verify_chain())"
+
+# 8. 启动 HTTP 服务（生产入口）
+# lc server --config-dir config --port 8080
+#
+# 调用示例（需先在 config/identity.yaml 配置静态 token 或 JWT）：
+# curl -H "Authorization: Bearer <token>" \
+#      -H "Content-Type: application/json" \
+#      -d '{"tool_name":"web_search","arguments":{"query":"AI"}}' \
+#      http://localhost:8080/v1/govern/tool-call
 ```
 
 会话上下文持久化路径默认是 `./data/conversations.jsonl`，审批请求/结果持久化路径默认是 `./data/approvals.jsonl`，可在 `config/` 下新增 `conversation.yaml` / `approval_store.yaml`（或环境变量 `LOOP_CONTROLLER_CONVERSATION_PATH` / `LOOP_CONTROLLER_APPROVAL_STORE_PATH`）覆盖；Planner 通过 `UserQuestion` 请求用户补充后，外部调用方写入 `runtime.add_user_message(...)` 并调用 `resume_task` 继续。
@@ -81,22 +105,25 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 
 | 文件 | 作用 |
 |---|---|
-| `agents.yaml` / `users.yaml` | Agent 身份与 Profile 绑定、用户名录 |
+| `agents.yaml` | Agent 身份、Profile 绑定、外部身份元数据 |
 | `profiles.yaml` | CapabilityProfile：工具白名单、参数白名单、调用上限、预算 |
 | `mcp_servers.yaml` | MCP server 连接、工具映射、`cost_per_call` |
 | `permission_rules.yaml` | 权限组合规则（deny / require_approval） |
 | `masking_rules.yaml` | 审计/审批的分级掩码规则 |
 | `approval.yaml` | 审批人默认与规则（用于确定 escalation_target） |
+| `identity.yaml` | 身份 Provider 配置（static / jwt / mtls） |
+| `entrypoints.yaml` | HTTP/gRPC/MCP Proxy 入口认证方式与开关 |
 | `policies/default.rego` | 主策略（Rego v1） |
 
 ## 已知局限
 
-**本项目当前为 v0.3.0-iteration5，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链需配合 seal/WORM、HMAC-SHA256 为默认、单进程 asyncio 假设、外部 Agent 直接接入尚不支持。
+**本项目当前为 v0.20.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链需配合 seal/WORM、HMAC-SHA256 为默认、单进程 asyncio 假设、同进程 SDK/Adapter 不承诺实时阻断、v0.20.0 仅支持 MCP 工具执行。
 
 ## 文档
 
 ### 当前有效
 
+- `loop_controller_v0.20.0_development.md`——v0.20.0 可信身份控制平面与执行器抽象基座
 - `Loop_Controller_下一阶段开发方案_v0.3.0.md`——v0.3.0 开发方案与 Iteration 4/5 验收标准
 - `loop_controller_v0.4.0_development.md`——v0.4.0 跨 Task Session 风险状态持久化方案
 - `loop_controller_v0.5.0_development.md`——v0.5.0 MCP Proxy / 外来 Agent 接入方案
@@ -113,6 +140,7 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `history/Loop_Controller方案_v1.2增补.md`——v1.2 能力增补方案
 - `history/LLMPlanner设计补充_v1.0.md`——v1.0 LLMPlanner 设计补充
 - `history/ask.md`——v0.3.0 前规划问题清单
+- `history/Loop_Controller_MVP_LangChain_Agent_示例_v1.0.md`——LangChain Agent 示例
 - `history/discussion_summary_for_planning_agent.md`——代码/规划 agent 讨论摘要
 
 ## 许可与边界

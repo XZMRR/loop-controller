@@ -1348,3 +1348,294 @@
 ### 设计文档
 
 - `src/loop_controller_v0.19.0_development.md`
+
+---
+
+## v0.20.0：可信身份控制平面与执行器抽象基座
+
+### 完成内容
+
+- **接入形态收敛**：
+  - 核心包只保留三种官方形态：HTTP 服务、gRPC 服务、MCP Proxy；
+  - `Framework Adapters`（LangChain / OpenAI Agents / AutoGen）从 `src/loop_controller/adapters/` 移出到 `examples/contrib/adapters/`，仅作为迁移示例；
+  - `pyproject.toml` 移除 `[langchain]`、`[openai-agents]`、`[autogen]`、`[all-adapters]` 可选依赖；
+  - `Python SDK / ToolGovernor` 保留但明确为"内部开发/可信 Agent"使用，不承诺工具级实时阻断。
+
+- **可信身份控制平面**：
+  - 新建 `src/loop_controller/identity/` 包：
+    - `models.py`：`AgentIdentity`、`IdentityCredential`；
+    - `provider.py`：`IdentityProvider` 协议（verify + get_agent + get_user）；
+    - `static.py`：`ConfigIdentityProvider` 静态 token 验证（仅开发/测试）；
+    - `jwt.py`：`JWTIdentityProvider` 支持 RS256 / JWKS；
+    - `mtls.py`：`MTLSIdentityProvider` 支持证书 CN/SAN 模板映射与显式映射表。
+  - `src/loop_controller/infra/identity.py` 改为兼容层，重新导出新包符号。
+  - `ConfigLoader` 加载 `config/identity.yaml` 与 `config/entrypoints.yaml`；
+  - `build_runtime()` 根据 `identity_config.provider` 自动构造对应 Provider。
+
+- **入口身份认证**：
+  - `server.py`：HTTP `/v1/govern/tool-call` 等端点默认要求 `Authorization: Bearer <jwt>`，从凭证推导 `agent_id` / `user_id`；请求体中的字段仅做一致性校验；Admin 端点保留 API key；
+  - `grpc_server.py`：支持 mTLS，从客户端证书提取身份并校验；
+  - `proxy_server.py`：stdio 模式支持 `--identity-token`（生产禁用），SSE 模式支持 mTLS 与证书头提取；
+  - `cli.py`：新增 `lc proxy` 身份参数与 `lc server` / `lc grpc-server` 认证开关。
+
+- **可插拔执行器抽象**：
+  - 新建 `src/loop_controller/executors/` 包：
+    - `base.py`：`ToolExecutor` 协议、`ExecutionContext`、`ExecutorRegistry`；
+    - `mcp_executor.py`：`MCPExecutor` 转发到 `MCPGateway`。
+  - `Checkpoint.forward()` 改为从 `ExecutorRegistry` 获取执行器并调用 `execute()`；
+  - `build_runtime()` 为每个 `tool_mapping` 注册 `MCPExecutor`；
+  - 保留 `gateway` 参数向后兼容：未传 `executor_registry` 时自动构造默认 `MCPExecutor`。
+
+- **配置与文档**：
+  - 新增 `config/identity.yaml`、`config/entrypoints.yaml`；
+  - 更新 `config/agents.yaml` 增加 `identity` 字段；
+  - `Agent` 模型新增 `identity: dict[str, Any] | None`；
+  - 更新 `src/README.md`、`src/KNOWN_LIMITATIONS.md`；
+  - 新增 `src/loop_controller_v0.20.0_development.md`。
+
+- **依赖**：
+  - 核心依赖增加 `pyjwt[crypto]>=2.8`。
+
+### 关键决策
+
+- **v0.20.0 MCP-only 是阶段性边界**：`ToolExecutor` / `ExecutorRegistry` 抽象为 HTTP / 本地函数 / 沙箱执行器预留接口，但 v0.20.0 只实现 `MCPExecutor`；
+- **身份认证不是可选项**：生产入口默认要求认证，开发环境可降级为 static；
+- **agent_id 从凭证推导**：请求体中的 `agent_id` 不再作为权威来源；
+- **stdio 模式 MCP Proxy 不用于生产**：因为 Agent 进程可能读取环境变量中的 token；
+- **同进程 SDK/Adapter 不承诺实时阻断**：明确写入 KNOWN_LIMITATIONS。
+
+### 设计文档
+
+- `src/loop_controller_v0.20.0_development.md`
+
+---
+
+## v0.21.0：HTTP Executor —— 原生 REST API 工具治理
+
+### 完成内容
+
+- **HTTP 执行器实现**：
+  - 新建 `src/loop_controller/executors/http_models.py`：
+    - `HTTPToolSpec`：声明式 HTTP 工具规格（base_url、method、path、headers、body_template、auth、response_mapping、allowed_hosts、timeout、retry 等）；
+    - `HTTPAuthConfig`：支持 `none` / `bearer_token` / `api_key_header` / `api_key_query` / `basic` / `mtls`，并为 Secret Broker 预留 `secret_ref`；
+    - `HTTPResponseMapping`：成功状态码、JSONPath 提取字段、错误码映射；
+    - `resolve_env_refs()`：递归解析配置中的 `${ENV_NAME}` 引用。
+  - 新建 `src/loop_controller/executors/http_security.py`：
+    - `HTTPSecurityPolicy`：默认禁止本地/私有地址访问；支持 `allowed_hosts` 精确/通配符白名单；可选 DNS 解析后二次校验。
+  - 新建 `src/loop_controller/executors/http_client.py`：
+    - `HTTPClient`：受控 `httpx.AsyncClient`，统一超时、连接池、手动处理重定向以校验中间 URL、限制响应体大小。
+  - 新建 `src/loop_controller/executors/http_executor.py`：
+    - `HTTPExecutor` 实现 `ToolExecutor`，渲染模板 → 安全校验 → 发送请求 → 响应映射 → 返回 `ToolResult`。
+
+- **Runtime 与配置集成**：
+  - `ConfigLoader` 扩展 `tool_mapping` 支持 `type: http`，解析并构造 `HTTPToolSpec`；
+  - `AppConfig` 新增 `http_tool_specs`；启动校验工具名同时检查 MCP 与 HTTP 工具；
+  - `build_runtime()` 创建 `HTTPClient` 与 `HTTPExecutor`，为每个 HTTP 工具注册到 `ExecutorRegistry`；
+  - `Runtime` 新增 `http_client` 与 `http_tool_names`；`start()`/`aclose()` 管理 HTTP client 生命周期；
+  - `build_runtime()` 的 `tool_costs` 合并 MCP 与 HTTP 工具成本。
+
+- **治理链路增强**：
+  - `LoopController._evaluate_proposal()` 对 HTTP 工具默认风险等级提升一级（low→medium→high→critical）。
+
+- **可观测与审计**：
+  - HTTP 工具返回的 `ToolResult` 包含 `elapsed_ms`、`error_code`（如 `http_timeout`、`http_security_blocked`、`http_unauthorized` 等）；
+  - 成功响应支持 JSONPath 字段提取，失败响应按 `error_codes` 或默认规则映射。
+
+- **测试与文档**：
+  - 新增 `tests/test_http_executor.py`、`tests/test_http_security.py`；
+  - 扩展 `tests/test_executor_registry.py` 覆盖 MCP + HTTP 多执行器并存分发；
+  - 更新 `src/KNOWN_LIMITATIONS.md` 与 `src/development_log.md`。
+
+### 关键决策
+
+- **配置即工具**：HTTP 工具通过 `config/mcp_servers.yaml` 的 `tool_mapping` 中 `type: http` 声明，不强制写代码；v0.22 再考虑拆分为独立 `config/tools.yaml`。
+- **凭证不落地配置**：敏感值使用 `${ENV}` 引用；未解析时 `resolve_env_refs()` 抛 `ValueError`，`ConfigLoader` 启动拒绝（fail-closed）。
+- **默认 fail-closed 安全**：HTTP 工具默认 `default_risk=high`；`HTTPSecurityPolicy` 默认禁止本地/内网地址；`allowed_hosts` 未设置时自动从 `base_url` 推导。
+- **零侵入执行器抽象**：`Checkpoint.forward()` 不感知执行器类型；HTTP Executor 仅扩展 `ExecutorRegistry` 注册。
+- **不引入 jsonpath-ng**：v0.21.0 用极简 `$.a.b[0].c` 解析器覆盖常见场景，避免新增依赖。
+
+### 验收状态
+
+- `pytest tests/`：**361 passed, 2 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success**
+
+### 设计文档
+
+- `src/loop_controller_v0.21.0_development.md`
+
+---
+
+## v0.22.0：Secret Broker 与 HTTP 工具热更新
+
+### 完成内容
+
+- **Secret Broker 统一凭证管理**：
+  - 新建 `src/loop_controller/secrets/` 包：
+    - `models.py`：`SecretScope`、`SecretValue`、`SecretRef`；
+    - `broker.py`：`SecretBroker` Protocol；
+    - `exceptions.py`：`SecretError`、`SecretNotFoundError`；
+    - `file_backend.py`：`FileSecretBackend` 按 `secrets/global/{name}.json` 与 `secrets/tenants/{tenant_id}/{name}.json` 分层加载，支持 key 提取、版本匹配、过期检查、文件权限校验；
+    - `memory_backend.py`：`MemorySecretBackend` 供测试与本地开发使用。
+  - Secret 查找顺序：优先 tenant 命名空间，未命中 fallback 到 global；`SecretRef.key` 支持从 JSON 对象 secret 中提取字段。
+
+- **HTTP 工具与 Secret Broker 集成**：
+  - `HTTPAuthConfig.secret_ref` 改为 `SecretRef` 类型；保留 `token` / `username` / `password` 直接值作为向后兼容，`secret_ref` 优先；
+  - `HTTPToolSpec.build_request()` 改为 async，注入 `secret_broker` 与 `tenant_id` 运行时解析凭证；
+  - `HTTPExecutor` 构造时接收 `secret_broker`，执行时传入 `context.tenant_id`；
+  - secret 缺失/过期时返回 `http_auth_error`，阻止调用。
+
+- **HTTP 工具配置独立与热更新**：
+  - `ConfigLoader` 新增 `config/http_tools.yaml` 独立加载，同时兼容 `mcp_servers.yaml` 中的 `type: http` 条目；
+  - 新增 `config/secrets.yaml` 加载 Secret Broker 后端配置，缺失时默认使用 `secrets/` 文件后端；
+  - 新增 `ConfigLoader.reload_http_tools()` / `reload_secrets_config()` 热更新方法；
+  - 新建 `src/loop_controller/infra/hot_reload.py`：`HotReloader` 使用 asyncio 轮询监控 `http_tools.yaml`、`secrets.yaml` 与 `secrets/` 下 JSON 文件；更新失败保留旧配置并记录告警。
+
+- **多租户隔离基础**：
+  - `Agent` / `Task` / `ExecutionContext` 新增可选 `tenant_id`；
+  - `Checkpoint.forward()` 接收 `tenant_id` 并传入执行器上下文；
+  - `controller.py` 与 `proxy_server.py` 调用处透传 `task.tenant_id`。
+
+- **Runtime 集成**：
+  - `build_runtime()` 根据 `config.secrets_config` 构造 `SecretBroker`（支持 `file` / `memory` 后端）；
+  - `HTTPExecutor` 注入 `secret_broker`；
+  - `Runtime` 新增 `secret_broker` 与 `hot_reloader`；`start()` 启动热更新轮询，`aclose()` 停止。
+
+- **测试与文档**：
+  - 新增 `tests/test_secret_broker.py`、`tests/test_hot_reload.py`；
+  - 扩展 `tests/test_http_executor.py` 覆盖 bearer/basic secret、tenant 查找、secret 缺失等场景；
+  - 更新 `src/KNOWN_LIMITATIONS.md` 与 `src/development_log.md`。
+
+### 关键决策
+
+- **Secret 不落地配置文件**：HTTP 工具配置中只保留 `secret_ref`，真实 secret 由 `SecretBroker` 运行期注入；
+- **热更新 fail-closed**：配置更新失败保留旧配置，不中断正在执行的请求；
+- **最小权限**：`FileSecretBackend` 在 Unix 上拒绝 world-readable secret 文件；Windows 依赖 ACL，不做 POSIX 权限检查；
+- **向后兼容**：v0.21.0 的 `${ENV}` 环境变量引用继续支持，但标记为 deprecated；MCP 工具与原有配置不受影响；
+- **热更新范围**：仅 HTTP 工具规格与 secret 文件；MCP server、Profile、Policy 仍建议重启。
+
+### 验收状态
+
+- `pytest tests/`：**381 passed, 3 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+---
+
+## v0.23.0：Sandboxed Local Function Executor
+
+### 完成内容
+
+- **本地函数执行器**：
+  - 新建 `src/loop_controller/executors/local_function_models.py`：
+    - `LocalFunctionSandboxConfig`：超时、最大输出字节、路径白名单、环境变量白名单；
+    - `LocalFunctionSpec`：声明式函数规格（`module:function`、描述、输入 schema、默认风险、成本）。
+  - 新建 `src/loop_controller/executors/local_function_runner.py`：
+    - 子进程入口，从 stdin 读取 JSON，导入目标函数并执行；
+    - 包装 `builtins.open()` 限制文件访问路径；
+    - 支持同步/异步函数；异常返回结构化错误码。
+  - 新建 `src/loop_controller/executors/local_function_executor.py`：
+    - `LocalFunctionExecutor` 实现 `ToolExecutor`；
+    - 每个调用启动独立 Python 子进程，通过 stdin/stdout JSON 通信；
+    - 支持超时 kill、返回码/输出校验、错误码映射。
+
+- **Runtime 与配置集成**：
+  - `ConfigLoader` 新增 `config/local_functions.yaml` 加载；
+  - `AppConfig` 新增 `local_function_specs`；
+  - 启动校验 `_check_tool_mapping()` 把本地函数纳入可用工具集合；
+  - `build_runtime()` 创建 `LocalFunctionExecutor` 并注册到 `ExecutorRegistry`；
+  - `tool_costs` 合并本地函数 `cost_per_call`。
+
+- **配置示例**：
+  - 新增 `config/local_functions.yaml`，展示 `calculate_checksum` / `transform_data` 注册方式。
+
+- **Bug 修复与工程**：
+  - 修复 Windows 子进程因缺失 `APPDATA` / `PATH` / `SYSTEMROOT` 等系统变量导致 `httpx` 导入失败的问题；
+    - 未配置 `env_whitelist` 时继承当前完整环境并修正 `PYTHONPATH`；
+    - 配置 `env_whitelist` 时保留白名单变量 + 必要系统变量。
+  - 修复 `LocalFunctionExecutor._build_env()` 变量重定义导致的 mypy 错误；
+  - 修复 `asyncio.TimeoutError` / `hot_reload.py` 中同类型 ruff 告警；
+  - 清理 `tests/test_secret_broker.py` 未使用导入。
+
+### 关键决策
+
+- **粗粒度子进程沙箱**：v0.23.0 用子进程隔离作为最小可行沙箱，不引入 AST 白名单、RestrictedPython 或容器；高危函数仍应交部署层隔离。
+- **函数代码不热更新**：函数实现文件变更会随子进程重新导入生效，但工具注册增删改需要主进程重启。
+- **JSON 通信**：参数与结果全部走 JSON，保证简单、可审计、与 HTTP/MCP 工具结果格式一致。
+- **环境变量白名单语义调整**：开发文档原意是“仅保留白名单变量”，但实际实现发现 Windows 等平台需要保留系统变量才能启动 Python；因此调整为“白名单变量 + 系统必要变量”。
+
+### 验收状态
+
+- `pytest tests/`：**389 passed, 3 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.23.0_development.md`
+
+---
+
+## v0.23.1：代码审计修复（P0/P1/P2）
+
+### 完成内容
+
+基于 `src/audit_report.md` 逐条确认并修复 v0.20.0–v0.23.0 中的安全与健壮性问题：
+
+- **身份认证（P0/P1）**：
+  - 修复 `JWTIdentityProvider` JWKS 模式：缓存 `PyJWKClient` 并通过 `get_signing_key_from_jwt(token)` 获取真实公钥；
+  - 修复 `grpc_server.py` 多个端点绕过认证：`ResumeAfterApproval`、`WaitForApproval`、`ListPendingApprovals`、`QueryAuditEvents` 统一调用 `_require_identity`；
+  - 修复 gRPC mTLS 静默降级：`require_client_cert=True` 时强制要求服务端证书与 `client_ca_cert`，否则启动失败；
+  - 修复 `MCPProxyServer` SSE header 伪造身份：仅当配置了 client mTLS 且请求为 HTTPS 时才信任 `x-ssl-client-cn/san`；
+  - 修复 `ConfigIdentityProvider.default_ttl_seconds` 未生效问题：`AgentIdentity.expires_at` 现在按 `default_ttl` 计算；
+  - 修复 `MTLSIdentityProvider` 模板正则未锚定：改为非贪婪匹配并在末尾强制 `\Z`，防止后缀被吞入最后一个字段；
+  - 修复 `server.py` 空字符串 API key 绕过：空字符串 key 不再等同于未配置，未提供有效 key 的请求将被拒绝。
+
+- **HTTP 执行器安全（P0/P1）**：
+  - 修复 `HTTPSecurityPolicy` 默认关闭 DNS 解析校验：`require_dns_resolution` 默认 `True`；`localhost` 匹配锚定为 `^localhost$`；
+  - 修复 `HTTPClient` 响应体 OOM：通过 `aiter_bytes()` 流式读取并截断，先检查 `Content-Length` 再读取；
+  - 修复 `HTTPToolSpec.build_request` 空认证值绕过：bearer/api_key/basic 密码为空字符串时抛出 `SecretNotFoundError`；
+  - 修复 `HTTPToolSpec.require_dns_resolution` 开关未透传到执行器的问题。
+
+- **本地函数沙箱（P0/P1）**：
+  - 修复 `local_function_runner.py` 仅 hook `builtins.open` 的绕过：新增 `os.open` hook；
+  - 修复 `LocalFunctionExecutor` 子进程输出 OOM：`_communicate_with_limit` 流式读取 stdout/stderr，超限时 kill 子进程并返回 `local_function_output_too_large`；
+  - 修复 `LocalFunctionExecutor` 环境变量注入过宽：`_build_env` 仅保留系统必要变量 + 白名单变量 + `PYTHONPATH`；
+  - 修复 `LocalFunctionExecutor.execute` docstring 与 HTTPExecutor 复制不一致。
+
+- **热更新与 Runtime 状态（P0）**：
+  - 修复 `HotReloader` secrets 目录写死：从 `SecretBroker.base_path` 推导；
+  - 修复 `http_tool_names` 热更新不同步：`Runtime` 与 `HotReloader` 共享可变集合；
+  - 清理 `FileSecretBackend._last_load` 死存储。
+
+- **配置校验（P1）**：
+  - `ConfigLoader` 新增 `_check_identity_config` 与 `_check_entrypoints_config`，启动期校验 provider 取值、JWT 配置完整性、mTLS 模板/映射、entrypoints 的 auth 与 require_auth。
+
+- **MCP 治理上下文透传（P1）**：
+  - `MCPExecutor` 将 `agent_id/user_id/session_id/tenant_id` 透传至 `MCPGateway.call_tool`；
+  - `MCPGateway.call_tool` 接收并记录这些字段。
+
+- **CLI 安全（P1）**：
+  - 修复 `lc proxy --identity-token` 敏感 token 泄露：移除 `--identity-token` 参数，stdio 模式 token 仅通过 `LOOP_CONTROLLER_IDENTITY_TOKEN` 环境变量读取。
+
+- **执行器注册协议校验（P2）**：
+  - `ExecutorRegistry.register` / `set_default` 校验对象是否符合 `ToolExecutor` 协议，不符合抛出 `TypeError`。
+
+- **依赖与测试**：
+  - 将 `mcp` 固定为 `<2.0`，避免 mcp 2.0 的破坏性 API 变更导致现有 mock server 无法启动；
+  - `email_server.py` 兼容 mcp>=1.0（FastMCP）与 mcp>=2.0（MCPServer）两种 API，降低未来升级风险。
+
+### 关键决策
+
+- **审计优先**：先确认漏洞真实存在再修复，避免误报；所有 P0/P1 问题均补充回归测试；
+- **环境变量 > 命令行参数**：敏感 token 不再通过 CLI 暴露；
+- **最小权限原则**：本地函数沙箱只保留必要环境变量，HTTP 认证拒绝空字符串；
+- **Fail-Close**：gRPC mTLS、HTTP 响应体、本地函数输出超限等场景在异常时直接拒绝而不是降级。
+
+### 验收状态
+
+- `pytest tests/`：**433 passed, 1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+---

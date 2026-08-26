@@ -11,6 +11,7 @@ import pytest
 
 pytest.importorskip("grpc")
 
+import grpc
 from grpc import aio as grpc_aio
 
 from loop_controller.controller import LoopController
@@ -230,3 +231,91 @@ async def test_query_audit_events(grpc_client) -> None:
         events.append(event)
     assert len(events) == 1
     assert "s-1" in events[0].payload_json
+
+
+@pytest.fixture
+async def grpc_client_require_auth():
+    """require_auth=true 但无 mTLS 凭证的 in-process gRPC server。"""
+    controller = _MockController()
+    controller._runtime = _MockRuntime()
+    controller.started = True
+    server = grpc_aio.server()
+    servicer = ToolGovernanceServicer(
+        controller, entrypoints_config={"grpc": {"require_auth": True}}
+    )
+    add_servicer_to_server(servicer, server)
+    port = server.add_insecure_port("localhost:0")
+    await server.start()
+    client = ToolGovernanceClient(f"localhost:{port}")
+    try:
+        yield client, controller
+    finally:
+        await client.close()
+        await server.stop(None)
+
+
+@pytest.mark.asyncio
+async def test_require_auth_evaluate_rejects_unauthenticated(
+    grpc_client_require_auth,
+) -> None:
+    client, _controller = grpc_client_require_auth
+    with pytest.raises(grpc_aio.AioRpcError) as exc_info:
+        await client.evaluate_tool_call(
+            agent_id="researcher_001",
+            user_id="alice",
+            tool_name="send_email",
+            arguments={},
+        )
+    assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
+@pytest.mark.asyncio
+async def test_require_auth_resume_rejects_unauthenticated(
+    grpc_client_require_auth,
+) -> None:
+    client, _controller = grpc_client_require_auth
+    with pytest.raises(grpc_aio.AioRpcError) as exc_info:
+        await client.resume_after_approval("req-1")
+    assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
+@pytest.mark.asyncio
+async def test_require_auth_wait_rejects_unauthenticated(
+    grpc_client_require_auth,
+) -> None:
+    client, _controller = grpc_client_require_auth
+    with pytest.raises(grpc_aio.AioRpcError) as exc_info:
+        async for _ in client.wait_for_approval("req-1", max_wait_seconds=1):
+            pass
+    assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
+@pytest.mark.asyncio
+async def test_require_auth_list_pending_rejects_unauthenticated(
+    grpc_client_require_auth,
+) -> None:
+    client, _controller = grpc_client_require_auth
+    with pytest.raises(grpc_aio.AioRpcError) as exc_info:
+        await client.list_pending_approvals()
+    assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
+@pytest.mark.asyncio
+async def test_require_auth_query_audit_rejects_unauthenticated(
+    grpc_client_require_auth,
+) -> None:
+    client, _controller = grpc_client_require_auth
+    with pytest.raises(grpc_aio.AioRpcError) as exc_info:
+        async for _ in client.query_audit_events(limit=10):
+            pass
+    assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
+@pytest.mark.asyncio
+async def test_require_auth_get_health_allows_unauthenticated(
+    grpc_client_require_auth,
+) -> None:
+    """health 检查保持公开。"""
+    client, _controller = grpc_client_require_auth
+    response = await client.get_health()
+    assert response.status == "ok"

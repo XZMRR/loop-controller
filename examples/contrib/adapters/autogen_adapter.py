@@ -1,13 +1,14 @@
-"""AutoGen 适配器：把 Loop Controller 包装成 AutoGen Agent 可调用的工具（v0.15.0）。
+"""AutoGen 适配器示例：把 Loop Controller 包装成 AutoGen Agent 可调用的工具（v0.15.0）。
 
-本模块属于框架扩展，需要额外安装 ``autogen-agentchat``：
+本模块已从 Loop Controller 核心包移出，仅作为示例和迁移便利。
+需要额外安装 ``autogen-agentchat``：
 
-    uv pip install "loop-controller[autogen]"
+    uv pip install autogen-agentchat
 
 使用方式：
 
     from autogen_agentchat.agents import AssistantAgent
-    from loop_controller.adapters.autogen import govern_tool
+    from autogen_adapter import govern_tool
     from loop_controller.controller import build_controller
 
     controller = await build_controller(config)

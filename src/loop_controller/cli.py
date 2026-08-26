@@ -17,6 +17,9 @@ Proxy 入口（v0.5.0）：
 
     lc proxy --agent-id <id> --user-id <id> [--transport stdio|sse] [--port 8080]
 
+stdio 模式的身份 token 仅通过环境变量 LOOP_CONTROLLER_IDENTITY_TOKEN 读取，
+不再提供 --identity-token 参数，避免敏感 token 进入 shell history / ps 列表。
+
 HTTP 服务入口（v0.17.0）：
 
     lc server [--host 127.0.0.1] [--port 8080] [--opa-url http://127.0.0.1:8181]
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from datetime import UTC, datetime
 
@@ -106,6 +110,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     proxy.add_argument("--host", default="127.0.0.1", help="SSE 模式 host（默认 127.0.0.1）")
     proxy.add_argument("--port", type=int, default=8080, help="SSE 模式端口（默认 8080）")
+    proxy.add_argument(
+        "--identity-cert",
+        default=None,
+        help="SSE 模式服务器 TLS 证书路径",
+    )
+    proxy.add_argument(
+        "--identity-key",
+        default=None,
+        help="SSE 模式服务器 TLS 私钥路径",
+    )
+    proxy.add_argument(
+        "--client-ca-cert",
+        default=None,
+        help="SSE 模式要求客户端 mTLS 的 CA 证书路径",
+    )
 
     server = subparsers.add_parser("server", help="启动 HTTP 治理服务（v0.17.0）")
     server.add_argument("--host", default="127.0.0.1", help="监听 host（默认 127.0.0.1）")
@@ -115,6 +134,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default="http://127.0.0.1:8181",
         help="OPA 服务地址（默认 http://127.0.0.1:8181）",
     )
+    server.add_argument(
+        "--require-auth",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 entrypoints.http.require_auth",
+    )
 
     grpc_server = subparsers.add_parser("grpc-server", help="启动 gRPC 治理服务（v0.19.0）")
     grpc_server.add_argument("--port", type=int, default=50051, help="监听端口（默认 50051）")
@@ -122,6 +147,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "--opa-url",
         default="http://127.0.0.1:8181",
         help="OPA 服务地址（默认 http://127.0.0.1:8181）",
+    )
+    grpc_server.add_argument(
+        "--require-auth",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 entrypoints.grpc.require_auth",
+    )
+    grpc_server.add_argument(
+        "--key",
+        default=None,
+        help="gRPC 服务端 TLS 私钥路径",
+    )
+    grpc_server.add_argument(
+        "--cert",
+        default=None,
+        help="gRPC 服务端 TLS 证书路径",
+    )
+    grpc_server.add_argument(
+        "--client-ca",
+        default=None,
+        help="gRPC 客户端 mTLS CA 证书路径",
     )
 
     return parser
@@ -264,6 +310,11 @@ def _cmd_proxy(config: AppConfig, args: argparse.Namespace) -> int:
                     user_id=args.user_id,
                     session_id=args.session_id,
                 ),
+                identity_token=os.environ.get("LOOP_CONTROLLER_IDENTITY_TOKEN"),
+                identity_cert=args.identity_cert,
+                identity_key=args.identity_key,
+                client_ca_cert=args.client_ca_cert,
+                entrypoints_config=config.entrypoints_config,
             )
             if args.transport == "stdio":
                 await proxy.run_stdio()
@@ -295,8 +346,18 @@ def _cmd_server(config_dir: str, args: argparse.Namespace) -> int:
 
     async def run() -> None:
         config = ConfigLoader().load(config_dir, opa_base_url=args.opa_url)
+        entrypoints_config = config.entrypoints_config
+        if args.require_auth is not None:
+            entrypoints_config = dict(entrypoints_config)
+            http_cfg = dict(entrypoints_config.get("http") or {})
+            http_cfg["require_auth"] = args.require_auth
+            entrypoints_config["http"] = http_cfg
         controller = await build_controller(config, opa_url=args.opa_url)
-        app = build_app(controller, api_key=load_api_key())
+        app = build_app(
+            controller,
+            api_key=load_api_key(),
+            entrypoints_config=entrypoints_config,
+        )
         server = uvicorn.Server(
             uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
         )
@@ -320,8 +381,22 @@ def _cmd_grpc_server(config_dir: str, args: argparse.Namespace) -> int:
 
     async def run() -> None:
         config = ConfigLoader().load(config_dir, opa_base_url=args.opa_url)
+        entrypoints_config = config.entrypoints_config
+        if args.require_auth is not None:
+            entrypoints_config = dict(entrypoints_config)
+            grpc_cfg = dict(entrypoints_config.get("grpc") or {})
+            grpc_cfg["require_auth"] = args.require_auth
+            entrypoints_config["grpc"] = grpc_cfg
         controller = await build_controller(config, opa_url=args.opa_url)
-        server = await serve(controller, port=args.port)
+        server = await serve(
+            controller,
+            port=args.port,
+            entrypoints_config=entrypoints_config,
+            server_key=args.key,
+            server_cert=args.cert,
+            client_ca_cert=args.client_ca,
+            require_client_cert=args.client_ca is not None,
+        )
         await server.wait_for_termination()
 
     asyncio.run(run())

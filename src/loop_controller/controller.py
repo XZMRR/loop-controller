@@ -101,6 +101,16 @@ class LoopController:
     def __init__(self, runtime: Runtime) -> None:
         self._runtime = runtime
 
+    @staticmethod
+    def _bump_risk_signal(signal: RiskSignal) -> RiskSignal:
+        """v0.21.0：HTTP 工具风险等级提升一级。"""
+        order: list[str] = ["low", "medium", "high", "critical"]
+        current = signal.risk_level
+        if current in order and current != "critical":
+            idx = order.index(current)
+            return signal.model_copy(update={"risk_level": order[idx + 1]})
+        return signal
+
     async def start(self) -> None:
         """拉起 MCP gateway 等异步初始化。"""
         await self._runtime.start()
@@ -148,6 +158,9 @@ class LoopController:
 
         # R1 轻量分类
         signal = self._runtime.classifier.classify(task, agent, proposal, profile)
+        # v0.21.0：HTTP 工具默认风险提升一级
+        if proposal.tool_name in self._runtime.http_tool_names:
+            signal = self._bump_risk_signal(signal)
         proposal = proposal.model_copy(
             update={"risk_level": signal.risk_level, "risk_tags": signal.tags}
         )
@@ -544,7 +557,11 @@ class LoopController:
         session = self._runtime.session_manager.get_session(task.session_id)
         session_id = session.session_id if session is not None else task.session_id
         result = await self._runtime.checkpoint.forward(
-            proposal, decision, session_id=session_id
+            proposal,
+            decision,
+            session_id=session_id,
+            user_id=task.user_id,
+            tenant_id=task.tenant_id,
         )
         self._runtime.audit_store.append(
             _audit_event(

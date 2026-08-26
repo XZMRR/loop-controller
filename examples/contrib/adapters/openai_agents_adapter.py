@@ -1,13 +1,14 @@
-"""OpenAI Agents SDK 适配器：把 Loop Controller 包装成 SDK 工具（v0.15.0）。
+"""OpenAI Agents SDK 适配器示例：把 Loop Controller 包装成 SDK 工具（v0.15.0）。
 
-本模块属于框架扩展，需要额外安装 ``openai-agents``：
+本模块已从 Loop Controller 核心包移出，仅作为示例和迁移便利。
+需要额外安装 ``openai-agents``：
 
-    uv pip install "loop-controller[openai-agents]"
+    uv pip install openai-agents openai
 
 使用方式：
 
     from agents import Agent, Runner
-    from loop_controller.adapters.openai_agents import govern_function_tool
+    from openai_agents_adapter import govern_function_tool
     from loop_controller.controller import build_controller
 
     controller = await build_controller(config)

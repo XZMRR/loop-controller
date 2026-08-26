@@ -5,6 +5,11 @@ agents:
     name: Research Assistant
     profile_id: research_assistant_v1
     owner_id: zhang_manager
+    identity:
+      issuer: https://auth.company.com
+      subject: agent://research-assistant/prod-001
+      # mTLS 场景下证书 CN/SAN 匹配模板（可选）
+      # cert_subject_template: "agent-researcher-prod-{harness_id}"
 
 users:
   - user_id: alice

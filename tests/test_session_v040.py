@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -58,7 +59,12 @@ class FakePolicyEngine:
 
 class FakeGateway:
     async def call_tool(
-        self, tool_name: str, arguments: dict, call_id: str, task_id: str
+        self,
+        tool_name: str,
+        arguments: dict,
+        call_id: str,
+        task_id: str,
+        **kwargs: Any,
     ) -> ToolResult:
         return ToolResult(
             call_id=call_id,

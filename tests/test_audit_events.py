@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -69,7 +70,7 @@ class _FakeGateway(MCPGateway):
     async def list_tools(self, profile):
         return []
 
-    async def call_tool(self, tool_name: str, arguments: dict, call_id: str, task_id: str) -> ToolResult:
+    async def call_tool(self, tool_name: str, arguments: dict, call_id: str, task_id: str, **kwargs: Any) -> ToolResult:
         return ToolResult(
             call_id=call_id,
             task_id=task_id,

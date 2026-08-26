@@ -3,7 +3,7 @@
 被 MCPGateway 以 stdio 子进程拉起。发送记录追加写入 ``data/sent_emails.jsonl``，
 可用环境变量 ``SENT_EMAILS_PATH`` 覆盖路径（供测试注入临时目录）。
 
-使用 ``mcp.server.mcpserver.MCPServer`` 装饰器式 API。
+兼容 mcp>=1.0（FastMCP）与 mcp>=2.0（MCPServer）两种 API。
 """
 
 from __future__ import annotations
@@ -12,18 +12,32 @@ import json
 import os
 from pathlib import Path
 
-from mcp.server.mcpserver import MCPServer  # type: ignore[import-not-found]
+try:
+    from mcp.server.fastmcp import FastMCP  # type: ignore[import-untyped]
+
+    _APP = FastMCP("email_mock")
+    _TOOL_DECORATOR = _APP.tool
+
+    def _run() -> None:  # type: ignore[no-untyped-def]
+        _APP.run()
+
+except ImportError:
+    from mcp.server.mcpserver import MCPServer  # type: ignore[import-not-found]
+
+    _APP = MCPServer("email_mock")
+    _TOOL_DECORATOR = _APP.tool
+
+    def _run() -> None:
+        _APP.run()
 
 _DEFAULT_SENT_PATH = Path(__file__).resolve().parents[3] / "data" / "sent_emails.jsonl"
-
-APP = MCPServer("email_mock")
 
 
 def _sent_path() -> Path:
     return Path(os.environ.get("SENT_EMAILS_PATH", _DEFAULT_SENT_PATH))
 
 
-@APP.tool()
+@_TOOL_DECORATOR()
 def send_email(to: str, subject: str, body: str) -> str:  # noqa: ARG001
     """发送一封报告邮件（Mock：只记录不真发）。"""
     path = _sent_path()
@@ -35,7 +49,7 @@ def send_email(to: str, subject: str, body: str) -> str:  # noqa: ARG001
     return json.dumps({"status": "queued"}, ensure_ascii=False)
 
 
-@APP.tool()
+@_TOOL_DECORATOR()
 def web_search(query: str) -> str:
     """搜索公开资料（Mock：返回固定结果，断网可运行）。"""
     return json.dumps(
@@ -52,4 +66,4 @@ def web_search(query: str) -> str:
 
 
 if __name__ == "__main__":
-    APP.run()
+    _run()

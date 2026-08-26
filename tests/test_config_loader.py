@@ -295,3 +295,73 @@ def test_hmac_sha256_rejects_invalid_encoding(config_dir):
         mp.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", "not-hex-or-base64!!!")
         with pytest.raises(ValueError, match="无法解析"):
             ConfigLoader.resolve_audit_key(config_with_hmac)
+
+
+# 校验 identity/entrypoints 配置
+
+def test_identity_unknown_provider(config_dir):
+    _write_yaml(
+        config_dir / "identity.yaml",
+        {"identity": {"provider": "oauth2"}},
+    )
+    with pytest.raises(ConfigValidationError, match="identity.provider 必须是"):
+        ConfigLoader().load(config_dir)
+
+
+def test_identity_jwt_missing_issuer(config_dir):
+    _write_yaml(
+        config_dir / "identity.yaml",
+        {"identity": {"provider": "jwt", "jwt": {"public_key": "pk"}}},
+    )
+    with pytest.raises(ConfigValidationError, match="jwt.issuer"):
+        ConfigLoader().load(config_dir)
+
+
+def test_identity_jwt_missing_key_source(config_dir):
+    _write_yaml(
+        config_dir / "identity.yaml",
+        {"identity": {"provider": "jwt", "jwt": {"issuer": "https://auth"}}},
+    )
+    with pytest.raises(ConfigValidationError, match="jwks_url 或 jwt.public_key"):
+        ConfigLoader().load(config_dir)
+
+
+def test_identity_mtls_missing_template_or_mappings(config_dir):
+    _write_yaml(
+        config_dir / "identity.yaml",
+        {"identity": {"provider": "mtls", "mtls": {}}},
+    )
+    with pytest.raises(ConfigValidationError, match="mtls.cert_subject_template"):
+        ConfigLoader().load(config_dir)
+
+
+def test_identity_static_missing_fields(config_dir):
+    _write_yaml(
+        config_dir / "identity.yaml",
+        {
+            "identity": {
+                "provider": "static",
+                "static": {"allowed_tokens": [{"token": "t", "agent_id": "a"}]},
+            }
+        },
+    )
+    with pytest.raises(ConfigValidationError, match="缺少或空字段 user_id"):
+        ConfigLoader().load(config_dir)
+
+
+def test_entrypoints_unknown_auth(config_dir):
+    _write_yaml(
+        config_dir / "entrypoints.yaml",
+        {"entrypoints": {"http": {"auth": "basic", "require_auth": True}}},
+    )
+    with pytest.raises(ConfigValidationError, match="entrypoints.http.auth 必须是"):
+        ConfigLoader().load(config_dir)
+
+
+def test_entrypoints_require_auth_not_bool(config_dir):
+    _write_yaml(
+        config_dir / "entrypoints.yaml",
+        {"entrypoints": {"http": {"auth": "jwt", "require_auth": "yes"}}},
+    )
+    with pytest.raises(ConfigValidationError, match="require_auth 必须是布尔值"):
+        ConfigLoader().load(config_dir)

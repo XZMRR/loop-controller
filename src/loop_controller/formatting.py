@@ -1,4 +1,4 @@
-"""适配器共享辅助：把 LoopController 的 GovernanceResult 转成自然语言。"""
+"""治理结果格式化辅助。"""
 
 from __future__ import annotations
 

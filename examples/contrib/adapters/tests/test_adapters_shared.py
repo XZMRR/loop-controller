@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from loop_controller.adapters._shared import format_governance_result
 from loop_controller.models import GovernanceResult
+
+from .._shared import format_governance_result
 
 
 @pytest.mark.parametrize(

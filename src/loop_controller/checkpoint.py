@@ -19,9 +19,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
 
 from loop_controller.authority import AuthorityManager, NoopAuthorityManager
+from loop_controller.executors.base import ExecutionContext, ExecutorRegistry
+from loop_controller.executors.mcp_executor import MCPExecutor
 from loop_controller.governance_context import build_context_meta, build_governance_context
+from loop_controller.identity import IdentityProvider
 from loop_controller.infra.config_loader import PermissionRule
-from loop_controller.infra.identity import IdentityProvider
 from loop_controller.infra.policy_store import PolicyStore
 from loop_controller.infra.reservation_store import InMemoryReservationStore, ReservationStore
 from loop_controller.mcp_gateway import MCPGateway
@@ -182,7 +184,8 @@ class Checkpoint:
         profiles: profile_id -> CapabilityProfile（来自 ConfigLoader）。
         policy_engine: OPA/Rego 主策略引擎。
         policy_store: 策略版本来源（Decision.policy_version）。
-        gateway: MCPGateway（forward 的唯一执行通道）。
+        gateway: MCPGateway（forward 的默认执行通道；v0.20.0 保留以兼容旧构造）。
+        executor_registry: 执行器注册表（v0.20.0 新增；未提供时自动用 gateway 构造 MCPExecutor）。
         identity: 可信身份源（步骤 0 交叉校验用）。
         decision_store: 防重放存储（默认内存占位）。
         budget_ledger: 预算记账（默认恒通过占位）。
@@ -196,7 +199,8 @@ class Checkpoint:
         profiles: dict[str, CapabilityProfile],
         policy_engine: PolicyEngine,
         policy_store: PolicyStore,
-        gateway: MCPGateway,
+        gateway: MCPGateway | None = None,
+        executor_registry: ExecutorRegistry | None = None,
         identity: IdentityProvider,
         session_manager: SessionManager | None = None,  # v1.2 会话管理
         risk_manager: RiskStateManager | None = None,  # v1.2 风险状态管理
@@ -209,10 +213,16 @@ class Checkpoint:
         masker=None,  # Masker（T3.2 接入 build_approval_request）
         now: Callable[[], datetime] | None = None,
     ) -> None:
+        if executor_registry is None:
+            if gateway is None:
+                raise ValueError("Checkpoint 必须提供 gateway 或 executor_registry")
+            executor_registry = ExecutorRegistry()
+            executor_registry.set_default(MCPExecutor(gateway))
         self._profiles = profiles
         self._policy_engine = policy_engine
         self._policy_store = policy_store
         self._gateway = gateway
+        self._executor_registry = executor_registry
         self._identity = identity
         self._session_manager = session_manager
         self._risk_manager = risk_manager or RiskStateManager()  # 默认内存实现
@@ -670,11 +680,15 @@ class Checkpoint:
         proposal: ActionProposal,
         decision: Decision,
         session_id: str | None = None,
+        user_id: str = "",
+        tenant_id: str | None = None,
     ) -> ToolResult:
         """校验 1-5 失败抛异常；modify 复核失败返回 blocked 结果（不抛异常）。
 
         Args:
             session_id: v1.2 新增，用于 forward 成功后按低风险成功衰减会话风险分。
+            user_id: v0.20.0 新增，用于构造执行器上下文；调用方未提供时为空字符串。
+            tenant_id: v0.22.0 新增，用于 Secret Broker 租户命名空间路由。
         """
         # 校验 1-3：语义错误 / 过期授权一律抛异常（调用方 bug，不静默）
         if decision.call_id != proposal.call_id:
@@ -715,8 +729,18 @@ class Checkpoint:
 
         # 校验 7-8：转发执行；成功才记入 per-task 历史；异常 refund 预算
         try:
-            result = await self._gateway.call_tool(
-                proposal.tool_name, effective_args, proposal.call_id, proposal.task_id
+            executor = self._executor_registry.get_executor(proposal.tool_name)
+            result = await executor.execute(
+                tool_name=proposal.tool_name,
+                arguments=effective_args,
+                context=ExecutionContext(
+                    call_id=proposal.call_id,
+                    task_id=proposal.task_id,
+                    agent_id=proposal.agent_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                ),
             )
         except Exception:
             self._refund_reservation(reservation)

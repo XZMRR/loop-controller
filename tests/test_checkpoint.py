@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
@@ -82,7 +83,12 @@ class FakeGateway:
         self.calls: list[tuple] = []
 
     async def call_tool(
-        self, tool_name: str, arguments: dict, call_id: str, task_id: str
+        self,
+        tool_name: str,
+        arguments: dict,
+        call_id: str,
+        task_id: str,
+        **kwargs: Any,
     ) -> ToolResult:
         self.calls.append((tool_name, arguments, call_id, task_id))
         return ToolResult(

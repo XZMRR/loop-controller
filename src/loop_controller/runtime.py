@@ -19,6 +19,10 @@ from loop_controller.authority import EarnedAuthorityManager
 from loop_controller.budget import JsonlBudgetLedger
 from loop_controller.checkpoint import Checkpoint
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
+from loop_controller.executors import ExecutorRegistry, LocalFunctionExecutor, MCPExecutor
+from loop_controller.executors.http_client import HTTPClient
+from loop_controller.executors.http_executor import HTTPExecutor
+from loop_controller.identity import ConfigIdentityProvider, IdentityProvider
 from loop_controller.infra.alert_store import JsonlAlertStore
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import AuditStore, JsonlAuditStore
@@ -30,7 +34,7 @@ from loop_controller.infra.conversation_store import (
     JsonlConversationStore,
 )
 from loop_controller.infra.decision_store import JsonlDecisionStore
-from loop_controller.infra.identity import ConfigIdentityProvider
+from loop_controller.infra.hot_reload import HotReloader
 from loop_controller.infra.policy_store import FilePolicyStore
 from loop_controller.infra.reservation_store import (
     InMemoryReservationStore,
@@ -48,6 +52,7 @@ from loop_controller.permission_interaction import (
 )
 from loop_controller.policy_engine import OPAPolicyEngine
 from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
+from loop_controller.secrets import FileSecretBackend, MemorySecretBackend, SecretBroker
 from loop_controller.session import JsonlSessionBackend, Session, SessionManager
 
 logger = logging.getLogger(__name__)
@@ -75,6 +80,10 @@ class Runtime:
     task_store: TaskStore = field(default_factory=InMemoryTaskStore)
     reservation_store: ReservationStore = field(default_factory=InMemoryReservationStore)
     audit_analyzer: AuditAnalyzer | None = None
+    http_client: HTTPClient | None = None  # v0.21.0
+    http_tool_names: set[str] = field(default_factory=set)  # v0.21.0
+    secret_broker: SecretBroker | None = None  # v0.22.0
+    hot_reloader: HotReloader | None = None  # v0.22.0
 
     def create_task(
         self,
@@ -148,10 +157,81 @@ class Runtime:
     async def start(self) -> None:
         """拉起 MCP gateway 等异步初始化。"""
         await self.gateway.start()
+        if self.http_client is not None:
+            await self.http_client.start()
+        if self.hot_reloader is not None:
+            await self.hot_reloader.start()
 
     async def aclose(self) -> None:
         """关闭 MCP gateway 等异步资源。"""
+        if self.hot_reloader is not None:
+            await self.hot_reloader.stop()
         await self.gateway.aclose()
+        if self.http_client is not None:
+            await self.http_client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Identity 工厂
+# ---------------------------------------------------------------------------
+
+
+def _build_identity_provider(config: AppConfig) -> IdentityProvider:
+    """根据 config.identity_config 构造对应 IdentityProvider。"""
+    provider_type = config.identity_config.get("provider", "static")
+    agents = config.agents
+    users = config.users
+
+    if provider_type == "jwt":
+        jwt_cfg = config.identity_config.get("jwt", {})
+        from loop_controller.identity.jwt import JWTIdentityProvider
+
+        return JWTIdentityProvider(
+            agents=agents,
+            users=users,
+            issuer=jwt_cfg["issuer"],
+            audience=jwt_cfg.get("audience", "loop-controller"),
+            jwks_url=jwt_cfg.get("jwks_url"),
+            public_key=jwt_cfg.get("public_key"),
+            claim_mappings=jwt_cfg.get("claim_mappings"),
+        )
+
+    if provider_type == "mtls":
+        mtls_cfg = config.identity_config.get("mtls", {})
+        from loop_controller.identity.mtls import MTLSIdentityProvider
+
+        return MTLSIdentityProvider(
+            agents=agents,
+            users=users,
+            cert_mappings=mtls_cfg.get("cert_mappings"),
+            cert_subject_template=mtls_cfg.get("cert_subject_template"),
+        )
+
+    # static / default
+    static_cfg = config.identity_config.get("static", {})
+    return ConfigIdentityProvider(
+        agents=agents,
+        users=users,
+        allowed_tokens=static_cfg.get("allowed_tokens"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Secret Broker 工厂
+# ---------------------------------------------------------------------------
+
+
+def _build_secret_broker(config: AppConfig) -> SecretBroker:
+    """根据 ``config.secrets_config`` 构造 Secret Broker。"""
+    backend_config = config.secrets_config.get("backend", {})
+    backend_type = backend_config.get("type", "file")
+    if backend_type == "memory":
+        return MemorySecretBackend()
+    base_path = backend_config.get("base_path")
+    if not base_path:
+        project_root = Path(config.policy_dir).parent
+        base_path = str(project_root / "secrets")
+    return FileSecretBackend(base_path)
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +252,7 @@ def build_runtime(
         opa_url: OPA sidecar HTTP 地址。
         env_extra: 传递给 MCP 子进程的额外环境变量；默认会注入 ``PYTHONPATH`` 指向项目 ``src``。
     """
-    identity = ConfigIdentityProvider(config.agents, config.users)
+    identity = _build_identity_provider(config)
     policy_store = FilePolicyStore(config.policy_dir)
     policy_engine = OPAPolicyEngine(base_url=opa_url, timeout=2.0)
 
@@ -186,6 +266,20 @@ def build_runtime(
         env_extra=mcp_env,
         cwd=str(project_root),
     )
+    mcp_executor = MCPExecutor(gateway)
+    secret_broker = _build_secret_broker(config)
+    http_client = HTTPClient()
+    http_executor = HTTPExecutor(
+        http_client, config.http_tool_specs, secret_broker=secret_broker
+    )
+    local_executor = LocalFunctionExecutor(config.local_function_specs)
+    executor_registry = ExecutorRegistry()
+    for canonical_name in config.tool_mapping:
+        executor_registry.register(canonical_name, mcp_executor)
+    for canonical_name in config.http_tool_specs:
+        executor_registry.register(canonical_name, http_executor)
+    for canonical_name in config.local_function_specs:
+        executor_registry.register(canonical_name, local_executor)
     masker = Masker(config.masking_rules)
     budget_ledger = JsonlBudgetLedger(config.budget_ledger_path)
     session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
@@ -205,6 +299,7 @@ def build_runtime(
         policy_engine=policy_engine,
         policy_store=policy_store,
         gateway=gateway,
+        executor_registry=executor_registry,
         identity=identity,
         session_manager=session_manager,
         risk_manager=risk_manager,
@@ -217,8 +312,18 @@ def build_runtime(
         ),
         authority_manager=authority_manager,
         tool_costs={
-            name: BudgetCost(token_count=entry.cost_per_call)
-            for name, entry in config.tool_mapping.items()
+            **{
+                name: BudgetCost(token_count=entry.cost_per_call)
+                for name, entry in config.tool_mapping.items()
+            },
+            **{
+                name: BudgetCost(token_count=spec.cost_per_call)
+                for name, spec in config.http_tool_specs.items()
+            },
+            **{
+                name: BudgetCost(token_count=spec.cost_per_call)
+                for name, spec in config.local_function_specs.items()
+            },
         },
         masker=masker,
     )
@@ -241,6 +346,20 @@ def build_runtime(
         alert_store=alert_store,
     )
 
+    hot_reload_config = config.secrets_config.get("hot_reload", {})
+    config_dir = Path(config.policy_dir).parent / "config"
+    # 与 Runtime 共享同一可变集合，确保 HTTP 工具热更新后 controller 可见。
+    http_tool_names = set(config.http_tool_specs)
+    hot_reloader = HotReloader(
+        config_dir=config_dir,
+        config_loader=ConfigLoader(),
+        http_executor=http_executor,
+        secret_broker=secret_broker,
+        http_tool_names=http_tool_names,
+        enabled=hot_reload_config.get("enabled", True),
+        poll_interval_seconds=hot_reload_config.get("poll_interval_seconds", 30),
+    )
+
     return Runtime(
         classifier=RuleBasedClassifier(),
         checkpoint=checkpoint,
@@ -255,4 +374,8 @@ def build_runtime(
         task_store=task_store,
         reservation_store=reservation_store,
         audit_analyzer=audit_analyzer,
+        http_client=http_client,
+        http_tool_names=http_tool_names,
+        secret_broker=secret_broker,
+        hot_reloader=hot_reloader,
     )

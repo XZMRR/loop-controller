@@ -7,13 +7,13 @@
 
 前置依赖：
 
-    uv pip install "loop-controller[openai-agents]"
+    uv pip install loop-controller openai-agents openai
 
 运行方式：
 
     set LOOP_CONTROLLER_AUDIT_HMAC_KEY=0123456789abcdef...
     set OPENAI_API_KEY=sk-...
-    python examples/openai_agents_demo.py
+    python examples/contrib/adapters/openai_agents_demo.py
 
 环境变量：
 - ``OPENAI_API_KEY``：OpenAI Agents SDK 调用 LLM 所需；
@@ -24,13 +24,17 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 
-from loop_controller.adapters.openai_agents import govern_function_tool
+sys.path.insert(0, str(Path(__file__).parent))
+
+from openai_agents_adapter import govern_function_tool
+
 from loop_controller.controller import build_controller
 from loop_controller.infra.config_loader import ConfigLoader
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 OPA_URL = "http://127.0.0.1:8181"
 
 

@@ -207,3 +207,21 @@ def test_approvals_approver_must_exist(config_dir: str, capsys) -> None:
     assert rc == 1
     captured = capsys.readouterr()
     assert "审批人 ghost_user 不存在" in captured.err
+
+
+def test_proxy_rejects_identity_token_flag(config_dir: str) -> None:
+    """P1.6：lc proxy 不再接受 --identity-token，避免敏感 token 泄露到进程列表。"""
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--config-dir",
+                config_dir,
+                "proxy",
+                "--agent-id",
+                "researcher_001",
+                "--user-id",
+                "alice",
+                "--identity-token",
+                "secret",
+            ]
+        )

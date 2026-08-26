@@ -8,6 +8,14 @@ from loop_controller.approval_manager import AsyncApprovalManager
 from loop_controller.checkpoint import Checkpoint, CheckpointError
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
 from loop_controller.controller import LoopController, build_controller
+from loop_controller.executors import ExecutionContext, ExecutorRegistry, MCPExecutor, ToolExecutor
+from loop_controller.formatting import format_governance_result
+from loop_controller.identity import (
+    AgentIdentity,
+    ConfigIdentityProvider,
+    IdentityCredential,
+    IdentityProvider,
+)
 from loop_controller.mcp_gateway import MCPGateway, MCPGatewayError
 from loop_controller.models import (
     ActionProposal,
@@ -33,6 +41,7 @@ from loop_controller.tool_governor import ToolGovernor
 __all__ = [
     "ActionProposal",
     "Agent",
+    "AgentIdentity",
     "ApprovalRecord",
     "ApprovalRequest",
     "AsyncApprovalManager",
@@ -42,9 +51,16 @@ __all__ = [
     "CapabilityProfile",
     "Checkpoint",
     "CheckpointError",
+    "ConfigIdentityProvider",
     "Decision",
+    "ExecutionContext",
+    "ExecutorRegistry",
+    "format_governance_result",
+    "IdentityCredential",
+    "IdentityProvider",
     "LightweightClassifier",
     "LoopController",
+    "MCPExecutor",
     "MCPGateway",
     "MCPGatewayError",
     "PlannedAction",
@@ -54,6 +70,7 @@ __all__ = [
     "RuleBasedClassifier",
     "Task",
     "Tool",
+    "ToolExecutor",
     "ToolGovernor",
     "ToolPermission",
     "ToolResult",

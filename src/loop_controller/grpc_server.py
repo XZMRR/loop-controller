@@ -32,6 +32,7 @@ from grpc import aio as grpc_aio
 
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
+from loop_controller.identity import AgentIdentity, IdentityCredential, IdentityProvider
 from loop_controller.v1 import governance_pb2, governance_pb2_grpc
 
 logger = logging.getLogger("loop_controller.grpc_server")
@@ -47,6 +48,50 @@ def _governance_result(response) -> governance_pb2.EvaluateToolCallResponse:
     )
 
 
+def _extract_identity_provider(controller: LoopController) -> IdentityProvider | None:
+    """从 LoopController 的 Runtime 中提取 IdentityProvider。"""
+    runtime = getattr(controller, "_runtime", None)
+    if runtime is None:
+        return None
+    checkpoint = getattr(runtime, "checkpoint", None)
+    if checkpoint is None:
+        return None
+    return getattr(checkpoint, "_identity", None)
+
+
+def _extract_client_cert_identity(context: grpc_aio.ServicerContext) -> IdentityCredential | None:
+    """从 gRPC mTLS 上下文中提取客户端证书 CN/SAN。"""
+    auth_context = context.auth_context()
+    if not auth_context:
+        return None
+    cn = None
+    sans: list[str] = []
+    for key, values in auth_context.items():
+        if key == "x509_common_name" and values:
+            raw = values[0]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            cn = raw.removeprefix("CN=")
+        elif key == "x509_subject_alternative_name" and values:
+            for value in values:
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="replace")
+                sans.append(value)
+        elif key == "x509_pem_cert" and values and not cn:
+            # 部分实现未单独提供 CN；尝试从 PEM 中解析 subject。
+            import re
+
+            raw = values[0]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            match = re.search(r"CN=([^,/\n]+)", raw)
+            if match:
+                cn = match.group(1)
+    if not cn and not sans:
+        return None
+    return IdentityCredential(cert_cn=cn, cert_sans=sans, cert_subject=cn)
+
+
 class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
     """gRPC servicer：把 LoopController 包装成标准 gRPC 服务。"""
 
@@ -54,16 +99,53 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         self,
         controller: LoopController,
         watcher: ApprovalWatcher | None = None,
+        identity_provider: IdentityProvider | None = None,
+        entrypoints_config: dict[str, Any] | None = None,
     ) -> None:
         self._controller = controller
         self._watcher = watcher or ApprovalWatcher()
         self._start_time = time.time()
+        self._identity_provider = identity_provider or _extract_identity_provider(controller)
+        self._entrypoints_config = entrypoints_config or {}
+
+    def _grpc_require_auth(self) -> bool:
+        """读取 entrypoints.grpc.require_auth；缺省 false 保持向后兼容。"""
+        grpc_cfg = self._entrypoints_config.get("grpc") or {}
+        return bool(grpc_cfg.get("require_auth", False))
+
+    async def _verify_identity(
+        self, context: grpc_aio.ServicerContext
+    ) -> AgentIdentity | None:
+        """验证 gRPC 客户端 mTLS 身份；无 Provider 或未提供凭证返回 None。"""
+        if self._identity_provider is None:
+            return None
+        credential = _extract_client_cert_identity(context)
+        if credential is None:
+            return None
+        return await self._identity_provider.verify(credential)
+
+    async def _require_identity(
+        self, context: grpc_aio.ServicerContext
+    ) -> AgentIdentity | None:
+        """需要身份认证时校验 mTLS 身份；未通过会设置 gRPC 错误码并返回 None。"""
+        identity = await self._verify_identity(context)
+        if self._grpc_require_auth() and identity is None:
+            context.set_code(grpc.StatusCode.UNAUTHENTICATED)
+            context.set_details("client certificate required or invalid")
+            return None
+        return identity
 
     async def EvaluateToolCall(
         self,
         request: governance_pb2.EvaluateToolCallRequest,
         context: grpc_aio.ServicerContext,
     ) -> governance_pb2.EvaluateToolCallResponse:
+        identity = await self._verify_identity(context)
+        if self._grpc_require_auth() and identity is None:
+            context.set_code(grpc.StatusCode.UNAUTHENTICATED)
+            context.set_details("client certificate required or invalid")
+            return governance_pb2.EvaluateToolCallResponse()
+
         try:
             arguments = json.loads(request.arguments_json) if request.arguments_json else {}
         except json.JSONDecodeError as exc:
@@ -71,9 +153,25 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
             context.set_details(f"invalid arguments_json: {exc}")
             return governance_pb2.EvaluateToolCallResponse()
 
+        # 使用验证后的身份；请求体中的 agent_id/user_id 仅做一致性校验。
+        if identity is not None:
+            if request.agent_id and request.agent_id != identity.agent_id:
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("agent_id inconsistent with certificate identity")
+                return governance_pb2.EvaluateToolCallResponse()
+            if request.user_id and request.user_id != identity.user_id:
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("user_id inconsistent with certificate identity")
+                return governance_pb2.EvaluateToolCallResponse()
+            agent_id = identity.agent_id
+            user_id = identity.user_id
+        else:
+            agent_id = request.agent_id
+            user_id = request.user_id
+
         result = await self._controller.evaluate_and_execute(
-            agent_id=request.agent_id,
-            user_id=request.user_id,
+            agent_id=agent_id,
+            user_id=user_id,
             tool_name=request.tool_name,
             arguments=arguments,
             task_context=request.task_context,
@@ -87,6 +185,9 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         request: governance_pb2.ResumeAfterApprovalRequest,
         context: grpc_aio.ServicerContext,
     ) -> governance_pb2.EvaluateToolCallResponse:
+        await self._require_identity(context)
+        if context.code() == grpc.StatusCode.UNAUTHENTICATED:
+            return governance_pb2.EvaluateToolCallResponse()
         result = await self._controller.resume_after_approval(request.request_id)
         return _governance_result(result)
 
@@ -95,6 +196,9 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         request: governance_pb2.WaitForApprovalRequest,
         context: grpc_aio.ServicerContext,
     ):
+        identity = await self._require_identity(context)
+        if self._grpc_require_auth() and identity is None:
+            return
         request_id = request.request_id
         max_wait = request.max_wait_seconds or 60
         max_wait = max(1, min(max_wait, 300))
@@ -144,6 +248,9 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         request: governance_pb2.ListPendingApprovalsRequest,
         context: grpc_aio.ServicerContext,
     ) -> governance_pb2.ListPendingApprovalsResponse:
+        await self._require_identity(context)
+        if context.code() == grpc.StatusCode.UNAUTHENTICATED:
+            return governance_pb2.ListPendingApprovalsResponse()
         store = self._controller._runtime.approval_manager._store
         pending = store.get_pending()
         approvals = [
@@ -163,6 +270,9 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         request: governance_pb2.QueryAuditEventsRequest,
         context: grpc_aio.ServicerContext,
     ):
+        identity = await self._require_identity(context)
+        if self._grpc_require_auth() and identity is None:
+            return
         audit_store = self._controller._runtime.audit_store
         session_id = request.session_id or None
         task_id = request.task_id or None
@@ -227,17 +337,68 @@ def add_servicer_to_server(
     governance_pb2_grpc.add_ToolGovernanceServicer_to_server(servicer, server)
 
 
+def _load_pem(path: str | None) -> bytes | None:
+    """读取 PEM 文件；path 为 None 时返回 None。"""
+    if path is None:
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _build_server_credentials(
+    server_key_path: str | None,
+    server_cert_path: str | None,
+    client_ca_cert_path: str | None,
+    require_client_cert: bool,
+) -> grpc.ServerCredentials | None:
+    """构造 gRPC 服务端 TLS/mTLS 凭证。"""
+    if not server_key_path or not server_cert_path:
+        return None
+    private_key = _load_pem(server_key_path)
+    certificate_chain = _load_pem(server_cert_path)
+    if private_key is None or certificate_chain is None:
+        raise ValueError("server_key 与 server_cert 必须同时提供")
+    client_ca = _load_pem(client_ca_cert_path)
+    return grpc.ssl_server_credentials(
+        ((private_key, certificate_chain),),
+        root_certificates=client_ca,
+        require_client_auth=require_client_cert and client_ca is not None,
+    )
+
+
 async def serve(
     controller: LoopController,
     port: int = 50051,
     watcher: ApprovalWatcher | None = None,
+    identity_provider: IdentityProvider | None = None,
+    entrypoints_config: dict[str, Any] | None = None,
+    server_key: str | None = None,
+    server_cert: str | None = None,
+    client_ca_cert: str | None = None,
+    require_client_cert: bool = False,
 ) -> grpc_aio.Server:
     """启动 gRPC 服务并返回 server 实例。"""
+    if require_client_cert and (not server_key or not server_cert):
+        raise ValueError("require_client_cert=true 时必须提供 server_key 与 server_cert")
+    if require_client_cert and not client_ca_cert:
+        raise ValueError("require_client_cert=true 时必须提供 client_ca_cert 以验证客户端")
     server = grpc_aio.server()
-    servicer = ToolGovernanceServicer(controller, watcher=watcher)
+    servicer = ToolGovernanceServicer(
+        controller,
+        watcher=watcher,
+        identity_provider=identity_provider,
+        entrypoints_config=entrypoints_config,
+    )
     add_servicer_to_server(servicer, server)
     address = f"[::]:{port}"
-    server.add_insecure_port(address)
+    credentials = _build_server_credentials(
+        server_key, server_cert, client_ca_cert, require_client_cert
+    )
+    if credentials is not None:
+        server.add_secure_port(address, credentials)
+        logger.info("Loop Controller gRPC server started on %s (TLS/mTLS)", address)
+    else:
+        server.add_insecure_port(address)
+        logger.info("Loop Controller gRPC server started on %s", address)
     await server.start()
-    logger.info("Loop Controller gRPC server started on %s", address)
     return server
