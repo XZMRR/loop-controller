@@ -28,6 +28,12 @@ from typing import Any, Literal, cast
 import httpx
 import yaml
 
+from loop_controller.executors.harness_models import (
+    DockerBackendConfig,
+    HarnessToolSpec,
+    HTTPBackendConfig,
+    SubprocessBackendConfig,
+)
 from loop_controller.executors.http_models import HTTPToolSpec, resolve_env_refs
 from loop_controller.executors.local_function_models import LocalFunctionSpec
 from loop_controller.models import (
@@ -199,6 +205,8 @@ class AppConfig:
     tool_mapping: dict[str, ToolMappingEntry]
     http_tool_specs: dict[str, HTTPToolSpec]  # v0.21.0 HTTP 工具规格
     local_function_specs: dict[str, LocalFunctionSpec]  # v0.23.0 本地函数规格
+    harness_tool_specs: dict[str, HarnessToolSpec]  # v0.25.0 Harness 工具规格
+    harness_backends: dict[str, SubprocessBackendConfig | DockerBackendConfig | HTTPBackendConfig]  # v0.25.0 Harness 后端
     permission_rules: list[PermissionRule]
     capability_rules: CapabilityRules  # v0.10.0
     authority_rules: AuthorityRules  # v0.11.0
@@ -254,6 +262,9 @@ class ConfigLoader:
         # mcp_servers.yaml 中的 type: http 条目作为向后兼容补充
         http_tool_specs.update(legacy_http_specs)
         local_function_specs = self._load_local_functions(config_dir / "local_functions.yaml")
+        harness_tool_specs, harness_backends = self._load_harness_tools(
+            config_dir / "harness_tools.yaml"
+        )
         secrets_config = self._load_secrets_config(config_dir / "secrets.yaml", root)
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
@@ -308,6 +319,8 @@ class ConfigLoader:
             tool_mapping=tool_mapping,
             http_tool_specs=http_tool_specs,
             local_function_specs=local_function_specs,
+            harness_tool_specs=harness_tool_specs,
+            harness_backends=harness_backends,
             permission_rules=permission_rules,
             capability_rules=capability_rules,
             authority_rules=authority_rules,
@@ -442,6 +455,39 @@ class ConfigLoader:
         for canonical, entry in (data.get("tools") or {}).items():
             specs[canonical] = LocalFunctionSpec(tool_name=canonical, **entry)
         return specs
+
+    def _load_harness_tools(
+        self, path: Path
+    ) -> tuple[
+        dict[str, HarnessToolSpec],
+        dict[str, SubprocessBackendConfig | DockerBackendConfig | HTTPBackendConfig],
+    ]:
+        """加载 Harness 后端与工具规格（v0.25.0）。
+
+        文件缺失时返回空 dict（向后兼容）。
+        """
+        tool_specs: dict[str, HarnessToolSpec] = {}
+        backends: dict[
+            str, SubprocessBackendConfig | DockerBackendConfig | HTTPBackendConfig
+        ] = {}
+        if not path.exists():
+            return tool_specs, backends
+        data = self._read_yaml(path)
+        for name, entry in (data.get("backends") or {}).items():
+            backend_type = entry.get("type", "subprocess")
+            if backend_type == "subprocess":
+                backends[name] = SubprocessBackendConfig(name=name, **entry)
+            elif backend_type == "docker":
+                backends[name] = DockerBackendConfig(name=name, **entry)
+            elif backend_type == "http":
+                backends[name] = HTTPBackendConfig(name=name, **entry)
+            else:
+                raise ConfigValidationError(
+                    f"Harness 后端 {name} 的类型 {backend_type!r} 不受支持"
+                )
+        for canonical, entry in (data.get("tools") or {}).items():
+            tool_specs[canonical] = HarnessToolSpec(tool_name=canonical, **entry)
+        return tool_specs, backends
 
     def reload_http_tools(self, config_dir: str | Path) -> dict[str, HTTPToolSpec]:
         """热更新：仅重新加载 HTTP 工具规格。"""
@@ -611,12 +657,13 @@ class ConfigLoader:
             set(config.tool_mapping)
             | set(config.http_tool_specs)
             | set(config.local_function_specs)
+            | set(config.harness_tool_specs)
         )
         for profile_id, profile in config.profiles.items():
             for tool_name in profile.tools:
                 if tool_name not in all_tools:
                     raise ConfigValidationError(
-                        f"Profile {profile_id} 的工具 {tool_name} 不在 tool_mapping / http_tool_specs / local_function_specs 中"
+                        f"Profile {profile_id} 的工具 {tool_name} 不在 tool_mapping / http_tool_specs / local_function_specs / harness_tool_specs 中"
                     )
 
     def _check_policy_loadable(self, opa_base_url: str, config: AppConfig) -> None:

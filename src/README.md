@@ -1,6 +1,6 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.20.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 策略判定 → 审批 → 授权转发 → 审计"的完整闭环；v0.20.0 重点实现可信身份控制平面与可插拔执行器抽象基座。
+企业级 AI Agent 治理层（v0.25.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 策略判定 → 审批 → 授权转发 → 审计"的完整闭环；v0.25.0 在可信身份控制平面基础上，新增 Harness 作为生产级可插拔执行后端。
 
 **核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为工具调用治理控制平面，是所有经治理工具调用的**唯一授权出口**。
 
@@ -18,7 +18,7 @@
 - **预算控制**：按工具计费的 token 预算，超支即拒。
 - **可信身份控制平面**（v0.20.0）：Agent 身份由 JWT / mTLS / 静态 token 验证，`agent_id` 从凭证推导，不可伪造；
 - **可插拔执行器抽象**（v0.20.0）：`ExecutorRegistry` + `ToolExecutor` 让 MCP / HTTP 协议型工具可统一接入；
-  Shell / SQL / 浏览器等能力通过外部 MCP Server 或 Harness 接入，不在 Loop Controller 进程内执行；
+- **Harness 可插拔执行后端**（v0.25.0）：`HarnessExecutor` 把治理后的调用转发给外部 Harness（子进程/远程 HTTP/Docker）执行，Shell / SQL / 浏览器等高危能力不在 Loop Controller 进程内执行；
 - **网络级治理入口**（v0.20.0）：HTTP、gRPC、MCP Proxy 作为生产入口，Agent 不直接持有工具凭证。
 
 ## 架构
@@ -31,8 +31,9 @@ R2 Checkpoint（身份校验 → 防重放 → Profile → 预算 → 组合规�
          │  Decision: allow / deny / modify / require_approval
          ▼
 ExecutorRegistry ──→ MCPExecutor ──→ MCPGateway ──→ MCP Servers
-                                  └─→ HTTP Executor（v0.21+）
-                                  └─→ LocalFunctionExecutor（v0.23+，可选辅助）
+                                  ├─→ HTTP Executor（v0.21+）
+                                  ├─→ LocalFunctionExecutor（v0.23+，可选辅助）
+                                  └─→ HarnessExecutor（v0.25+）──→ Harness（子进程/远程 HTTP/Docker）
 
 Shell / SQL / Browser 等高危工具通过外部 MCP Server 或 Harness 接入，
 不在 Loop Controller 进程内执行。见 examples/contrib/mcp_wrappers/ 与
@@ -118,11 +119,12 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 | `approval.yaml` | 审批人默认与规则（用于确定 escalation_target） |
 | `identity.yaml` | 身份 Provider 配置（static / jwt / mtls） |
 | `entrypoints.yaml` | HTTP/gRPC/MCP Proxy 入口认证方式与开关 |
+| `harness_tools.yaml` | Harness 后端与工具配置（v0.25.0，默认注释不启用） |
 | `policies/default.rego` | 主策略（Rego v1） |
 
 ## 已知局限
 
-**本项目当前为 v0.20.0+，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链需配合 seal/WORM、HMAC-SHA256 为默认、单进程 asyncio 假设、同进程 SDK/Adapter 不承诺实时阻断、Loop Controller 内部仅代理 MCP / HTTP 协议型工具，Shell / SQL / 浏览器等通过外部 MCP Server 或 Harness 接入治理。
+**本项目当前为 v0.25.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链需配合 seal/WORM、HMAC-SHA256 为默认、单进程 asyncio 假设、同进程 SDK/Adapter 不承诺实时阻断、Loop Controller 内部仅代理 MCP / HTTP 协议型工具，Shell / SQL / 浏览器等高危能力通过 Harness 或外部 MCP Server 接入治理，Harness 默认不启用且子进程模式仅用于开发/测试。
 
 ## 文档
 
@@ -132,6 +134,7 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `Loop_Controller_下一阶段开发方案_v0.3.0.md`——v0.3.0 开发方案与 Iteration 4/5 验收标准
 - `loop_controller_v0.4.0_development.md`——v0.4.0 跨 Task Session 风险状态持久化方案
 - `loop_controller_v0.5.0_development.md`——v0.5.0 MCP Proxy / 外来 Agent 接入方案
+- `loop_controller_v0.25.0_development.md`——v0.25.0 Harness 作为生产级执行后端
 - `development_log.md`——开发记录与决策追溯
 - `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
 - `answer.md`——MVP 审查分析与修复状态追踪

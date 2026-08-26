@@ -32,8 +32,9 @@ Shell、SQL、浏览器、文件系统、本地函数等操作系统级或应用
 
 1. **包装成 MCP Server**：见 `examples/contrib/mcp_wrappers/` 下的
    `shell_mcp_server.py`、`sql_mcp_server.py`、`browser_mcp_server.py`；
-2. **接入 Harness / 沙箱 / 容器**：Loop Controller 做治理决策， Harness
-   在隔离环境中执行，见 `examples/contrib/harness/`。
+2. **接入 Harness**：Loop Controller 做治理决策， HarnessExecutor 将调用转发给外部 Harness 进程/容器执行，见 `examples/contrib/harness/`。
+
+v0.25.0 已将 Harness 提升为生产级可插拔执行后端，支持子进程（开发/测试）、HTTP 远程 Harness 两种形态，并保留 Docker 配置模型与示例。
 
 `LocalFunctionExecutor`（v0.23.0）保留，但仅定位为“不方便包装成 MCP 时的可选辅助”，
 不是核心架构方向。
@@ -220,6 +221,34 @@ HTTP 工具的 API Key / Secret 通过 `${ENV_NAME}` 引用解析，配置文件
 ### V21-5. HTTP 工具风险等级默认提升一级
 
 `RuleBasedClassifier` 仍按工具名/参数判断；HTTP 工具在 `LoopController._evaluate_proposal()` 中统一提升一级风险。未来会把风险计算下沉到工具元数据。
+
+---
+
+## v0.25.0 边界声明
+
+### V25-1. Harness 是独立执行平面，默认不启用
+
+v0.25.0 实现 `HarnessExecutor`，通过 `config/harness_tools.yaml` 将工具调用转发给外部 Harness 进程/容器执行。Loop Controller 仍然是治理控制平面，不直接执行 Shell / SQL / Browser 等副作用。
+
+`config/harness_tools.yaml` 默认全部注释，启动时不会自动拉起 Harness 后端；用户显式启用后才生效，避免无 Harness 环境启动失败。
+
+### V25-2. 子进程 Harness 仅用于开发/测试
+
+`SubprocessBackendConfig` 允许 Loop Controller 启动本地子进程作为 Harness。该模式与 Loop Controller 主进程共享文件系统、网络、CPU/内存 等底层资源，**不用于生产环境**。
+
+生产环境应使用 Docker 容器或远程 HTTP Harness，由部署层提供真正隔离。
+
+### V25-3. Docker Harness 后端为示例级
+
+v0.25.0 保留 `DockerBackendConfig` 配置模型与 `examples/contrib/harness/docker_backend.py` 示例实现，但 Docker 后端未与 `HarnessExecutor` 直接集成；企业需要自行将 Docker 后端接入 Harness 服务或替换为生产级容器编排方案。
+
+### V25-4. Harness 工具风险等级由配置决定
+
+Harness 工具的 `default_risk` 默认为 `critical`，由 `RuleBasedClassifier` 读取工具规格后作为 R1 风险信号；R2 最终裁决仍以 Profile、OPA/Rego 与组合规则为准。
+
+### V25-5. Harness 后端不支持运行期热更新
+
+`config/harness_tools.yaml` 在进程启动时一次性加载；后端配置、工具注册、沙箱参数的增删改需要重启主进程。未来可考虑统一纳入 `HotReloader`，但当前版本未实现。
 
 ## 环境备注
 

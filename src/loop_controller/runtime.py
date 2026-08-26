@@ -19,7 +19,12 @@ from loop_controller.authority import EarnedAuthorityManager
 from loop_controller.budget import JsonlBudgetLedger
 from loop_controller.checkpoint import Checkpoint
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
-from loop_controller.executors import ExecutorRegistry, LocalFunctionExecutor, MCPExecutor
+from loop_controller.executors import (
+    ExecutorRegistry,
+    HarnessExecutor,
+    LocalFunctionExecutor,
+    MCPExecutor,
+)
 from loop_controller.executors.http_client import HTTPClient
 from loop_controller.executors.http_executor import HTTPExecutor
 from loop_controller.identity import ConfigIdentityProvider, IdentityProvider
@@ -89,6 +94,7 @@ class Runtime:
     http_tool_names: set[str] = field(default_factory=set)  # v0.21.0
     secret_broker: SecretBroker | None = None  # v0.22.0
     hot_reloader: HotReloader | None = None  # v0.22.0
+    harness_executor: HarnessExecutor | None = None  # v0.25.0
 
     def create_task(
         self,
@@ -166,11 +172,15 @@ class Runtime:
             await self.http_client.start()
         if self.hot_reloader is not None:
             await self.hot_reloader.start()
+        if self.harness_executor is not None:
+            await self.harness_executor.start()
 
     async def aclose(self) -> None:
         """关闭 MCP gateway 等异步资源。"""
         if self.hot_reloader is not None:
             await self.hot_reloader.stop()
+        if self.harness_executor is not None:
+            await self.harness_executor.stop()
         await self.gateway.aclose()
         if self.http_client is not None:
             await self.http_client.aclose()
@@ -281,6 +291,9 @@ def build_runtime(
         http_client, config.http_tool_specs, secret_broker=secret_broker
     )
     local_executor = LocalFunctionExecutor(config.local_function_specs)
+    harness_executor = HarnessExecutor(
+        config.harness_tool_specs, config.harness_backends
+    )
     executor_registry = ExecutorRegistry()
     for canonical_name in config.tool_mapping:
         executor_registry.register(canonical_name, mcp_executor)
@@ -288,6 +301,8 @@ def build_runtime(
         executor_registry.register(canonical_name, http_executor)
     for canonical_name in config.local_function_specs:
         executor_registry.register(canonical_name, local_executor)
+    for canonical_name in config.harness_tool_specs:
+        executor_registry.register(canonical_name, harness_executor)
     masker = Masker(config.masking_rules)
     budget_ledger = JsonlBudgetLedger(config.budget_ledger_path)
     session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
@@ -331,6 +346,10 @@ def build_runtime(
             **{
                 name: BudgetCost(token_count=spec.cost_per_call)
                 for name, spec in config.local_function_specs.items()
+            },
+            **{
+                name: BudgetCost(token_count=spec.cost_per_call)
+                for name, spec in config.harness_tool_specs.items()
             },
         },
         masker=masker,
@@ -386,4 +405,5 @@ def build_runtime(
         http_tool_names=http_tool_names,
         secret_broker=secret_broker,
         hot_reloader=hot_reloader,
+        harness_executor=harness_executor,
     )

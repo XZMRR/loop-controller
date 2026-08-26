@@ -239,6 +239,7 @@ class ToolResult(BaseModel):
     content: Any
     error_code: str | None = None
     elapsed_ms: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)  # v0.25.0 Harness 透传元数据
 
 
 # ---------------------------------------------------------------------------

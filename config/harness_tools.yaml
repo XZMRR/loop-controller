@@ -1,0 +1,54 @@
+# Harness 后端与工具配置（v0.25.0）
+# Loop Controller 通过 Harness 将高危工具调用转发给独立执行进程/容器，
+# 保持治理平面自身不直接执行 Shell/SQL/Browser 等副作用。
+#
+# 本文件默认全部注释，避免在测试/启动时自动拉起子进程 Harness。
+# 启用前请取消注释对应后端与工具，并将工具名加入 profiles.yaml 中对应 Profile。
+
+# backends:
+#   local_subprocess_harness:
+#     type: subprocess
+#     command:
+#       - python
+#       - -m
+#       - examples.contrib.harness.harness_server
+#     env:
+#       HARNESS_LOG_LEVEL: INFO
+#     max_concurrent_calls: 10
+#
+#   remote_http_harness:
+#     type: http
+#     base_url: http://127.0.0.1:9000
+#     api_key_env: HARNESS_API_KEY
+#     timeout_seconds: 30
+#     max_concurrent_calls: 10
+#
+# tools:
+#   harness_echo:
+#     harness: local_subprocess_harness
+#     description: 示例 Harness 工具，仅做回显，用于验证 Loop Controller ↔ Harness 协议连通性。
+#     default_risk: low
+#     cost_per_call: 10
+#     input_schema:
+#       type: object
+#       properties:
+#         message:
+#           type: string
+#       required:
+#         - message
+#
+#   harness_shell:
+#     harness: local_subprocess_harness
+#     description: 示例 Harness shell 执行器（仅用于本地集成测试，生产环境请关闭或替换为受限后端）。
+#     default_risk: critical
+#     cost_per_call: 100
+#     input_schema:
+#       type: object
+#       properties:
+#         command:
+#           type: string
+#       required:
+#         - command
+#     sandbox:
+#       timeout_seconds: 30
+#       max_output_bytes: 65536

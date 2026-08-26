@@ -1724,9 +1724,68 @@ v0.23.2 已完成 v0.23.1 残留问题的收尾。v0.24.0 根据 `src/audit_repo
 - 新增 `EncryptedFileSecretBackend` 测试覆盖加密解密、密钥缺失、密钥长度、明文兼容；
 - 文档更新到位，明确 v0.24.0 架构边界。
 
+---
+
+## v0.25.0：Harness 作为生产级执行后端
+
+### 目标
+
+把 Harness 从 v0.24.0 的示例提升为生产级可插拔执行后端，让 Loop Controller 能够把任意工具调用安全地路由到外部 Harness 执行，Loop Controller 只做治理决策，Harness 负责实际执行与隔离。
+
+### 完成内容
+
+- **Loop Controller ↔ Harness 通信协议**：
+  - 新增 `src/loop_controller/executors/harness_protocol.py`：
+    - `HarnessContext`：透传 `call_id/task_id/agent_id/user_id/session_id/tenant_id`；
+    - `HarnessSandbox`：超时、输出大小、网络/路径/环境变量白名单；
+    - `HarnessExecuteRequest` / `HarnessExecuteResponse`：标准请求/响应模型。
+  - 采用轻量级 HTTP/JSON 协议，未来可扩展为 gRPC。
+
+- **HarnessExecutor 实现**：
+  - 新增 `src/loop_controller/executors/harness_executor.py`：
+    - `HarnessExecutor` 实现 `ToolExecutor` 协议；
+    - 支持 HTTP 后端、子进程后端两种生产/开发形态；
+    - Docker 后端保留配置模型（`DockerBackendConfig`），执行层作为示例保留；
+    - `list_tools()` 按 Profile 过滤返回 `Tool` 元数据；
+    - `Runtime.start()` / `aclose()` 自动管理 Harness 后端生命周期。
+  - 新增 `src/loop_controller/executors/harness_models.py`：
+    - `HarnessToolSpec`、`HarnessSandboxConfig`；
+    - `SubprocessBackendConfig`、`DockerBackendConfig`、`HTTPBackendConfig`。
+
+- **Runtime 与配置集成**：
+  - `ConfigLoader` 新增 `config/harness_tools.yaml` 加载；
+  - `AppConfig` 新增 `harness_tool_specs` 与 `harness_backends`；
+  - 启动校验 `_check_tool_mapping()` 把 Harness 工具纳入可用工具集合；
+  - `build_runtime()` 创建 `HarnessExecutor` 并注册到 `ExecutorRegistry`；
+  - `tool_costs` 合并 Harness 工具 `cost_per_call`。
+
+- **参考 Harness 服务器与后端示例**：
+  - 重写 `examples/contrib/harness/harness_server.py`：基于 Starlette，接收 `/harness/v1/execute`，内置 echo/shell 示例工具；
+  - 新增 `examples/contrib/harness/subprocess_backend.py`：直接子进程执行示例；
+  - 新增 `examples/contrib/harness/docker_backend.py`：Docker 容器执行示例；
+  - `config/harness_tools.yaml` 提供默认注释示例，避免测试/启动时自动拉起子进程 Harness。
+
+- **测试与验证**：
+  - 新增 `tests/test_harness_executor.py`：覆盖 HTTP 后端成功/错误、后端未找到、工具未注册、list_tools 过滤、请求形状校验；
+  - 新增 `tests/test_harness_subprocess.py`：覆盖子进程 Harness echo 调用；
+  - 全量 `pytest tests/`：**429 passed, 3 skipped**；
+  - `ruff check src tests examples`：**All checks passed**；
+  - `mypy src`：**Success: no issues found**。
+
+### 关键决策
+
+- **治理与执行彻底分离**：Loop Controller 只负责身份、策略、审批、审计，Harness 负责实际执行与隔离；
+- **Harness 默认不启用**：`config/harness_tools.yaml` 全部注释，用户显式启用后才拉起后端，避免测试/无 Harness 环境启动失败；
+- **HTTP/JSON 优先于 gRPC**：复用现有 HTTP 基础设施，降低初期复杂度；
+- **ToolResult 扩展 `metadata`**：允许 Harness 透传执行元数据（如实际耗时、容器 ID 等），默认空 dict 保持向后兼容；
+- **子进程后端仅用于开发/测试**：生产环境应使用 Docker 容器或远程 HTTP Harness，避免与 Loop Controller 共享资源。
+
+### 验收状态
+
+- `pytest tests/`：**429 passed, 3 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
 ### 设计文档
 
-- `src/loop_controller_v0.24.0_development.md`
-- `src/audit_report.md`
-
----
+- `src/loop_controller_v0.25.0_development.md`
