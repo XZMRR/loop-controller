@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from loop_controller.executors.http_executor import HTTPExecutor
+from loop_controller.identity.revocation import RevocationList
 from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.secrets import SecretBroker
 
@@ -30,6 +31,7 @@ class HotReloader:
         http_executor: HTTPExecutor,
         secret_broker: SecretBroker,
         http_tool_names: set[str] | None = None,
+        revocation_list: RevocationList | None = None,
         poll_interval_seconds: float = 30.0,
         enabled: bool = True,
     ) -> None:
@@ -39,6 +41,7 @@ class HotReloader:
         self._secret_broker = secret_broker
         # 与 Runtime 共享的可变集合；热更新 HTTP 工具后同步刷新。
         self._http_tool_names = http_tool_names
+        self._revocation_list = revocation_list
         self._poll_interval = poll_interval_seconds
         self._enabled = enabled
         self._task: asyncio.Task[Any] | None = None
@@ -116,6 +119,9 @@ class HotReloader:
         secrets_yaml = self._config_dir / "secrets.yaml"
         if secrets_yaml.exists():
             paths.append(secrets_yaml)
+        revocation_yaml = self._config_dir / "revocation.yaml"
+        if revocation_yaml.exists():
+            paths.append(revocation_yaml)
         # 监控 secret 后端 base_path 下的所有 .json 文件；优先使用 backend 声明的路径。
         secrets_dir = self._secrets_dir()
         if secrets_dir is not None and secrets_dir.exists():
@@ -151,3 +157,11 @@ class HotReloader:
             logger.info("HTTP 工具规格热更新完成，共 %d 个工具", len(new_specs))
         except Exception as exc:  # noqa: BLE001
             logger.warning("HTTP 工具规格热更新失败，保留旧配置：%s", exc)
+
+        if self._revocation_list is not None:
+            try:
+                self._loader.reload_revocation_config(self._config_dir)
+                self._revocation_list.reload()
+                logger.info("吊销列表热更新完成")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("吊销列表热更新失败，保留旧配置：%s", exc)

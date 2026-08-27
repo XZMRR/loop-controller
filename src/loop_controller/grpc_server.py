@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
+from datetime import datetime
 from typing import Any
 
 import grpc
@@ -32,7 +34,15 @@ from grpc import aio as grpc_aio
 
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
-from loop_controller.identity import AgentIdentity, IdentityCredential, IdentityProvider
+from loop_controller.identity import (
+    AgentIdentity,
+    IdentityCredential,
+    IdentityProvider,
+    KillSwitchConfig,
+    RevocationEntry,
+    RevocationType,
+)
+from loop_controller.models import AuditEvent
 from loop_controller.v1 import governance_pb2, governance_pb2_grpc
 
 logger = logging.getLogger("loop_controller.grpc_server")
@@ -134,6 +144,41 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
             context.set_details("client certificate required or invalid")
             return None
         return identity
+
+    async def _require_admin_identity(
+        self, context: grpc_aio.ServicerContext
+    ) -> AgentIdentity | None:
+        """Admin RPC 始终要求经 mTLS Provider 验证的身份。"""
+        identity = await self._verify_identity(context)
+        if identity is None:
+            context.set_code(grpc.StatusCode.UNAUTHENTICATED)
+            context.set_details("admin client certificate required or invalid")
+        return identity
+
+    def _audit_admin_operation(
+        self,
+        identity: AgentIdentity,
+        operation: str,
+        *,
+        target: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        audit_store = getattr(self._controller._runtime, "audit_store", None)
+        if audit_store is None:
+            return
+        audit_store.append(
+            AuditEvent(
+                event_id=uuid.uuid4().hex,
+                trace_id=uuid.uuid4().hex,
+                session_id="admin",
+                actor_type="system",
+                actor_id=identity.agent_id,
+                action="admin_operation",
+                target=target,
+                reason=operation,
+                metadata=metadata or {},
+            )
+        )
 
     async def EvaluateToolCall(
         self,
@@ -301,6 +346,109 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
             count += 1
             if count >= limit:
                 break
+
+    async def Revoke(
+        self,
+        request: governance_pb2.RevokeRequest,
+        context: grpc_aio.ServicerContext,
+    ) -> governance_pb2.RevokeResponse:
+        identity = await self._require_admin_identity(context)
+        if identity is None:
+            return governance_pb2.RevokeResponse()
+        revocations = getattr(self._controller._runtime, "revocation_list", None)
+        if revocations is None:
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
+            context.set_details("revocation unavailable")
+            return governance_pb2.RevokeResponse()
+        try:
+            entry_type = RevocationType(request.type)
+            if request.remove:
+                tenant_id = request.tenant_id or None
+                removed = revocations.remove(entry_type, request.id, tenant_id)
+                self._audit_admin_operation(
+                    identity,
+                    "revocation_removed",
+                    target=f"{entry_type.value}:{request.id}",
+                    metadata={"tenant_id": tenant_id, "removed": removed},
+                )
+                return governance_pb2.RevokeResponse(success=True, removed=removed)
+            entry = RevocationEntry(
+                type=entry_type,
+                id=request.id,
+                reason=request.reason,
+                expires_at=datetime.fromisoformat(request.expires_at)
+                if request.expires_at
+                else None,
+                tenant_id=request.tenant_id or None,
+            )
+            revocations.add(entry)
+            self._audit_admin_operation(
+                identity,
+                "revocation_added",
+                target=f"{entry.type.value}:{entry.id}",
+                metadata={"tenant_id": entry.tenant_id, "reason": entry.reason},
+            )
+            return governance_pb2.RevokeResponse(success=True)
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return governance_pb2.RevokeResponse()
+
+    async def SetKillSwitch(
+        self,
+        request: governance_pb2.SetKillSwitchRequest,
+        context: grpc_aio.ServicerContext,
+    ) -> governance_pb2.KillSwitchResponse:
+        identity = await self._require_admin_identity(context)
+        if identity is None:
+            return governance_pb2.KillSwitchResponse()
+        revocations = getattr(self._controller._runtime, "revocation_list", None)
+        if revocations is None:
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
+            return governance_pb2.KillSwitchResponse()
+        config = KillSwitchConfig(
+            enabled=request.enabled,
+            reason=request.reason,
+            except_tools=list(request.except_tools),
+            except_agents=list(request.except_agents),
+        )
+        revocations.set_kill_switch(config)
+        self._audit_admin_operation(
+            identity,
+            "kill_switch_updated",
+            target="kill_switch",
+            metadata=config.model_dump(mode="json"),
+        )
+        return governance_pb2.KillSwitchResponse(**config.model_dump())
+
+    async def GetRevocationList(
+        self,
+        request: governance_pb2.GetRevocationListRequest,
+        context: grpc_aio.ServicerContext,
+    ) -> governance_pb2.RevocationListResponse:
+        identity = await self._require_admin_identity(context)
+        if identity is None:
+            return governance_pb2.RevocationListResponse()
+        revocations = getattr(self._controller._runtime, "revocation_list", None)
+        if revocations is None:
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
+            return governance_pb2.RevocationListResponse()
+        entries = [
+            governance_pb2.RevocationEntry(
+                type=entry.type.value,
+                id=entry.id,
+                reason=entry.reason,
+                revoked_at=entry.revoked_at.isoformat(),
+                expires_at=entry.expires_at.isoformat() if entry.expires_at else "",
+                tenant_id=entry.tenant_id or "",
+            )
+            for entry in revocations.entries
+        ]
+        config = revocations.kill_switch
+        return governance_pb2.RevocationListResponse(
+            revocations=entries,
+            kill_switch=governance_pb2.KillSwitchResponse(**config.model_dump()),
+        )
 
     async def _try_resume(self, request_id: str) -> Any | None:
         store = self._controller._runtime.approval_manager._store

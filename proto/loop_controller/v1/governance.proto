@@ -9,6 +9,9 @@ service ToolGovernance {
   rpc GetHealth(HealthRequest) returns (HealthResponse);
   rpc ListPendingApprovals(ListPendingApprovalsRequest) returns (ListPendingApprovalsResponse);
   rpc QueryAuditEvents(QueryAuditEventsRequest) returns (stream AuditEvent);
+  rpc Revoke(RevokeRequest) returns (RevokeResponse);
+  rpc SetKillSwitch(SetKillSwitchRequest) returns (KillSwitchResponse);
+  rpc GetRevocationList(GetRevocationListRequest) returns (RevocationListResponse);
 }
 
 message EvaluateToolCallRequest {
@@ -64,6 +67,50 @@ message QueryAuditEventsRequest {
   string session_id = 1;
   string task_id = 2;
   int32 limit = 3;
+}
+
+message RevokeRequest {
+  string type = 1;
+  string id = 2;
+  string reason = 3;
+  string expires_at = 4;
+  string tenant_id = 5;
+  bool remove = 6;
+}
+
+message RevokeResponse {
+  bool success = 1;
+  bool removed = 2;
+}
+
+message SetKillSwitchRequest {
+  bool enabled = 1;
+  string reason = 2;
+  repeated string except_tools = 3;
+  repeated string except_agents = 4;
+}
+
+message KillSwitchResponse {
+  bool enabled = 1;
+  string reason = 2;
+  repeated string except_tools = 3;
+  repeated string except_agents = 4;
+}
+
+message GetRevocationListRequest {}
+
+message RevocationEntry {
+  string type = 1;
+  string id = 2;
+  string reason = 3;
+  string revoked_at = 4;
+  string expires_at = 5;
+  string tenant_id = 6;
+}
+
+message RevocationListResponse {
+  repeated RevocationEntry revocations = 1;
+  KillSwitchResponse kill_switch = 2;
 }
 
 message AuditEvent {

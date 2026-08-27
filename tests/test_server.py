@@ -386,6 +386,13 @@ def test_admin_audit_query() -> None:
     assert data["events"][0]["session_id"] == "s-1"
 
 
+def test_existing_admin_endpoints_allow_unconfigured_api_key() -> None:
+    client, _controller = _build_client()
+
+    assert client.get("/v1/admin/approvals/pending").status_code == 200
+    assert client.get("/v1/admin/audit").status_code == 200
+
+
 def test_api_key_auth_header() -> None:
     client, _controller = _build_client(api_key="secret")
     resp = client.post(

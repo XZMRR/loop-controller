@@ -1,6 +1,6 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.25.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 策略判定 → 审批 → 授权转发 → 审计"的完整闭环；v0.25.0 在可信身份控制平面基础上，新增 Harness 作为生产级可插拔执行后端。
+企业级 AI Agent 治理层（v0.26.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 授权转发 → 审计"的完整闭环；v0.26.0 新增全局吊销/Kill Switch 与本地签名证据链。
 
 **核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为工具调用治理控制平面，是所有经治理工具调用的**唯一授权出口**。
 
@@ -19,6 +19,8 @@
 - **可信身份控制平面**（v0.20.0）：Agent 身份由 JWT / mTLS / 静态 token 验证，`agent_id` 从凭证推导，不可伪造；
 - **可插拔执行器抽象**（v0.20.0）：`ExecutorRegistry` + `ToolExecutor` 让 MCP / HTTP 协议型工具可统一接入；
 - **Harness 可插拔执行后端**（v0.25.0）：`HarnessExecutor` 把治理后的调用转发给外部 Harness（子进程/远程 HTTP/Docker）执行，Shell / SQL / 浏览器等高危能力不在 Loop Controller 进程内执行；
+- **全局吊销与 Kill Switch**（v0.26.0）：可按 agent、user、tool、secret 阻断调用，并在审批恢复及执行前复查；
+- **本地签名证据链**（v0.26.0）：审计事件可同步写入 HMAC-SHA256 或 Ed25519 签名的链式 JSONL 证据；
 - **网络级治理入口**（v0.20.0）：HTTP、gRPC、MCP Proxy 作为生产入口，Agent 不直接持有工具凭证。
 
 ## 架构
@@ -27,7 +29,7 @@
 User → R1 Agent（规划 + 轻量分类器自检）
          │  ActionProposal（动作申报）
          ▼
-R2 Checkpoint（身份校验 → 防重放 → Profile → 预算 → 组合规则 → OPA/Rego）
+R2 Checkpoint（身份校验 → 吊销检查 → 防重放 → Profile → 预算 → 组合规则 → OPA/Rego）
          │  Decision: allow / deny / modify / require_approval
          ▼
 ExecutorRegistry ──→ MCPExecutor ──→ MCPGateway ──→ MCP Servers
@@ -39,7 +41,7 @@ Shell / SQL / Browser 等高危工具通过外部 MCP Server 或 Harness 接入�
 不在 Loop Controller 进程内执行。见 examples/contrib/mcp_wrappers/ 与
 examples/contrib/harness/。
 
-R3 AuditStore：异步全量记录 + 哈希链 + 分级掩码（只读，无指令下发权）
+R3 AuditStore：异步全量记录 + 哈希链 + 可选本地签名证据链 + 分级掩码（只读，无指令下发权）
 R0 AsyncApprovalManager：异步审批请求持久化，审批人通过 `lc` CLI 写入结果
 ```
 
@@ -71,6 +73,8 @@ echo "# AI 合规 checklist" > /data/kb/ai_compliance_checklist.md
 export LOOP_CONTROLLER_AUDIT_HMAC_KEY=$(openssl rand -hex 32)
 # 可选：配置 key_id，用于未来密钥轮换识别（默认为 "default"）
 export LOOP_CONTROLLER_AUDIT_KEY_ID="default"
+# config/evidence.yaml 默认启用 Ed25519；配置 32 字节私钥（base64）
+export LOOP_CONTROLLER_EVIDENCE_PRIVATE_KEY=$(openssl rand -base64 32)
 
 # 4. 启动 OPA sidecar
 opa run --server --addr localhost:8181 policies/
@@ -107,7 +111,7 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 
 ## 配置
 
-所有治理行为由 `config/` 下的文件定义，改配置 = 重启进程：
+治理行为由 `config/` 下的文件定义；除吊销列表和已注明的热更新配置外，修改后需重启进程：
 
 | 文件 | 作用 |
 |---|---|
@@ -120,11 +124,13 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 | `identity.yaml` | 身份 Provider 配置（static / jwt / mtls） |
 | `entrypoints.yaml` | HTTP/gRPC/MCP Proxy 入口认证方式与开关 |
 | `harness_tools.yaml` | Harness 后端与工具配置（v0.25.0，默认注释不启用） |
+| `revocation.yaml` | 全局吊销列表与 Kill Switch（v0.26.0，支持热更新） |
+| `evidence.yaml` | 本地签名证据链后端与签名算法（v0.26.0） |
 | `policies/default.rego` | 主策略（Rego v1） |
 
 ## 已知局限
 
-**本项目当前为 v0.25.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：审计哈希链需配合 seal/WORM、HMAC-SHA256 为默认、单进程 asyncio 假设、同进程 SDK/Adapter 不承诺实时阻断、Loop Controller 内部仅代理 MCP / HTTP 协议型工具，Shell / SQL / 浏览器等高危能力通过 Harness 或外部 MCP Server 接入治理，Harness 默认不启用且子进程模式仅用于开发/测试。
+**本项目当前为 v0.26.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：吊销状态与本地证据链均按单进程部署设计；证据文件仍需 WORM/独立备份防删除；KMS/HSM、远程证据存储和完整多租户隔离尚未实现；同进程 SDK/Adapter 不承诺实时阻断；Harness 默认不启用且子进程模式仅用于开发/测试。
 
 ## 文档
 
@@ -135,6 +141,7 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `loop_controller_v0.4.0_development.md`——v0.4.0 跨 Task Session 风险状态持久化方案
 - `loop_controller_v0.5.0_development.md`——v0.5.0 MCP Proxy / 外来 Agent 接入方案
 - `loop_controller_v0.25.0_development.md`——v0.25.0 Harness 作为生产级执行后端
+- `loop_controller_v0.26.0_development.md`——v0.26.0 全局吊销与本地签名证据链
 - `development_log.md`——开发记录与决策追溯
 - `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
 - `answer.md`——MVP 审查分析与修复状态追踪

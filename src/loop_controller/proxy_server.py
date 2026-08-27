@@ -40,7 +40,7 @@ from starlette.responses import Response  # type: ignore[import-untyped]
 from starlette.routing import Mount, Route  # type: ignore[import-untyped]
 
 from loop_controller.checkpoint import CheckpointError
-from loop_controller.identity import IdentityCredential, IdentityProvider
+from loop_controller.identity import AgentIdentity, IdentityCredential, IdentityProvider
 from loop_controller.models import (
     ActionProposal,
     ApprovalRequest,
@@ -163,6 +163,11 @@ class LoopControllerProxyServer:
         verified = await provider.verify(credential)
         if verified is None:
             raise ValueError("stdio 身份 token 验证失败")
+        if verified.agent_id != self._identity.agent_id or verified.user_id != self._identity.user_id:
+            raise ValueError("stdio 身份 token 与配置身份不一致")
+        revoked, reason = self._check_revocation(verified, "")
+        if revoked:
+            raise ValueError(reason or "stdio identity revoked")
         logger.info(
             "stdio identity verified: agent_id=%s user_id=%s",
             verified.agent_id,
@@ -234,6 +239,9 @@ class LoopControllerProxyServer:
             credential = IdentityCredential(cert_cn=cert_cn, cert_sans=cert_sans)
             verified = await provider.verify(credential)
             if verified is not None:
+                revoked, _reason = self._check_revocation(verified, "")
+                if revoked:
+                    return None
                 return ProxyIdentity(
                     agent_id=verified.agent_id,
                     user_id=verified.user_id,
@@ -241,7 +249,19 @@ class LoopControllerProxyServer:
                 )
             # 提供了 mTLS header 但验证失败：拒绝，避免 header 伪造后 fallback 到默认身份。
             return None
-        return self._resolve_identity()
+        identity = self._resolve_identity()
+        agent = self._runtime.checkpoint._identity.get_agent(identity.agent_id)
+        if agent is None:
+            return None
+        fallback_identity = AgentIdentity(
+            agent_id=agent.agent_id,
+            user_id=identity.user_id,
+            harness_id=(agent.identity or {}).get("harness_id"),
+            profile_id=agent.profile_id,
+            tenant_id=agent.tenant_id,
+        )
+        revoked, _reason = self._check_revocation(fallback_identity, "")
+        return None if revoked else identity
 
     def _build_starlette_app(self) -> Starlette:
         """构造 SSE 模式使用的 Starlette app。"""
@@ -300,6 +320,16 @@ class LoopControllerProxyServer:
             return self._error_result(f"unknown agent_id: {identity.agent_id}")
 
         raw_arguments = dict(arguments)
+        verified_identity = AgentIdentity(
+            agent_id=agent.agent_id,
+            user_id=identity.user_id,
+            harness_id=(agent.identity or {}).get("harness_id"),
+            profile_id=agent.profile_id,
+            tenant_id=agent.tenant_id,
+        )
+        revoked, reason = self._check_revocation(verified_identity, name, raw_arguments)
+        if revoked:
+            return self._error_result(reason or "revoked")
 
         # v0.7.0：内部工具优先路由，不进入治理流程。
         if name == _APPROVAL_STATUS_TOOL_NAME:
@@ -471,6 +501,40 @@ class LoopControllerProxyServer:
         return self._tool_result_to_mcp(result)
 
     # -- 辅助方法 -----------------------------------------------------------
+
+    @staticmethod
+    def _secret_refs(arguments: dict[str, Any]) -> list[str]:
+        refs: list[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, nested in value.items():
+                    if key == "secret_ref":
+                        if isinstance(nested, str):
+                            refs.append(nested)
+                        elif isinstance(nested, dict) and isinstance(nested.get("name"), str):
+                            refs.append(nested["name"])
+                    visit(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    visit(nested)
+
+        visit(arguments)
+        return refs
+
+    def _check_revocation(
+        self,
+        identity: AgentIdentity,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> tuple[bool, str | None]:
+        revocations = getattr(self._runtime, "revocation_list", None)
+        if revocations is None:
+            return False, None
+        revoked, reason = revocations.is_revoked(
+            identity, tool_name, self._secret_refs(arguments or {})
+        )
+        return bool(revoked), reason
 
     def _current_request(self) -> Request | None:
         """从 MCP RequestContext 获取当前原始请求（SSE 为 Request，stdio 为 None）。"""

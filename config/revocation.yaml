@@ -1,0 +1,9 @@
+kill_switch:
+  enabled: false
+  reason: ""
+  except_tools:
+    - health_check
+  except_agents:
+    - admin-agent
+
+revocations: []

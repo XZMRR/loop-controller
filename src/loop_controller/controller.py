@@ -15,6 +15,7 @@ import uuid
 from typing import Any
 
 from loop_controller.checkpoint import CheckpointError
+from loop_controller.identity import AgentIdentity
 from loop_controller.infra.config_loader import AppConfig
 from loop_controller.masker import Masker
 from loop_controller.models import (
@@ -144,6 +145,9 @@ class LoopController:
             task_id=task_id,
             task_context=task_context,
         )
+        revoked, reason = self._check_revocation(agent, task.user_id, proposal)
+        if revoked:
+            return EvaluationResult(status="blocked", reason=reason or "revoked")
         return await self._evaluate_proposal(task, agent, proposal)
 
     async def _evaluate_proposal(
@@ -268,6 +272,26 @@ class LoopController:
                 error_code="agent_id_mismatch",
             )
 
+        if decision.call_id != proposal.call_id:
+            return ToolResult(
+                call_id=decision.call_id,
+                task_id=decision.task_id,
+                tool_name=proposal.tool_name,
+                status="error",
+                content="call_id mismatch between decision and proposal",
+                error_code="call_id_mismatch",
+            )
+
+        if decision.task_id != proposal.task_id:
+            return ToolResult(
+                call_id=decision.call_id,
+                task_id=decision.task_id,
+                tool_name=proposal.tool_name,
+                status="error",
+                content="task_id mismatch between decision and proposal",
+                error_code="task_id_mismatch",
+            )
+
         task = self._runtime.get_task(decision.task_id)
         if task is None:
             return ToolResult(
@@ -277,6 +301,17 @@ class LoopController:
                 status="error",
                 content=f"task not found: {decision.task_id}",
                 error_code="task_not_found",
+            )
+
+        revoked, reason = self._check_revocation(agent, task.user_id, proposal)
+        if revoked:
+            return ToolResult(
+                call_id=decision.call_id,
+                task_id=decision.task_id,
+                tool_name=proposal.tool_name,
+                status="blocked",
+                content=reason or "revoked",
+                error_code="revoked",
             )
 
         try:
@@ -320,9 +355,9 @@ class LoopController:
 
         eval_result = await self._evaluate_proposal(task, agent, proposal)
 
-        if eval_result.status == "deny":
+        if eval_result.status in ("deny", "blocked"):
             return GovernanceResult(
-                status="deny",
+                status=eval_result.status,
                 call_id=proposal.call_id,
                 tool_name=tool_name,
                 arguments=arguments,
@@ -419,6 +454,20 @@ class LoopController:
             arguments=request.tool_arguments,
             task_context="",
         )
+        agent = self._runtime.checkpoint._identity.get_agent(request.agent_id)
+        if agent is None:
+            return GovernanceResult(
+                status="error",
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                arguments=request.tool_arguments,
+                reason=f"unknown agent_id: {request.agent_id}",
+                error_code="unknown_agent",
+            )
+        revoked, reason = self._check_revocation(agent, task.user_id, approve_proposal)
+        if revoked:
+            return self._revoked_governance_result(approve_proposal, reason)
+
         if record.verdict == "approve":
             approve_action: AuditAction = "approve"
             approve_verdict: Verdict = "allow"
@@ -509,6 +558,59 @@ class LoopController:
     # 内部辅助
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _secret_refs(arguments: dict[str, Any]) -> list[str]:
+        refs: list[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, nested in value.items():
+                    if key == "secret_ref":
+                        if isinstance(nested, str):
+                            refs.append(nested)
+                        elif isinstance(nested, dict) and isinstance(nested.get("name"), str):
+                            refs.append(nested["name"])
+                    visit(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    visit(nested)
+
+        visit(arguments)
+        return refs
+
+    def _check_revocation(
+        self, agent: Agent, user_id: str, proposal: ActionProposal
+    ) -> tuple[bool, str | None]:
+        revocations = getattr(self._runtime, "revocation_list", None)
+        if revocations is None:
+            return False, None
+        identity = AgentIdentity(
+            agent_id=agent.agent_id,
+            user_id=user_id,
+            harness_id=(agent.identity or {}).get("harness_id"),
+            profile_id=agent.profile_id,
+            tenant_id=agent.tenant_id,
+        )
+        revoked, reason = revocations.is_revoked(
+            identity, proposal.tool_name, self._secret_refs(proposal.arguments)
+        )
+        return bool(revoked), reason
+
+    @staticmethod
+    def _revoked_governance_result(
+        proposal: ActionProposal, reason: str | None
+    ) -> GovernanceResult:
+        message = reason or "revoked"
+        return GovernanceResult(
+            status="blocked",
+            call_id=proposal.call_id,
+            tool_name=proposal.tool_name,
+            arguments=proposal.arguments,
+            reason=message,
+            content=message,
+            error_code="revoked",
+        )
+
     def _prepare(
         self,
         *,
@@ -554,6 +656,19 @@ class LoopController:
         decision: Decision,
     ) -> ToolResult:
         """调用 Checkpoint.forward 执行 Decision，并写审计事件。"""
+        agent = self._runtime.checkpoint._identity.get_agent(proposal.agent_id)
+        if agent is None:
+            raise CheckpointError(f"unknown agent_id: {proposal.agent_id}")
+        revoked, reason = self._check_revocation(agent, task.user_id, proposal)
+        if revoked:
+            return ToolResult(
+                call_id=proposal.call_id,
+                task_id=proposal.task_id,
+                tool_name=proposal.tool_name,
+                status="blocked",
+                content=reason or "revoked",
+                error_code="revoked",
+            )
         session = self._runtime.session_manager.get_session(task.session_id)
         session_id = session.session_id if session is not None else task.session_id
         result = await self._runtime.checkpoint.forward(

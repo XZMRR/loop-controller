@@ -233,6 +233,8 @@ class AppConfig:
     identity_config: dict[str, Any] = field(default_factory=dict)  # v0.20.0 身份 Provider 配置
     entrypoints_config: dict[str, Any] = field(default_factory=dict)  # v0.20.0 入口认证配置
     secrets_config: dict[str, Any] = field(default_factory=dict)  # v0.22.0 Secret Broker 配置
+    revocation_config: dict[str, Any] = field(default_factory=dict)  # v0.26.0 吊销配置
+    evidence_config: dict[str, Any] = field(default_factory=dict)  # v0.26.0 证据链配置
 
 # ---------------------------------------------------------------------------
 # ConfigLoader
@@ -266,6 +268,8 @@ class ConfigLoader:
             config_dir / "harness_tools.yaml"
         )
         secrets_config = self._load_secrets_config(config_dir / "secrets.yaml", root)
+        revocation_config = self._load_optional_config(config_dir / "revocation.yaml")
+        evidence_config = self._load_optional_config(config_dir / "evidence.yaml")
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
         identity_config = self._load_identity_config(config_dir / "identity.yaml")
@@ -345,6 +349,8 @@ class ConfigLoader:
             identity_config=identity_config,
             entrypoints_config=entrypoints_config,
             secrets_config=secrets_config,
+            revocation_config=revocation_config,
+            evidence_config=evidence_config,
         )
 
         self._check_profile_exists(app_config)
@@ -506,6 +512,16 @@ class ConfigLoader:
         config_dir = Path(config_dir)
         root = config_dir.parent
         return self._load_secrets_config(config_dir / "secrets.yaml", root)
+
+    def reload_revocation_config(self, config_dir: str | Path) -> dict[str, Any]:
+        """热更新：重新加载 revocation.yaml。"""
+        return self._load_optional_config(Path(config_dir) / "revocation.yaml")
+
+    def _load_optional_config(self, path: Path) -> dict[str, Any]:
+        """加载可选 YAML 配置；文件缺失时保持旧版本行为。"""
+        if not path.exists():
+            return {}
+        return self._read_yaml(path)
 
     def _load_permission_rules(self, path: Path) -> list[PermissionRule]:
         data = self._read_yaml(path)

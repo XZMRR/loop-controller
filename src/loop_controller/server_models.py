@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
+
+from loop_controller.identity import KillSwitchConfig, RevocationEntry, RevocationType
 
 
 class GovernToolRequest(BaseModel):
@@ -64,6 +68,22 @@ class PendingApprovalsResponse(BaseModel):
     """GET /v1/admin/approvals/pending 响应体。"""
 
     approvals: list[PendingApprovalItem] = Field(default_factory=list, description="待审批请求列表")
+
+
+class RevokeRequest(BaseModel):
+    type: RevocationType
+    id: str
+    reason: str
+    expires_at: datetime | None = None
+    tenant_id: str | None = None
+
+    def to_entry(self) -> RevocationEntry:
+        return RevocationEntry(**self.model_dump())
+
+
+class RevocationListResponse(BaseModel):
+    revocations: list[RevocationEntry] = Field(default_factory=list)
+    kill_switch: KillSwitchConfig = Field(default_factory=KillSwitchConfig)
 
 
 class AuditQueryResponse(BaseModel):

@@ -1789,3 +1789,23 @@ v0.23.2 已完成 v0.23.1 残留问题的收尾。v0.24.0 根据 `src/audit_repo
 ### 设计文档
 
 - `src/loop_controller_v0.25.0_development.md`
+
+---
+
+## v0.26.0：吊销与签名证据链
+
+### 完成内容
+
+- 新增 agent/user/tool/secret 全局吊销与 Kill Switch，覆盖初次判定、审批恢复和执行前检查；
+- 新增 HTTP/gRPC 管理接口，吊销状态持久化到 `config/revocation.yaml` 并支持热更新；
+- 新增 HMAC-SHA256、Ed25519 签名器与本地 JSONL 证据链，审计事件可同步生成可验证证据；
+- 新增 `config/revocation.yaml`、`config/evidence.yaml` 示例配置。
+
+### 明确边界
+
+- 多租户隔离、分布式状态一致性、KMS/HSM 与远程/WORM 证据存储不在本版本范围；
+- 本地证据链只能检测篡改，不能阻止拥有文件系统权限的攻击者删除文件。
+
+### 设计文档
+
+- `src/loop_controller_v0.26.0_development.md`

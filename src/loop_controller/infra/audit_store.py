@@ -13,15 +13,23 @@ P0 新增 HMAC-SHA256 支持：
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
+import logging
+import threading
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from loop_controller.models import AuditEvent
+from loop_controller.audit.evidence import EvidenceChain
+from loop_controller.infra.alert_store import AlertStore
+from loop_controller.models import AuditAlert, AuditEvent
 from loop_controller.utils.canonical import canonical_json
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -65,8 +73,12 @@ class JsonlAuditStore:
         hash_algo: str = "sha256",
         hmac_key: bytes | None = None,
         key_id: str | None = None,
+        evidence_chain: EvidenceChain | None = None,
+        alert_store: AlertStore | None = None,
     ) -> None:
         self._path = Path(path)
+        self._evidence_chain = evidence_chain
+        self._alert_store = alert_store
         self._path.parent.mkdir(parents=True, exist_ok=True)
         if hash_algo not in ("sha256", "hmac-sha256"):
             raise ValueError(f"不支持的 hash_algo：{hash_algo}")
@@ -158,11 +170,94 @@ class JsonlAuditStore:
             }
         )
         line = canonical_json(to_write.model_dump(mode="json", exclude_none=True))
+        if self._evidence_chain is not None:
+            try:
+                self._append_evidence(to_write)
+            except Exception as exc:
+                logger.exception("签名证据链写入失败，仍写入原审计记录")
+                self._save_evidence_alert(
+                    rule_id="evidence_chain_append_failed",
+                    title="签名证据链写入失败",
+                    description=str(exc),
+                    event=to_write,
+                )
         with self._path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
             fh.flush()
         self._prev_hash = self._hash(line, self._chain_hash)
         self._chain_hash = self._prev_hash
+
+    def _save_evidence_alert(
+        self,
+        *,
+        rule_id: str,
+        title: str,
+        description: str,
+        event: AuditEvent | None = None,
+    ) -> None:
+        if self._alert_store is None:
+            return
+        alert = AuditAlert(
+            alert_id=uuid.uuid4().hex,
+            session_id=event.session_id if event is not None else "",
+            task_id=event.trace_id if event is not None else None,
+            rule_id=rule_id,
+            severity="critical",
+            title=title,
+            description=description,
+            evidence=[event.event_id] if event is not None else [],
+        )
+        try:
+            self._alert_store.save_alert(alert)
+        except Exception:
+            logger.exception("证据链告警写入失败")
+
+    async def verify_evidence_chain(self) -> bool:
+        """验证已有签名证据链；失败时告警但不抛出。"""
+        if self._evidence_chain is None:
+            return True
+        try:
+            valid = await self._evidence_chain.verify()
+        except Exception as exc:
+            logger.exception("启动验证签名证据链失败")
+            description = str(exc)
+        else:
+            if valid:
+                return True
+            logger.error("启动验证发现签名证据链不完整")
+            description = "签名证据链完整性验证失败"
+        self._save_evidence_alert(
+            rule_id="evidence_chain_verification_failed",
+            title="签名证据链验证失败",
+            description=description,
+        )
+        return False
+
+    def _append_evidence(self, event: AuditEvent) -> None:
+        """从同步审计接口调用异步证据链，并兼容已运行的事件循环。"""
+        evidence_chain = self._evidence_chain
+        if evidence_chain is None:
+            return
+        coroutine = evidence_chain.append(event)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(coroutine)
+            return
+
+        error: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                asyncio.run(coroutine)
+            except BaseException as exc:
+                error.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join()
+        if error:
+            raise error[0]
 
     def seal(self, reason: str = "periodic_seal") -> AuditEvent:
         """写入 seal 记录，固定当前链累积 HMAC。

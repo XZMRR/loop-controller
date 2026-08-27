@@ -22,6 +22,8 @@ CLI：
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import time
@@ -33,7 +35,13 @@ import httpx
 
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
-from loop_controller.identity import AgentIdentity, IdentityCredential, IdentityProvider
+from loop_controller.identity import (
+    AgentIdentity,
+    IdentityCredential,
+    IdentityProvider,
+    KillSwitchConfig,
+    RevocationType,
+)
 from loop_controller.logging_config import configure_logging, set_trace_id
 from loop_controller.metrics import (
     observe_request,
@@ -44,6 +52,7 @@ from loop_controller.metrics import (
 from loop_controller.metrics import (
     set_trace_id as metrics_set_trace_id,
 )
+from loop_controller.models import AuditEvent
 from loop_controller.server_models import (
     AuditQueryResponse,
     GovernResponse,
@@ -52,6 +61,8 @@ from loop_controller.server_models import (
     PendingApprovalItem,
     PendingApprovalsResponse,
     ResumeApprovalRequest,
+    RevocationListResponse,
+    RevokeRequest,
     WaitApprovalResponse,
 )
 
@@ -143,9 +154,7 @@ class ToolGovernServer:
         return bool(http_cfg.get("require_auth", False))
 
     def _check_api_key(self, request: Request) -> bool:
-        """管理员端点保留的全局 API key 校验。"""
-        if self._api_key is None:
-            return True
+        """管理员端点的全局 API key 强制校验。"""
         if not self._api_key:
             return False
         header = request.headers.get("x-api-key") or ""
@@ -154,7 +163,37 @@ class ToolGovernServer:
             token = auth[7:].strip()
         else:
             token = ""
-        return bool(header) and header == self._api_key or bool(token) and token == self._api_key
+        return bool(header) and hmac.compare_digest(header, self._api_key) or bool(
+            token
+        ) and hmac.compare_digest(token, self._api_key)
+
+    def _audit_admin_operation(
+        self,
+        request: Request,
+        operation: str,
+        *,
+        target: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        audit_store = getattr(self._controller._runtime, "audit_store", None)
+        if audit_store is None:
+            return
+        api_key = self._api_key or ""
+        actor_id = f"api-key:{hashlib.sha256(api_key.encode()).hexdigest()[:12]}"
+        trace_id = getattr(request.state, "trace_id", uuid.uuid4().hex[:16])
+        audit_store.append(
+            AuditEvent(
+                event_id=uuid.uuid4().hex,
+                trace_id=trace_id,
+                session_id="admin",
+                actor_type="system",
+                actor_id=actor_id,
+                action="admin_operation",
+                target=target,
+                reason=operation,
+                metadata=metadata or {},
+            )
+        )
 
     async def _verify_identity(self, request: Request) -> AgentIdentity | None:
         """从 Authorization: Bearer <jwt> 提取并验证身份；未提供/无 Provider 返回 None。"""
@@ -218,7 +257,7 @@ class ToolGovernServer:
         )
 
     async def _handle_metrics(self, request: Request) -> PlainTextResponse:
-        if not self._check_api_key(request):
+        if self._api_key is not None and not self._check_api_key(request):
             return PlainTextResponse(content="unauthorized", status_code=401)
         data = render_metrics()
         return PlainTextResponse(content=data, media_type="text/plain; version=0.0.4; charset=utf-8")
@@ -426,7 +465,7 @@ class ToolGovernServer:
         return await self._controller.resume_after_approval(request_id)
 
     async def _handle_admin_pending_approvals(self, request: Request) -> JSONResponse:
-        if not self._check_api_key(request):
+        if self._api_key is not None and not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         store = self._controller._runtime.approval_manager._store
@@ -443,8 +482,72 @@ class ToolGovernServer:
         ]
         return JSONResponse(PendingApprovalsResponse(approvals=items).model_dump())
 
-    async def _handle_admin_audit(self, request: Request) -> JSONResponse:
+    async def _handle_admin_revoke(self, request: Request) -> JSONResponse:
         if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        revocations = getattr(self._controller._runtime, "revocation_list", None)
+        if revocations is None:
+            return JSONResponse({"error": "revocation unavailable"}, status_code=503)
+        try:
+            if request.method == "DELETE":
+                entry_type = RevocationType(request.query_params.get("type", ""))
+                entry_id = request.query_params.get("id", "")
+                if not entry_id:
+                    raise ValueError("missing id")
+                tenant_id = request.query_params.get("tenant_id")
+                removed = revocations.remove(entry_type, entry_id, tenant_id)
+                self._audit_admin_operation(
+                    request,
+                    "revocation_removed",
+                    target=f"{entry_type.value}:{entry_id}",
+                    metadata={"tenant_id": tenant_id, "removed": removed},
+                )
+                return JSONResponse({"removed": removed})
+            body = RevokeRequest.model_validate(await request.json())
+            entry = body.to_entry()
+            revocations.add(entry)
+            self._audit_admin_operation(
+                request,
+                "revocation_added",
+                target=f"{entry.type.value}:{entry.id}",
+                metadata={"tenant_id": entry.tenant_id, "reason": entry.reason},
+            )
+            return JSONResponse({"revoked": True})
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+
+    async def _handle_admin_revocation_list(self, request: Request) -> JSONResponse:
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        revocations = getattr(self._controller._runtime, "revocation_list", None)
+        if revocations is None:
+            return JSONResponse({"error": "revocation unavailable"}, status_code=503)
+        response = RevocationListResponse(
+            revocations=revocations.entries, kill_switch=revocations.kill_switch
+        )
+        return JSONResponse(response.model_dump(mode="json"))
+
+    async def _handle_admin_kill_switch(self, request: Request) -> JSONResponse:
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        revocations = getattr(self._controller._runtime, "revocation_list", None)
+        if revocations is None:
+            return JSONResponse({"error": "revocation unavailable"}, status_code=503)
+        try:
+            config = KillSwitchConfig.model_validate(await request.json())
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+        revocations.set_kill_switch(config)
+        self._audit_admin_operation(
+            request,
+            "kill_switch_updated",
+            target="kill_switch",
+            metadata=config.model_dump(mode="json"),
+        )
+        return JSONResponse(config.model_dump(mode="json"))
+
+    async def _handle_admin_audit(self, request: Request) -> JSONResponse:
+        if self._api_key is not None and not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         session_id = request.query_params.get("session_id")
@@ -538,6 +641,9 @@ def build_app(
             Route("/v1/wait-for-approval", server._handle_wait_for_approval, methods=["GET"]),
             Route("/v1/wait-for-approval/sse", server._handle_wait_for_approval_sse, methods=["GET"]),
             Route("/v1/admin/approvals/pending", server._handle_admin_pending_approvals, methods=["GET"]),
+            Route("/admin/revoke", server._handle_admin_revoke, methods=["POST", "DELETE"]),
+            Route("/admin/revocation-list", server._handle_admin_revocation_list, methods=["GET"]),
+            Route("/admin/kill-switch", server._handle_admin_kill_switch, methods=["POST"]),
             Route("/v1/admin/audit", server._handle_admin_audit, methods=["GET"]),
         ],
     )

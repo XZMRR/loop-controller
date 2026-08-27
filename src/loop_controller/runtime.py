@@ -8,12 +8,15 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from loop_controller.approval_manager import AsyncApprovalManager
+from loop_controller.audit.evidence import Ed25519EvidenceSigner, EvidenceChain, HMACEvidenceSigner
+from loop_controller.audit.evidence_backends import LocalFileEvidenceBackend
 from loop_controller.audit_analyzer import AuditAnalyzer, RuleBasedAuditAnalyzer
 from loop_controller.authority import EarnedAuthorityManager
 from loop_controller.budget import JsonlBudgetLedger
@@ -28,6 +31,7 @@ from loop_controller.executors import (
 from loop_controller.executors.http_client import HTTPClient
 from loop_controller.executors.http_executor import HTTPExecutor
 from loop_controller.identity import ConfigIdentityProvider, IdentityProvider
+from loop_controller.identity.revocation import RevocationList
 from loop_controller.infra.alert_store import JsonlAlertStore
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import AuditStore, JsonlAuditStore
@@ -95,6 +99,7 @@ class Runtime:
     secret_broker: SecretBroker | None = None  # v0.22.0
     hot_reloader: HotReloader | None = None  # v0.22.0
     harness_executor: HarnessExecutor | None = None  # v0.25.0
+    revocation_list: RevocationList = field(default_factory=RevocationList)  # v0.26.0
 
     def create_task(
         self,
@@ -167,6 +172,8 @@ class Runtime:
 
     async def start(self) -> None:
         """拉起 MCP gateway 等异步初始化。"""
+        if isinstance(self.audit_store, JsonlAuditStore):
+            await self.audit_store.verify_evidence_chain()
         await self.gateway.start()
         if self.http_client is not None:
             await self.http_client.start()
@@ -234,6 +241,37 @@ def _build_identity_provider(config: AppConfig) -> IdentityProvider:
 # ---------------------------------------------------------------------------
 # Secret Broker 工厂
 # ---------------------------------------------------------------------------
+
+
+def _build_evidence_chain(config: AppConfig) -> EvidenceChain | None:
+    """按可选 evidence.yaml 构造本地签名证据链。"""
+    evidence = config.evidence_config.get("evidence")
+    if not evidence or not evidence.get("enabled", False):
+        return None
+    if evidence.get("backend", "local") != "local":
+        raise ValueError("evidence.backend 当前仅支持 local")
+    signing = evidence.get("signing", {})
+    algorithm = signing.get("algorithm", "hmac-sha256")
+    key_id = signing.get("key_id", config.audit_key_id)
+    signer: Ed25519EvidenceSigner | HMACEvidenceSigner
+    if algorithm == "ed25519":
+        signer = Ed25519EvidenceSigner.from_environment(
+            key_id=key_id,
+            variable=signing.get("private_key_env", "LOOP_CONTROLLER_EVIDENCE_PRIVATE_KEY"),
+        )
+    elif algorithm == "hmac-sha256":
+        key_env = signing.get("key_env", "LOOP_CONTROLLER_EVIDENCE_HMAC_KEY")
+        encoded = os.environ.get(key_env)
+        if not encoded:
+            raise ValueError(f"环境变量 {key_env} 未配置")
+        signer = HMACEvidenceSigner(encoded.encode("utf-8"), key_id=key_id)
+    else:
+        raise ValueError(f"不支持的证据签名算法：{algorithm}")
+    local_path = evidence.get("local", {}).get("path", "evidence")
+    path = Path(local_path)
+    if not path.is_absolute():
+        path = Path(config.policy_dir).parent / path
+    return EvidenceChain(LocalFileEvidenceBackend(path), signer)
 
 
 def _build_secret_broker(config: AppConfig) -> SecretBroker:
@@ -357,16 +395,19 @@ def build_runtime(
     audit_key: bytes | None = None
     if config.audit_hash_algo == "hmac-sha256":
         audit_key = ConfigLoader.resolve_audit_key(config)
+    evidence_chain = _build_evidence_chain(config)
+    alert_store = JsonlAlertStore(config.alert_store_path)
     audit_store = JsonlAuditStore(
         config.audit_log_path,
         hash_algo=config.audit_hash_algo,
         hmac_key=audit_key,
         key_id=config.audit_key_id,
+        evidence_chain=evidence_chain,
+        alert_store=alert_store,
     )
     approval_manager = AsyncApprovalManager(
         JsonlApprovalStore(config.approval_store_path)
     )
-    alert_store = JsonlAlertStore(config.alert_store_path)
     audit_analyzer = RuleBasedAuditAnalyzer(
         rules=config.audit_rules,
         audit_store=audit_store,
@@ -375,6 +416,8 @@ def build_runtime(
 
     hot_reload_config = config.secrets_config.get("hot_reload", {})
     config_dir = Path(config.policy_dir).parent / "config"
+    revocation_path = config_dir / "revocation.yaml"
+    revocation_list = RevocationList.from_file(revocation_path)
     # 与 Runtime 共享同一可变集合，确保 HTTP 工具热更新后 controller 可见。
     http_tool_names = set(config.http_tool_specs)
     hot_reloader = HotReloader(
@@ -383,6 +426,7 @@ def build_runtime(
         http_executor=http_executor,
         secret_broker=secret_broker,
         http_tool_names=http_tool_names,
+        revocation_list=revocation_list,
         enabled=hot_reload_config.get("enabled", True),
         poll_interval_seconds=hot_reload_config.get("poll_interval_seconds", 30),
     )
@@ -406,4 +450,6 @@ def build_runtime(
         secret_broker=secret_broker,
         hot_reloader=hot_reloader,
         harness_executor=harness_executor,
+        # 复用 HotReloader 持有的可变撤销列表，确保热更新对 Runtime 可见。
+        revocation_list=revocation_list,
     )

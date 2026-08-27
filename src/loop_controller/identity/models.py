@@ -21,6 +21,7 @@ class AgentIdentity(BaseModel):
     user_id: str
     harness_id: str | None = None
     profile_id: str
+    tenant_id: str | None = None
     issued_at: datetime = Field(default_factory=_utc_now)
     expires_at: datetime | None = None
 

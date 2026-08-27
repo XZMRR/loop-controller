@@ -39,6 +39,7 @@ AuditAction = Literal[
     "authority_used",  # v0.11.0：动态权限提升使用
     "authority_revoked",  # v0.11.0：动态权限提升撤销
     "authority_expired",  # v0.11.0：动态权限提升过期
+    "admin_operation",
 ]
 ApprovalVerdict = Literal["approve", "deny"]
 ConversationRole = Literal["user", "agent"]

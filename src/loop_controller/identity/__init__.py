@@ -8,6 +8,12 @@ from __future__ import annotations
 from loop_controller.identity.models import AgentIdentity, IdentityCredential
 from loop_controller.identity.mtls import MTLSIdentityProvider
 from loop_controller.identity.provider import IdentityProvider
+from loop_controller.identity.revocation import (
+    KillSwitchConfig,
+    RevocationEntry,
+    RevocationList,
+    RevocationType,
+)
 from loop_controller.identity.static import ConfigIdentityProvider
 
 __all__ = [
@@ -15,5 +21,9 @@ __all__ = [
     "ConfigIdentityProvider",
     "IdentityCredential",
     "IdentityProvider",
+    "KillSwitchConfig",
     "MTLSIdentityProvider",
+    "RevocationEntry",
+    "RevocationList",
+    "RevocationType",
 ]

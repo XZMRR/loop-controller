@@ -1,0 +1,9 @@
+evidence:
+  enabled: false
+  backend: local
+  local:
+    path: evidence/
+    max_file_size_mb: 10
+  signing:
+    algorithm: ed25519
+    private_key_env: LOOP_CONTROLLER_EVIDENCE_PRIVATE_KEY
