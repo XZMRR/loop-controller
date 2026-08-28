@@ -111,6 +111,7 @@ class _MockRuntime:
         self.approval_manager = approval_manager or _MockApprovalManager()
         self.audit_store = audit_store or _MockAuditStore()
         self.checkpoint = _MockCheckpoint()
+        self.harness_executor = None
 
 
 class _MockController(LoopController):
@@ -393,6 +394,58 @@ def test_existing_admin_endpoints_allow_unconfigured_api_key() -> None:
     assert client.get("/v1/admin/audit").status_code == 200
 
 
+def test_admin_harness_backends_is_authenticated_and_sanitized() -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from loop_controller.executors.harness_protocol import HarnessBackendStatus
+
+    class HarnessExecutorStub:
+        def backend_statuses(self) -> list[HarnessBackendStatus]:
+            return [
+                HarnessBackendStatus(
+                    name="production",
+                    type="http",
+                    status="healthy",
+                    max_concurrent_calls=20,
+                    checked_at=datetime(2026, 8, 28, tzinfo=UTC),
+                    in_flight=2,
+                )
+            ]
+
+    client, controller = _build_client(api_key="secret")
+    controller._runtime.harness_executor = HarnessExecutorStub()
+    controller._runtime.harness_config = SimpleNamespace(
+        base_url="https://user:password@harness.example",
+        api_key="must-not-leak",
+        key_env="HARNESS_SECRET",
+    )
+
+    assert client.get("/v1/admin/harness/backends").status_code == 401
+    response = client.get(
+        "/v1/admin/harness/backends", headers={"X-API-Key": "secret"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "backends": [
+            {
+                "name": "production",
+                "type": "http",
+                "status": "healthy",
+                "max_concurrent_calls": 20,
+                "checked_at": "2026-08-28T00:00:00Z",
+                "consecutive_failures": 0,
+                "last_error_code": None,
+                "in_flight": 2,
+            }
+        ]
+    }
+    serialized = response.text
+    assert "password" not in serialized
+    assert "must-not-leak" not in serialized
+    assert "HARNESS_SECRET" not in serialized
+
+
 def test_api_key_auth_header() -> None:
     client, _controller = _build_client(api_key="secret")
     resp = client.post(
@@ -428,6 +481,7 @@ def test_api_key_protects_admin_and_wait_endpoints() -> None:
     for path in (
         "/v1/admin/approvals/pending",
         "/v1/admin/audit",
+        "/v1/admin/harness/backends",
         "/v1/wait-for-approval",
         "/v1/wait-for-approval/sse",
     ):

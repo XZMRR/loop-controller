@@ -440,7 +440,12 @@ def build_runtime(
     )
 
     return Runtime(
-        classifier=RuleBasedClassifier(),
+        classifier=RuleBasedClassifier(
+            {
+                name: spec.default_risk
+                for name, spec in config.harness_tool_specs.items()
+            }
+        ),
         checkpoint=checkpoint,
         gateway=gateway,
         approval_manager=approval_manager,

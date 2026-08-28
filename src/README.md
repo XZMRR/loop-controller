@@ -1,6 +1,6 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.26.1）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环；v0.26.1 修复了吊销、Kill Switch 与本地签名证据链的安全边界和一致性问题。
+企业级 AI Agent 治理层（v0.27.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环；v0.27.0 为远程 HTTP Harness 补齐认证、防重放、进程内并发门控、健康检查、启动校验和风险下限接线。
 
 **核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为工具调用治理控制平面，是所有经治理工具调用的**唯一授权出口**。
 
@@ -18,7 +18,7 @@
 - **预算控制**：按工具计费的 token 预算，超支即拒。
 - **可信身份控制平面**（v0.20.0）：Agent 身份由 JWT / mTLS / 静态 token 验证，`agent_id` 从凭证推导，不可伪造；
 - **可插拔执行器抽象**（v0.20.0）：`ExecutorRegistry` + `ToolExecutor` 让 MCP / HTTP 协议型工具可统一接入；
-- **Harness 可插拔执行后端**（v0.25.0）：`HarnessExecutor` 把治理后的调用转发给外部 Harness（子进程/远程 HTTP/Docker）执行，Shell / SQL / 浏览器等高危能力不在 Loop Controller 进程内执行；
+- **远程 HTTP Harness 生产出口**（v0.27.0）：`HarnessExecutor` 支持 HMAC/API Key、timestamp + nonce 防重放、TLS/可选 mTLS 客户端、每后端进程内并发门控、健康检查与启动校验；子进程仅供开发/测试，Docker/Kubernetes 由部署层运行独立 HTTP Harness Service；
 - **全局吊销与 Kill Switch**（v0.26.1）：可按 agent、user、tool、secret 阻断调用；可信 Secret 依赖来自执行器当前配置，所有执行路径在最终执行边界复查，阻断会释放未提交预算并写审计；
 - **本地签名证据链**（v0.26.1）：审计事件可写入 HMAC-SHA256 或 Ed25519 签名的链式 JSONL 证据；异步写入保持单进程有序，并通过审计—证据交叉校验和签名本地 checkpoint 检测单边丢失与相对回退；
 - **网络级治理入口**（v0.20.0）：HTTP、gRPC、MCP Proxy 作为生产入口，Agent 不直接持有工具凭证。
@@ -35,11 +35,11 @@ R2 Checkpoint（身份校验 → 吊销检查 → 防重放 → Profile → 预�
 ExecutorRegistry ──→ MCPExecutor ──→ MCPGateway ──→ MCP Servers
                                   ├─→ HTTP Executor（v0.21+）
                                   ├─→ LocalFunctionExecutor（v0.23+，可选辅助）
-                                  └─→ HarnessExecutor（v0.25+）──→ Harness（子进程/远程 HTTP/Docker）
+                                  └─→ HarnessExecutor（v0.27）──HTTPS/HMAC──→ 独立 Harness Service
 
-Shell / SQL / Browser 等高危工具通过外部 MCP Server 或 Harness 接入，
-不在 Loop Controller 进程内执行。见 examples/contrib/mcp_wrappers/ 与
-examples/contrib/harness/。
+Shell / SQL / Browser 等高危工具通过外部 MCP Server 或独立 Harness Service 接入，
+不在 Loop Controller 进程内执行。容器/Kubernetes/VM 提供真实隔离；subprocess Harness
+仅供开发/集成测试。见 examples/contrib/mcp_wrappers/ 与 examples/contrib/harness/。
 
 R3 AuditStore：异步全量记录 + 哈希链 + 可选本地签名证据链 + 分级掩码（只读，无指令下发权）
 R0 AsyncApprovalManager：异步审批请求持久化，审批人通过 `lc` CLI 写入结果
@@ -123,14 +123,14 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 | `approval.yaml` | 审批人默认与规则（用于确定 escalation_target） |
 | `identity.yaml` | 身份 Provider 配置（static / jwt / mtls） |
 | `entrypoints.yaml` | HTTP/gRPC/MCP Proxy 入口认证方式与开关 |
-| `harness_tools.yaml` | Harness 后端与工具配置（v0.25.0，默认注释不启用） |
+| `harness_tools.yaml` | Harness 后端与工具配置（v0.27.0，默认注释；生产模板为 HTTPS + HMAC + 健康检查） |
 | `revocation.yaml` | 全局吊销列表与 Kill Switch（v0.26.0，支持热更新） |
 | `evidence.yaml` | 本地签名证据链后端与签名算法（v0.26.0） |
 | `policies/default.rego` | 主策略（Rego v1） |
 
 ## 已知局限
 
-**本项目当前为 v0.26.1，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：吊销状态与本地 JSONL 写入均按单进程部署设计；签名本地 checkpoint 可检测相对回退及审计/证据单边丢失，但它不是 WORM 或远程可信锚点，审计、证据与 checkpoint 同时被删除仍无法检测；生产环境仍需外部可信锚点、远程不可变存储或独立备份。KMS/HSM、远程证据存储和完整多租户隔离尚未实现；同进程 SDK/Adapter 不承诺实时阻断；Harness 默认不启用且子进程模式仅用于开发/测试。
+**本项目当前为 v0.27.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：Harness 默认不启用；生产仅推荐独立 HTTPS HTTP Harness，参考服务和 subprocess 都不是生产沙箱；并发门控、防重放 nonce store、吊销状态与本地 JSONL 写入均是单进程/单实例语义。远程调用超时后的执行结果可能未知且不会自动重试；远程取消、跨实例长期幂等和分布式配额尚未实现；Harness 只读 Admin 状态端点复用现有 API key 鉴权，专用调用/排队/过载/in-flight/健康指标已接入 Prometheus。签名本地 checkpoint 仍不是 WORM 或远程可信锚点；KMS/HSM、远程证据存储和完整多租户隔离也尚未实现。
 
 ## 文档
 
@@ -142,7 +142,8 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `loop_controller_v0.5.0_development.md`——v0.5.0 MCP Proxy / 外来 Agent 接入方案
 - `loop_controller_v0.25.0_development.md`——v0.25.0 Harness 作为生产级执行后端
 - `loop_controller_v0.26.0_development.md`——v0.26.0 全局吊销与本地签名证据链
-- `loop_controller_v0.26.1_development.md`——v0.26.1 吊销、Kill Switch 与证据链可靠性修复（当前版本依据）
+- `loop_controller_v0.26.1_development.md`——v0.26.1 吊销、Kill Switch 与证据链可靠性修复
+- `loop_controller_v0.27.0_development.md`——v0.27.0 Harness 生产闭环（当前版本依据）
 - `development_log.md`——开发记录与决策追溯
 - `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
 - `answer.md`——MVP 审查分析与修复状态追踪

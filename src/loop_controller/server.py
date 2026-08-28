@@ -549,6 +549,22 @@ class ToolGovernServer:
         )
         return JSONResponse(config.model_dump(mode="json"))
 
+    async def _handle_admin_harness_backends(self, request: Request) -> JSONResponse:
+        if self._api_key is not None and not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        executor = getattr(self._controller._runtime, "harness_executor", None)
+        if executor is None:
+            return JSONResponse({"backends": []})
+        return JSONResponse(
+            {
+                "backends": [
+                    status.model_dump(mode="json")
+                    for status in executor.backend_statuses()
+                ]
+            }
+        )
+
     async def _handle_admin_audit(self, request: Request) -> JSONResponse:
         if self._api_key is not None and not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -644,6 +660,7 @@ def build_app(
             Route("/v1/wait-for-approval", server._handle_wait_for_approval, methods=["GET"]),
             Route("/v1/wait-for-approval/sse", server._handle_wait_for_approval_sse, methods=["GET"]),
             Route("/v1/admin/approvals/pending", server._handle_admin_pending_approvals, methods=["GET"]),
+            Route("/v1/admin/harness/backends", server._handle_admin_harness_backends, methods=["GET"]),
             Route("/admin/revoke", server._handle_admin_revoke, methods=["POST", "DELETE"]),
             Route("/admin/revocation-list", server._handle_admin_revocation_list, methods=["GET"]),
             Route("/admin/kill-switch", server._handle_admin_kill_switch, methods=["POST"]),

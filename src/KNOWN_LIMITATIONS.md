@@ -1,6 +1,6 @@
 # 已知局限（Known Limitations）
 
-> 本文件列出 Loop Controller v0.26.1 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
+> 本文件列出 Loop Controller v0.27.0 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
 
 ---
 
@@ -34,7 +34,7 @@ Shell、SQL、浏览器、文件系统、本地函数等操作系统级或应用
    `shell_mcp_server.py`、`sql_mcp_server.py`、`browser_mcp_server.py`；
 2. **接入 Harness**：Loop Controller 做治理决策， HarnessExecutor 将调用转发给外部 Harness 进程/容器执行，见 `examples/contrib/harness/`。
 
-v0.25.0 已将 Harness 提升为生产级可插拔执行后端，支持子进程（开发/测试）、HTTP 远程 Harness 两种形态，并保留 Docker 配置模型与示例。
+v0.27.0 将远程 HTTP Harness 收敛为生产主路径，支持认证、防重放、进程内并发门控、健康检查和 TLS/mTLS 客户端配置。子进程仍仅用于开发/测试；Docker 配置在加载期被拒绝，Loop Controller 不直接调用 Docker daemon。
 
 `LocalFunctionExecutor`（v0.23.0）保留，但仅定位为“不方便包装成 MCP 时的可选辅助”，
 不是核心架构方向。
@@ -238,15 +238,15 @@ v0.25.0 实现 `HarnessExecutor`，通过 `config/harness_tools.yaml` 将工具�
 
 `SubprocessBackendConfig` 允许 Loop Controller 启动本地子进程作为 Harness。该模式与 Loop Controller 主进程共享文件系统、网络、CPU/内存 等底层资源，**不用于生产环境**。
 
-生产环境应使用 Docker 容器或远程 HTTP Harness，由部署层提供真正隔离。
+生产环境应由部署层在容器、Kubernetes、VM 或专用主机中运行独立 HTTPS HTTP Harness Service，并由部署层提供真正隔离。
 
-### V25-3. Docker Harness 后端为示例级
+### V25-3. Loop Controller 不提供 Docker/Kubernetes 编排
 
-v0.25.0 保留 `DockerBackendConfig` 配置模型与 `examples/contrib/harness/docker_backend.py` 示例实现，但 Docker 后端未与 `HarnessExecutor` 直接集成；企业需要自行将 Docker 后端接入 Harness 服务或替换为生产级容器编排方案。
+`DockerBackendConfig` 类型和 `examples/contrib/harness/docker_backend.py` 示例仍在代码库中，但 v0.27.0 配置加载器会在启动期拒绝 `type: docker`，不会把它注册到 `HarnessExecutor`。生产容器或 Kubernetes 工作负载必须由部署层启动为独立 HTTP Harness Service。
 
-### V25-4. Harness 工具风险等级由配置决定
+### V25-4. Harness 工具风险等级由配置提供下限
 
-Harness 工具的 `default_risk` 默认为 `critical`，由 `RuleBasedClassifier` 读取工具规格后作为 R1 风险信号；R2 最终裁决仍以 Profile、OPA/Rego 与组合规则为准。
+Harness 工具的 `default_risk` 默认为 `critical`；v0.27.0 将它接入统一 `RuleBasedClassifier`，R1 结果取规则风险与工具默认风险的较高者。它不是最终授权：R2 的 Profile、OPA/Rego、审批和组合规则仍保留最终裁决权。
 
 ### V25-5. Harness 后端不支持运行期热更新
 
@@ -289,6 +289,32 @@ v0.26.1 支持 HMAC-SHA256 与 Ed25519，并通过审计—证据交叉校验和
 ### V261-4. 证据验证失败采用降级而非拒绝启动
 
 启动时审计—证据—checkpoint 校验失败会产生告警，并通过健康检查暴露 `evidence_status=degraded`；为保留主审计可用性，服务仍会启动。对证据完整性要求必须 fail-stop 的部署，需要在外部编排或健康检查 gate 中拒绝接流量。
+
+## v0.27.0 边界声明
+
+### V27-1. 生产保证止于独立 HTTP Harness 的控制与协议边界
+
+Loop Controller 可对远程 HTTP Harness 做启动校验、HMAC/API Key 认证、TLS/可选 mTLS 客户端配置、每后端并发门控、健康检查、Secret 吊销和风险下限接线，但不执行真实工具，也不提供文件系统、网络、进程、CPU 或内存隔离。参考 Harness 只用于演示协议、认证、参数校验、超时、输出上限和 fail-closed 语义，不是生产沙箱。
+
+### V27-2. 防重放、并发门控和健康状态是单实例语义
+
+nonce 缓存位于参考 Harness 进程内；`asyncio.Semaphore` 与健康状态位于 Loop Controller 进程内。多副本部署没有共享 nonce store、分布式并发配额或状态一致性。生产多副本必须自行接入共享 nonce/配额/状态设施，或接受每实例独立的边界。
+
+### V27-3. 超时和取消不等于远端执行已取消
+
+HTTP 请求发送后超时或连接中断时，远端工具可能已经执行；本版本返回不确定结果且不自动重试。调用方取消本地协程只释放本地并发槽位，不会取消远端动作。本版本没有远程取消端点，也不提供跨实例或长期 `call_id` 幂等保证。
+
+### V27-4. 沙箱字段不是控制平面的隔离保证
+
+参考 Harness 对非空 `allowed_hosts`/`allowed_paths` 返回 `harness_sandbox_unsupported`，不会静默忽略；`env_whitelist` 只允许服务端预配置环境变量。真正的网络和文件系统策略仍须由部署环境强制执行。参考 shell 工具只是预注册命令 allowlist 示例，不应直接作为生产运维执行器。
+
+### V27-5. 运维状态端点沿用现有 HTTP Admin 鉴权边界
+
+`GET /v1/admin/harness/backends` 复用现有 HTTP Admin API key，返回净化后的类型、健康状态、检查时间、失败次数、错误码、in-flight 与并发上限；Harness 调用、耗时、排队、in-flight、过载和健康指标已接入 Prometheus。当前没有对应 gRPC Admin RPC，也没有统一的 HTTP/gRPC Admin RBAC。
+
+### V27-6. 配置和密钥不支持运行期轮换
+
+`harness_tools.yaml` 仍只在启动时加载；认证环境变量、TLS 文件、工具注册和 backend 参数变更后需要重启。旧 `api_key_env` 仅为兼容入口，已弃用且不能与新 `auth` 同时配置。
 
 ## 环境备注
 

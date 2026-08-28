@@ -1,7 +1,7 @@
 # Loop Controller — 企业内部 Agent 工具调用治理基础设施
 
-> **当前版本**：v0.26.1（吊销、Kill Switch 与本地签名证据链可靠性修复）
-> **项目阶段**：MVP 已完成；当前提供 HTTP、gRPC、MCP Proxy 治理入口，以及可信身份、全局吊销、可插拔执行器和本地签名证据链
+> **当前版本**：v0.27.0（远程 HTTP Harness 生产闭环）
+> **项目阶段**：MVP 已完成；当前提供 HTTP、gRPC、MCP Proxy 治理入口，以及可信身份、全局吊销、可插拔执行器、本地签名证据链和受治理的远程 HTTP Harness 出口
 > **首选语言**：Python（Agent 生态最丰富，社区传播友好）
 > **文档语言**：中文为主，代码与核心 API 文档以英文为主，便于国际化开源
 
@@ -95,11 +95,11 @@ tests/legacy/security_experiments/  # 早期实验（已归档，pytest 忽略�
 
 ---
 
-## 5. v0.26.1 安全边界摘要
+## 5. v0.27.0 安全边界摘要
 
-v0.26.1 修复了可信 Secret 吊销、最终执行前吊销/Kill Switch 复查、gRPC Admin allowlist、UTC 时间校验、异步审计写入，以及审计—证据—本地 checkpoint 一致性验证。
+v0.27.0 为远程 HTTP Harness 补齐启动期配置校验、HMAC/API Key 认证、timestamp + nonce 防重放、每后端进程内并发门控、健康检查、TLS/可选 mTLS 客户端配置、Secret 吊销接线、稳定失败语义，以及 `default_risk` 风险下限接线。生产环境应由部署层运行独立 HTTPS Harness Service；Loop Controller 不直接执行 Shell/SQL/Browser，也不编排 Docker/Kubernetes。
 
-本地签名 checkpoint 只能检测相对上次本地状态的回退和审计/证据单边丢失；它不是 WORM 或远程可信锚点。若攻击者同时删除全部本地审计、证据和 checkpoint，本版本无法检测。生产环境需配合外部可信锚点、远程不可变存储或独立备份。完整说明见 [`src/KNOWN_LIMITATIONS.md`](./src/KNOWN_LIMITATIONS.md)，配置说明见 [`src/README.md`](./src/README.md#配置)。
+参考 Harness 是协议与安全失败语义示例，不是生产沙箱。网络/文件系统/进程/资源隔离依赖容器、Kubernetes、VM 或专用主机；多副本全局防重放、分布式并发配额、远程取消与长期幂等均未提供。Harness 后端状态可通过受现有 Admin API key 保护的只读端点查询，执行、排队、过载、in-flight 与健康指标已接入 Prometheus。完整说明见 [`src/KNOWN_LIMITATIONS.md`](./src/KNOWN_LIMITATIONS.md)，配置说明见 [`src/README.md`](./src/README.md#配置)。
 
 ## 5. 快速开始
 

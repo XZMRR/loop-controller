@@ -11,6 +11,7 @@ from loop_controller.models import (
     ActionProposal,
     Agent,
     CapabilityProfile,
+    RiskLevel,
     Task,
     ToolPermission,
 )
@@ -109,3 +110,36 @@ def test_bearer_token_value_credential(task, agent, profile) -> None:
     )
     assert signal.risk_level == "high"
     assert signal.tags == ["credential_involved"]
+
+
+@pytest.mark.parametrize("default_risk", ["medium", "high", "critical"])
+def test_tool_default_risk_is_r1_floor(
+    task, agent, profile, default_risk: RiskLevel
+) -> None:
+    signal = classify(
+        RuleBasedClassifier({"harness_tool": default_risk}),
+        task,
+        agent,
+        profile,
+        "harness_tool",
+        {},
+    )
+
+    assert signal.risk_level == default_risk
+    assert signal.tags == []
+    assert f"tool_default_risk={default_risk}" in signal.reason
+
+
+def test_rule_risk_above_tool_default_is_preserved(task, agent, profile) -> None:
+    signal = classify(
+        RuleBasedClassifier({"read_file": "low"}),
+        task,
+        agent,
+        profile,
+        "read_file",
+        {"path": "/data/kb/doc.md", "content": "contact alice@company.com"},
+    )
+
+    assert signal.risk_level == "high"
+    assert signal.tags == ["data_access", "pii_involved"]
+    assert "tool_default_risk" not in signal.reason

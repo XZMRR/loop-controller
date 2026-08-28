@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 import re
-from typing import Protocol, runtime_checkable
+from collections.abc import Mapping
+from typing import Protocol, get_args, runtime_checkable
 
 from loop_controller.models import (
     ActionProposal,
@@ -32,6 +33,7 @@ _SENSITIVE_FIELD_NAMES = (
     "authorization",
     "credential",
 )
+_RISK_ORDER: tuple[RiskLevel, ...] = get_args(RiskLevel)
 
 
 @runtime_checkable
@@ -48,7 +50,7 @@ class LightweightClassifier(Protocol):
 
 
 class RuleBasedClassifier:
-    """规则版分类器（MVP 打桩），四条规则：
+    """规则版分类器（MVP 打桩），规则如下：
 
     | 规则 | risk_level | tags |
     |---|---|---|
@@ -56,8 +58,12 @@ class RuleBasedClassifier:
     | ``tool_name == "read_file"`` | medium | ``[data_access]`` |
     | 参数值匹配敏感模式（邮箱） | high | 追加 ``[pii_involved]`` |
     | 参数值匹配敏感模式（Bearer token / 密码字段名） | high | 追加 ``[credential_involved]`` |
+    | 工具默认风险高于规则结果 | 取工具默认风险 | 保留规则标签 |
     | 其他 | low | ``[]`` |
     """
+
+    def __init__(self, tool_default_risks: Mapping[str, RiskLevel] | None = None) -> None:
+        self._tool_default_risks = dict(tool_default_risks or {})
 
     def classify(
         self,
@@ -88,6 +94,11 @@ class RuleBasedClassifier:
             level = "high"
             tags.append("credential_involved")
             hits.append("value=credential")
+
+        default_risk = self._tool_default_risks.get(proposal.tool_name)
+        if default_risk is not None and _RISK_ORDER.index(default_risk) > _RISK_ORDER.index(level):
+            level = default_risk
+            hits.append(f"tool_default_risk={default_risk}")
 
         return RiskSignal(
             risk_level=level,

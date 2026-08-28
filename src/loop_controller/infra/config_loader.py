@@ -18,15 +18,18 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 import re
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import urlparse
 
 import httpx
 import yaml
+from pydantic import ValidationError
 
 from loop_controller.executors.harness_models import (
     DockerBackendConfig,
@@ -363,6 +366,7 @@ class ConfigLoader:
         self._check_approver_exists(app_config)
         self._check_llm_planner_api_key(app_config)
         self._check_audit_key(app_config)
+        self._check_harness_config(app_config)
         self._check_identity_config(app_config)
         self._check_entrypoints_config(app_config)
         return app_config
@@ -481,18 +485,26 @@ class ConfigLoader:
         data = self._read_yaml(path)
         for name, entry in (data.get("backends") or {}).items():
             backend_type = entry.get("type", "subprocess")
-            if backend_type == "subprocess":
-                backends[name] = SubprocessBackendConfig(name=name, **entry)
-            elif backend_type == "docker":
-                backends[name] = DockerBackendConfig(name=name, **entry)
-            elif backend_type == "http":
-                backends[name] = HTTPBackendConfig(name=name, **entry)
-            else:
-                raise ConfigValidationError(
-                    f"Harness 后端 {name} 的类型 {backend_type!r} 不受支持"
-                )
+            try:
+                if backend_type == "subprocess":
+                    backends[name] = SubprocessBackendConfig(name=name, **entry)
+                elif backend_type == "docker":
+                    raise ConfigValidationError(
+                        f"Harness 后端 {name} 使用不受支持的 docker 类型；请由部署层启动 HTTP Harness Service"
+                    )
+                elif backend_type == "http":
+                    backends[name] = HTTPBackendConfig(name=name, **entry)
+                else:
+                    raise ConfigValidationError(
+                        f"Harness 后端 {name} 的类型 {backend_type!r} 不受支持"
+                    )
+            except ValidationError as exc:
+                raise ConfigValidationError(f"Harness 后端 {name} 配置非法：{exc}") from exc
         for canonical, entry in (data.get("tools") or {}).items():
-            tool_specs[canonical] = HarnessToolSpec(tool_name=canonical, **entry)
+            try:
+                tool_specs[canonical] = HarnessToolSpec(tool_name=canonical, **entry)
+            except ValidationError as exc:
+                raise ConfigValidationError(f"Harness 工具 {canonical} 配置非法：{exc}") from exc
         return tool_specs, backends
 
     def reload_http_tools(self, config_dir: str | Path) -> dict[str, HTTPToolSpec]:
@@ -837,6 +849,60 @@ class ConfigLoader:
             raise ValueError(f"key 长度 {len(key)} 字节，必须 ≥32 字节")
         return key
 
+    def _check_harness_config(self, config: AppConfig) -> None:
+        """校验 Harness backend/tool 引用、传输与认证边界。"""
+        for tool_name, spec in config.harness_tool_specs.items():
+            if spec.harness not in config.harness_backends:
+                raise ConfigValidationError(
+                    f"Harness 工具 {tool_name} 引用的 backend {spec.harness} 不存在"
+                )
+            try:
+                json.dumps(spec.input_schema)
+            except (TypeError, ValueError) as exc:
+                raise ConfigValidationError(
+                    f"Harness 工具 {tool_name} 的 input_schema 不是合法 JSON Schema 对象"
+                ) from exc
+            schema_type = spec.input_schema.get("type")
+            if schema_type is not None and schema_type not in {
+                "array", "boolean", "integer", "null", "number", "object", "string"
+            }:
+                raise ConfigValidationError(
+                    f"Harness 工具 {tool_name} 的 input_schema.type 非法：{schema_type!r}"
+                )
+
+        for name, backend in config.harness_backends.items():
+            if not isinstance(backend, HTTPBackendConfig):
+                continue
+            parsed = urlparse(backend.base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ConfigValidationError(
+                    f"Harness HTTP 后端 {name} 的 base_url 必须是有效的 HTTP(S) URL"
+                )
+            loopback = parsed.hostname in {"localhost", "127.0.0.1"}
+            if parsed.scheme == "http" and not (loopback and backend.allow_insecure_http):
+                raise ConfigValidationError(
+                    f"Harness HTTP 后端 {name} 必须使用 HTTPS；仅 loopback 可显式设置 allow_insecure_http"
+                )
+            if parsed.scheme == "https" and not backend.tls.verify:
+                raise ConfigValidationError(
+                    f"Harness HTTP 后端 {name} 的生产 HTTPS 不得关闭 TLS 校验"
+                )
+            if backend.auth.type != "none":
+                env_name = backend.auth.key_env
+                if not env_name or not os.environ.get(env_name, "").strip():
+                    raise ConfigValidationError(
+                        f"Harness HTTP 后端 {name} 的认证环境变量 {env_name!r} 未设置或为空"
+                    )
+            for field_name in ("ca_file", "client_cert_file", "client_key_file"):
+                file_name = getattr(backend.tls, field_name)
+                if not file_name:
+                    continue
+                path = Path(file_name)
+                if not path.is_file() or not os.access(path, os.R_OK):
+                    raise ConfigValidationError(
+                        f"Harness HTTP 后端 {name} 的 TLS 文件 {field_name} 不存在或不可读"
+                    )
+
     def _check_identity_config(self, config: AppConfig) -> None:
         """校验 identity provider 配置，避免启动后因配置错误才发现问题。"""
         identity = config.identity_config
@@ -915,8 +981,29 @@ class ConfigLoader:
     def _read_yaml(path: Path) -> dict[str, Any]:
         if not path.exists():
             raise ConfigValidationError(f"配置文件缺失：{path}")
+
+        class UniqueKeyLoader(yaml.SafeLoader):
+            pass
+
+        def construct_unique_mapping(
+            loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False
+        ) -> dict[Any, Any]:
+            mapping: dict[Any, Any] = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in mapping:
+                    raise ConfigValidationError(
+                        f"配置文件 {path} 包含重复名称 {key!r}"
+                    )
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
+
+        UniqueKeyLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            construct_unique_mapping,
+        )
         with path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+            data = yaml.load(f, Loader=UniqueKeyLoader)
         if data is None:
             return {}
         if not isinstance(data, dict):

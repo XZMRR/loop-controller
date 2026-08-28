@@ -365,3 +365,154 @@ def test_entrypoints_require_auth_not_bool(config_dir):
     )
     with pytest.raises(ConfigValidationError, match="require_auth 必须是布尔值"):
         ConfigLoader().load(config_dir)
+
+
+# v0.27.0 Harness 阶段 1 配置校验
+
+
+def _write_harness_config(config_dir: Path, backend: dict, tool: dict | None = None) -> None:
+    data = {"backends": {"remote": backend}, "tools": {}}
+    if tool is not None:
+        data["tools"] = {"deploy": tool}
+    _write_yaml(config_dir / "harness_tools.yaml", data)
+
+
+def test_harness_legacy_api_key_env_is_normalized(config_dir, monkeypatch):
+    monkeypatch.setenv("HARNESS_API_KEY", "secret")
+    _write_harness_config(
+        config_dir,
+        {"type": "http", "base_url": "https://harness.example", "api_key_env": "HARNESS_API_KEY"},
+    )
+    backend = ConfigLoader().load(config_dir).harness_backends["remote"]
+    assert backend.auth.type == "api_key"
+    assert backend.auth.key_env == "HARNESS_API_KEY"
+
+
+def test_harness_rejects_legacy_and_new_auth_together(config_dir, monkeypatch):
+    monkeypatch.setenv("HARNESS_API_KEY", "secret")
+    _write_harness_config(
+        config_dir,
+        {
+            "type": "http",
+            "base_url": "https://harness.example",
+            "api_key_env": "HARNESS_API_KEY",
+            "auth": {"type": "api_key", "key_env": "HARNESS_API_KEY"},
+        },
+    )
+    with pytest.raises(ConfigValidationError, match="api_key_env 与 auth 不得同时配置"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_tool_rejects_missing_backend(config_dir):
+    _write_yaml(
+        config_dir / "harness_tools.yaml",
+        {"tools": {"deploy": {"harness": "missing", "input_schema": {"type": "object"}}}},
+    )
+    with pytest.raises(ConfigValidationError, match="backend missing 不存在"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_rejects_duplicate_backend_name(config_dir):
+    (config_dir / "harness_tools.yaml").write_text(
+        "backends:\n"
+        "  remote:\n"
+        "    type: subprocess\n"
+        "    command: [python, first.py]\n"
+        "  remote:\n"
+        "    type: subprocess\n"
+        "    command: [python, second.py]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigValidationError, match="包含重复名称 'remote'"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_rejects_non_loopback_http(config_dir):
+    _write_harness_config(
+        config_dir,
+        {"type": "http", "base_url": "http://harness.example", "allow_insecure_http": True},
+    )
+    with pytest.raises(ConfigValidationError, match="必须使用 HTTPS"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_loopback_http_requires_explicit_opt_in(config_dir):
+    _write_harness_config(config_dir, {"type": "http", "base_url": "http://127.0.0.1:8080"})
+    with pytest.raises(ConfigValidationError, match="allow_insecure_http"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_loopback_http_explicit_opt_in_ok(config_dir):
+    _write_harness_config(
+        config_dir,
+        {"type": "http", "base_url": "http://localhost:8080", "allow_insecure_http": True},
+    )
+    assert "remote" in ConfigLoader().load(config_dir).harness_backends
+
+
+def test_harness_production_https_rejects_disabled_verify(config_dir):
+    _write_harness_config(
+        config_dir,
+        {"type": "http", "base_url": "https://harness.example", "tls": {"verify": False}},
+    )
+    with pytest.raises(ConfigValidationError, match="不得关闭 TLS 校验"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_auth_requires_nonempty_environment_variable(config_dir, monkeypatch):
+    monkeypatch.setenv("HARNESS_SIGNING_KEY", "   ")
+    _write_harness_config(
+        config_dir,
+        {
+            "type": "http",
+            "base_url": "https://harness.example",
+            "auth": {"type": "hmac_sha256", "key_env": "HARNESS_SIGNING_KEY", "key_id": "key-1"},
+        },
+    )
+    with pytest.raises(ConfigValidationError, match="未设置或为空"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_mtls_cert_and_key_must_be_paired(config_dir):
+    _write_harness_config(
+        config_dir,
+        {
+            "type": "http",
+            "base_url": "https://harness.example",
+            "tls": {"client_cert_file": "client.pem"},
+        },
+    )
+    with pytest.raises(ConfigValidationError, match="必须成对配置"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_tls_files_must_exist(config_dir):
+    _write_harness_config(
+        config_dir,
+        {
+            "type": "http",
+            "base_url": "https://harness.example",
+            "tls": {"ca_file": str(config_dir / "missing-ca.pem")},
+        },
+    )
+    with pytest.raises(ConfigValidationError, match="TLS 文件 ca_file 不存在或不可读"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_rejects_invalid_input_schema_type(config_dir):
+    _write_harness_config(
+        config_dir,
+        {"type": "subprocess", "command": ["python", "runner.py"]},
+        {"harness": "remote", "input_schema": {"type": "invalid"}},
+    )
+    with pytest.raises(ConfigValidationError, match="input_schema.type 非法"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_rejects_docker_at_load_time(config_dir):
+    _write_harness_config(
+        config_dir,
+        {"type": "docker", "image": "example/harness:latest"},
+    )
+    with pytest.raises(ConfigValidationError, match="不受支持的 docker 类型"):
+        ConfigLoader().load(config_dir)

@@ -1,13 +1,30 @@
-"""Loop Controller ↔ Harness 通信协议（v0.25.0）。
-
-当前采用轻量级 HTTP/JSON 协议，未来可扩展为 gRPC。
-"""
+"""Loop Controller ↔ Harness HTTP/JSON 协议。"""
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+HARNESS_PROTOCOL_VERSION = "1"
+HARNESS_EXECUTE_PATH = "/harness/v1/execute"
+HarnessErrorCode = Literal[
+    "harness_backend_unavailable",
+    "harness_overloaded",
+    "harness_request_timeout",
+    "harness_auth_required",
+    "harness_auth_failed",
+    "harness_replay_detected",
+    "harness_protocol_unsupported",
+    "harness_invalid_request",
+    "harness_tool_not_found",
+    "harness_sandbox_violation",
+    "harness_sandbox_unsupported",
+    "harness_timeout",
+    "harness_output_limit_exceeded",
+    "harness_invalid_response",
+]
 
 
 class HarnessContext(BaseModel):
@@ -53,5 +70,20 @@ class HarnessExecuteResponse(BaseModel):
 
     status: Literal["success", "error"]
     content: Any | None = None
-    error_code: str | None = None
+    error_code: HarnessErrorCode | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class HarnessBackendStatus(BaseModel):
+    """可安全向运维接口暴露的后端状态。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    type: Literal["subprocess", "docker", "http"]
+    status: Literal["unknown", "healthy", "degraded", "unhealthy"]
+    max_concurrent_calls: int
+    checked_at: datetime | None = None
+    consecutive_failures: int = 0
+    last_error_code: str | None = None
+    in_flight: int = 0

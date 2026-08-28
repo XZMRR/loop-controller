@@ -1,12 +1,37 @@
-# Harness 后端与工具配置（v0.25.0）
-# Loop Controller 通过 Harness 将高危工具调用转发给独立执行进程/容器，
-# 保持治理平面自身不直接执行 Shell/SQL/Browser 等副作用。
+# Harness 后端与工具配置（v0.27.0）
+# Loop Controller 只负责治理并将调用转发给独立 Harness Service；文件系统、网络、
+# 进程和资源隔离必须由 Harness 及其容器/Kubernetes/VM/专用主机部署环境提供。
 #
-# 本文件默认全部注释，避免在测试/启动时自动拉起子进程 Harness。
-# 启用前请取消注释对应后端与工具，并将工具名加入 profiles.yaml 中对应 Profile。
+# 本文件默认全部注释，避免无 Harness 环境启动失败。生产主路径是 HTTPS 远程
+# HTTP Harness；subprocess 仅用于开发/集成测试。Loop Controller 不直接编排 Docker。
+# 启用前还需将工具名加入 profiles.yaml，并通过环境变量注入认证密钥。
 
 # backends:
-#   local_subprocess_harness:
+#   production_harness:
+#     type: http
+#     base_url: https://harness.internal.example
+#     timeout_seconds: 30
+#     max_concurrent_calls: 20
+#     acquire_timeout_seconds: 2
+#     auth:
+#       type: hmac_sha256
+#       key_env: HARNESS_SIGNING_KEY
+#       key_id: lc-harness-2026-01
+#       max_clock_skew_seconds: 60
+#     tls:
+#       verify: true
+#       ca_file: /etc/loop-controller/harness-ca.pem
+#       client_cert_file: /etc/loop-controller/client.pem
+#       client_key_file: /etc/loop-controller/client-key.pem
+#     health:
+#       enabled: true
+#       path: /health
+#       startup_required: true
+#       interval_seconds: 15
+#       timeout_seconds: 3
+#       unhealthy_threshold: 3
+#
+#   local_development_harness:
 #     type: subprocess
 #     command:
 #       - python
@@ -14,41 +39,30 @@
 #       - examples.contrib.harness.harness_server
 #     env:
 #       HARNESS_LOG_LEVEL: INFO
-#     max_concurrent_calls: 10
-#
-#   remote_http_harness:
-#     type: http
-#     base_url: http://127.0.0.1:9000
-#     api_key_env: HARNESS_API_KEY
-#     timeout_seconds: 30
-#     max_concurrent_calls: 10
+#     max_concurrent_calls: 2
+#     acquire_timeout_seconds: 2
 #
 # tools:
-#   harness_echo:
-#     harness: local_subprocess_harness
-#     description: 示例 Harness 工具，仅做回显，用于验证 Loop Controller ↔ Harness 协议连通性。
-#     default_risk: low
-#     cost_per_call: 10
-#     input_schema:
-#       type: object
-#       properties:
-#         message:
-#           type: string
-#       required:
-#         - message
-#
-#   harness_shell:
-#     harness: local_subprocess_harness
-#     description: 示例 Harness shell 执行器（仅用于本地集成测试，生产环境请关闭或替换为受限后端）。
+#   production_shell:
+#     harness: production_harness
+#     description: 在企业受控 Harness 中执行预注册运维动作。
 #     default_risk: critical
 #     cost_per_call: 100
+#     secret_refs:
+#       - PROD_OPERATIONS_TOKEN
 #     input_schema:
 #       type: object
 #       properties:
-#         command:
+#         action:
 #           type: string
-#       required:
-#         - command
+#           enum: [list_pods, inspect_deployment]
+#       required: [action]
+#       additionalProperties: false
 #     sandbox:
 #       timeout_seconds: 30
 #       max_output_bytes: 65536
+#       allowed_hosts: []
+#       allowed_paths: []
+#       env_whitelist: []
+#
+# 兼容说明：旧 api_key_env 仍可加载，但已弃用；不要与 auth 同时配置。

@@ -1846,3 +1846,37 @@ v0.23.2 已完成 v0.23.1 残留问题的收尾。v0.24.0 根据 `src/audit_repo
 ### 设计文档
 
 - `src/loop_controller_v0.26.1_development.md`
+
+---
+
+## v0.27.0：Harness 生产闭环
+
+### 完成内容
+
+- 远程 HTTP Harness 增加 HMAC-SHA256/API Key 认证、timestamp + nonce 签名协议与参考服务防重放；
+- 增加 HTTPS 强制、loopback HTTP 显式豁免、TLS 企业 CA 和可选 mTLS 客户端证书配置；
+- 每个 backend 使用共享 `asyncio.Semaphore` 执行进程内并发门控，获取超时返回 `harness_overloaded`，异常与取消路径释放槽位；
+- 增加启动健康检查、周期探活、净化后的 backend 状态与受 Admin API key 保护的只读 HTTP 状态端点；不健康 backend fail-closed；
+- 接入 Harness 调用、耗时、排队、in-flight、过载和健康 Prometheus 指标；
+- 配置加载期校验 tool/backend 引用、认证环境变量、TLS 文件、JSON Schema 基本结构，并在启动期拒绝 Docker backend；
+- Harness `default_risk` 接入统一分类器，作为规则风险的下限；backend 认证 Secret 引用进入统一吊销检查；
+- 参考 Harness 增加协议版本检查、严格工具注册和参数校验、超时终止、stdout/stderr 合计输出限制、最小环境与不支持沙箱字段 fail-closed；
+- 更新 `config/harness_tools.yaml` 为默认注释的 HTTPS + HMAC 生产模板，版本升级为 `0.27.0`。
+
+### 准确边界
+
+- Loop Controller 仍是控制平面，不提供 Shell/SQL/Browser 内置生产沙箱，也不编排 Docker/Kubernetes；
+- subprocess 与参考 Harness 仅用于开发、集成和协议示例；生产隔离由容器/Kubernetes/VM/专用主机承担；
+- 防重放 nonce store、并发门控和健康状态均为单实例语义，不提供分布式一致性；
+- HTTP 超时后的执行结果可能未知，不自动重试；调用取消不会取消远端执行，未提供远程取消和长期幂等；
+- Harness 只读 backend 状态端点复用现有 HTTP Admin API key；当前没有对应 gRPC Admin RPC，也没有统一 HTTP/gRPC Admin RBAC；
+- Harness 配置、认证密钥和 TLS 文件不支持运行期热更新或轮换。
+
+### 验证
+
+- Harness 配置、执行器、分类器和参考服务测试覆盖认证、防重放、并发、健康、风险与 fail-closed 行为；
+- 发布验证结果以本次实际运行的 pytest、ruff、mypy 输出为准。
+
+### 设计文档
+
+- `src/loop_controller_v0.27.0_development.md`
