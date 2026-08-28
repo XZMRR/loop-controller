@@ -344,9 +344,7 @@ class Checkpoint:
             return current
         allowed = _LEGAL_RESERVATION_TRANSITIONS.get(current.state, set())
         if state not in allowed:
-            raise CheckpointError(
-                f"非法 reservation 状态转移：{current.state!r} -> {state!r}"
-            )
+            raise CheckpointError(f"非法 reservation 状态转移：{current.state!r} -> {state!r}")
         update: dict = {"state": state}
         if expires_at is not None:
             update["expires_at"] = expires_at
@@ -378,9 +376,7 @@ class Checkpoint:
         """确认 reservation 对应预算消耗并标记为 committed。"""
         current = self._reservation_store.get(reservation.reservation_id) or reservation
         if current.state not in ("pending", "pending_approval"):
-            raise CheckpointError(
-                f"cannot commit reservation in state {current.state!r}"
-            )
+            raise CheckpointError(f"cannot commit reservation in state {current.state!r}")
         self._budget_ledger.commit(current.task_id, current.cost)
         return self._transition_reservation(current, "committed")
 
@@ -414,6 +410,15 @@ class Checkpoint:
             if r.state in ("pending", "pending_approval")
             and (r.expires_at is None or r.expires_at >= now)
         ]
+
+    def _get_expired_reservation_by_call_id(self, call_id: str) -> BudgetReservation | None:
+        """v0.29.0-fix：查询 call_id 对应是否已存在过期但未被清理的 reservation。"""
+        reservation = self._reservation_store.get_by_call_id(call_id)
+        if reservation is None or reservation.state not in ("pending", "pending_approval"):
+            return None
+        if reservation.expires_at is None or reservation.expires_at >= self._now():
+            return None
+        return reservation
 
     def recover_stale_reservations(self, now: datetime | None = None) -> None:
         """v0.29.0：扫描并清理过期的 pending / pending_approval reservation。
@@ -869,6 +874,10 @@ class Checkpoint:
         # 路径（含 decision 过期、防重放失败等）都能统一 refund，避免预留悬空。
         reservation = self.get_pending_reservation(proposal.call_id)
         if reservation is None:
+            reservation = self._get_expired_reservation_by_call_id(proposal.call_id)
+            if reservation is not None:
+                self._refund_reservation(reservation)
+                raise CheckpointError("reservation expired")
             if not self.reserve_for_execution(proposal.task_id, proposal):
                 raise CheckpointError("找不到对应预算预留且无法现场预留（预算不足）")
             reservation = self.get_pending_reservation(proposal.call_id)

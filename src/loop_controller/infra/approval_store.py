@@ -16,13 +16,15 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import portalocker
 
-from loop_controller.models import ApprovalRecord, ApprovalRequest
+from loop_controller.infra.alert_store import AlertStore
+from loop_controller.models import ApprovalRecord, ApprovalRequest, AuditAlert
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +88,10 @@ class JsonlApprovalStore:
     - ``_lock``：线程安全锁（保护内存索引与偏移量）。
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, alert_store: AlertStore | None = None) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._alert_store = alert_store
         self._requests: dict[str, ApprovalRequest] = {}
         self._responses: dict[str, ApprovalRecord] = {}
         self._lock = threading.RLock()
@@ -144,27 +147,23 @@ class JsonlApprovalStore:
             return records, start_offset
         with self._path.open("r", encoding="utf-8") as fh:
             fh.seek(start_offset)
-            lines: list[tuple[str, int]] = []
+            lines: list[str] = []
+            new_offset = start_offset
             while True:
                 pos = fh.tell()
                 line = fh.readline()
                 if not line:
                     break
-                lines.append((line, pos))
-            if not lines:
-                return records, fh.tell()
-            # 末行半行检测：文本模式下 readline 返回的行若不以换行符结尾，说明文件尾端不完整。
-            if not lines[-1][0].endswith("\n"):
-                logger.warning(
-                    "审批存储 %s 末行不完整（偏移 %d），等待后续写入",
-                    self._path,
-                    lines[-1][1],
-                )
-                lines.pop()
-            if not lines:
-                return records, start_offset
-            new_offset = lines[-1][1] + len(lines[-1][0].encode("utf-8"))
-            for line, _ in lines:
+                if not line.endswith("\n"):
+                    logger.warning(
+                        "审批存储 %s 末行不完整（偏移 %d），等待后续写入",
+                        self._path,
+                        pos,
+                    )
+                    break
+                lines.append(line)
+                new_offset = fh.tell()
+            for line in lines:
                 text = line.strip()
                 if not text:
                     continue
@@ -176,7 +175,28 @@ class JsonlApprovalStore:
                         self._path,
                         text[:200],
                     )
+                    self._alert_for_bad_line(text, "invalid_json")
             return records, new_offset
+
+    def _alert_for_bad_line(self, line_text: str, reason: str) -> None:
+        """对损坏/非法审批行写入告警（如 alert_store 已注入）。"""
+        if self._alert_store is None:
+            return
+        try:
+            self._alert_store.save_alert(
+                AuditAlert(
+                    alert_id=uuid.uuid4().hex,
+                    session_id="",
+                    task_id=None,
+                    rule_id="approval_store_corrupted_line",
+                    severity="high",
+                    title="审批存储损坏/非法行",
+                    description=f"审批存储 {self._path} 遇到 reason={reason} 的损坏/非法行",
+                    evidence=[line_text[:200]],
+                )
+            )
+        except Exception as exc:
+            logger.warning("审批存储损坏告警写入失败: %s", exc)
 
     def _merge_record(self, record: dict, *, keep_first_response: bool = True) -> None:
         rtype = record.get("type")
@@ -185,6 +205,7 @@ class JsonlApprovalStore:
                 request = _deserialize_request(record)
             except (TypeError, ValueError):
                 logger.warning("审批存储 %s 非法 request 行已跳过", self._path)
+                self._alert_for_bad_line(str(record)[:200], "invalid_request")
                 return
             self._requests[request.decision_id] = request
         elif rtype == "response":
@@ -192,6 +213,7 @@ class JsonlApprovalStore:
                 response = _deserialize_record(record)
             except (TypeError, ValueError):
                 logger.warning("审批存储 %s 非法 response 行已跳过", self._path)
+                self._alert_for_bad_line(str(record)[:200], "invalid_response")
                 return
             if keep_first_response:
                 self._responses.setdefault(response.decision_id, response)
@@ -234,9 +256,7 @@ class JsonlApprovalStore:
             if existing is not None:
                 if existing == record:
                     return
-                raise ApprovalStoreError(
-                    f"decision {record.decision_id} 已有审批结果，不允许覆盖"
-                )
+                raise ApprovalStoreError(f"decision {record.decision_id} 已有审批结果，不允许覆盖")
             self._responses[record.decision_id] = record
             self._append(_serialize_record(record))
 
@@ -247,14 +267,50 @@ class JsonlApprovalStore:
     def _append(self, record: dict) -> None:
         line = json.dumps(record, ensure_ascii=False) + "\n"
         try:
-            with portalocker.Lock(
-                str(self._path), "a", encoding="utf-8", timeout=5
-            ) as fh:
+            with portalocker.Lock(str(self._path), "a", encoding="utf-8", timeout=5) as fh:
                 fh.write(line)
                 fh.flush()
         except portalocker.LockException as exc:
-            raise ApprovalStoreError(
-                f"无法获取审批存储文件锁 {self._path}: {exc}"
-            ) from exc
+            raise ApprovalStoreError(f"无法获取审批存储文件锁 {self._path}: {exc}") from exc
         except OSError as exc:
             raise ApprovalStoreError(f"无法写入审批存储 {self._path}: {exc}") from exc
+
+
+class InMemoryApprovalStore:
+    """内存版 ApprovalStore；适合测试与单进程内存场景。
+
+    不持久化，refresh 为空操作。
+    """
+
+    def __init__(self) -> None:
+        self._requests: dict[str, ApprovalRequest] = {}
+        self._responses: dict[str, ApprovalRecord] = {}
+
+    def refresh(self) -> None:
+        """内存版无需刷新。"""
+
+    def submit_request(self, request: ApprovalRequest) -> None:
+        self._requests[request.decision_id] = request
+
+    def get_pending(self) -> list[ApprovalRequest]:
+        return [
+            req for decision_id, req in self._requests.items() if decision_id not in self._responses
+        ]
+
+    def get_request(self, decision_id: str) -> ApprovalRequest | None:
+        return self._requests.get(decision_id)
+
+    def get_request_by_id(self, request_id: str) -> ApprovalRequest | None:
+        for req in self._requests.values():
+            if req.request_id == request_id:
+                return req
+        return None
+
+    def record_response(self, record: ApprovalRecord) -> None:
+        existing = self._responses.get(record.decision_id)
+        if existing is not None and existing != record:
+            raise ApprovalStoreError(f"decision {record.decision_id} 已有审批结果，不允许覆盖")
+        self._responses[record.decision_id] = record
+
+    def get_record(self, decision_id: str) -> ApprovalRecord | None:
+        return self._responses.get(decision_id)

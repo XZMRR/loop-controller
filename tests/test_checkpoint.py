@@ -175,9 +175,7 @@ def task(agent: Agent) -> Task:
 
 @pytest.fixture
 def identity(agent: Agent) -> ConfigIdentityProvider:
-    return ConfigIdentityProvider(
-        agents={agent.agent_id: agent}, users={"alice": "Alice"}
-    )
+    return ConfigIdentityProvider(agents={agent.agent_id: agent}, users={"alice": "Alice"})
 
 
 def make_checkpoint(
@@ -419,7 +417,11 @@ def test_build_approval_request_uses_approval_request_mask_level(
     masker = Masker(
         MaskingRules(
             field_name_blacklist=["password"],
-            value_patterns=[ValuePattern(name="email", pattern=r"[\w.+-]+@[\w-]+\.[\w.]+", replacement="***@***")],
+            value_patterns=[
+                ValuePattern(
+                    name="email", pattern=r"[\w.+-]+@[\w-]+\.[\w.]+", replacement="***@***"
+                )
+            ],
             masking_applies_to={
                 "audit_log": ["field_name_blacklist", "value_patterns"],
                 "approval_request": ["field_name_blacklist"],
@@ -638,9 +640,7 @@ async def test_evaluate_call_limit_exceeded(
 async def test_evaluate_budget_exceeded(
     task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
 ) -> None:
-    small_budget_profile = profile.model_copy(
-        update={"max_budget_token": 0}
-    )
+    small_budget_profile = profile.model_copy(update={"max_budget_token": 0})
     cp, engine, _ = make_checkpoint(small_budget_profile, identity)
     proposal = make_proposal(task, agent, tool_name="web_search")
 
@@ -660,8 +660,8 @@ async def test_evaluate_budget_cost_per_call(
         tight_profile,
         identity,
         tool_costs={
-            "web_search": BudgetCost(token_count=200),   # 低成本：400 额度内放行
-            "send_email": BudgetCost(token_count=800),   # 800 > 400 → deny
+            "web_search": BudgetCost(token_count=200),  # 低成本：400 额度内放行
+            "send_email": BudgetCost(token_count=800),  # 800 > 400 → deny
         },
         engine_by_tool={"send_email": {"verdict": "allow", "reason": "ok"}},
     )
@@ -1229,10 +1229,10 @@ def test_get_pending_reservation_filters_expired(
     assert cp.get_pending_reservation(reservation.call_id) is None
 
 
-async def test_forward_expired_reservation_no_commit(
+async def test_forward_expired_reservation_refunded_and_raised(
     task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
 ) -> None:
-    """v0.29.0：reservation 已过期时 forward 抛 CheckpointError 且 budget 不被 commit。"""
+    """v0.29.0-fix：reservation 已过期时 forward 抛 CheckpointError 并 refund 释放额度。"""
     now = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
     budget = InMemoryBudgetLedger()
     budget.set_budget(task.task_id, 10)
@@ -1243,7 +1243,11 @@ async def test_forward_expired_reservation_no_commit(
         budget_ledger=budget,
     )
     reservation = _make_stale_reservation(
-        task, agent, state="pending", cost=BudgetCost(token_count=10), expires_at=now - timedelta(seconds=1)
+        task,
+        agent,
+        state="pending",
+        cost=BudgetCost(token_count=10),
+        expires_at=now - timedelta(seconds=1),
     )
     cp._save_reservation(reservation)
     budget.check_and_reserve(task.task_id, reservation.cost)
@@ -1260,9 +1264,13 @@ async def test_forward_expired_reservation_no_commit(
         expires_at=now + timedelta(minutes=5),
     )
 
-    with pytest.raises(CheckpointError):
+    with pytest.raises(CheckpointError, match="reservation expired"):
         await cp.forward(proposal, decision)
     assert budget._committed[task.task_id] == 0
+    assert budget._reserved[task.task_id] == 0
+    updated = cp._reservation_store.get(reservation.reservation_id)
+    assert updated is not None
+    assert updated.state == "refunded"
     assert gw.calls == []
 
 

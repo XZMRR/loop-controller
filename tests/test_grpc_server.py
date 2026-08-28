@@ -112,6 +112,12 @@ class _MockApprovalManager:
     def __init__(self):
         self._store = _MockApprovalStore()
 
+    def get_request_by_id(self, request_id: str) -> Any | None:
+        return self._store.get_request_by_id(request_id)
+
+    def check(self, decision_id: str) -> Any | None:
+        return self._store.get_record(decision_id)
+
 
 class _MockRuntime:
     def __init__(self):

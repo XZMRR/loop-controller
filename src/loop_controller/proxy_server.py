@@ -39,7 +39,7 @@ from starlette.requests import Request  # type: ignore[import-untyped]
 from starlette.responses import Response  # type: ignore[import-untyped]
 from starlette.routing import Mount, Route  # type: ignore[import-untyped]
 
-from loop_controller.checkpoint import CheckpointError
+from loop_controller.checkpoint import CheckpointError, DecisionAlreadyConsumed
 from loop_controller.identity import AgentIdentity, IdentityCredential, IdentityProvider
 from loop_controller.models import (
     ActionProposal,
@@ -163,7 +163,10 @@ class LoopControllerProxyServer:
         verified = await provider.verify(credential)
         if verified is None:
             raise ValueError("stdio 身份 token 验证失败")
-        if verified.agent_id != self._identity.agent_id or verified.user_id != self._identity.user_id:
+        if (
+            verified.agent_id != self._identity.agent_id
+            or verified.user_id != self._identity.user_id
+        ):
             raise ValueError("stdio 身份 token 与配置身份不一致")
         revoked, reason = self._check_revocation(verified, "")
         if revoked:
@@ -233,7 +236,9 @@ class LoopControllerProxyServer:
         # 当反向代理终止 mTLS 时，通常会把证书信息转发为以下 header。
         cert_cn = headers.get("x-ssl-client-cn")
         cert_san_header = headers.get("x-ssl-client-san")
-        cert_sans = [s.strip() for s in cert_san_header.split(",") if s.strip()] if cert_san_header else []
+        cert_sans = (
+            [s.strip() for s in cert_san_header.split(",") if s.strip()] if cert_san_header else []
+        )
         mtls_terminated = self._client_ca_cert is not None and request.url.scheme == "https"
         if mtls_terminated and provider is not None and (cert_cn or cert_sans):
             credential = IdentityCredential(cert_cn=cert_cn, cert_sans=cert_sans)
@@ -245,7 +250,9 @@ class LoopControllerProxyServer:
                 return ProxyIdentity(
                     agent_id=verified.agent_id,
                     user_id=verified.user_id,
-                    session_id=headers.get("x-loop-controller-session-id", self._identity.session_id),
+                    session_id=headers.get(
+                        "x-loop-controller-session-id", self._identity.session_id
+                    ),
                 )
             # 提供了 mTLS header 但验证失败：拒绝，避免 header 伪造后 fallback 到默认身份。
             return None
@@ -269,12 +276,8 @@ class LoopControllerProxyServer:
         server = self._build_server()
 
         async def handle_sse(request: Request) -> Response:
-            async with sse.connect_sse(
-                request.scope, request.receive, request._send
-            ) as streams:
-                await server.run(
-                    streams[0], streams[1], server.create_initialization_options()
-                )
+            async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+                await server.run(streams[0], streams[1], server.create_initialization_options())
             return Response()
 
         return Starlette(
@@ -354,24 +357,18 @@ class LoopControllerProxyServer:
         """v0.5.1：审批通过后携带 decision_id 重试。"""
         record = self._runtime.approval_manager.check(decision_id)
         if record is None:
-            return self._error_result(
-                f"decision_id={decision_id} not approved or not found"
-            )
+            return self._error_result(f"decision_id={decision_id} not approved or not found")
 
         if record.verdict == "deny":
             return self._error_result(f"approval denied for decision_id={decision_id}")
 
         request = self._runtime.approval_manager.get_request(decision_id)
         if request is None:
-            return self._error_result(
-                f"approval request not found for decision_id={decision_id}"
-            )
+            return self._error_result(f"approval request not found for decision_id={decision_id}")
 
         # 参数一致性校验：防止 decision_id 被复用于不同参数调用。
         if request.tool_name != tool_name or request.tool_arguments != arguments:
-            return self._error_result(
-                "retry parameters mismatch original approved request"
-            )
+            return self._error_result("retry parameters mismatch original approved request")
 
         original_decision = request.original_decision
         if original_decision is None:
@@ -408,6 +405,17 @@ class LoopControllerProxyServer:
         try:
             finalized_decision = self._runtime.checkpoint.finalize_after_approval(
                 original_decision, record, request
+            )
+        except DecisionAlreadyConsumed as exc:
+            return self._error_result(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "decision_already_consumed",
+                        "message": str(exc),
+                    },
+                    ensure_ascii=False,
+                )
             )
         except CheckpointError as exc:
             return self._error_result(str(exc))
@@ -483,9 +491,7 @@ class LoopControllerProxyServer:
 
         if decision.verdict == "require_approval":
             try:
-                request = self._runtime.checkpoint.build_approval_request(
-                    decision, proposal, task
-                )
+                request = self._runtime.checkpoint.build_approval_request(decision, proposal, task)
                 await self._runtime.approval_manager.submit(request)
             except Exception as exc:
                 logger.exception("Proxy submit approval request 失败")
@@ -537,9 +543,7 @@ class LoopControllerProxyServer:
         tool_name: str,
         arguments: dict[str, Any] | None = None,
     ) -> tuple[bool, str | None]:
-        match = self._runtime.checkpoint.check_revocation(
-            identity, tool_name, arguments or {}
-        )
+        match = self._runtime.checkpoint.check_revocation(identity, tool_name, arguments or {})
         return match.revoked, match.reason
 
     async def _handle_revocation(
@@ -676,7 +680,9 @@ class LoopControllerProxyServer:
                 "can_retry": status == "approved",
             }
             return types.CallToolResult(
-                content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+                content=[
+                    types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))
+                ]
             )
 
         # 无审批记录时，检查 Decision 是否过期
@@ -687,7 +693,9 @@ class LoopControllerProxyServer:
                 "can_retry": False,
             }
             return types.CallToolResult(
-                content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+                content=[
+                    types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))
+                ]
             )
 
         if self._runtime.checkpoint._now() >= decision.expires_at:
@@ -697,7 +705,9 @@ class LoopControllerProxyServer:
                 "can_retry": False,
             }
             return types.CallToolResult(
-                content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+                content=[
+                    types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))
+                ]
             )
 
         payload = {

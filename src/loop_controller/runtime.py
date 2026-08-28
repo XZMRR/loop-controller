@@ -141,9 +141,7 @@ class Runtime:
         """按 task_id 取 Task。"""
         return self.task_store.get(task_id)
 
-    def add_user_message(
-        self, session_id: str, task_id: str, content: str
-    ) -> ConversationMessage:
+    def add_user_message(self, session_id: str, task_id: str, content: str) -> ConversationMessage:
         """写入用户消息并返回。"""
         message = ConversationMessage(
             message_id=uuid.uuid4().hex,
@@ -155,9 +153,7 @@ class Runtime:
         self.conversation_store.append_message(message)
         return message
 
-    def add_agent_message(
-        self, session_id: str, task_id: str, content: str
-    ) -> ConversationMessage:
+    def add_agent_message(self, session_id: str, task_id: str, content: str) -> ConversationMessage:
         """写入 Agent 消息并返回。"""
         message = ConversationMessage(
             message_id=uuid.uuid4().hex,
@@ -286,9 +282,7 @@ def _build_evidence_chain(config: AppConfig) -> EvidenceChain | None:
     checkpoint_path = Path(local_config.get("checkpoint_path", path / "checkpoint.json"))
     if not checkpoint_path.is_absolute():
         checkpoint_path = Path(config.policy_dir).parent / checkpoint_path
-    return EvidenceChain(
-        LocalFileEvidenceBackend(path), signer, checkpoint_path=checkpoint_path
-    )
+    return EvidenceChain(LocalFileEvidenceBackend(path), signer, checkpoint_path=checkpoint_path)
 
 
 def _build_evidence_anchor(
@@ -381,13 +375,9 @@ def build_runtime(
     mcp_executor = MCPExecutor(gateway)
     secret_broker = _build_secret_broker(config)
     http_client = HTTPClient()
-    http_executor = HTTPExecutor(
-        http_client, config.http_tool_specs, secret_broker=secret_broker
-    )
+    http_executor = HTTPExecutor(http_client, config.http_tool_specs, secret_broker=secret_broker)
     local_executor = LocalFunctionExecutor(config.local_function_specs)
-    harness_executor = HarnessExecutor(
-        config.harness_tool_specs, config.harness_backends
-    )
+    harness_executor = HarnessExecutor(config.harness_tool_specs, config.harness_backends)
     executor_registry = ExecutorRegistry()
     for canonical_name in config.tool_mapping:
         executor_registry.register(canonical_name, mcp_executor)
@@ -398,7 +388,8 @@ def build_runtime(
     for canonical_name in config.harness_tool_specs:
         executor_registry.register(canonical_name, harness_executor)
     masker = Masker(config.masking_rules)
-    budget_ledger = JsonlBudgetLedger(config.budget_ledger_path)
+    alert_store = JsonlAlertStore(config.alert_store_path)
+    budget_ledger = JsonlBudgetLedger(config.budget_ledger_path, alert_store=alert_store)
     session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
     risk_manager = RiskStateManager(JsonlRiskStateStore(config.risk_state_path))
     conversation_store = JsonlConversationStore(
@@ -455,7 +446,6 @@ def build_runtime(
     if config.audit_hash_algo == "hmac-sha256":
         audit_key = ConfigLoader.resolve_audit_key(config)
     evidence_chain = _build_evidence_chain(config)
-    alert_store = JsonlAlertStore(config.alert_store_path)
     evidence_anchor = _build_evidence_anchor(config, alert_store)
     audit_store = JsonlAuditStore(
         config.audit_log_path,
@@ -476,7 +466,7 @@ def build_runtime(
     )
     checkpoint._audit_store = audit_store
     approval_manager = AsyncApprovalManager(
-        JsonlApprovalStore(config.approval_store_path)
+        JsonlApprovalStore(config.approval_store_path, alert_store=alert_store)
     )
     audit_analyzer = RuleBasedAuditAnalyzer(
         rules=config.audit_rules,
@@ -501,10 +491,7 @@ def build_runtime(
 
     return Runtime(
         classifier=RuleBasedClassifier(
-            {
-                name: spec.default_risk
-                for name, spec in config.harness_tool_specs.items()
-            }
+            {name: spec.default_risk for name, spec in config.harness_tool_specs.items()}
         ),
         checkpoint=checkpoint,
         gateway=gateway,

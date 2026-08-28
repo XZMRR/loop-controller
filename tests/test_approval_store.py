@@ -6,7 +6,12 @@ import json
 
 import pytest
 
-from loop_controller.infra.approval_store import ApprovalStoreError, JsonlApprovalStore
+from loop_controller.infra.alert_store import InMemoryAlertStore
+from loop_controller.infra.approval_store import (
+    ApprovalStoreError,
+    InMemoryApprovalStore,
+    JsonlApprovalStore,
+)
 from loop_controller.models import ApprovalRecord, ApprovalRequest
 
 
@@ -141,3 +146,54 @@ def test_replay_keeps_first_response(tmp_path) -> None:
 
     store = JsonlApprovalStore(path)
     assert store.get_record("d1") == record1
+
+
+def test_corrupted_line_writes_alert(tmp_path) -> None:
+    path = tmp_path / "approvals.jsonl"
+    alert_store = InMemoryAlertStore()
+    store = JsonlApprovalStore(path, alert_store=alert_store)
+
+    with path.open("ab") as fh:
+        fh.write(b"{not-json}\n")
+
+    store.refresh()
+
+    alerts = alert_store.list_alerts()
+    assert len(alerts) == 1
+    assert alerts[0].rule_id == "approval_store_corrupted_line"
+    assert alerts[0].severity == "high"
+    assert "invalid_json" in alerts[0].description
+    assert alerts[0].evidence == ["{not-json}"]
+
+
+def test_refresh_offset_accurate_after_crlf(tmp_path) -> None:
+    path = tmp_path / "approvals.jsonl"
+    request = _make_request("d1")
+    line = json.dumps(
+        {**request.model_dump(mode="json"), "type": "request"}, ensure_ascii=False
+    ).encode("utf-8")
+    path.write_bytes(line + b"\r\n")
+
+    store_a = JsonlApprovalStore(path)
+    store_b = JsonlApprovalStore(path)
+    record = _make_record("d1", "approve")
+    store_b.record_response(record)
+
+    store_a.refresh()
+    assert store_a.get_record("d1") == record
+
+
+def test_in_memory_store_refresh_noop() -> None:
+    store = InMemoryApprovalStore()
+    request = _make_request("d1")
+    record = _make_record("d1", "approve")
+
+    store.submit_request(request)
+    store.refresh()
+    assert store.get_request("d1") == request
+    assert store.get_pending() == [request]
+
+    store.record_response(record)
+    store.refresh()
+    assert store.get_record("d1") == record
+    assert store.get_pending() == []

@@ -99,6 +99,12 @@ class _MockApprovalManager:
     def __init__(self, store: _MockApprovalStore | None = None):
         self._store = store or _MockApprovalStore()
 
+    def get_request_by_id(self, request_id: str) -> Any | None:
+        return self._store.get_request_by_id(request_id)
+
+    def check(self, decision_id: str) -> Any | None:
+        return self._store.get_record(decision_id)
+
 
 class _MockPolicyEngine:
     """策略引擎 mock，用于 health 检查。"""
@@ -321,7 +327,9 @@ def test_wait_for_approval_sse_returns_result() -> None:
     )
     store.add_record("d-1", {"status": "approved"})
 
-    with client.stream("GET", "/v1/wait-for-approval/sse", params={"request_id": "req-1", "max_wait": 5}) as resp:
+    with client.stream(
+        "GET", "/v1/wait-for-approval/sse", params={"request_id": "req-1", "max_wait": 5}
+    ) as resp:
         text = ""
         for line in resp.iter_lines():
             text += line + "\n"
@@ -347,7 +355,9 @@ def test_wait_for_approval_sse_notified() -> None:
     )
     store.add_record("d-1", {"status": "approved"})
 
-    with client.stream("GET", "/v1/wait-for-approval/sse", params={"request_id": "req-1", "max_wait": 5}) as resp:
+    with client.stream(
+        "GET", "/v1/wait-for-approval/sse", params={"request_id": "req-1", "max_wait": 5}
+    ) as resp:
         text = ""
         for line in resp.iter_lines():
             text += line + "\n"
@@ -443,9 +453,7 @@ def test_admin_harness_backends_is_authenticated_and_sanitized() -> None:
     )
 
     assert client.get("/v1/admin/harness/backends").status_code == 401
-    response = client.get(
-        "/v1/admin/harness/backends", headers={"X-API-Key": "secret"}
-    )
+    response = client.get("/v1/admin/harness/backends", headers={"X-API-Key": "secret"})
     assert response.status_code == 200
     assert response.json() == {
         "backends": [
@@ -891,13 +899,12 @@ def test_admin_approvals_conflict_when_already_decided() -> None:
 
     headers = {"X-API-Key": "secret"}
     body = {"approver": "zhang_manager", "comment": "approved"}
-    assert client.post(
-        "/v1/admin/approvals/d-1/approve", json=body, headers=headers
-    ).status_code == 200
-
-    resp = client.post(
-        "/v1/admin/approvals/d-1/approve", json=body, headers=headers
+    assert (
+        client.post("/v1/admin/approvals/d-1/approve", json=body, headers=headers).status_code
+        == 200
     )
+
+    resp = client.post("/v1/admin/approvals/d-1/approve", json=body, headers=headers)
     assert resp.status_code == 409
     assert "已有审批结果" in resp.json()["error"]
 

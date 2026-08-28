@@ -52,7 +52,9 @@ def _governance_result(response) -> governance_pb2.EvaluateToolCallResponse:
     """把 GovernanceResult 属性映射到 gRPC response。"""
     return governance_pb2.EvaluateToolCallResponse(
         status=response.status,
-        result=response.content if response.content is not None else response.reason or response.status,
+        result=response.content
+        if response.content is not None
+        else response.reason or response.status,
         request_id=response.request_id or "",
         error_code=response.error_code or "",
     )
@@ -127,9 +129,7 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         grpc_cfg = self._entrypoints_config.get("grpc") or {}
         return set(grpc_cfg.get("admin_agent_ids") or [])
 
-    async def _verify_identity(
-        self, context: grpc_aio.ServicerContext
-    ) -> AgentIdentity | None:
+    async def _verify_identity(self, context: grpc_aio.ServicerContext) -> AgentIdentity | None:
         """验证 gRPC 客户端 mTLS 身份；无 Provider 或未提供凭证返回 None。"""
         if self._identity_provider is None:
             return None
@@ -138,9 +138,7 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
             return None
         return await self._identity_provider.verify(credential)
 
-    async def _require_identity(
-        self, context: grpc_aio.ServicerContext
-    ) -> AgentIdentity | None:
+    async def _require_identity(self, context: grpc_aio.ServicerContext) -> AgentIdentity | None:
         """需要身份认证时校验 mTLS 身份；未通过会设置 gRPC 错误码并返回 None。"""
         identity = await self._verify_identity(context)
         if self._grpc_require_auth() and identity is None:
@@ -162,7 +160,9 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
             context.set_code(grpc.StatusCode.PERMISSION_DENIED)
             context.set_details("admin identity is not authorized")
             await self._audit_admin_operation(
-                identity, "admin_operation_failed", target="grpc_admin",
+                identity,
+                "admin_operation_failed",
+                target="grpc_admin",
                 metadata={"reason": "not_authorized"},
             )
             return None
@@ -179,7 +179,9 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
                 context.set_code(grpc.StatusCode.PERMISSION_DENIED)
                 context.set_details("admin identity is revoked")
                 await self._audit_admin_operation(
-                    identity, "admin_operation_failed", target="grpc_admin",
+                    identity,
+                    "admin_operation_failed",
+                    target="grpc_admin",
                     metadata={"reason": "identity_revoked"},
                 )
                 return None
@@ -324,7 +326,9 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
                 "anchor_last_error_code": "",
             }
         )
-        anchor_summary = {key: value if value is not None else "" for key, value in anchor_summary.items()}
+        anchor_summary = {
+            key: value if value is not None else "" for key, value in anchor_summary.items()
+        }
         uptime = time.time() - self._start_time
         degraded = evidence_status == "degraded" or anchor_summary["anchor_status"] not in {
             "disabled",
@@ -502,11 +506,11 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         )
 
     async def _try_resume(self, request_id: str) -> Any | None:
-        store = self._controller._runtime.approval_manager._store
-        approval_request = store.get_request_by_id(request_id)
+        approval_manager = self._controller._runtime.approval_manager
+        approval_request = approval_manager.get_request_by_id(request_id)
         if approval_request is None:
             return None
-        record = store.get_record(approval_request.decision_id)
+        record = approval_manager.check(approval_request.decision_id)
         if record is None:
             return None
         return await self._controller.resume_after_approval(request_id)
@@ -581,13 +585,9 @@ async def serve(
     grpc_auth = grpc_cfg.get("auth")
     if grpc_auth == "mtls":
         if not server_key or not server_cert:
-            raise ValueError(
-                "entrypoints.grpc.auth=mtls 时必须提供 server_key 与 server_cert"
-            )
+            raise ValueError("entrypoints.grpc.auth=mtls 时必须提供 server_key 与 server_cert")
         if not client_ca_cert:
-            raise ValueError(
-                "entrypoints.grpc.auth=mtls 时必须提供 client_ca_cert 以验证客户端"
-            )
+            raise ValueError("entrypoints.grpc.auth=mtls 时必须提供 client_ca_cert 以验证客户端")
         require_client_cert = True
     if require_client_cert and (not server_key or not server_cert):
         raise ValueError("require_client_cert=true 时必须提供 server_key 与 server_cert")

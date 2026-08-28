@@ -59,9 +59,7 @@ def _audit_event(
     args_hash: str | None = None
     args_mask: dict | None = None
     if proposal is not None:
-        args_hash = hashlib.sha256(
-            canonical_json(proposal.arguments).encode("utf-8")
-        ).hexdigest()
+        args_hash = hashlib.sha256(canonical_json(proposal.arguments).encode("utf-8")).hexdigest()
         if masker is not None:
             args_mask = masker.mask(proposal.arguments, "audit_log")
 
@@ -70,8 +68,14 @@ def _audit_event(
     if actor_id is None:
         actor_id = task.agent_id
 
-    verdict = decision_verdict if decision_verdict is not None else (decision.verdict if decision else None)
-    reason_value = reason or (decision.reason if decision else None) or (result.content if result else None)
+    verdict = (
+        decision_verdict
+        if decision_verdict is not None
+        else (decision.verdict if decision else None)
+    )
+    reason_value = (
+        reason or (decision.reason if decision else None) or (result.content if result else None)
+    )
 
     return AuditEvent(
         event_id=uuid.uuid4().hex,
@@ -476,7 +480,14 @@ class LoopController:
             approve_action = "deny"
             approve_verdict = "deny"
         else:
-            raise CheckpointError(f"unknown approval verdict: {record.verdict!r}")
+            return GovernanceResult(
+                status="error",
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                arguments=request.tool_arguments,
+                reason=f"unknown approval verdict: {record.verdict!r}",
+                error_code="invalid_verdict",
+            )
         await self._runtime.audit_store.append_async(
             _audit_event(
                 task,

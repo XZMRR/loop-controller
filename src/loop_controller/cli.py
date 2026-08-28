@@ -38,7 +38,7 @@ from datetime import UTC, datetime
 from loop_controller.approval_service import ApprovalServiceError, build_approval_record
 from loop_controller.audit_analyzer import RuleBasedAuditAnalyzer
 from loop_controller.infra.alert_store import JsonlAlertStore
-from loop_controller.infra.approval_store import JsonlApprovalStore
+from loop_controller.infra.approval_store import ApprovalStoreError, JsonlApprovalStore
 from loop_controller.infra.audit_store import JsonlAuditStore
 from loop_controller.infra.config_loader import AppConfig, ConfigLoader
 from loop_controller.proxy_server import LoopControllerProxyServer, ProxyIdentity
@@ -228,7 +228,11 @@ def _cmd_approve_or_deny(
         print(f"错误：{exc}", file=sys.stderr)
         return 1
 
-    store.record_response(record)
+    try:
+        store.record_response(record)
+    except ApprovalStoreError as exc:
+        print(f"错误：审批结果写入失败：{exc}", file=sys.stderr)
+        return 1
     action = "批准" if verdict == "approve" else "拒绝"
     print(f"已{action} decision_id={decision_id}")
     return 0

@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from loop_controller.cli import main
-from loop_controller.infra.approval_store import JsonlApprovalStore
+from loop_controller.infra.approval_store import ApprovalStoreError, JsonlApprovalStore
 from loop_controller.models import ApprovalRequest, Decision
 
 
@@ -30,11 +30,7 @@ def config_dir(tmp_path) -> str:
         encoding="utf-8",
     )
     (base / "profiles.yaml").write_text(
-        "profiles:\n"
-        "  - profile_id: p1\n"
-        "    tools:\n"
-        "      web_search:\n"
-        "        allowed: true\n",
+        "profiles:\n  - profile_id: p1\n    tools:\n      web_search:\n        allowed: true\n",
         encoding="utf-8",
     )
     (base / "mcp_servers.yaml").write_text(
@@ -56,8 +52,7 @@ def config_dir(tmp_path) -> str:
         encoding="utf-8",
     )
     (base / "approval.yaml").write_text(
-        "default: zhang_manager\n"
-        "rules: []\n",
+        "default: zhang_manager\nrules: []\n",
         encoding="utf-8",
     )
     (base / "llm_planner.yaml").write_text("enabled: false\n", encoding="utf-8")
@@ -147,7 +142,15 @@ def test_approvals_deny(config_dir: str) -> None:
 
 def test_approvals_unknown_decision(config_dir: str, capsys) -> None:
     rc = main(
-        ["--config-dir", config_dir, "approvals", "approve", "no-such", "--approver", "zhang_manager"]
+        [
+            "--config-dir",
+            config_dir,
+            "approvals",
+            "approve",
+            "no-such",
+            "--approver",
+            "zhang_manager",
+        ]
     )
     assert rc == 1
     captured = capsys.readouterr()
@@ -179,9 +182,7 @@ def test_approvals_deny_requires_comment(config_dir: str, capsys) -> None:
 def test_approvals_approver_cannot_be_requester(config_dir: str, capsys) -> None:
     """A7：审批人不能是请求者本人。"""
     _put_pending_request(config_dir, "d1")
-    rc = main(
-        ["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "alice"]
-    )
+    rc = main(["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "alice"])
     assert rc == 1
     captured = capsys.readouterr()
     assert "审批人不能是请求者本人" in captured.err
@@ -278,3 +279,22 @@ def test_list_marks_expired(config_dir: str, capsys) -> None:
     captured = capsys.readouterr()
     assert "d1" in captured.out
     assert "[expired]" in captured.out
+
+
+def test_approve_store_error_friendly_message(config_dir: str, capsys, monkeypatch) -> None:
+    """ApprovalStore 写失败时 CLI 返回非零并输出友好错误，无 traceback。"""
+    _put_pending_request(config_dir, "d1")
+
+    def _raise_store_error(self, record) -> None:
+        raise ApprovalStoreError("simulated write failure")
+
+    monkeypatch.setattr(JsonlApprovalStore, "record_response", _raise_store_error)
+    rc = main(
+        ["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "zhang_manager"]
+    )
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "审批结果写入失败" in captured.err
+    assert "simulated write failure" in captured.err
+    assert "Traceback" not in captured.err

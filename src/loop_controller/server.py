@@ -43,6 +43,7 @@ from loop_controller.identity import (
     KillSwitchConfig,
     RevocationType,
 )
+from loop_controller.infra.approval_store import ApprovalStoreError
 from loop_controller.logging_config import configure_logging, set_trace_id
 from loop_controller.metrics import (
     observe_request,
@@ -164,9 +165,12 @@ class ToolGovernServer:
             token = auth[7:].strip()
         else:
             token = ""
-        return bool(header) and hmac.compare_digest(header, self._api_key) or bool(
-            token
-        ) and hmac.compare_digest(token, self._api_key)
+        return (
+            bool(header)
+            and hmac.compare_digest(header, self._api_key)
+            or bool(token)
+            and hmac.compare_digest(token, self._api_key)
+        )
 
     def _admin_actor_id(self, request: Request) -> str:
         """从请求中提取管理员 API key 的匿名标识；未认证时返回 unauthenticated。"""
@@ -295,7 +299,9 @@ class ToolGovernServer:
         if self._api_key is not None and not self._check_api_key(request):
             return PlainTextResponse(content="unauthorized", status_code=401)
         data = render_metrics()
-        return PlainTextResponse(content=data, media_type="text/plain; version=0.0.4; charset=utf-8")
+        return PlainTextResponse(
+            content=data, media_type="text/plain; version=0.0.4; charset=utf-8"
+        )
 
     async def _handle_govern_tool_call(self, request: Request) -> JSONResponse:
         authorized, identity = await self._check_agent_auth(request)
@@ -346,9 +352,7 @@ class ToolGovernServer:
 
         response = GovernResponse(
             status=result.status,
-            result=result.content
-            if result.content is not None
-            else result.reason or result.status,
+            result=result.content if result.content is not None else result.reason or result.status,
             request_id=result.request_id if result.status == "require_approval" else None,
             error_code=result.error_code,
         )
@@ -490,11 +494,11 @@ class ToolGovernServer:
 
     async def _try_resume(self, request_id: str) -> Any | None:
         """尝试恢复审批；若审批不存在则返回 None。"""
-        store = self._controller._runtime.approval_manager._store
-        approval_request = store.get_request_by_id(request_id)
+        approval_manager = self._controller._runtime.approval_manager
+        approval_request = approval_manager.get_request_by_id(request_id)
         if approval_request is None:
             return None
-        record = store.get_record(approval_request.decision_id)
+        record = approval_manager.check(approval_request.decision_id)
         if record is None:
             return None
         return await self._controller.resume_after_approval(request_id)
@@ -589,12 +593,7 @@ class ToolGovernServer:
         if executor is None:
             return JSONResponse({"backends": []})
         return JSONResponse(
-            {
-                "backends": [
-                    status.model_dump(mode="json")
-                    for status in executor.backend_statuses()
-                ]
-            }
+            {"backends": [status.model_dump(mode="json") for status in executor.backend_statuses()]}
         )
 
     async def _handle_admin_evidence_anchor(self, request: Request) -> JSONResponse:
@@ -682,7 +681,7 @@ class ToolGovernServer:
         return JSONResponse(summary)
 
     async def _handle_admin_approval(self, request: Request, *, verdict: str) -> JSONResponse:
-        if self._api_key is not None and not self._check_api_key(request):
+        if not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         decision_id = request.path_params["decision_id"]
@@ -723,7 +722,12 @@ class ToolGovernServer:
             status = 409 if "已有审批结果" in str(exc) else 422
             return JSONResponse({"error": str(exc)}, status_code=status)
 
-        store.record_response(record)
+        try:
+            store.record_response(record)
+        except ApprovalStoreError as exc:
+            if "已有审批结果" in str(exc):
+                return JSONResponse({"error": "approval already recorded"}, status_code=409)
+            return JSONResponse({"error": str(exc)}, status_code=500)
         if req is not None:
             self._watcher.notify(req.request_id)
         await self._audit_admin_operation(
@@ -803,7 +807,9 @@ def build_app(
 ) -> Starlette:
     """从 LoopController 构造 Starlette ASGI 应用。"""
     if configure_logs:
-        configure_logging(json_format=os.environ.get("LOOP_CONTROLLER_JSON_LOGS", "").lower() == "true")
+        configure_logging(
+            json_format=os.environ.get("LOOP_CONTROLLER_JSON_LOGS", "").lower() == "true"
+        )
     server = ToolGovernServer(
         controller,
         api_key=api_key,
@@ -831,17 +837,51 @@ def build_app(
             Route("/v1/health", server._handle_health, methods=["GET"]),
             Route("/metrics", server._handle_metrics, methods=["GET"]),
             Route("/v1/govern/tool-call", server._handle_govern_tool_call, methods=["POST"]),
-            Route("/v1/govern/resume-after-approval", server._handle_resume_after_approval, methods=["POST"]),
+            Route(
+                "/v1/govern/resume-after-approval",
+                server._handle_resume_after_approval,
+                methods=["POST"],
+            ),
             Route("/v1/wait-for-approval", server._handle_wait_for_approval, methods=["GET"]),
-            Route("/v1/wait-for-approval/sse", server._handle_wait_for_approval_sse, methods=["GET"]),
-            Route("/v1/admin/approvals/pending", server._handle_admin_pending_approvals, methods=["GET"]),
-            Route("/v1/admin/harness/backends", server._handle_admin_harness_backends, methods=["GET"]),
-            Route("/v1/admin/evidence/anchor", server._handle_admin_evidence_anchor, methods=["GET"]),
-            Route("/v1/admin/evidence/anchor/verify", server._handle_admin_evidence_anchor_verify, methods=["POST"]),
-            Route("/v1/admin/evidence/anchor/publish", server._handle_admin_evidence_anchor_publish, methods=["POST"]),
-            Route("/v1/admin/evidence/anchor/bootstrap", server._handle_admin_evidence_anchor_bootstrap, methods=["POST"]),
-            Route("/v1/admin/approvals/{decision_id}/approve", server._handle_admin_approvals_approve, methods=["POST"]),
-            Route("/v1/admin/approvals/{decision_id}/deny", server._handle_admin_approvals_deny, methods=["POST"]),
+            Route(
+                "/v1/wait-for-approval/sse", server._handle_wait_for_approval_sse, methods=["GET"]
+            ),
+            Route(
+                "/v1/admin/approvals/pending",
+                server._handle_admin_pending_approvals,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/admin/harness/backends", server._handle_admin_harness_backends, methods=["GET"]
+            ),
+            Route(
+                "/v1/admin/evidence/anchor", server._handle_admin_evidence_anchor, methods=["GET"]
+            ),
+            Route(
+                "/v1/admin/evidence/anchor/verify",
+                server._handle_admin_evidence_anchor_verify,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/admin/evidence/anchor/publish",
+                server._handle_admin_evidence_anchor_publish,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/admin/evidence/anchor/bootstrap",
+                server._handle_admin_evidence_anchor_bootstrap,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/admin/approvals/{decision_id}/approve",
+                server._handle_admin_approvals_approve,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/admin/approvals/{decision_id}/deny",
+                server._handle_admin_approvals_deny,
+                methods=["POST"],
+            ),
             Route("/admin/revoke", server._handle_admin_revoke, methods=["POST", "DELETE"]),
             Route("/admin/revocation-list", server._handle_admin_revocation_list, methods=["GET"]),
             Route("/admin/kill-switch", server._handle_admin_kill_switch, methods=["POST"]),
