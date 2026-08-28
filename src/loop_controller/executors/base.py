@@ -7,6 +7,27 @@ from typing import Any, Protocol, runtime_checkable
 from loop_controller.models import CapabilityProfile, Tool, ToolResult
 
 
+def extract_declared_secret_refs(arguments: dict[str, Any]) -> list[str]:
+    """递归提取调用参数声明的 Secret 引用（仅作为可信配置的补充）。"""
+    refs: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key == "secret_ref":
+                    if isinstance(nested, str):
+                        refs.add(nested)
+                    elif isinstance(nested, dict) and isinstance(nested.get("name"), str):
+                        refs.add(nested["name"])
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(arguments)
+    return sorted(refs)
+
+
 class ExecutionContext:
     """执行器运行时的治理上下文。"""
 
@@ -34,6 +55,10 @@ class ToolExecutor(Protocol):
 
     实现者负责把规范化工具名和参数转换为真实副作用，并返回 ToolResult。
     """
+
+    def secret_refs_for(self, tool_name: str) -> list[str]:
+        """返回执行器当前配置中工具实际依赖的 Secret 引用。"""
+        ...
 
     async def execute(
         self,
@@ -80,3 +105,12 @@ class ExecutorRegistry:
         if self._default is not None:
             return self._default
         raise ExecutorRegistryError(f"工具 {tool_name!r} 没有注册执行器")
+
+    def resolve_secret_refs(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> list[str]:
+        """合并执行器可信配置与调用参数补充声明中的 Secret 引用。"""
+        executor = self._executors.get(tool_name) or self._default
+        trusted_refs = executor.secret_refs_for(tool_name) if executor is not None else []
+        declared_refs = extract_declared_secret_refs(arguments)
+        return sorted(set(trusted_refs) | set(declared_refs))

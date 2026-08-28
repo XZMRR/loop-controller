@@ -101,6 +101,24 @@ def test_pending_to_refunded_on_deny() -> None:
     assert cp.get_pending_reservation(proposal.call_id) is None
 
 
+def test_refund_is_idempotent_and_does_not_refund_committed() -> None:
+    cp, _, _ = make_checkpoint(_make_profile(), _make_identity())
+    task = _make_task()
+    proposal = _make_proposal(task)
+
+    reservation = cp._create_reservation(proposal, datetime.now(UTC))
+    cp._save_reservation(reservation)
+    first = cp._refund_reservation(reservation)
+    second = cp._refund_reservation(reservation)
+    assert first.state == second.state == "refunded"
+
+    committed_proposal = proposal.model_copy(update={"call_id": "committed-call"})
+    committed = cp._create_reservation(committed_proposal, datetime.now(UTC))
+    cp._save_reservation(committed)
+    committed = cp._commit_reservation(committed)
+    assert cp._refund_reservation(committed).state == "committed"
+
+
 def test_pending_to_pending_approval() -> None:
     """require_approval 路径 reservation 保持预算并转为 pending_approval。"""
     cp, _, _ = make_checkpoint(_make_profile(), _make_identity())

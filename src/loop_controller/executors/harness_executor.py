@@ -270,6 +270,9 @@ class HarnessExecutor(ToolExecutor):
             raise KeyError(f"Harness 工具 {tool_name!r} 未注册")
         return spec
 
+    def secret_refs_for(self, tool_name: str) -> list[str]:
+        return []
+
     async def start(self) -> None:
         await asyncio.gather(
             *[backend.start() for backend in self._backends.values()]

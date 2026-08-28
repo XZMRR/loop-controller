@@ -36,6 +36,9 @@ class LocalFunctionExecutor(ToolExecutor):
             raise KeyError(tool_name)
         return spec
 
+    def secret_refs_for(self, tool_name: str) -> list[str]:
+        return []
+
     async def execute(
         self,
         tool_name: str,

@@ -267,11 +267,17 @@ def _build_evidence_chain(config: AppConfig) -> EvidenceChain | None:
         signer = HMACEvidenceSigner(encoded.encode("utf-8"), key_id=key_id)
     else:
         raise ValueError(f"不支持的证据签名算法：{algorithm}")
-    local_path = evidence.get("local", {}).get("path", "evidence")
+    local_config = evidence.get("local", {})
+    local_path = local_config.get("path", "evidence")
     path = Path(local_path)
     if not path.is_absolute():
         path = Path(config.policy_dir).parent / path
-    return EvidenceChain(LocalFileEvidenceBackend(path), signer)
+    checkpoint_path = Path(local_config.get("checkpoint_path", path / "checkpoint.json"))
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = Path(config.policy_dir).parent / checkpoint_path
+    return EvidenceChain(
+        LocalFileEvidenceBackend(path), signer, checkpoint_path=checkpoint_path
+    )
 
 
 def _build_secret_broker(config: AppConfig) -> SecretBroker:
@@ -355,6 +361,8 @@ def build_runtime(
         rules=config.authority_rules,
         store=JsonlAuthorityStore(config.authority_log_path),
     )
+    revocation_path = Path(config.policy_dir).parent / "config" / "revocation.yaml"
+    revocation_list = RevocationList.from_file(revocation_path)
     checkpoint = Checkpoint(
         profiles=config.profiles,
         policy_engine=policy_engine,
@@ -372,6 +380,7 @@ def build_runtime(
             CapabilityBasedPermissionAnalyzer(config.capability_rules),
         ),
         authority_manager=authority_manager,
+        revocation_list=revocation_list,
         tool_costs={
             **{
                 name: BudgetCost(token_count=entry.cost_per_call)
@@ -405,6 +414,7 @@ def build_runtime(
         evidence_chain=evidence_chain,
         alert_store=alert_store,
     )
+    checkpoint._audit_store = audit_store
     approval_manager = AsyncApprovalManager(
         JsonlApprovalStore(config.approval_store_path)
     )
@@ -416,8 +426,6 @@ def build_runtime(
 
     hot_reload_config = config.secrets_config.get("hot_reload", {})
     config_dir = Path(config.policy_dir).parent / "config"
-    revocation_path = config_dir / "revocation.yaml"
-    revocation_list = RevocationList.from_file(revocation_path)
     # 与 Runtime 共享同一可变集合，确保 HTTP 工具热更新后 controller 可见。
     http_tool_names = set(config.http_tool_specs)
     hot_reloader = HotReloader(

@@ -26,7 +26,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import grpc
@@ -123,6 +123,10 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         grpc_cfg = self._entrypoints_config.get("grpc") or {}
         return bool(grpc_cfg.get("require_auth", False))
 
+    def _grpc_admin_agent_ids(self) -> set[str]:
+        grpc_cfg = self._entrypoints_config.get("grpc") or {}
+        return set(grpc_cfg.get("admin_agent_ids") or [])
+
     async def _verify_identity(
         self, context: grpc_aio.ServicerContext
     ) -> AgentIdentity | None:
@@ -148,11 +152,37 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
     async def _require_admin_identity(
         self, context: grpc_aio.ServicerContext
     ) -> AgentIdentity | None:
-        """Admin RPC 始终要求经 mTLS Provider 验证的身份。"""
+        """Admin RPC 要求有效、未吊销且在 allowlist 内的 mTLS 身份。"""
         identity = await self._verify_identity(context)
         if identity is None:
             context.set_code(grpc.StatusCode.UNAUTHENTICATED)
             context.set_details("admin client certificate required or invalid")
+            return None
+        if identity.agent_id not in self._grpc_admin_agent_ids():
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("admin identity is not authorized")
+            self._audit_admin_operation(
+                identity, "admin_operation_failed", target="grpc_admin",
+                metadata={"reason": "not_authorized"},
+            )
+            return None
+        revocations = getattr(self._controller._runtime, "revocation_list", None)
+        if revocations is not None:
+            identity_revoked = any(
+                entry.type == RevocationType.AGENT
+                and entry.id == identity.agent_id
+                and (entry.tenant_id is None or entry.tenant_id == identity.tenant_id)
+                and (entry.expires_at is None or entry.expires_at > datetime.now(UTC))
+                for entry in revocations.entries
+            )
+            if identity_revoked:
+                context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+                context.set_details("admin identity is revoked")
+                self._audit_admin_operation(
+                    identity, "admin_operation_failed", target="grpc_admin",
+                    metadata={"reason": "identity_revoked"},
+                )
+                return None
         return identity
 
     def _audit_admin_operation(
@@ -280,12 +310,15 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
     ) -> governance_pb2.HealthResponse:
         opa_reachable = await self._opa_reachable()
         gateway_ready = getattr(self._controller, "started", True)
+        audit_store = self._controller._runtime.audit_store
+        evidence_status = getattr(audit_store, "evidence_status", "disabled")
         uptime = time.time() - self._start_time
         return governance_pb2.HealthResponse(
-            status="ok",
+            status="degraded" if evidence_status == "degraded" else "ok",
             opa_reachable=opa_reachable,
             gateway_ready=gateway_ready,
             uptime_seconds=uptime,
+            evidence_status=evidence_status,
         )
 
     async def ListPendingApprovals(

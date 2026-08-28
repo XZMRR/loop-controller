@@ -47,6 +47,7 @@ message HealthResponse {
   bool opa_reachable = 2;
   bool gateway_ready = 3;
   float uptime_seconds = 4;
+  string evidence_status = 5;
 }
 
 message PendingApproval {

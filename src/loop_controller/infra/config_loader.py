@@ -899,6 +899,15 @@ class ConfigLoader:
                 raise ConfigValidationError(
                     f"entrypoints.{name}.require_auth 必须是布尔值"
                 )
+            admin_agent_ids = cfg.get("admin_agent_ids")
+            if admin_agent_ids is not None and (
+                name != "grpc"
+                or not isinstance(admin_agent_ids, list)
+                or any(not isinstance(agent_id, str) or not agent_id for agent_id in admin_agent_ids)
+            ):
+                raise ConfigValidationError(
+                    "entrypoints.grpc.admin_agent_ids 必须是非空字符串列表"
+                )
 
     # -- 工具 ---------------------------------------------------------------
 

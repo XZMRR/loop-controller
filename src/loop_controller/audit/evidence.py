@@ -6,10 +6,12 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import Protocol, runtime_checkable
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -144,13 +146,72 @@ class EvidenceChain:
         signer: EvidenceSigner,
         *,
         seq_start: int = 0,
+        checkpoint_path: str | Path | None = None,
     ) -> None:
         self._backend = backend
         self._signer = signer
         self._seq_start = seq_start
+        self._checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
         self._seq_by_tenant: dict[str | None, int] = {}
         self._prev_hash_by_tenant: dict[str | None, str] = {}
         self._locks: dict[str | None, asyncio.Lock] = {}
+        self.status = "healthy"
+        self.degraded_reason: str | None = None
+
+    @property
+    def signer(self) -> EvidenceSigner:
+        return self._signer
+
+    def mark_degraded(self, reason: str) -> None:
+        self.status = "degraded"
+        self.degraded_reason = reason
+
+    def checkpoint_path(self, tenant_id: str | None = None) -> Path | None:
+        if self._checkpoint_path is None:
+            return None
+        if tenant_id is None:
+            return self._checkpoint_path
+        return self._checkpoint_path.with_name(
+            f"{self._checkpoint_path.stem}-{tenant_id}{self._checkpoint_path.suffix}"
+        )
+
+    def write_checkpoint(self, payload: dict[str, Any], tenant_id: str | None = None) -> None:
+        path = self.checkpoint_path(tenant_id)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        signed_payload = dict(payload)
+        signed_payload.update(
+            {
+                "updated_at": datetime.now(UTC).isoformat(),
+                "algorithm": self._signer.algorithm,
+                "key_id": self._signer.key_id,
+            }
+        )
+        signature = self._signer.sign(canonical_json(signed_payload).encode("utf-8"))
+        record = {**signed_payload, "signature": base64.b64encode(signature).decode("ascii")}
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(canonical_json(record) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+
+    def read_checkpoint(self, tenant_id: str | None = None) -> dict[str, Any] | None:
+        path = self.checkpoint_path(tenant_id)
+        if path is None or not path.exists():
+            return None
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("证据 checkpoint 必须是 JSON 对象")
+        record: dict[str, Any] = loaded
+        signature_text = record.pop("signature", "")
+        if record.get("algorithm") != self._signer.algorithm or record.get("key_id") != self._signer.key_id:
+            raise ValueError("证据 checkpoint 签名算法或 key_id 不匹配")
+        try:
+            signature = base64.b64decode(signature_text, validate=True)
+        except ValueError as exc:
+            raise ValueError("证据 checkpoint 签名格式无效") from exc
+        if not self._signer.verify(canonical_json(record).encode("utf-8"), signature):
+            raise ValueError("证据 checkpoint 签名验证失败")
+        return record
 
     async def _recover(self, tenant_id: str | None) -> None:
         if tenant_id in self._seq_by_tenant:

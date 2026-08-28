@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -202,6 +203,97 @@ def test_evidence_failure_alerts_before_preserving_audit_event(tmp_path: Path) -
     alert = alert_store.list_alerts()[0]
     assert alert.rule_id == "evidence_chain_append_failed"
     assert alert.evidence == ["event-1"]
+
+
+@pytest.mark.asyncio
+async def test_async_concurrent_append_is_ordered_and_checkpointed(tmp_path: Path) -> None:
+    backend = LocalFileEvidenceBackend(tmp_path / "evidence")
+    chain = EvidenceChain(
+        backend,
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        checkpoint_path=tmp_path / "checkpoint.json",
+    )
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
+
+    await asyncio.gather(*(store.append_async(_event(number)) for number in range(1, 51)))
+
+    events = [event async for event in store.iter_events()]
+    evidence = await _records(backend)
+    assert [event.seq for event in events] == list(range(1, 51))
+    assert [record.seq for record in evidence] == list(range(1, 51))
+    assert store.verify_chain()
+    assert await store.verify_evidence_chain()
+    assert json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))["audit_seq"] == 50
+
+
+@pytest.mark.asyncio
+async def test_slow_evidence_backend_does_not_block_heartbeat(tmp_path: Path) -> None:
+    class SlowBackend(LocalFileEvidenceBackend):
+        async def append(self, tenant_id, signed_evidence) -> None:
+            await asyncio.sleep(0.05)
+            await super().append(tenant_id, signed_evidence)
+
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    chain = EvidenceChain(SlowBackend(tmp_path / "evidence"), HMACEvidenceSigner(b"k", key_id="k"))
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
+    await asyncio.gather(store.append_async(_event()), heartbeat())
+    assert ticks == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("audit_kept", "evidence_kept"), [(True, False), (False, True)])
+async def test_cross_validation_detects_one_sided_loss(
+    tmp_path: Path, audit_kept: bool, evidence_kept: bool
+) -> None:
+    backend = LocalFileEvidenceBackend(tmp_path / "evidence")
+    chain = EvidenceChain(
+        backend,
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        checkpoint_path=tmp_path / "checkpoint.json",
+    )
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
+    await store.append_async(_event(1))
+    await store.append_async(_event(2))
+    if not audit_kept:
+        (tmp_path / "audit.jsonl").write_text(
+            (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()[0] + "\n",
+            encoding="utf-8",
+        )
+    if not evidence_kept:
+        (tmp_path / "evidence" / "default.jsonl").write_text(
+            (tmp_path / "evidence" / "default.jsonl").read_text(encoding="utf-8").splitlines()[0] + "\n",
+            encoding="utf-8",
+        )
+
+    restarted = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=EvidenceChain(
+        LocalFileEvidenceBackend(tmp_path / "evidence"),
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        checkpoint_path=tmp_path / "checkpoint.json",
+    ))
+    assert not await restarted.verify_evidence_chain()
+    assert restarted.evidence_status == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_missing_checkpoint_with_data_is_degraded(tmp_path: Path) -> None:
+    chain = EvidenceChain(
+        LocalFileEvidenceBackend(tmp_path / "evidence"),
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        checkpoint_path=tmp_path / "checkpoint.json",
+    )
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
+    await store.append_async(_event())
+    (tmp_path / "checkpoint.json").unlink()
+
+    assert not await store.verify_evidence_chain()
+    assert store.evidence_status == "degraded"
 
 
 @pytest.mark.asyncio

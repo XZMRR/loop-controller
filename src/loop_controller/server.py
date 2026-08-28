@@ -226,12 +226,15 @@ class ToolGovernServer:
     async def _handle_health(self, request: Request) -> JSONResponse:
         opa_reachable = await self._opa_reachable()
         gateway_ready = self._controller.started if hasattr(self._controller, "started") else True
+        audit_store = self._controller._runtime.audit_store
+        evidence_status = getattr(audit_store, "evidence_status", "disabled")
         uptime = time.time() - self._start_time
         return JSONResponse(
             HealthResponse(
-                status="ok",
+                status="degraded" if evidence_status == "degraded" else "ok",
                 opa_reachable=opa_reachable,
                 gateway_ready=gateway_ready,
+                evidence_status=evidence_status,
                 uptime_seconds=round(uptime, 2),
             ).model_dump()
         )

@@ -22,7 +22,9 @@ from loop_controller.authority import AuthorityManager, NoopAuthorityManager
 from loop_controller.executors.base import ExecutionContext, ExecutorRegistry
 from loop_controller.executors.mcp_executor import MCPExecutor
 from loop_controller.governance_context import build_context_meta, build_governance_context
-from loop_controller.identity import IdentityProvider
+from loop_controller.identity import AgentIdentity, IdentityProvider
+from loop_controller.identity.revocation import RevocationList, RevocationMatch, RevocationType
+from loop_controller.infra.audit_store import AuditStore
 from loop_controller.infra.config_loader import PermissionRule
 from loop_controller.infra.policy_store import PolicyStore
 from loop_controller.infra.reservation_store import InMemoryReservationStore, ReservationStore
@@ -31,6 +33,7 @@ from loop_controller.models import (
     ActionProposal,
     Agent,
     ApprovalRequest,
+    AuditEvent,
     BudgetCost,
     BudgetReservation,
     CapabilityProfile,
@@ -75,11 +78,15 @@ class CheckpointError(Exception):
 class DecisionStore(Protocol):
     """持久化已签发的 Decision 使用记录，提供跨重启防重放（§4.5）。"""
 
-    def is_call_id_seen(self, call_id: str) -> bool: ...  # v1.1：全局唯一性检测（不再按 task_id 分区）
+    def is_call_id_seen(
+        self, call_id: str
+    ) -> bool: ...  # v1.1：全局唯一性检测（不再按 task_id 分区）
     def record_proposal(self, task_id: str, call_id: str) -> None: ...
     def record_decision(self, decision: Decision) -> None: ...  # v0.3.0：记录完整 Decision 元信息
     def get_decision(self, decision_id: str) -> Decision | None: ...  # v0.3.0
-    def use_decision(self, decision_id: str, now: datetime) -> bool: ...  # v0.3.0：原子检查过期/次数并落盘
+    def use_decision(
+        self, decision_id: str, now: datetime
+    ) -> bool: ...  # v0.3.0：原子检查过期/次数并落盘
 
 
 class InMemoryDecisionStore:
@@ -211,6 +218,8 @@ class Checkpoint:
         authority_manager: AuthorityManager | None = None,  # v0.11.0 动态权限提升
         tool_costs: dict[str, BudgetCost] | None = None,  # v1.1：tool_name -> 单次调用成本
         masker=None,  # Masker（T3.2 接入 build_approval_request）
+        revocation_list: RevocationList | None = None,
+        audit_store: AuditStore | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         if executor_registry is None:
@@ -233,6 +242,8 @@ class Checkpoint:
         self._authority_manager = authority_manager or NoopAuthorityManager()
         self._tool_costs = tool_costs or {}
         self._masker = masker
+        self._revocation_list = revocation_list
+        self._audit_store = audit_store
         self._now = now or _utc_now
         # per-task 已成功执行的动作历史（§6.1 步骤 5 / 偏离 D12），任务结束即弃。
         self._history: dict[str, list[ActionProposal]] = {}
@@ -318,9 +329,19 @@ class Checkpoint:
         return updated
 
     def _refund_reservation(self, reservation: BudgetReservation) -> BudgetReservation:
-        """返还 reservation 对应预算并标记为 refunded。"""
-        self._budget_ledger.refund(reservation.task_id, reservation.cost)
-        return self._transition_reservation(reservation, "refunded")
+        """幂等返还未提交 reservation；历史 committed reservation 保持不变。"""
+        current = self._reservation_store.get(reservation.reservation_id) or reservation
+        if current.state not in ("pending", "pending_approval"):
+            return current
+        self._budget_ledger.refund(current.task_id, current.cost)
+        return self._transition_reservation(current, "refunded")
+
+    def refund_reservation_for_call(self, call_id: str) -> BudgetReservation | None:
+        """统一释放指定调用仍处于活动状态的预算预留。"""
+        reservation = self._reservation_store.get_by_call_id(call_id)
+        if reservation is None:
+            return None
+        return self._refund_reservation(reservation)
 
     def _commit_reservation(self, reservation: BudgetReservation) -> BudgetReservation:
         """确认 reservation 对应预算消耗并标记为 committed。"""
@@ -444,9 +465,7 @@ class Checkpoint:
                     )
                     if valid_tokens:
                         proposal = proposal.model_copy(
-                            update={
-                                "authority_token_ids": [t.token_id for t in valid_tokens]
-                            }
+                            update={"authority_token_ids": [t.token_id for t in valid_tokens]}
                         )
                         authority_override = True
                     else:
@@ -465,9 +484,7 @@ class Checkpoint:
         # 步骤 5.5：防御性校验 proposal 中声明的 token（无论组合规则是否命中）
         if proposal.authority_token_ids and not authority_override:
             # 仅校验 token 仍然有效；不影响已有 rule 决策
-            valid_tokens = self._authority_manager.validate_for_proposal(
-                proposal, []
-            )
+            valid_tokens = self._authority_manager.validate_for_proposal(proposal, [])
             proposal = proposal.model_copy(
                 update={"authority_token_ids": [t.token_id for t in valid_tokens]}
             )
@@ -501,7 +518,11 @@ class Checkpoint:
         hits = list(rego_decision.get("policy_hits") or [])
         # v1.2：高 session_risk 时，Reg 返回的 modify 也必须升级为 require_approval。
         session_risk_above = session_risk.cumulative_risk_score >= profile.session_risk_threshold
-        if pending_approval or verdict == "require_approval" or (verdict == "modify" and session_risk_above):
+        if (
+            pending_approval
+            or verdict == "require_approval"
+            or (verdict == "modify" and session_risk_above)
+        ):
             reason = rego_decision.get("reason", "requires human approval")
             if rule is not None and verdict != "require_approval":
                 hits.append(rule.id)
@@ -513,7 +534,9 @@ class Checkpoint:
                 self._risk_manager.update(task.session_id, "critical")
             # v0.6.1：require_approval 保持预算预留，审批通过后直接 commit，无需二次 reserve
             reservation = self._to_pending_approval(reservation, now)
-            return self._handle_require_approval(agent, proposal, profile, reason, now, policy_version, hits)
+            return self._handle_require_approval(
+                agent, proposal, profile, reason, now, policy_version, hits
+            )
 
         if proposal.risk_level == "critical":
             self._risk_manager.update(task.session_id, "critical")
@@ -570,9 +593,7 @@ class Checkpoint:
         """组装审批请求；冲突校验失败直接抛 CheckpointError（§3.10）。"""
         approver_id = decision.escalation_target or ""
         if approver_id == task.user_id or approver_id == proposal.agent_id:
-            raise CheckpointError(
-                f"审批人冲突：approver_id={approver_id} 与 requester/agent 相同"
-            )
+            raise CheckpointError(f"审批人冲突：approver_id={approver_id} 与 requester/agent 相同")
         return ApprovalRequest(
             request_id=uuid.uuid4().hex,
             decision_id=decision.decision_id,
@@ -637,7 +658,9 @@ class Checkpoint:
 
         # approve：reservation 保持 pending，forward 执行时 commit
         if reservation is not None and reservation.state == "pending_approval":
-            self._transition_reservation(reservation, "pending", expires_at=now + _ALLOW_MODIFY_DELTA)
+            self._transition_reservation(
+                reservation, "pending", expires_at=now + _ALLOW_MODIFY_DELTA
+            )
         return decision.model_copy(
             update={
                 "verdict": "allow",
@@ -672,6 +695,67 @@ class Checkpoint:
         )
         self._decision_store.record_decision(decision)
         return decision
+
+    def resolve_secret_refs(self, tool_name: str, arguments: dict) -> list[str]:
+        """统一解析执行器可信配置与参数补充声明中的 Secret 引用。"""
+        return self._executor_registry.resolve_secret_refs(tool_name, arguments)
+
+    def check_revocation(
+        self,
+        identity: AgentIdentity,
+        tool_name: str,
+        arguments: dict,
+    ) -> RevocationMatch:
+        """使用共享吊销快照与执行器当前可信配置检查一次调用。"""
+        if self._revocation_list is None:
+            return RevocationMatch(revoked=False)
+        return self._revocation_list.match(
+            identity, tool_name, self.resolve_secret_refs(tool_name, arguments)
+        )
+
+    def handle_revocation_block(
+        self,
+        *,
+        identity: AgentIdentity,
+        proposal: ActionProposal,
+        task: Task,
+        match: RevocationMatch,
+        stage: str,
+    ) -> ToolResult:
+        """统一退款、结构化审计并返回吊销阻断结果。"""
+        self.refund_reservation_for_call(proposal.call_id)
+        if self._audit_store is not None:
+            self._audit_store.append(
+                AuditEvent(
+                    event_id=uuid.uuid4().hex,
+                    trace_id=task.task_id,
+                    session_id=task.session_id,
+                    call_id=proposal.call_id,
+                    actor_type="agent",
+                    actor_id=identity.agent_id,
+                    action="revocation_blocked",
+                    target=proposal.tool_name,
+                    decision="blocked",
+                    reason=match.reason or "revoked",
+                    metadata={
+                        "revocation_type": (
+                            match.type.value
+                            if isinstance(match.type, RevocationType)
+                            else match.type
+                        ),
+                        "revocation_id": match.id,
+                        "stage": stage,
+                    },
+                )
+            )
+        return ToolResult(
+            call_id=proposal.call_id,
+            task_id=proposal.task_id,
+            tool_name=proposal.tool_name,
+            status="blocked",
+            content=match.reason or "revoked",
+            error_code="revoked",
+        )
 
     # -- forward：执行前校验（§6.6） ----------------------------------------
 
@@ -718,7 +802,9 @@ class Checkpoint:
         # 校验 6：modify 复核（PEP 职责，不抛异常，返回 blocked）
         effective_args = proposal.arguments
         if decision.verdict == "modify":
-            if decision.modified_args is None or set(decision.modified_args) != set(proposal.arguments):
+            if decision.modified_args is None or set(decision.modified_args) != set(
+                proposal.arguments
+            ):
                 self._refund_reservation(reservation)
                 return self._blocked(proposal, "modified_args 缺失或改动超出参数值范围")
             perm = self._tool_permission_for(proposal)
@@ -727,7 +813,37 @@ class Checkpoint:
                 return self._blocked(proposal, "modify 后参数未通过 Profile 白/黑名单复核")
             effective_args = decision.modified_args
 
-        # 校验 7-8：转发执行；成功才记入 per-task 历史；异常 refund 预算
+        # 校验 7-8：最终吊销检查后转发执行；成功才记入 per-task 历史。
+        if self._revocation_list is not None:
+            agent = self._identity.get_agent(proposal.agent_id)
+            if agent is None:
+                self._refund_reservation(reservation)
+                raise CheckpointError(f"unknown agent_id: {proposal.agent_id}")
+            identity = AgentIdentity(
+                agent_id=agent.agent_id,
+                user_id=user_id,
+                harness_id=(agent.identity or {}).get("harness_id"),
+                profile_id=agent.profile_id,
+                tenant_id=agent.tenant_id,
+            )
+            match = self.check_revocation(identity, proposal.tool_name, effective_args)
+            if match.revoked:
+                task = Task(
+                    task_id=proposal.task_id,
+                    session_id=session_id or proposal.task_id,
+                    user_id=user_id,
+                    agent_id=proposal.agent_id,
+                    description="",
+                    tenant_id=tenant_id,
+                )
+                return self.handle_revocation_block(
+                    identity=identity,
+                    proposal=proposal,
+                    task=task,
+                    match=match,
+                    stage="pre_execute",
+                )
+
         try:
             executor = self._executor_registry.get_executor(proposal.tool_name)
             result = await executor.execute(

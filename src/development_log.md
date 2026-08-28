@@ -1809,3 +1809,40 @@ v0.23.2 已完成 v0.23.1 残留问题的收尾。v0.24.0 根据 `src/audit_repo
 ### 设计文档
 
 - `src/loop_controller_v0.26.0_development.md`
+
+---
+
+## v0.26.1：吊销与证据链可靠性修复
+
+### 完成内容
+
+- Secret 吊销改为同时解析执行器当前生效配置中的可信 Secret 引用，调用参数仅作为补充，HTTP 工具热更新后立即使用新引用；
+- Controller、MCP Proxy、SDK/`ToolGovernor` 与 `execute_with_proposal` 在最终执行边界统一复查吊销和 Kill Switch；阻断时释放未提交 reservation，并写入结构化 `revocation_blocked` 审计；
+- gRPC Admin RPC 增加 `entrypoints.grpc.admin_agent_ids` allowlist 授权；未配置时默认拒绝普通已认证身份；
+- `RevocationEntry` 严格拒绝无时区 `revoked_at`/`expires_at`，合法时间统一转换为 UTC；
+- AuditStore 增加真正的异步有序写入路径，移除每条事件创建线程并 `join()` 的事件循环阻塞方式；
+- 启动时交叉验证审计、签名证据与签名本地尾状态 checkpoint；不一致时将证据状态标记为 `degraded` 并告警，但不阻塞服务启动；
+- 管理接口持久化失败不再返回成功，且保持内存状态不变。
+
+### 本地 checkpoint 安全边界
+
+- checkpoint 与当前审计/证据尾部联合校验，可发现相对上次本地状态的序号回退、尾哈希不一致，以及审计或证据的单边尾部/整体丢失；
+- checkpoint 载荷由 EvidenceSigner 签名，并通过临时文件写入后原子替换；它是本地一致性记录，不是远程可信锚点、WORM 或主机级不可删除证明；
+- 拥有主机权限的攻击者若同时删除全部本地审计、证据和 checkpoint，系统仍会把该状态视为新部署，无法检测此前数据被删除；生产环境仍需外部可信锚点、远程不可变存储或独立备份；
+- 验证失败采用可用性优先策略：告警并暴露 `evidence_status=degraded`，不阻止服务启动。
+
+### 配置变更
+
+- `config/entrypoints.yaml`：`entrypoints.grpc.admin_agent_ids` 为显式管理员 Agent ID 列表，默认空列表语义为全部 Admin RPC 拒绝；
+- `config/evidence.yaml`：`evidence.local.checkpoint_path` 可覆盖默认 `<evidence.local.path>/checkpoint.json`；checkpoint 与证据使用同一签名器；
+- `config/revocation.yaml`：吊销时间必须是带时区的 ISO 8601 值（如 `2026-08-28T12:00:00Z`），无时区值会被拒绝且热更新保留旧快照。
+
+### 明确边界
+
+- 仍不提供多进程/多 worker 对同一 JSONL 文件的安全并发写入；
+- 仍不提供完整多租户隔离、KMS/HSM、远程证据后端或外部可信锚点；
+- 本地 Ed25519 私钥保护等级不等同于 KMS/HSM。
+
+### 设计文档
+
+- `src/loop_controller_v0.26.1_development.md`

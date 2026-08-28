@@ -52,6 +52,36 @@ def test_agent_user_tool_and_secret_revocations(
     assert revocations.is_revoked(_identity(), tool_name, secret_refs) == (True, "compromised")
 
 
+def test_revocation_datetimes_require_timezone_and_normalize_to_utc() -> None:
+    with pytest.raises(ValueError, match="datetime must include timezone"):
+        RevocationEntry(type="agent", id="agent-1", revoked_at="2026-08-28T12:00:00")
+    with pytest.raises(ValueError, match="datetime must include timezone"):
+        RevocationEntry(type="agent", id="agent-1", expires_at="2026-08-28T12:00:00")
+
+    zulu = RevocationEntry(type="agent", id="agent-1", expires_at="2026-08-28T12:00:00Z")
+    offset = RevocationEntry(
+        type="agent", id="agent-1", expires_at="2026-08-28T15:00:00+03:00"
+    )
+    assert zulu.expires_at == datetime(2026, 8, 28, 12, tzinfo=UTC)
+    assert offset.expires_at == datetime(2026, 8, 28, 12, tzinfo=UTC)
+
+
+def test_structured_revocation_match() -> None:
+    revocations = RevocationList(
+        [RevocationEntry(type="secret", id="api-key", reason="compromised")]
+    )
+    match = revocations.match(_identity(), "search", ["api-key"])
+    assert match.revoked
+    assert match.type == RevocationType.SECRET
+    assert match.id == "api-key"
+
+    killed = RevocationList(
+        kill_switch=KillSwitchConfig(enabled=True, reason="emergency")
+    ).match(_identity(), "search")
+    assert killed.type == "kill_switch"
+    assert killed.id == "global"
+
+
 def test_expired_and_other_tenant_revocations_do_not_match() -> None:
     revocations = RevocationList(
         [
@@ -112,6 +142,16 @@ def test_http_admin_crud_and_kill_switch(tmp_path: Path) -> None:
             headers=headers,
         )
         assert added.status_code == 200
+        assert client.post(
+            "/admin/revoke",
+            json={
+                "type": "tool",
+                "id": "naive-time",
+                "reason": "invalid",
+                "expires_at": "2026-08-28T12:00:00",
+            },
+            headers=headers,
+        ).status_code == 422
         listing = client.get("/admin/revocation-list", headers=headers).json()
         assert listing["revocations"][0]["id"] == "search"
 
@@ -178,8 +218,20 @@ async def test_grpc_admin_methods() -> None:
         users={admin.agent_id: admin.owner_id},
         cert_mappings=[{"cn": "admin-agent", "agent_id": admin.agent_id}],
     )
-    servicer = ToolGovernanceServicer(  # type: ignore[arg-type]
+    unauthorized = ToolGovernanceServicer(  # type: ignore[arg-type]
         controller, identity_provider=identity_provider
+    )
+    denied_context = Context()
+    denied = await unauthorized.GetRevocationList(
+        governance_pb2.GetRevocationListRequest(), denied_context
+    )
+    assert not denied.revocations
+    assert denied_context.code() is grpc.StatusCode.PERMISSION_DENIED
+
+    servicer = ToolGovernanceServicer(  # type: ignore[arg-type]
+        controller,
+        identity_provider=identity_provider,
+        entrypoints_config={"grpc": {"admin_agent_ids": ["admin-agent"]}},
     )
     context = Context()
     response = await servicer.Revoke(
@@ -201,6 +253,25 @@ async def test_grpc_admin_methods() -> None:
         governance_pb2.RevokeRequest(type="agent", id="agent-1", remove=True), context
     )
     assert removed.success and removed.removed
+
+    invalid_time_context = Context()
+    invalid_time = await servicer.Revoke(
+        governance_pb2.RevokeRequest(
+            type="agent", id="agent-1", expires_at="2026-08-28T12:00:00"
+        ),
+        invalid_time_context,
+    )
+    assert not invalid_time.success
+    assert invalid_time_context.code() is grpc.StatusCode.INVALID_ARGUMENT
+
+    revocations.add(RevocationEntry(type="agent", id="admin-agent", reason="compromised"))
+    revoked_context = Context()
+    denied = await servicer.GetRevocationList(
+        governance_pb2.GetRevocationListRequest(), revoked_context
+    )
+    assert not denied.revocations
+    assert revoked_context.code() is grpc.StatusCode.PERMISSION_DENIED
+    assert revoked_context.details == "admin identity is revoked"
 
 
 @pytest.mark.asyncio
@@ -263,7 +334,16 @@ def test_persistence_failure_keeps_memory_protection(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("replacement", [None, "", "not: [valid"])
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        None,
+        "",
+        "not: [valid",
+        "revocations:\n  - type: tool\n    id: search\n"
+        "    revoked_at: '2026-08-28T12:00:00'\n",
+    ],
+)
 async def test_hot_reload_error_or_deletion_keeps_memory_protection(
     tmp_path: Path, replacement: str | None
 ) -> None:
@@ -370,5 +450,19 @@ async def test_revocation_during_approval_wait_blocks_execution(
         assert result.status == "blocked"
         assert result.error_code == "revoked"
         assert result.content == "revoked while waiting"
+        reservation = controller._runtime.reservation_store.get_by_call_id(pending.call_id)
+        assert reservation is not None and reservation.state == "refunded"
+        blocked_events = [
+            event
+            for event in controller._runtime.audit_store.query_by_trace(request.task_id)
+            if event.action == "revocation_blocked"
+        ]
+        assert len(blocked_events) == 1
+        assert blocked_events[0].decision == "blocked"
+        assert blocked_events[0].metadata == {
+            "revocation_type": "agent",
+            "revocation_id": "researcher_001",
+            "stage": "approval_resume",
+        }
     finally:
         await controller.aclose()

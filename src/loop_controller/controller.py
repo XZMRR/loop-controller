@@ -145,9 +145,9 @@ class LoopController:
             task_id=task_id,
             task_context=task_context,
         )
-        revoked, reason = self._check_revocation(agent, task.user_id, proposal)
-        if revoked:
-            return EvaluationResult(status="blocked", reason=reason or "revoked")
+        blocked = self._handle_revocation(task, agent, proposal, "initial")
+        if blocked is not None:
+            return EvaluationResult(status="blocked", reason=blocked.content)
         return await self._evaluate_proposal(task, agent, proposal)
 
     async def _evaluate_proposal(
@@ -168,7 +168,7 @@ class LoopController:
         proposal = proposal.model_copy(
             update={"risk_level": signal.risk_level, "risk_tags": signal.tags}
         )
-        self._runtime.audit_store.append(
+        await self._runtime.audit_store.append_async(
             _audit_event(
                 task,
                 action="propose",
@@ -187,7 +187,7 @@ class LoopController:
         except CheckpointError as exc:
             return EvaluationResult(status="deny", reason=str(exc))
 
-        self._runtime.audit_store.append(
+        await self._runtime.audit_store.append_async(
             _audit_event(
                 task,
                 action="evaluate",
@@ -303,17 +303,6 @@ class LoopController:
                 error_code="task_not_found",
             )
 
-        revoked, reason = self._check_revocation(agent, task.user_id, proposal)
-        if revoked:
-            return ToolResult(
-                call_id=decision.call_id,
-                task_id=decision.task_id,
-                tool_name=proposal.tool_name,
-                status="blocked",
-                content=reason or "revoked",
-                error_code="revoked",
-            )
-
         try:
             return await self._execute_proposal(task, proposal, decision)
         except CheckpointError as exc:
@@ -352,6 +341,18 @@ class LoopController:
             task_id=task_id,
             task_context=task_context,
         )
+
+        blocked = self._handle_revocation(task, agent, proposal, "initial")
+        if blocked is not None:
+            return GovernanceResult(
+                status="blocked",
+                call_id=proposal.call_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                reason=blocked.content,
+                content=blocked.content,
+                error_code="revoked",
+            )
 
         eval_result = await self._evaluate_proposal(task, agent, proposal)
 
@@ -464,9 +465,9 @@ class LoopController:
                 reason=f"unknown agent_id: {request.agent_id}",
                 error_code="unknown_agent",
             )
-        revoked, reason = self._check_revocation(agent, task.user_id, approve_proposal)
-        if revoked:
-            return self._revoked_governance_result(approve_proposal, reason)
+        blocked = self._handle_revocation(task, agent, approve_proposal, "approval_resume")
+        if blocked is not None:
+            return self._revoked_governance_result(approve_proposal, blocked.content)
 
         if record.verdict == "approve":
             approve_action: AuditAction = "approve"
@@ -578,23 +579,44 @@ class LoopController:
         visit(arguments)
         return refs
 
-    def _check_revocation(
-        self, agent: Agent, user_id: str, proposal: ActionProposal
-    ) -> tuple[bool, str | None]:
-        revocations = getattr(self._runtime, "revocation_list", None)
-        if revocations is None:
-            return False, None
-        identity = AgentIdentity(
+    @staticmethod
+    def _agent_identity(agent: Agent, user_id: str) -> AgentIdentity:
+        return AgentIdentity(
             agent_id=agent.agent_id,
             user_id=user_id,
             harness_id=(agent.identity or {}).get("harness_id"),
             profile_id=agent.profile_id,
             tenant_id=agent.tenant_id,
         )
-        revoked, reason = revocations.is_revoked(
-            identity, proposal.tool_name, self._secret_refs(proposal.arguments)
+
+    def _check_revocation(
+        self, agent: Agent, user_id: str, proposal: ActionProposal
+    ) -> tuple[bool, str | None]:
+        match = self._runtime.checkpoint.check_revocation(
+            self._agent_identity(agent, user_id), proposal.tool_name, proposal.arguments
         )
-        return bool(revoked), reason
+        return match.revoked, match.reason
+
+    def _handle_revocation(
+        self,
+        task: Task,
+        agent: Agent,
+        proposal: ActionProposal,
+        stage: str,
+    ) -> ToolResult | None:
+        identity = self._agent_identity(agent, task.user_id)
+        match = self._runtime.checkpoint.check_revocation(
+            identity, proposal.tool_name, proposal.arguments
+        )
+        if not match.revoked:
+            return None
+        return self._runtime.checkpoint.handle_revocation_block(
+            identity=identity,
+            proposal=proposal,
+            task=task,
+            match=match,
+            stage=stage,
+        )
 
     @staticmethod
     def _revoked_governance_result(
@@ -659,16 +681,9 @@ class LoopController:
         agent = self._runtime.checkpoint._identity.get_agent(proposal.agent_id)
         if agent is None:
             raise CheckpointError(f"unknown agent_id: {proposal.agent_id}")
-        revoked, reason = self._check_revocation(agent, task.user_id, proposal)
-        if revoked:
-            return ToolResult(
-                call_id=proposal.call_id,
-                task_id=proposal.task_id,
-                tool_name=proposal.tool_name,
-                status="blocked",
-                content=reason or "revoked",
-                error_code="revoked",
-            )
+        blocked = self._handle_revocation(task, agent, proposal, "pre_execute")
+        if blocked is not None:
+            return blocked
         session = self._runtime.session_manager.get_session(task.session_id)
         session_id = session.session_id if session is not None else task.session_id
         result = await self._runtime.checkpoint.forward(
@@ -678,7 +693,7 @@ class LoopController:
             user_id=task.user_id,
             tenant_id=task.tenant_id,
         )
-        self._runtime.audit_store.append(
+        await self._runtime.audit_store.append_async(
             _audit_event(
                 task,
                 action="execute",

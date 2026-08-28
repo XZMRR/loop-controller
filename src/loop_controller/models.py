@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 RiskLevel = Literal["low", "medium", "high", "critical"]
 Verdict = Literal["allow", "deny", "modify", "require_approval"]
+AuditDecision = Literal["allow", "deny", "modify", "require_approval", "blocked"]
 ToolResultStatus = Literal["success", "error", "blocked"]
 ActorType = Literal["agent", "user", "r0_delegate", "system", "checkpoint"]
 AuditAction = Literal[
@@ -40,6 +41,7 @@ AuditAction = Literal[
     "authority_revoked",  # v0.11.0：动态权限提升撤销
     "authority_expired",  # v0.11.0：动态权限提升过期
     "admin_operation",
+    "revocation_blocked",
 ]
 ApprovalVerdict = Literal["approve", "deny"]
 ConversationRole = Literal["user", "agent"]
@@ -375,7 +377,7 @@ class AuditEvent(BaseModel):
     actor_id: str
     action: AuditAction
     target: str | None = None  # tool_name 或 "checkpoint"
-    decision: Verdict | None = None
+    decision: AuditDecision | None = None
     args_hash: str | None = None  # 规范 JSON 的 SHA-256 / HMAC-SHA256
     hash_algo: str = "sha256"  # "sha256" | "hmac-sha256"；升级 HMAC 时改此字段，schema 不变
     key_id: str | None = None  # HMAC key 标识，为轮换留口

@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n#loop_controller/v1/governance.proto\x12\x18loop_controller.proto.v1\"\xa2\x01\n\x17\x45valuateToolCallRequest\x12\x10\n\x08\x61gent_id\x18\x01 \x01(\t\x12\x0f\n\x07user_id\x18\x02 \x01(\t\x12\x11\n\ttool_name\x18\x03 \x01(\t\x12\x16\n\x0e\x61rguments_json\x18\x04 \x01(\t\x12\x14\n\x0ctask_context\x18\x05 \x01(\t\x12\x12\n\nsession_id\x18\x06 \x01(\t\x12\x0f\n\x07task_id\x18\x07 \x01(\t\"b\n\x18\x45valuateToolCallResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\x12\x0e\n\x06result\x18\x02 \x01(\t\x12\x12\n\nrequest_id\x18\x03 \x01(\t\x12\x12\n\nerror_code\x18\x04 \x01(\t\"0\n\x1aResumeAfterApprovalRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\"F\n\x16WaitForApprovalRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x18\n\x10max_wait_seconds\x18\x02 \x01(\x05\"\x0f\n\rHealthRequest\"f\n\x0eHealthResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\x12\x15\n\ropa_reachable\x18\x02 \x01(\x08\x12\x15\n\rgateway_ready\x18\x03 \x01(\x08\x12\x16\n\x0euptime_seconds\x18\x04 \x01(\x02\"s\n\x0fPendingApproval\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x13\n\x0b\x64\x65\x63ision_id\x18\x02 \x01(\t\x12\x11\n\ttool_name\x18\x03 \x01(\t\x12\x14\n\x0crequester_id\x18\x04 \x01(\t\x12\x0e\n\x06reason\x18\x05 \x01(\t\"\x1d\n\x1bListPendingApprovalsRequest\"\\\n\x1cListPendingApprovalsResponse\x12<\n\tapprovals\x18\x01 \x03(\x0b\x32).loop_controller.proto.v1.PendingApproval\"M\n\x17QueryAuditEventsRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0f\n\x07task_id\x18\x02 \x01(\t\x12\r\n\x05limit\x18\x03 \x01(\x05\"p\n\rRevokeRequest\x12\x0c\n\x04type\x18\x01 \x01(\t\x12\n\n\x02id\x18\x02 \x01(\t\x12\x0e\n\x06reason\x18\x03 \x01(\t\x12\x12\n\nexpires_at\x18\x04 \x01(\t\x12\x11\n\ttenant_id\x18\x05 \x01(\t\x12\x0e\n\x06remove\x18\x06 \x01(\x08\"2\n\x0eRevokeResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07removed\x18\x02 \x01(\x08\"d\n\x14SetKillSwitchRequest\x12\x0f\n\x07\x65nabled\x18\x01 \x01(\x08\x12\x0e\n\x06reason\x18\x02 \x01(\t\x12\x14\n\x0c\x65xcept_tools\x18\x03 \x03(\t\x12\x15\n\rexcept_agents\x18\x04 \x03(\t\"b\n\x12KillSwitchResponse\x12\x0f\n\x07\x65nabled\x18\x01 \x01(\x08\x12\x0e\n\x06reason\x18\x02 \x01(\t\x12\x14\n\x0c\x65xcept_tools\x18\x03 \x03(\t\x12\x15\n\rexcept_agents\x18\x04 \x03(\t\"\x1a\n\x18GetRevocationListRequest\"v\n\x0fRevocationEntry\x12\x0c\n\x04type\x18\x01 \x01(\t\x12\n\n\x02id\x18\x02 \x01(\t\x12\x0e\n\x06reason\x18\x03 \x01(\t\x12\x12\n\nrevoked_at\x18\x04 \x01(\t\x12\x12\n\nexpires_at\x18\x05 \x01(\t\x12\x11\n\ttenant_id\x18\x06 \x01(\t\"\x9b\x01\n\x16RevocationListResponse\x12>\n\x0brevocations\x18\x01 \x03(\x0b\x32).loop_controller.proto.v1.RevocationEntry\x12\x41\n\x0bkill_switch\x18\x02 \x01(\x0b\x32,.loop_controller.proto.v1.KillSwitchResponse\"\xd5\x01\n\nAuditEvent\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\x12\x10\n\x08trace_id\x18\x02 \x01(\t\x12\x12\n\nsession_id\x18\x03 \x01(\t\x12\x0e\n\x06\x61\x63tion\x18\x04 \x01(\t\x12\x12\n\nactor_type\x18\x05 \x01(\t\x12\x10\n\x08\x61\x63tor_id\x18\x06 \x01(\t\x12\x0e\n\x06target\x18\x07 \x01(\t\x12\x10\n\x08\x64\x65\x63ision\x18\x08 \x01(\t\x12\x0e\n\x06reason\x18\t \x01(\t\x12\x11\n\ttimestamp\x18\n \x01(\t\x12\x14\n\x0cpayload_json\x18\x0b \x01(\t2\xa5\x08\n\x0eToolGovernance\x12y\n\x10\x45valuateToolCall\x12\x31.loop_controller.proto.v1.EvaluateToolCallRequest\x1a\x32.loop_controller.proto.v1.EvaluateToolCallResponse\x12\x7f\n\x13ResumeAfterApproval\x12\x34.loop_controller.proto.v1.ResumeAfterApprovalRequest\x1a\x32.loop_controller.proto.v1.EvaluateToolCallResponse\x12y\n\x0fWaitForApproval\x12\x30.loop_controller.proto.v1.WaitForApprovalRequest\x1a\x32.loop_controller.proto.v1.EvaluateToolCallResponse0\x01\x12^\n\tGetHealth\x12\'.loop_controller.proto.v1.HealthRequest\x1a(.loop_controller.proto.v1.HealthResponse\x12\x85\x01\n\x14ListPendingApprovals\x12\x35.loop_controller.proto.v1.ListPendingApprovalsRequest\x1a\x36.loop_controller.proto.v1.ListPendingApprovalsResponse\x12m\n\x10QueryAuditEvents\x12\x31.loop_controller.proto.v1.QueryAuditEventsRequest\x1a$.loop_controller.proto.v1.AuditEvent0\x01\x12[\n\x06Revoke\x12\'.loop_controller.proto.v1.RevokeRequest\x1a(.loop_controller.proto.v1.RevokeResponse\x12m\n\rSetKillSwitch\x12..loop_controller.proto.v1.SetKillSwitchRequest\x1a,.loop_controller.proto.v1.KillSwitchResponse\x12y\n\x11GetRevocationList\x12\x32.loop_controller.proto.v1.GetRevocationListRequest\x1a\x30.loop_controller.proto.v1.RevocationListResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n#loop_controller/v1/governance.proto\x12\x18loop_controller.proto.v1\"\xa2\x01\n\x17\x45valuateToolCallRequest\x12\x10\n\x08\x61gent_id\x18\x01 \x01(\t\x12\x0f\n\x07user_id\x18\x02 \x01(\t\x12\x11\n\ttool_name\x18\x03 \x01(\t\x12\x16\n\x0e\x61rguments_json\x18\x04 \x01(\t\x12\x14\n\x0ctask_context\x18\x05 \x01(\t\x12\x12\n\nsession_id\x18\x06 \x01(\t\x12\x0f\n\x07task_id\x18\x07 \x01(\t\"b\n\x18\x45valuateToolCallResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\x12\x0e\n\x06result\x18\x02 \x01(\t\x12\x12\n\nrequest_id\x18\x03 \x01(\t\x12\x12\n\nerror_code\x18\x04 \x01(\t\"0\n\x1aResumeAfterApprovalRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\"F\n\x16WaitForApprovalRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x18\n\x10max_wait_seconds\x18\x02 \x01(\x05\"\x0f\n\rHealthRequest\"\x7f\n\x0eHealthResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\x12\x15\n\ropa_reachable\x18\x02 \x01(\x08\x12\x15\n\rgateway_ready\x18\x03 \x01(\x08\x12\x16\n\x0euptime_seconds\x18\x04 \x01(\x02\x12\x17\n\x0f\x65vidence_status\x18\x05 \x01(\t\"s\n\x0fPendingApproval\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x13\n\x0b\x64\x65\x63ision_id\x18\x02 \x01(\t\x12\x11\n\ttool_name\x18\x03 \x01(\t\x12\x14\n\x0crequester_id\x18\x04 \x01(\t\x12\x0e\n\x06reason\x18\x05 \x01(\t\"\x1d\n\x1bListPendingApprovalsRequest\"\\\n\x1cListPendingApprovalsResponse\x12<\n\tapprovals\x18\x01 \x03(\x0b\x32).loop_controller.proto.v1.PendingApproval\"M\n\x17QueryAuditEventsRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0f\n\x07task_id\x18\x02 \x01(\t\x12\r\n\x05limit\x18\x03 \x01(\x05\"p\n\rRevokeRequest\x12\x0c\n\x04type\x18\x01 \x01(\t\x12\n\n\x02id\x18\x02 \x01(\t\x12\x0e\n\x06reason\x18\x03 \x01(\t\x12\x12\n\nexpires_at\x18\x04 \x01(\t\x12\x11\n\ttenant_id\x18\x05 \x01(\t\x12\x0e\n\x06remove\x18\x06 \x01(\x08\"2\n\x0eRevokeResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07removed\x18\x02 \x01(\x08\"d\n\x14SetKillSwitchRequest\x12\x0f\n\x07\x65nabled\x18\x01 \x01(\x08\x12\x0e\n\x06reason\x18\x02 \x01(\t\x12\x14\n\x0c\x65xcept_tools\x18\x03 \x03(\t\x12\x15\n\rexcept_agents\x18\x04 \x03(\t\"b\n\x12KillSwitchResponse\x12\x0f\n\x07\x65nabled\x18\x01 \x01(\x08\x12\x0e\n\x06reason\x18\x02 \x01(\t\x12\x14\n\x0c\x65xcept_tools\x18\x03 \x03(\t\x12\x15\n\rexcept_agents\x18\x04 \x03(\t\"\x1a\n\x18GetRevocationListRequest\"v\n\x0fRevocationEntry\x12\x0c\n\x04type\x18\x01 \x01(\t\x12\n\n\x02id\x18\x02 \x01(\t\x12\x0e\n\x06reason\x18\x03 \x01(\t\x12\x12\n\nrevoked_at\x18\x04 \x01(\t\x12\x12\n\nexpires_at\x18\x05 \x01(\t\x12\x11\n\ttenant_id\x18\x06 \x01(\t\"\x9b\x01\n\x16RevocationListResponse\x12>\n\x0brevocations\x18\x01 \x03(\x0b\x32).loop_controller.proto.v1.RevocationEntry\x12\x41\n\x0bkill_switch\x18\x02 \x01(\x0b\x32,.loop_controller.proto.v1.KillSwitchResponse\"\xd5\x01\n\nAuditEvent\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\x12\x10\n\x08trace_id\x18\x02 \x01(\t\x12\x12\n\nsession_id\x18\x03 \x01(\t\x12\x0e\n\x06\x61\x63tion\x18\x04 \x01(\t\x12\x12\n\nactor_type\x18\x05 \x01(\t\x12\x10\n\x08\x61\x63tor_id\x18\x06 \x01(\t\x12\x0e\n\x06target\x18\x07 \x01(\t\x12\x10\n\x08\x64\x65\x63ision\x18\x08 \x01(\t\x12\x0e\n\x06reason\x18\t \x01(\t\x12\x11\n\ttimestamp\x18\n \x01(\t\x12\x14\n\x0cpayload_json\x18\x0b \x01(\t2\xa5\x08\n\x0eToolGovernance\x12y\n\x10\x45valuateToolCall\x12\x31.loop_controller.proto.v1.EvaluateToolCallRequest\x1a\x32.loop_controller.proto.v1.EvaluateToolCallResponse\x12\x7f\n\x13ResumeAfterApproval\x12\x34.loop_controller.proto.v1.ResumeAfterApprovalRequest\x1a\x32.loop_controller.proto.v1.EvaluateToolCallResponse\x12y\n\x0fWaitForApproval\x12\x30.loop_controller.proto.v1.WaitForApprovalRequest\x1a\x32.loop_controller.proto.v1.EvaluateToolCallResponse0\x01\x12^\n\tGetHealth\x12\'.loop_controller.proto.v1.HealthRequest\x1a(.loop_controller.proto.v1.HealthResponse\x12\x85\x01\n\x14ListPendingApprovals\x12\x35.loop_controller.proto.v1.ListPendingApprovalsRequest\x1a\x36.loop_controller.proto.v1.ListPendingApprovalsResponse\x12m\n\x10QueryAuditEvents\x12\x31.loop_controller.proto.v1.QueryAuditEventsRequest\x1a$.loop_controller.proto.v1.AuditEvent0\x01\x12[\n\x06Revoke\x12\'.loop_controller.proto.v1.RevokeRequest\x1a(.loop_controller.proto.v1.RevokeResponse\x12m\n\rSetKillSwitch\x12..loop_controller.proto.v1.SetKillSwitchRequest\x1a,.loop_controller.proto.v1.KillSwitchResponse\x12y\n\x11GetRevocationList\x12\x32.loop_controller.proto.v1.GetRevocationListRequest\x1a\x30.loop_controller.proto.v1.RevocationListResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -42,31 +42,31 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_HEALTHREQUEST']._serialized_start=452
   _globals['_HEALTHREQUEST']._serialized_end=467
   _globals['_HEALTHRESPONSE']._serialized_start=469
-  _globals['_HEALTHRESPONSE']._serialized_end=571
-  _globals['_PENDINGAPPROVAL']._serialized_start=573
-  _globals['_PENDINGAPPROVAL']._serialized_end=688
-  _globals['_LISTPENDINGAPPROVALSREQUEST']._serialized_start=690
-  _globals['_LISTPENDINGAPPROVALSREQUEST']._serialized_end=719
-  _globals['_LISTPENDINGAPPROVALSRESPONSE']._serialized_start=721
-  _globals['_LISTPENDINGAPPROVALSRESPONSE']._serialized_end=813
-  _globals['_QUERYAUDITEVENTSREQUEST']._serialized_start=815
-  _globals['_QUERYAUDITEVENTSREQUEST']._serialized_end=892
-  _globals['_REVOKEREQUEST']._serialized_start=894
-  _globals['_REVOKEREQUEST']._serialized_end=1006
-  _globals['_REVOKERESPONSE']._serialized_start=1008
-  _globals['_REVOKERESPONSE']._serialized_end=1058
-  _globals['_SETKILLSWITCHREQUEST']._serialized_start=1060
-  _globals['_SETKILLSWITCHREQUEST']._serialized_end=1160
-  _globals['_KILLSWITCHRESPONSE']._serialized_start=1162
-  _globals['_KILLSWITCHRESPONSE']._serialized_end=1260
-  _globals['_GETREVOCATIONLISTREQUEST']._serialized_start=1262
-  _globals['_GETREVOCATIONLISTREQUEST']._serialized_end=1288
-  _globals['_REVOCATIONENTRY']._serialized_start=1290
-  _globals['_REVOCATIONENTRY']._serialized_end=1408
-  _globals['_REVOCATIONLISTRESPONSE']._serialized_start=1411
-  _globals['_REVOCATIONLISTRESPONSE']._serialized_end=1566
-  _globals['_AUDITEVENT']._serialized_start=1569
-  _globals['_AUDITEVENT']._serialized_end=1782
-  _globals['_TOOLGOVERNANCE']._serialized_start=1785
-  _globals['_TOOLGOVERNANCE']._serialized_end=2846
+  _globals['_HEALTHRESPONSE']._serialized_end=596
+  _globals['_PENDINGAPPROVAL']._serialized_start=598
+  _globals['_PENDINGAPPROVAL']._serialized_end=713
+  _globals['_LISTPENDINGAPPROVALSREQUEST']._serialized_start=715
+  _globals['_LISTPENDINGAPPROVALSREQUEST']._serialized_end=744
+  _globals['_LISTPENDINGAPPROVALSRESPONSE']._serialized_start=746
+  _globals['_LISTPENDINGAPPROVALSRESPONSE']._serialized_end=838
+  _globals['_QUERYAUDITEVENTSREQUEST']._serialized_start=840
+  _globals['_QUERYAUDITEVENTSREQUEST']._serialized_end=917
+  _globals['_REVOKEREQUEST']._serialized_start=919
+  _globals['_REVOKEREQUEST']._serialized_end=1031
+  _globals['_REVOKERESPONSE']._serialized_start=1033
+  _globals['_REVOKERESPONSE']._serialized_end=1083
+  _globals['_SETKILLSWITCHREQUEST']._serialized_start=1085
+  _globals['_SETKILLSWITCHREQUEST']._serialized_end=1185
+  _globals['_KILLSWITCHRESPONSE']._serialized_start=1187
+  _globals['_KILLSWITCHRESPONSE']._serialized_end=1285
+  _globals['_GETREVOCATIONLISTREQUEST']._serialized_start=1287
+  _globals['_GETREVOCATIONLISTREQUEST']._serialized_end=1313
+  _globals['_REVOCATIONENTRY']._serialized_start=1315
+  _globals['_REVOCATIONENTRY']._serialized_end=1433
+  _globals['_REVOCATIONLISTRESPONSE']._serialized_start=1436
+  _globals['_REVOCATIONLISTRESPONSE']._serialized_end=1591
+  _globals['_AUDITEVENT']._serialized_start=1594
+  _globals['_AUDITEVENT']._serialized_end=1807
+  _globals['_TOOLGOVERNANCE']._serialized_start=1810
+  _globals['_TOOLGOVERNANCE']._serialized_end=2871
 # @@protoc_insertion_point(module_scope)

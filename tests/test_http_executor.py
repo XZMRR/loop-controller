@@ -141,6 +141,27 @@ class TestHTTPExecutor:
     def http_client(self) -> HTTPClient:
         return HTTPClient()
 
+    def test_secret_refs_follow_current_hot_reload_snapshot(
+        self, mock_client: AsyncMock
+    ) -> None:
+        old_spec = _create_spec(
+            auth=HTTPAuthConfig(
+                type="bearer_token", secret_ref=SecretRef(name="old-key")
+            )
+        )
+        executor = HTTPExecutor(mock_client, {"create_jira_ticket": old_spec})
+        assert executor.secret_refs_for("create_jira_ticket") == ["old-key"]
+
+        new_spec = old_spec.model_copy(
+            update={
+                "auth": HTTPAuthConfig(
+                    type="bearer_token", secret_ref=SecretRef(name="new-key")
+                )
+            }
+        )
+        executor.update_tool_specs({"create_jira_ticket": new_spec})
+        assert executor.secret_refs_for("create_jira_ticket") == ["new-key"]
+
     @pytest.mark.asyncio
     async def test_success_response_mapping(self, mock_client: AsyncMock) -> None:
         spec = _create_spec(

@@ -320,17 +320,6 @@ class LoopControllerProxyServer:
             return self._error_result(f"unknown agent_id: {identity.agent_id}")
 
         raw_arguments = dict(arguments)
-        verified_identity = AgentIdentity(
-            agent_id=agent.agent_id,
-            user_id=identity.user_id,
-            harness_id=(agent.identity or {}).get("harness_id"),
-            profile_id=agent.profile_id,
-            tenant_id=agent.tenant_id,
-        )
-        revoked, reason = self._check_revocation(verified_identity, name, raw_arguments)
-        if revoked:
-            return self._error_result(reason or "revoked")
-
         # v0.7.0：内部工具优先路由，不进入治理流程。
         if name == _APPROVAL_STATUS_TOOL_NAME:
             return self._handle_approval_status(raw_arguments)
@@ -397,6 +386,24 @@ class LoopControllerProxyServer:
                 "original task not available; please retry without decision_id"
             )
 
+        resume_proposal = ActionProposal(
+            task_id=task.task_id,
+            call_id=request.call_id,
+            agent_id=agent.agent_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            task_context="",
+        )
+        blocked = self._handle_revocation(
+            identity=identity,
+            agent=agent,
+            task=task,
+            proposal=resume_proposal,
+            stage="approval_resume",
+        )
+        if blocked is not None:
+            return self._tool_result_to_mcp(blocked)
+
         # 将原始 require_approval Decision 转换为可执行的 allow/deny Decision。
         try:
             finalized_decision = self._runtime.checkpoint.finalize_after_approval(
@@ -414,14 +421,7 @@ class LoopControllerProxyServer:
             )
 
         # 重试时必须复用原始 call_id，否则 forward 会判定 decision.call_id 不一致。
-        proposal = ActionProposal(
-            task_id=task.task_id,
-            call_id=request.call_id,
-            agent_id=agent.agent_id,
-            tool_name=tool_name,
-            arguments=arguments,
-            task_context="",
-        )
+        proposal = resume_proposal
 
         try:
             result = await self._runtime.checkpoint.forward(
@@ -465,6 +465,15 @@ class LoopControllerProxyServer:
             arguments=arguments,
             task_context="",
         )
+        blocked = self._handle_revocation(
+            identity=identity,
+            agent=agent,
+            task=task,
+            proposal=proposal,
+            stage="initial",
+        )
+        if blocked is not None:
+            return self._tool_result_to_mcp(blocked)
 
         try:
             decision = await self._runtime.checkpoint.evaluate(task, agent, proposal)
@@ -528,13 +537,39 @@ class LoopControllerProxyServer:
         tool_name: str,
         arguments: dict[str, Any] | None = None,
     ) -> tuple[bool, str | None]:
-        revocations = getattr(self._runtime, "revocation_list", None)
-        if revocations is None:
-            return False, None
-        revoked, reason = revocations.is_revoked(
-            identity, tool_name, self._secret_refs(arguments or {})
+        match = self._runtime.checkpoint.check_revocation(
+            identity, tool_name, arguments or {}
         )
-        return bool(revoked), reason
+        return match.revoked, match.reason
+
+    def _handle_revocation(
+        self,
+        *,
+        identity: ProxyIdentity,
+        agent: Any,
+        task: Any,
+        proposal: ActionProposal,
+        stage: str,
+    ) -> ToolResult | None:
+        verified = AgentIdentity(
+            agent_id=agent.agent_id,
+            user_id=identity.user_id,
+            harness_id=(agent.identity or {}).get("harness_id"),
+            profile_id=agent.profile_id,
+            tenant_id=agent.tenant_id,
+        )
+        match = self._runtime.checkpoint.check_revocation(
+            verified, proposal.tool_name, proposal.arguments
+        )
+        if not match.revoked:
+            return None
+        return self._runtime.checkpoint.handle_revocation_block(
+            identity=verified,
+            proposal=proposal,
+            task=task,
+            match=match,
+            stage=stage,
+        )
 
     def _current_request(self) -> Request | None:
         """从 MCP RequestContext 获取当前原始请求（SSE 为 Request，stdio 为 None）。"""

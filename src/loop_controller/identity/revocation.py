@@ -6,10 +6,10 @@ import threading
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from loop_controller.identity.models import AgentIdentity
 
@@ -26,10 +26,19 @@ class RevocationEntry(BaseModel):
 
     type: RevocationType
     id: str
-    reason: str
+    reason: str = ""
     revoked_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     expires_at: datetime | None = None
     tenant_id: str | None = None
+
+    @field_validator("revoked_at", "expires_at")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("datetime must include timezone")
+        return value.astimezone(UTC)
 
 
 class KillSwitchConfig(BaseModel):
@@ -39,6 +48,17 @@ class KillSwitchConfig(BaseModel):
     reason: str = ""
     except_tools: list[str] = Field(default_factory=list)
     except_agents: list[str] = Field(default_factory=list)
+
+
+class RevocationMatch(BaseModel):
+    """一次结构化吊销匹配结果。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    revoked: bool
+    reason: str | None = None
+    type: RevocationType | Literal["kill_switch"] | None = None
+    id: str | None = None
 
 
 class RevocationList:
@@ -98,15 +118,20 @@ class RevocationList:
             return False, None
         return True, config.reason or "global kill switch enabled"
 
-    def is_revoked(
+    def match(
         self,
         identity: AgentIdentity,
         tool_name: str,
         secret_refs: list[str] | None = None,
-    ) -> tuple[bool, str | None]:
+    ) -> RevocationMatch:
         killed, reason = self.check_kill_switch(identity, tool_name)
         if killed:
-            return killed, reason
+            return RevocationMatch(
+                revoked=True,
+                reason=reason,
+                type="kill_switch",
+                id="global",
+            )
         now = datetime.now(UTC)
         refs = set(secret_refs or [])
         with self._lock:
@@ -127,8 +152,23 @@ class RevocationList:
                 and entry.id in refs
             )
             if matched:
-                return True, entry.reason or f"{entry.type.value} {entry.id} revoked"
-        return False, None
+                return RevocationMatch(
+                    revoked=True,
+                    reason=entry.reason or f"{entry.type.value} {entry.id} revoked",
+                    type=entry.type,
+                    id=entry.id,
+                )
+        return RevocationMatch(revoked=False)
+
+    def is_revoked(
+        self,
+        identity: AgentIdentity,
+        tool_name: str,
+        secret_refs: list[str] | None = None,
+    ) -> tuple[bool, str | None]:
+        """兼容旧调用方的二元组接口。"""
+        match = self.match(identity, tool_name, secret_refs)
+        return match.revoked, match.reason
 
     def add(self, entry: RevocationEntry) -> None:
         with self._lock:

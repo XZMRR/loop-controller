@@ -19,6 +19,9 @@ class MCPExecutor(ToolExecutor):
     def __init__(self, gateway: MCPGateway) -> None:
         self._gateway = gateway
 
+    def secret_refs_for(self, tool_name: str) -> list[str]:
+        return []
+
     async def execute(
         self,
         tool_name: str,

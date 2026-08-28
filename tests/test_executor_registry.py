@@ -54,6 +54,9 @@ class _FakeExecutor(ToolExecutor):
         self.prefix = prefix
         self.calls: list[dict[str, Any]] = []
 
+    def secret_refs_for(self, tool_name: str) -> list[str]:
+        return []
+
     async def execute(
         self,
         tool_name: str,
@@ -114,6 +117,20 @@ class TestExecutorRegistry:
         registry = ExecutorRegistry()
         with pytest.raises(ExecutorRegistryError, match="没有注册执行器"):
             registry.get_executor("missing")
+
+    def test_resolve_secret_refs_merges_and_deduplicates(self) -> None:
+        registry = ExecutorRegistry()
+        executor = _FakeExecutor()
+        executor.secret_refs_for = lambda tool_name: ["trusted", "shared"]  # type: ignore[method-assign]
+        registry.register("tool_a", executor)
+
+        assert registry.resolve_secret_refs(
+            "tool_a",
+            {
+                "secret_ref": {"name": "declared"},
+                "nested": [{"secret_ref": "shared"}],
+            },
+        ) == ["declared", "shared", "trusted"]
 
     def test_register_rejects_non_executor(self) -> None:
         """P2：注册对象必须符合 ToolExecutor 协议。"""

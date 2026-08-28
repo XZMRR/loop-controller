@@ -3,6 +3,9 @@ evidence:
   backend: local
   local:
     path: evidence/
+    # 默认是 <path>/checkpoint.json；本地签名尾状态仅用于回退/单边丢失检测，
+    # 不是远程可信锚点，审计、证据与 checkpoint 同时被删除时无法检测。
+    checkpoint_path: evidence/checkpoint.json
     max_file_size_mb: 10
   signing:
     algorithm: ed25519

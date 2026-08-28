@@ -51,6 +51,9 @@ class HealthResponse(BaseModel):
     status: str = Field(..., description="服务状态")
     opa_reachable: bool = Field(default=False, description="OPA 是否可达")
     gateway_ready: bool = Field(default=False, description="MCP Gateway 是否就绪")
+    evidence_status: str = Field(
+        default="disabled", description="签名证据链状态：healthy / degraded / disabled"
+    )
     uptime_seconds: float = Field(default=0.0, description="服务运行秒数")
 
 

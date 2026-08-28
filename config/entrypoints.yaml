@@ -1,7 +1,8 @@
-# Loop Controller 入口认证配置（v0.20.0）
+# Loop Controller 入口认证与管理授权配置（v0.26.1）
 #
 # auth 可选：jwt / mtls / static_token / none
 # require_auth 为 false 时仅开发/测试使用
+# grpc.admin_agent_ids 是 Admin RPC 显式 allowlist；省略或设为空列表时全部拒绝
 entrypoints:
   http:
     auth: jwt
@@ -9,6 +10,8 @@ entrypoints:
   grpc:
     auth: mtls
     require_auth: true
+    admin_agent_ids:
+      - admin-agent
   mcp_proxy_stdio:
     auth: static_token
     require_auth: false  # 开发/测试可关闭；生产建议 true

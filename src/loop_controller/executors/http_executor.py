@@ -46,6 +46,11 @@ class HTTPExecutor(ToolExecutor):
         """原子替换 HTTP 工具规格（热更新）。"""
         self._tool_specs = tool_specs
 
+    def secret_refs_for(self, tool_name: str) -> list[str]:
+        """从当前热更新快照返回 HTTP 工具实际使用的 Secret 引用。"""
+        secret_ref = self._get_spec(tool_name).auth.secret_ref
+        return [secret_ref.name] if secret_ref is not None else []
+
     async def execute(
         self,
         tool_name: str,
