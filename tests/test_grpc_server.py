@@ -104,6 +104,9 @@ class _MockApprovalStore:
     def add_record(self, decision_id: str, record: Any) -> None:
         self._records[decision_id] = record
 
+    def refresh(self) -> None:
+        pass
+
 
 class _MockApprovalManager:
     def __init__(self):

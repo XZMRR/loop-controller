@@ -16,7 +16,8 @@ from starlette.testclient import TestClient
 
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
-from loop_controller.models import GovernanceResult
+from loop_controller.identity import ConfigIdentityProvider
+from loop_controller.models import ApprovalRequest, GovernanceResult
 from loop_controller.server import build_app
 
 
@@ -36,6 +37,9 @@ class _MockAuditStore:
 
     def __init__(self, events: list[_MockAuditEvent] | None = None):
         self._events = events or []
+
+    async def append_async(self, event: Any) -> None:
+        self._events.append(event)
 
     async def iter_events(self):
         for event in self._events:
@@ -73,11 +77,20 @@ class _MockApprovalStore:
     def get_request_by_id(self, request_id: str) -> _MockApprovalRequest | None:
         return next((req for req in self._pending if req.request_id == request_id), None)
 
+    def get_request(self, decision_id: str) -> Any | None:
+        return next((req for req in self._pending if req.decision_id == decision_id), None)
+
+    def record_response(self, record: Any) -> None:
+        self.add_record(record.decision_id, record)
+
     def get_record(self, decision_id: str) -> Any | None:
         return self._records.get(decision_id)
 
     def add_record(self, decision_id: str, record: Any) -> None:
         self._records[decision_id] = record
+
+    def refresh(self) -> None:
+        pass
 
 
 class _MockApprovalManager:
@@ -173,9 +186,16 @@ class _MockController(LoopController):
 def _build_client(
     api_key: str | None = None,
     watcher: ApprovalWatcher | None = None,
+    identity_provider: ConfigIdentityProvider | None = None,
 ) -> tuple[TestClient, _MockController]:
     controller = _MockController()
-    app = build_app(controller, api_key=api_key, watcher=watcher, configure_logs=False)
+    app = build_app(
+        controller,
+        api_key=api_key,
+        watcher=watcher,
+        configure_logs=False,
+        identity_provider=identity_provider,
+    )
     return TestClient(app), controller
 
 
@@ -742,3 +762,146 @@ def test_admin_evidence_anchor_with_real_store(tmp_path: Path) -> None:
     bootstrap_events = [e for e in events if e.action == "anchor_bootstrap"]
     assert len(bootstrap_events) == 1
     assert bootstrap_events[0].target == "anchor"
+
+
+def _admin_identity_provider() -> ConfigIdentityProvider:
+    """构造一个仅包含审批人用户的 IdentityProvider。"""
+    return ConfigIdentityProvider(
+        agents={},
+        users={"zhang_manager": "张经理"},
+    )
+
+
+def _pending_approval_request(decision_id: str = "d-1") -> ApprovalRequest:
+    return ApprovalRequest(
+        request_id="req-1",
+        decision_id=decision_id,
+        call_id="c1",
+        task_id="t1",
+        agent_id="researcher_001",
+        tool_name="send_email",
+        arguments_masked={"to": "zhang@company.com"},
+        reason="test",
+        requester_id="alice",
+        approver_id="zhang_manager",
+    )
+
+
+def test_admin_approvals_approve_success() -> None:
+    client, controller = _build_client(
+        api_key="secret",
+        identity_provider=_admin_identity_provider(),
+    )
+    store = controller._runtime.approval_manager._store
+    store._pending.append(_pending_approval_request())
+
+    resp = client.post(
+        "/v1/admin/approvals/d-1/approve",
+        json={"approver": "zhang_manager", "comment": "approved"},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["decision_id"] == "d-1"
+    assert data["verdict"] == "approve"
+
+    record = store.get_record("d-1")
+    assert record is not None
+    assert record.verdict == "approve"
+    assert record.approver_id == "zhang_manager"
+
+    audit = controller._runtime.audit_store._events
+    admin_ops = [e for e in audit if e.action == "admin_operation"]
+    assert len(admin_ops) == 1
+    assert admin_ops[0].reason == "approval_approve"
+    assert admin_ops[0].target == "decision:d-1"
+
+
+def test_admin_approvals_deny_success() -> None:
+    client, controller = _build_client(
+        api_key="secret",
+        identity_provider=_admin_identity_provider(),
+    )
+    store = controller._runtime.approval_manager._store
+    store._pending.append(_pending_approval_request())
+
+    resp = client.post(
+        "/v1/admin/approvals/d-1/deny",
+        json={"approver": "zhang_manager", "comment": "suspicious"},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["decision_id"] == "d-1"
+    assert data["verdict"] == "deny"
+
+    record = store.get_record("d-1")
+    assert record is not None
+    assert record.verdict == "deny"
+    assert record.comment == "suspicious"
+
+    audit = controller._runtime.audit_store._events
+    admin_ops = [e for e in audit if e.action == "admin_operation"]
+    assert len(admin_ops) == 1
+    assert admin_ops[0].reason == "approval_deny"
+    assert admin_ops[0].target == "decision:d-1"
+
+
+def test_admin_approvals_deny_requires_comment() -> None:
+    client, controller = _build_client(
+        api_key="secret",
+        identity_provider=_admin_identity_provider(),
+    )
+    store = controller._runtime.approval_manager._store
+    store._pending.append(_pending_approval_request())
+
+    resp = client.post(
+        "/v1/admin/approvals/d-1/deny",
+        json={"approver": "zhang_manager"},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 422
+    assert "deny 必须提供审批意见" in resp.json()["error"]
+
+
+def test_admin_approvals_rejects_non_approver() -> None:
+    client, controller = _build_client(
+        api_key="secret",
+        identity_provider=_admin_identity_provider(),
+    )
+    store = controller._runtime.approval_manager._store
+    store._pending.append(_pending_approval_request())
+
+    resp = client.post(
+        "/v1/admin/approvals/d-1/approve",
+        json={"approver": "ghost_user", "comment": "ok"},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 422
+    assert "ghost_user" in resp.json()["error"]
+
+
+def test_admin_approvals_conflict_when_already_decided() -> None:
+    client, controller = _build_client(
+        api_key="secret",
+        identity_provider=_admin_identity_provider(),
+    )
+    store = controller._runtime.approval_manager._store
+    store._pending.append(_pending_approval_request())
+
+    headers = {"X-API-Key": "secret"}
+    body = {"approver": "zhang_manager", "comment": "approved"}
+    assert client.post(
+        "/v1/admin/approvals/d-1/approve", json=body, headers=headers
+    ).status_code == 200
+
+    resp = client.post(
+        "/v1/admin/approvals/d-1/approve", json=body, headers=headers
+    )
+    assert resp.status_code == 409
+    assert "已有审批结果" in resp.json()["error"]
+
+    audit = controller._runtime.audit_store._events
+    admin_ops = [e for e in audit if e.action == "admin_operation"]
+    assert len(admin_ops) == 1
+    assert admin_ops[0].reason == "approval_approve"

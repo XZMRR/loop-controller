@@ -31,6 +31,7 @@ class ReservationStore(Protocol):
     def get(self, reservation_id: str) -> BudgetReservation | None: ...
     def get_by_call_id(self, call_id: str) -> BudgetReservation | None: ...
     def list_by_task(self, task_id: str) -> list[BudgetReservation]: ...
+    def list_all(self) -> list[BudgetReservation]: ...  # v0.29.0
 
 
 class InMemoryReservationStore:
@@ -60,6 +61,10 @@ class InMemoryReservationStore:
     def list_by_task(self, task_id: str) -> list[BudgetReservation]:
         reservation_ids = self._task_index.get(task_id, set())
         return [self._reservations[r] for r in reservation_ids if r in self._reservations]
+
+    def list_all(self) -> list[BudgetReservation]:
+        """v0.29.0：返回所有 reservation（含历史状态）。"""
+        return list(self._reservations.values())
 
 
 @dataclass
@@ -115,6 +120,10 @@ class JsonlReservationStore:
         reservation_ids = self._by_task.get(task_id, set())
         return [self._by_id[r] for r in reservation_ids if r in self._by_id]
 
+    def list_all(self) -> list[BudgetReservation]:
+        """v0.29.0：返回所有 reservation（含历史状态）。"""
+        return list(self._by_id.values())
+
     def _append(self, record: dict) -> None:
         try:
             with self._path.open("a", encoding="utf-8") as fh:
@@ -163,6 +172,8 @@ class JsonlReservationStore:
                 update: dict = {"state": record.get("state", existing.state)}
                 expires_at = record.get("expires_at")
                 if expires_at is not None:
+                    if isinstance(expires_at, str):
+                        expires_at = datetime.fromisoformat(expires_at)
                     update["expires_at"] = expires_at
                 reservation = existing.model_copy(update=update)
                 self._update_indices(reservation)

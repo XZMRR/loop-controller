@@ -36,6 +36,7 @@ AuditAction = Literal[
     "planner_error",
     "approval_expired",
     "approval_consumed",
+    "reservation_expired",  # v0.29.0：过期预算预留清理
     "authority_granted",  # v0.11.0：动态权限提升授予
     "authority_used",  # v0.11.0：动态权限提升使用
     "authority_revoked",  # v0.11.0：动态权限提升撤销

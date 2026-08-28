@@ -12,13 +12,15 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from loop_controller.models import BudgetCost
+from loop_controller.infra.alert_store import AlertStore
+from loop_controller.models import AuditAlert, BudgetCost
 
 logger = logging.getLogger(__name__)
 
@@ -84,16 +86,18 @@ class JsonlBudgetLedger:
     - ``commit``：确认消耗；
     - ``refund``：返还预占。
 
-    启动时重放所有事件恢复内存状态。
+    启动时重放所有事件恢复内存状态；重放发现未闭环 reserve 时写入 alert_store（不 fail）。
     """
 
     path: PathLike
     default_max_budget_token: int = 1_000_000
+    alert_store: AlertStore | None = None
     _path: Path = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._path = Path(str(self.path))
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._alert_store = self.alert_store
         self._max: dict[str, int] = {}
         self._reserved: dict[str, int] = defaultdict(int)
         self._committed: dict[str, int] = defaultdict(int)
@@ -190,3 +194,23 @@ class JsonlBudgetLedger:
                 self._reserved[task_id] -= token_count
                 if self._reserved[task_id] < 0:
                     self._reserved[task_id] = 0
+
+        # v0.29.0：未闭环 reserve 仅告警，不阻断启动。
+        if self._alert_store is not None:
+            for task_id, reserved in self._reserved.items():
+                if reserved > 0:
+                    try:
+                        self._alert_store.save_alert(
+                            AuditAlert(
+                                alert_id=uuid.uuid4().hex,
+                                session_id="",
+                                task_id=task_id,
+                                rule_id="budget_orphan_reserve",
+                                severity="high",
+                                title="未闭环预算预留",
+                                description=f"task {task_id} 有 {reserved} token 的 reserve 未匹配 commit/refund",
+                                evidence=[],
+                            )
+                        )
+                    except Exception as exc:
+                        logger.warning("orphan reserve 告警写入失败: %s", exc)

@@ -56,6 +56,7 @@ class JsonlDecisionStore(DecisionStore):
         self._call_ids: set[str] = set()
         self._decisions: dict[str, Decision] = {}
         self._used_counts: dict[str, int] = {}
+        self._finalized: set[str] = set()
         self._load()
 
     def _load(self) -> None:
@@ -89,6 +90,10 @@ class JsonlDecisionStore(DecisionStore):
                     decision_id = record.get("decision_id")
                     if decision_id:
                         self._used_counts[decision_id] = self._used_counts.get(decision_id, 0) + 1
+                elif rtype == "finalized":
+                    decision_id = record.get("decision_id")
+                    if decision_id:
+                        self._finalized.add(decision_id)
 
     def is_call_id_seen(self, call_id: str) -> bool:
         """call_id 全局唯一，跨 task 也防重放（v1.1 决策）。"""
@@ -128,6 +133,19 @@ class JsonlDecisionStore(DecisionStore):
             "ts": now.isoformat(),
         })
         return True
+
+    def record_finalized(self, decision_id: str) -> None:
+        """记录审批结果已被应用，重启后可通过 is_decision_finalized 查询。"""
+        self._finalized.add(decision_id)
+        self._append({
+            "type": "finalized",
+            "decision_id": decision_id,
+            "finalized_at": _utc_now().isoformat(),
+        })
+
+    def is_decision_finalized(self, decision_id: str) -> bool:
+        """决策是否已被 finalize（防重复 resume）。"""
+        return decision_id in self._finalized
 
     def _append(self, record: dict) -> None:
         with self._path.open("a", encoding="utf-8") as fh:

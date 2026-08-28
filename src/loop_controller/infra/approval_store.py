@@ -1,18 +1,34 @@
-"""审批请求与结果持久化（v0.3.0 Iteration 5）。
+"""审批请求与结果持久化（v0.3.0 Iteration 5 / v0.29.0 跨进程可见性加固）。
 
 ``JsonlApprovalStore`` 以追加方式记录 ``ApprovalRequest`` 与 ``ApprovalRecord``，
 CLI 通过它查询待审批请求并写入人工审批结果；Runtime 通过它读取审批结果以
 继续执行被拦截的动作。
+
+v0.29.0 新增：
+- ``refresh()`` 增量重放，让运行中的 Runtime 进程看到其它进程写入的审批结果；
+- ``record_response()`` 拒绝覆盖（相同内容幂等）；
+- 写路径使用 ``portalocker`` 跨进程文件锁；
+- 损坏/半行策略：中间损坏行 WARN 并跳过，末行半行忽略。
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+import portalocker
+
 from loop_controller.models import ApprovalRecord, ApprovalRequest
+
+logger = logging.getLogger(__name__)
+
+
+class ApprovalStoreError(Exception):
+    """ApprovalStore 损坏或操作冲突时抛出（fail-closed）。"""
 
 
 def _utc_now() -> datetime:
@@ -54,6 +70,7 @@ class ApprovalStore(Protocol):
     def get_request_by_id(self, request_id: str) -> ApprovalRequest | None: ...
     def record_response(self, record: ApprovalRecord) -> None: ...
     def get_record(self, decision_id: str) -> ApprovalRecord | None: ...
+    def refresh(self) -> None: ...
 
 
 class JsonlApprovalStore:
@@ -62,6 +79,11 @@ class JsonlApprovalStore:
     落盘格式（每行一个 JSON）：
     - ``{"type": "request", ...ApprovalRequest fields}``
     - ``{"type": "response", ...ApprovalRecord fields}``
+
+    v0.29.0 内部状态：
+    - ``_requests`` / ``_responses``：内存索引；
+    - ``_read_offset``：已读取到的文件字节偏移；
+    - ``_lock``：线程安全锁（保护内存索引与偏移量）。
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -69,67 +91,170 @@ class JsonlApprovalStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._requests: dict[str, ApprovalRequest] = {}
         self._responses: dict[str, ApprovalRecord] = {}
+        self._lock = threading.RLock()
+        self._read_offset = 0
         self._load()
 
     def _load(self) -> None:
-        """启动时重放全量日志。"""
+        """启动时全量重放日志。"""
+        with self._lock:
+            self._requests.clear()
+            self._responses.clear()
+            self._read_offset = 0
+            if not self._path.exists():
+                return
+            records, offset = self._read_lines_from(0)
+            for record in records:
+                self._merge_record(record, keep_first_response=True)
+            self._read_offset = offset
+
+    def refresh(self) -> None:
+        """增量读取自上次位置以来新增的行，合并进内存。"""
+        with self._lock:
+            self._refresh_unlocked()
+
+    def _refresh_unlocked(self) -> None:
         if not self._path.exists():
+            self._read_offset = 0
             return
+        size = self._path.stat().st_size
+        if size < self._read_offset:
+            logger.warning(
+                "审批存储 %s 文件被截断或重建（偏移 %d > 大小 %d），执行全量重放",
+                self._path,
+                self._read_offset,
+                size,
+            )
+            self._load()
+            return
+        if size == self._read_offset:
+            return
+        records, offset = self._read_lines_from(self._read_offset)
+        for record in records:
+            self._merge_record(record, keep_first_response=True)
+        self._read_offset = offset
+
+    def _read_lines_from(self, start_offset: int) -> tuple[list[dict], int]:
+        """从 ``start_offset`` 读取完整行，返回记录列表与新的字节偏移。
+
+        末行若缺少换行符则视为不完整，不返回、不推进偏移。
+        """
+        records: list[dict] = []
+        if not self._path.exists():
+            return records, start_offset
         with self._path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
+            fh.seek(start_offset)
+            lines: list[tuple[str, int]] = []
+            while True:
+                pos = fh.tell()
+                line = fh.readline()
                 if not line:
+                    break
+                lines.append((line, pos))
+            if not lines:
+                return records, fh.tell()
+            # 末行半行检测：文本模式下 readline 返回的行若不以换行符结尾，说明文件尾端不完整。
+            if not lines[-1][0].endswith("\n"):
+                logger.warning(
+                    "审批存储 %s 末行不完整（偏移 %d），等待后续写入",
+                    self._path,
+                    lines[-1][1],
+                )
+                lines.pop()
+            if not lines:
+                return records, start_offset
+            new_offset = lines[-1][1] + len(lines[-1][0].encode("utf-8"))
+            for line, _ in lines:
+                text = line.strip()
+                if not text:
                     continue
                 try:
-                    record = json.loads(line)
+                    records.append(json.loads(text))
                 except json.JSONDecodeError:
-                    continue
-                rtype = record.get("type")
-                if rtype == "request":
-                    try:
-                        request = _deserialize_request(record)
-                    except (TypeError, ValueError):
-                        continue
-                    self._requests[request.decision_id] = request
-                elif rtype == "response":
-                    try:
-                        response = _deserialize_record(record)
-                    except (TypeError, ValueError):
-                        continue
-                    self._responses[response.decision_id] = response
+                    logger.warning(
+                        "审批存储 %s 损坏行已跳过: %r",
+                        self._path,
+                        text[:200],
+                    )
+            return records, new_offset
+
+    def _merge_record(self, record: dict, *, keep_first_response: bool = True) -> None:
+        rtype = record.get("type")
+        if rtype == "request":
+            try:
+                request = _deserialize_request(record)
+            except (TypeError, ValueError):
+                logger.warning("审批存储 %s 非法 request 行已跳过", self._path)
+                return
+            self._requests[request.decision_id] = request
+        elif rtype == "response":
+            try:
+                response = _deserialize_record(record)
+            except (TypeError, ValueError):
+                logger.warning("审批存储 %s 非法 response 行已跳过", self._path)
+                return
+            if keep_first_response:
+                self._responses.setdefault(response.decision_id, response)
+            else:
+                self._responses[response.decision_id] = response
 
     def submit_request(self, request: ApprovalRequest) -> None:
         """提交审批请求；以 decision_id 为键去重覆盖。"""
-        self._requests[request.decision_id] = request
-        self._append(_serialize_request(request))
+        with self._lock:
+            self._requests[request.decision_id] = request
+            self._append(_serialize_request(request))
 
     def get_pending(self) -> list[ApprovalRequest]:
         """返回尚未有审批结果的请求列表。"""
-        return [
-            req
-            for decision_id, req in self._requests.items()
-            if decision_id not in self._responses
-        ]
+        with self._lock:
+            return [
+                req
+                for decision_id, req in self._requests.items()
+                if decision_id not in self._responses
+            ]
 
     def get_request(self, decision_id: str) -> ApprovalRequest | None:
-        return self._requests.get(decision_id)
+        with self._lock:
+            return self._requests.get(decision_id)
 
     def get_request_by_id(self, request_id: str) -> ApprovalRequest | None:
         """v0.13.0：按 request_id 查找原始审批请求。"""
-        for req in self._requests.values():
-            if req.request_id == request_id:
-                return req
-        return None
+        with self._lock:
+            for req in self._requests.values():
+                if req.request_id == request_id:
+                    return req
+            return None
 
     def record_response(self, record: ApprovalRecord) -> None:
-        """记录审批结果；覆盖同一 decision_id 的旧结果。"""
-        self._responses[record.decision_id] = record
-        self._append(_serialize_record(record))
+        """记录审批结果；已存在结果时拒绝覆盖（相同内容幂等）。"""
+        with self._lock:
+            # 先刷新，避免其它进程已经写入的结果被覆盖。
+            self._refresh_unlocked()
+            existing = self._responses.get(record.decision_id)
+            if existing is not None:
+                if existing == record:
+                    return
+                raise ApprovalStoreError(
+                    f"decision {record.decision_id} 已有审批结果，不允许覆盖"
+                )
+            self._responses[record.decision_id] = record
+            self._append(_serialize_record(record))
 
     def get_record(self, decision_id: str) -> ApprovalRecord | None:
-        return self._responses.get(decision_id)
+        with self._lock:
+            return self._responses.get(decision_id)
 
     def _append(self, record: dict) -> None:
-        with self._path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            fh.flush()
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        try:
+            with portalocker.Lock(
+                str(self._path), "a", encoding="utf-8", timeout=5
+            ) as fh:
+                fh.write(line)
+                fh.flush()
+        except portalocker.LockException as exc:
+            raise ApprovalStoreError(
+                f"无法获取审批存储文件锁 {self._path}: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise ApprovalStoreError(f"无法写入审批存储 {self._path}: {exc}") from exc

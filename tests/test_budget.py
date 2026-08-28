@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from loop_controller.budget import BudgetLedgerError, InMemoryBudgetLedger, JsonlBudgetLedger
+from loop_controller.infra.alert_store import InMemoryAlertStore
 from loop_controller.models import BudgetCost
 
 
@@ -100,3 +103,26 @@ def test_jsonl_ledger_corrupted_file_fail_closed(tmp_path) -> None:
     path.write_text("not json\n", encoding="utf-8")
     with pytest.raises(BudgetLedgerError):  # noqa: PT012
         JsonlBudgetLedger(path)
+
+
+def test_replay_orphan_reserve_emits_alert(tmp_path) -> None:
+    """v0.29.0：JsonlBudgetLedger._replay 对未闭环 reserve 产生 alert_store 告警（不 fail）。"""
+    path = tmp_path / "budget.jsonl"
+    alert_store = InMemoryAlertStore()
+
+    # 直接写入一条只有 reserve、没有 commit/refund 的事件
+    record = {
+        "type": "reserve",
+        "task_id": "t1",
+        "token_count": 7,
+    }
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    ledger = JsonlBudgetLedger(path, alert_store=alert_store)
+    assert ledger._reserved["t1"] == 7  # noqa: SLF001
+
+    alerts = alert_store.list_alerts()
+    assert len(alerts) == 1
+    assert alerts[0].rule_id == "budget_orphan_reserve"
+    assert alerts[0].task_id == "t1"
+    assert "7" in alerts[0].description

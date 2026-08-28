@@ -1944,3 +1944,63 @@ v0.23.2 已完成 v0.23.1 残留问题的收尾。v0.24.0 根据 `src/audit_repo
 ### 设计文档
 
 - `src/loop_controller_v0.28.0_development.md`
+
+---
+
+## v0.29.0：审批与状态恢复闭环
+
+### 完成内容
+
+- **审批结果跨进程可见（P0-1）**：
+  - `ApprovalStore` 协议新增 `refresh()`；`JsonlApprovalStore` 实现基于字节偏移的增量刷新；
+  - 文件截断/重建后自动重置偏移全量重放；末行/损坏行忽略并告警；
+  - `AsyncApprovalManager.check/get_request/get_request_by_id/get_decision` 调用前先 `refresh()`；
+  - 新增 `ApprovalStoreError`；`record_response` 拒绝覆盖同一 `decision_id` 的旧结果，相同内容幂等；
+  - `_load` / `refresh` 中 `response` 行使用 `setdefault` 保留第一条。
+
+- **审批共享校验与 Admin 端点**：
+  - 新增 `src/loop_controller/approval_service.py`：`build_approval_record()` 统一校验审批人身份、请求者/执行 Agent 隔离、过期 Decision、deny 必填 comment；
+  - CLI 与 HTTP Admin 端点复用同一校验逻辑；
+  - 新增 `POST /v1/admin/approvals/{decision_id}/approve` 与 `/deny`；写入后调用 `ApprovalWatcher.notify()` 唤醒同进程等待者。
+
+- **跨进程写锁（P0-3）**：
+  - `JsonlApprovalStore._append` 使用 `portalocker` 跨进程文件锁（Windows `msvcrt.locking` / POSIX `fcntl.flock`）；
+  - `pyproject.toml` 新增 `portalocker>=2.0` 依赖。
+
+- **预算预留清扫（P0-2）**：
+  - `Checkpoint.recover_stale_reservations()` 扫描过期 `pending` / `pending_approval`，执行 `refund`、标记 `expired`、写入 `reservation_expired` 审计事件；
+  - `Runtime.start()` 在锚点验证通过后调用清扫；
+  - `get_pending_reservation/get_pending_reservations` 过滤已过期项；
+  - `forward()` 中查到的 reservation 在后续 `CheckpointError` 抛出前统一 `refund`。
+
+- **Decision 状态机与跨重启防重放（R1-R8）**：
+  - `_transition_reservation` 定义合法转移表，非法转移抛 `CheckpointError`；
+  - `_commit_reservation` 校验当前状态必须为 `pending/pending_approval`；
+  - `_refund_reservation` 改为先写 reservation 状态、再 `budget.refund`（崩溃时不重复 commit）；
+  - `JsonlDecisionStore` 新增 `record_finalized()` 与 `is_decision_finalized()`，重放恢复 `_finalized_decisions`；
+  - `finalize_after_approval` 把 finalized 记录移到所有校验通过之后；未知 verdict 抛 `CheckpointError`；
+  - 新增 `DecisionAlreadyConsumed` 异常，`controller.resume_after_approval` 第二次返回 `error_code=decision_already_consumed`。
+
+- **边界修正（R5-R9）**：
+  - CLI 审批前校验 Decision 过期，`lc approvals list` 标注 `[expired]`；
+  - `forward()` modify 复核改为 `canonical_json` 全量比较。
+
+- **ReservationStore 增强**：
+  - `ReservationStore` 协议及实现新增 `list_all()`，供 `recover_stale_reservations` 扫描。
+
+### 关键决策
+
+- **可见性优先于推送**：本版本不实现服务端主动推送；Runtime/Agent 通过主动轮询或重试触发 `refresh()`，即可看到 CLI/Admin 写入的审批结果；
+- **fail-closed 的单写覆盖**：审批结果一旦落盘不可静默覆盖，避免双进程/双入口竞态导致决定被翻转；
+- **预算侧优先安全**：`_refund_reservation` 先落盘 reservation 状态，宁可出现孤儿 reserve 告警，也不允许重复 commit 突破预算上限；
+- **状态机显式化**：reservation 的合法流转从注释变成强制校验，非法调用直接抛错。
+
+### 验证
+
+- `pytest tests/`：**665 passed，1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.29.0_development.md`

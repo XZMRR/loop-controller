@@ -99,3 +99,13 @@ def test_corrupt_log_fail_closed(tmp_path) -> None:
 
     with pytest.raises(DecisionStoreError, match=r"decision log 第 2 行"):
         JsonlDecisionStore(path)
+
+
+def test_finalized_survives_restart(tmp_path) -> None:
+    """v0.29.0（R2）：record_finalized 后新建 store 实例仍能识别已 finalized。"""
+    path = tmp_path / "decisions.jsonl"
+    first = JsonlDecisionStore(path)
+    first.record_finalized("d1")
+
+    second = JsonlDecisionStore(path)
+    assert second.is_decision_finalized("d1")

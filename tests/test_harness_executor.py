@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -728,13 +728,16 @@ async def test_runtime_explicitly_starts_and_stops_harness_executor() -> None:
     runtime = object.__new__(Runtime)
     gateway = SimpleNamespace(start=AsyncMock(), aclose=AsyncMock())
     harness_executor = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+    checkpoint = SimpleNamespace(recover_stale_reservations=Mock())
     object.__setattr__(runtime, "audit_store", object())
     object.__setattr__(runtime, "gateway", gateway)
     object.__setattr__(runtime, "http_client", None)
     object.__setattr__(runtime, "hot_reloader", None)
     object.__setattr__(runtime, "harness_executor", harness_executor)
+    object.__setattr__(runtime, "checkpoint", checkpoint)
 
     await runtime.start()
+    checkpoint.recover_stale_reservations.assert_called_once_with()
     harness_executor.start.assert_awaited_once_with()
 
     await runtime.aclose()

@@ -1,6 +1,6 @@
 [project]
 name = "loop-controller"
-version = "0.28.0"
+version = "0.29.0"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.0",
@@ -10,6 +10,7 @@ dependencies = [
     "mcp<2.0",
     "pyjwt[crypto]>=2.8",
     "cryptography>=44.0",
+    "portalocker>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -54,6 +55,7 @@ ignore = ["E501", "ANN", "D", "BLE"]
 exclude = ["src/loop_controller/v1/*"]
 [tool.ruff.lint.per-file-ignores]
 "src/loop_controller/grpc_server.py" = ["N802"]
+"src/loop_controller/checkpoint.py" = ["N818"]
 "tests/test_grpc_server.py" = ["N802"]
 
 [tool.mypy]

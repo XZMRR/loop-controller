@@ -35,12 +35,12 @@ import os
 import sys
 from datetime import UTC, datetime
 
+from loop_controller.approval_service import ApprovalServiceError, build_approval_record
 from loop_controller.audit_analyzer import RuleBasedAuditAnalyzer
 from loop_controller.infra.alert_store import JsonlAlertStore
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import JsonlAuditStore
 from loop_controller.infra.config_loader import AppConfig, ConfigLoader
-from loop_controller.models import ApprovalRecord
 from loop_controller.proxy_server import LoopControllerProxyServer, ProxyIdentity
 from loop_controller.runtime import build_runtime
 
@@ -174,25 +174,32 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_list(store: JsonlApprovalStore, args: argparse.Namespace) -> int:
+    now = datetime.now(UTC)
     pending = store.get_pending()
     if not pending:
         print("没有待审批请求")
         return 0
 
     if args.format == "json":
-
         for req in pending:
             print(req.model_dump_json())
         return 0
 
     # table format
-    print(f"{'decision_id':<32} {'tool_name':<20} {'requester':<16} {'reason'}")
-    print("-" * 90)
+    print(f"{'decision_id':<32} {'tool_name':<20} {'requester':<16} {'status':<12} {'reason'}")
+    print("-" * 105)
     for req in pending:
+        expired = (
+            req.original_decision is not None
+            and req.original_decision.expires_at is not None
+            and req.original_decision.expires_at < now
+        )
+        status = "[expired]" if expired else "pending"
         print(
             f"{req.decision_id:<32} "
             f"{req.tool_name:<20} "
             f"{req.requester_id:<16} "
+            f"{status:<12} "
             f"{req.reason[:40]}"
         )
     return 0
@@ -206,38 +213,21 @@ def _cmd_approve_or_deny(
 ) -> int:
     decision_id = args.decision_id
     request = store.get_request(decision_id)
-    if request is None:
-        print(f"错误：未找到 decision_id={decision_id} 的审批请求", file=sys.stderr)
+    existing_record = store.get_record(decision_id)
+
+    try:
+        record = build_approval_record(
+            request,
+            existing_record,
+            args.approver,
+            verdict,
+            args.comment,
+            approver_exists=lambda user_id: user_id in config.users,
+        )
+    except ApprovalServiceError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
         return 1
 
-    if store.get_record(decision_id) is not None:
-        print(f"错误：decision_id={decision_id} 已审批", file=sys.stderr)
-        return 1
-
-    # v0.3.0：审批人不能是请求者或执行 Agent，且必须存在于用户列表
-    if args.approver == request.requester_id:
-        print("错误：审批人不能是请求者本人", file=sys.stderr)
-        return 1
-    if args.approver == request.agent_id:
-        print("错误：审批人不能是执行 Agent", file=sys.stderr)
-        return 1
-    if args.approver not in config.users:
-        print(f"错误：审批人 {args.approver} 不存在", file=sys.stderr)
-        return 1
-
-    # v0.3.0：deny 必须填写审批意见
-    if verdict == "deny" and not args.comment.strip():
-        print("错误：deny 必须提供 --comment 审批意见", file=sys.stderr)
-        return 1
-
-    record = ApprovalRecord(
-        request_id=request.request_id,
-        decision_id=decision_id,
-        verdict=verdict,  # type: ignore[arg-type]
-        approver_id=args.approver,
-        comment=args.comment,
-        decided_at=datetime.now(UTC),
-    )
     store.record_response(record)
     action = "批准" if verdict == "approve" else "拒绝"
     print(f"已{action} decision_id={decision_id}")

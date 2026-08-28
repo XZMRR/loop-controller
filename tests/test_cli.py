@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from loop_controller.cli import main
 from loop_controller.infra.approval_store import JsonlApprovalStore
-from loop_controller.models import ApprovalRequest
+from loop_controller.models import ApprovalRequest, Decision
 
 
 @pytest.fixture
@@ -162,7 +162,7 @@ def test_approvals_double_approval(config_dir: str, capsys) -> None:
     )
     assert rc == 1
     captured = capsys.readouterr()
-    assert "已审批" in captured.err
+    assert "已有审批结果" in captured.err
 
 
 def test_approvals_deny_requires_comment(config_dir: str, capsys) -> None:
@@ -173,7 +173,7 @@ def test_approvals_deny_requires_comment(config_dir: str, capsys) -> None:
     )
     assert rc == 1
     captured = capsys.readouterr()
-    assert "必须提供 --comment" in captured.err
+    assert "deny 必须提供审批意见" in captured.err
 
 
 def test_approvals_approver_cannot_be_requester(config_dir: str, capsys) -> None:
@@ -225,3 +225,56 @@ def test_proxy_rejects_identity_token_flag(config_dir: str) -> None:
                 "secret",
             ]
         )
+
+
+def _put_expired_request(config_dir: str, decision_id: str) -> None:
+    """构造一个 original_decision 已过期的待审批请求。"""
+    from loop_controller.infra.config_loader import ConfigLoader
+
+    cfg = ConfigLoader().load(config_dir)
+    store = JsonlApprovalStore(cfg.approval_store_path)
+    expired_decision = Decision(
+        decision_id=decision_id,
+        call_id="c1",
+        task_id="t1",
+        verdict="require_approval",
+        reason="test",
+        expires_at=datetime.now(UTC) - timedelta(minutes=5),
+    )
+    store.submit_request(
+        ApprovalRequest(
+            request_id="req-1",
+            decision_id=decision_id,
+            call_id="c1",
+            task_id="t1",
+            agent_id="researcher_001",
+            tool_name="send_email",
+            arguments_masked={"to": "zhang@company.com"},
+            reason="test",
+            requester_id="alice",
+            approver_id="zhang_manager",
+            original_decision=expired_decision,
+            created_at=datetime.now(UTC),
+        )
+    )
+
+
+def test_approve_rejects_expired_decision(config_dir: str, capsys) -> None:
+    """A10：approve 时若 Decision 已过期，应拒绝审批。"""
+    _put_expired_request(config_dir, "d1")
+    rc = main(
+        ["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "zhang_manager"]
+    )
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "过期" in captured.err
+
+
+def test_list_marks_expired(config_dir: str, capsys) -> None:
+    """list 应把 original_decision 已过期的请求标记为 [expired]。"""
+    _put_expired_request(config_dir, "d1")
+    rc = main(["--config-dir", config_dir, "approvals", "list"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "d1" in captured.out
+    assert "[expired]" in captured.out

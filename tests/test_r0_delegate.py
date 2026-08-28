@@ -48,11 +48,20 @@ class _InMemoryApprovalStore:
     def get_request(self, decision_id: str) -> ApprovalRequest | None:
         return self._requests.get(decision_id)
 
+    def get_request_by_id(self, request_id: str) -> ApprovalRequest | None:
+        for req in self._requests.values():
+            if req.request_id == request_id:
+                return req
+        return None
+
     def record_response(self, record: ApprovalRecord) -> None:
         self._responses[record.decision_id] = record
 
     def get_record(self, decision_id: str) -> ApprovalRecord | None:
         return self._responses.get(decision_id)
+
+    def refresh(self) -> None:
+        pass
 
 
 @pytest.fixture

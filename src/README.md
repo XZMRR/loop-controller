@@ -1,6 +1,6 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.28.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环；v0.28.0 为审计/证据链引入外部可信锚点，提供 Ed25519 receipt、HTTP 锚点后端、启动交叉验证、冲突/回滚写阻断与管理员锚点操作。
+企业级 AI Agent 治理层（v0.29.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环；v0.28.0 为审计/证据链引入外部可信锚点，v0.29.0 修复人工审批跨进程闭环失效与预算/决策状态泄漏，让"审批 → 恢复执行"在任何部署形态下都可靠闭环。
 
 **核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为工具调用治理控制平面，是所有经治理工具调用的**唯一授权出口**。
 
@@ -22,6 +22,7 @@
 - **全局吊销与 Kill Switch**（v0.26.1）：可按 agent、user、tool、secret 阻断调用；可信 Secret 依赖来自执行器当前配置，所有执行路径在最终执行边界复查，阻断会释放未提交预算并写审计；
 - **本地签名证据链**（v0.26.1）：审计事件可写入 HMAC-SHA256 或 Ed25519 签名的链式 JSONL 证据；异步写入保持单进程有序，并通过审计—证据交叉校验和签名本地 checkpoint 检测单边丢失与相对回退；
 - **外部可信锚点**（v0.28.0）：checkpoint 成功后向远程锚点服务发布当前链状态，获取 Ed25519 签名的 receipt；启动时交叉验证远程最新锚点与本地证据/审计；冲突/回滚时进入写阻断并告警；提供 Admin 端点用于 verify / publish / bootstrap；
+- **审批与状态恢复闭环**（v0.29.0）：审批结果通过增量 `refresh()` 对运行中的 Runtime 可见，CLI 与 Admin 端点复用统一校验；审批记录不可覆盖；`portalocker` 跨进程锁保护追加写；启动期清扫过期预算预留；Decision 状态机与 `finalized` 持久化防止重复消费。
 - **网络级治理入口**（v0.20.0）：HTTP、gRPC、MCP Proxy 作为生产入口，Agent 不直接持有工具凭证。
 
 ## 架构
@@ -145,7 +146,8 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `loop_controller_v0.26.0_development.md`——v0.26.0 全局吊销与本地签名证据链
 - `loop_controller_v0.26.1_development.md`——v0.26.1 吊销、Kill Switch 与证据链可靠性修复
 - `loop_controller_v0.27.0_development.md`——v0.27.0 Harness 生产闭环
-- `loop_controller_v0.28.0_development.md`——v0.28.0 可信锚点与审计链外部闭环（当前版本依据）
+- `loop_controller_v0.28.0_development.md`——v0.28.0 可信锚点与审计链外部闭环
+- `loop_controller_v0.29.0_development.md`——v0.29.0 审批与状态恢复闭环（当前版本依据）
 - `development_log.md`——开发记录与决策追溯
 - `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
 - `answer.md`——MVP 审查分析与修复状态追踪

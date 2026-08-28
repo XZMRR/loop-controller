@@ -14,7 +14,7 @@ import hashlib
 import uuid
 from typing import Any
 
-from loop_controller.checkpoint import CheckpointError
+from loop_controller.checkpoint import CheckpointError, DecisionAlreadyConsumed
 from loop_controller.identity import AgentIdentity
 from loop_controller.infra.config_loader import AppConfig
 from loop_controller.masker import Masker
@@ -472,9 +472,11 @@ class LoopController:
         if record.verdict == "approve":
             approve_action: AuditAction = "approve"
             approve_verdict: Verdict = "allow"
-        else:
+        elif record.verdict == "deny":
             approve_action = "deny"
             approve_verdict = "deny"
+        else:
+            raise CheckpointError(f"unknown approval verdict: {record.verdict!r}")
         await self._runtime.audit_store.append_async(
             _audit_event(
                 task,
@@ -502,6 +504,15 @@ class LoopController:
         try:
             finalized = self._runtime.checkpoint.finalize_after_approval(
                 original_decision, record, request
+            )
+        except DecisionAlreadyConsumed as exc:
+            return GovernanceResult(
+                status="error",
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                arguments=request.tool_arguments,
+                reason=str(exc),
+                error_code="decision_already_consumed",
             )
         except CheckpointError as exc:
             return GovernanceResult(

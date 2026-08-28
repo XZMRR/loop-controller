@@ -273,3 +273,162 @@ async def test_execute_with_proposal(workdir: Path, opa_server: str):
         assert result.content is not None
     finally:
         await controller.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_sees_external_response(
+    workdir: Path, opa_server: str, approvals_path: Path
+):
+    """v0.29.0：外部进程直接写入 approval store 后，controller.resume_after_approval 成功。"""
+    # 覆盖 profile 让 send_email 需要审批
+    (workdir / "config" / "profiles.yaml").write_text(
+        """
+profiles:
+  - profile_id: research_assistant_v1
+    description: 研究助手岗位说明书
+    max_budget_token: 100000
+    max_budget_payment: 0.0
+    session_block_threshold: 10
+    session_risk_threshold: 0.95
+    tools:
+      web_search:
+        allowed: true
+        max_calls_per_task: 10
+      send_email:
+        allowed: true
+        require_approval: true
+        allowed_args:
+          to: ["*@company.com"]
+        max_calls_per_task: 1
+""",
+        encoding="utf-8",
+    )
+    (workdir / "config" / "mcp_servers.yaml").write_text(
+        """
+servers:
+  email_mock:
+    command: ["python", "-m", "loop_controller.mocks.email_server"]
+    transport: stdio
+
+tool_mapping:
+  web_search: {server: email_mock, mcp_name: web_search, cost_per_call: 200}
+  send_email: {server: email_mock, mcp_name: send_email, cost_per_call: 800}
+""",
+        encoding="utf-8",
+    )
+    config = ConfigLoader().load(workdir / "config", opa_base_url=opa_server)
+    controller = await build_controller(config, opa_url=opa_server, env_extra=_env_extra())
+    controller._runtime.approval_manager._store = JsonlApprovalStore(str(approvals_path))
+
+    await controller.start()
+    try:
+        result = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
+            user_id="alice",
+            tool_name="send_email",
+            arguments={"to": "zhang@company.com", "subject": "摘要", "body": "请查收"},
+            task_context="发送报告",
+        )
+        assert result.status == "require_approval"
+        request_id = result.request_id
+        assert request_id is not None
+
+        request = controller._runtime.approval_manager._store.get_request(
+            result.decision.decision_id
+        )
+        record = ApprovalRecord(
+            request_id=request.request_id,
+            decision_id=request.decision_id,
+            verdict="approve",
+            approver_id=request.approver_id,
+            comment="approved externally",
+        )
+        # 模拟外部进程（如 CLI）直接操作同一个 approval store 文件写入审批结果
+        external_store = JsonlApprovalStore(str(approvals_path))
+        external_store.record_response(record)
+
+        final = await controller.resume_after_approval(request_id)
+        assert final.status == "allow"
+        assert final.content is not None
+    finally:
+        await controller.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_twice_returns_already_consumed(
+    workdir: Path, opa_server: str, approvals_path: Path
+):
+    """v0.29.0：重复 resume 返回 decision_already_consumed。"""
+    (workdir / "config" / "profiles.yaml").write_text(
+        """
+profiles:
+  - profile_id: research_assistant_v1
+    description: 研究助手岗位说明书
+    max_budget_token: 100000
+    max_budget_payment: 0.0
+    session_block_threshold: 10
+    session_risk_threshold: 0.95
+    tools:
+      web_search:
+        allowed: true
+        max_calls_per_task: 10
+      send_email:
+        allowed: true
+        require_approval: true
+        allowed_args:
+          to: ["*@company.com"]
+        max_calls_per_task: 1
+""",
+        encoding="utf-8",
+    )
+    (workdir / "config" / "mcp_servers.yaml").write_text(
+        """
+servers:
+  email_mock:
+    command: ["python", "-m", "loop_controller.mocks.email_server"]
+    transport: stdio
+
+tool_mapping:
+  web_search: {server: email_mock, mcp_name: web_search, cost_per_call: 200}
+  send_email: {server: email_mock, mcp_name: send_email, cost_per_call: 800}
+""",
+        encoding="utf-8",
+    )
+    config = ConfigLoader().load(workdir / "config", opa_base_url=opa_server)
+    controller = await build_controller(config, opa_url=opa_server, env_extra=_env_extra())
+    controller._runtime.approval_manager._store = JsonlApprovalStore(str(approvals_path))
+
+    await controller.start()
+    try:
+        result = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
+            user_id="alice",
+            tool_name="send_email",
+            arguments={"to": "zhang@company.com", "subject": "摘要", "body": "请查收"},
+            task_context="发送报告",
+        )
+        assert result.status == "require_approval"
+        request_id = result.request_id
+
+        request = controller._runtime.approval_manager._store.get_request(
+            result.decision.decision_id
+        )
+        record = ApprovalRecord(
+            request_id=request.request_id,
+            decision_id=request.decision_id,
+            verdict="approve",
+            approver_id=request.approver_id,
+            comment="approved externally",
+        )
+        external_store = JsonlApprovalStore(str(approvals_path))
+        external_store.record_response(record)
+
+        first = await controller.resume_after_approval(request_id)
+        assert first.status == "allow"
+        assert first.content is not None
+
+        second = await controller.resume_after_approval(request_id)
+        assert second.status == "error"
+        assert second.error_code == "decision_already_consumed"
+    finally:
+        await controller.aclose()

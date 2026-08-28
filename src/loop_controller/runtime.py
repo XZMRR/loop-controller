@@ -181,6 +181,8 @@ class Runtime:
                 await self.audit_store.verify_anchor_startup()
             if self.audit_store.write_blocked:
                 return
+        # v0.29.0：锚点验证通过后清理过期预算预留，防止崩溃/超时导致预算永久占用。
+        self.checkpoint.recover_stale_reservations()
         await self.gateway.start()
         if self.http_client is not None:
             await self.http_client.start()

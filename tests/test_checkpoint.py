@@ -29,6 +29,7 @@ from loop_controller.models import (
     ApprovalRecord,
     ApprovalRequest,
     BudgetCost,
+    BudgetReservation,
     CapabilityProfile,
     Decision,
     Task,
@@ -40,6 +41,19 @@ from loop_controller.risk_state import RiskStateManager
 from loop_controller.session import SessionManager
 
 PACKAGE = "loop_controller.tool_permission"
+
+
+class StubAuditStore:
+    """内存审计存储，用于 recover_stale_reservations 测试。"""
+
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    def append(self, event: Any) -> None:
+        self.events.append(event)
+
+    async def append_async(self, event: Any) -> None:
+        self.events.append(event)
 
 
 class StubPolicyStore:
@@ -180,6 +194,8 @@ def make_checkpoint(
     masker=None,
     session_manager: SessionManager | None = None,
     risk_manager: RiskStateManager | None = None,
+    reservation_store=None,
+    audit_store=None,
 ) -> tuple[Checkpoint, FakePolicyEngine, FakeGateway]:
     engine = FakePolicyEngine(
         decision=engine_decision,
@@ -197,9 +213,11 @@ def make_checkpoint(
         session_manager=session_manager,
         risk_manager=risk_manager or RiskStateManager(),
         budget_ledger=budget_ledger or InMemoryBudgetLedger(),
+        reservation_store=reservation_store,
         permission_analyzer=permission_analyzer,
         tool_costs=tool_costs,
         masker=masker,
+        audit_store=audit_store,
         now=(lambda: now) if now is not None else None,
     )
     return cp, engine, gw
@@ -843,7 +861,7 @@ async def test_forward_modify_allowed_value_passes(
 ) -> None:
     cp, _, gw = make_checkpoint(profile, identity)
     proposal = make_proposal(
-        task, agent, tool_name="read_file", arguments={"path": "/data/kb/doc.md"}
+        task, agent, tool_name="read_file", arguments={"path": "/data/kb/other.md"}
     )
     decision = Decision(
         decision_id=uuid.uuid4().hex,
@@ -1107,3 +1125,370 @@ async def test_evaluate_deny_unchanged_when_session_risk_high(
     decision = await cp.evaluate(task, agent, proposal)
 
     assert decision.verdict == "deny"
+
+
+# ---------------------------------------------------------------------------
+# v0.29.0：预算预留过期清理与状态机
+# ---------------------------------------------------------------------------
+
+
+def _make_stale_reservation(
+    task: Task,
+    agent: Agent,
+    *,
+    state: str,
+    cost: BudgetCost | None = None,
+    expires_at: datetime,
+    call_id: str | None = None,
+) -> BudgetReservation:
+    return BudgetReservation(
+        reservation_id=uuid.uuid4().hex,
+        task_id=task.task_id,
+        call_id=call_id or uuid.uuid4().hex,
+        tool_name="web_search",
+        cost=cost or BudgetCost(token_count=10),
+        state=state,  # type: ignore[arg-type]
+        created_at=expires_at - timedelta(minutes=10),
+        expires_at=expires_at,
+    )
+
+
+async def test_recover_stale_pending_reservation(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.29.0：过期 pending reservation 被 refund、标记 expired、写审计事件。"""
+    now = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    budget = InMemoryBudgetLedger()
+    budget.set_budget(task.task_id, 100)
+    audit = StubAuditStore()
+    cp, _, _ = make_checkpoint(
+        profile,
+        identity,
+        now=now,
+        budget_ledger=budget,
+        audit_store=audit,
+    )
+    reservation = _make_stale_reservation(
+        task, agent, state="pending", expires_at=now - timedelta(seconds=1)
+    )
+    cp._save_reservation(reservation)
+    budget.check_and_reserve(task.task_id, reservation.cost)
+
+    cp.recover_stale_reservations()
+
+    updated = cp._reservation_store.get(reservation.reservation_id)
+    assert updated is not None
+    assert updated.state == "expired"
+    assert budget._reserved[task.task_id] == 0
+    assert len(audit.events) == 1
+    assert audit.events[0].action == "reservation_expired"
+    assert audit.events[0].metadata["reservation_id"] == reservation.reservation_id
+
+
+async def test_recover_stale_pending_approval(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.29.0：过期 pending_approval reservation 同样被清理。"""
+    now = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    budget = InMemoryBudgetLedger()
+    budget.set_budget(task.task_id, 100)
+    audit = StubAuditStore()
+    cp, _, _ = make_checkpoint(
+        profile,
+        identity,
+        now=now,
+        budget_ledger=budget,
+        audit_store=audit,
+    )
+    reservation = _make_stale_reservation(
+        task, agent, state="pending_approval", expires_at=now - timedelta(seconds=1)
+    )
+    cp._save_reservation(reservation)
+    budget.check_and_reserve(task.task_id, reservation.cost)
+
+    cp.recover_stale_reservations()
+
+    updated = cp._reservation_store.get(reservation.reservation_id)
+    assert updated is not None
+    assert updated.state == "expired"
+    assert budget._reserved[task.task_id] == 0
+    assert any(e.action == "reservation_expired" for e in audit.events)
+
+
+def test_get_pending_reservation_filters_expired(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.29.0：get_pending_reservation 对过期 reservation 返回 None。"""
+    now = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    cp, _, _ = make_checkpoint(profile, identity, now=now)
+    reservation = _make_stale_reservation(
+        task, agent, state="pending", expires_at=now - timedelta(seconds=1)
+    )
+    cp._save_reservation(reservation)
+
+    assert cp.get_pending_reservation(reservation.call_id) is None
+
+
+async def test_forward_expired_reservation_no_commit(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.29.0：reservation 已过期时 forward 抛 CheckpointError 且 budget 不被 commit。"""
+    now = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    budget = InMemoryBudgetLedger()
+    budget.set_budget(task.task_id, 10)
+    cp, _, gw = make_checkpoint(
+        profile,
+        identity,
+        now=now,
+        budget_ledger=budget,
+    )
+    reservation = _make_stale_reservation(
+        task, agent, state="pending", cost=BudgetCost(token_count=10), expires_at=now - timedelta(seconds=1)
+    )
+    cp._save_reservation(reservation)
+    budget.check_and_reserve(task.task_id, reservation.cost)
+
+    proposal = make_proposal(task, agent, call_id=reservation.call_id)
+    decision = Decision(
+        decision_id=uuid.uuid4().hex,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        verdict="allow",
+        reason="ok",
+        policy_version="v",
+        profile_version="v",
+        expires_at=now + timedelta(minutes=5),
+    )
+
+    with pytest.raises(CheckpointError):
+        await cp.forward(proposal, decision)
+    assert budget._committed[task.task_id] == 0
+    assert gw.calls == []
+
+
+def test_commit_reservation_rejects_terminal_state(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.29.0：_commit_reservation 拒绝 terminal/refunded 状态。"""
+    cp, _, _ = make_checkpoint(profile, identity)
+    reservation = _make_stale_reservation(
+        task,
+        agent,
+        state="pending",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    cp._save_reservation(reservation)
+    refunded = cp._refund_reservation(reservation)
+
+    assert refunded.state == "refunded"
+    with pytest.raises(CheckpointError, match="cannot commit reservation"):
+        cp._commit_reservation(refunded)
+
+
+def test_transition_illegal_state_rejected(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.29.0：非法 reservation 状态转移抛 CheckpointError。"""
+    cp, _, _ = make_checkpoint(profile, identity)
+    reservation = _make_stale_reservation(
+        task,
+        agent,
+        state="refunded",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    cp._save_reservation(reservation)
+
+    with pytest.raises(CheckpointError, match="非法 reservation 状态转移"):
+        cp._transition_reservation(reservation, "pending")
+
+
+# ---------------------------------------------------------------------------
+# v0.29.0：finalize 原子性与未知 verdict
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_adds_finalized_after_validation(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.29.0：deny 无 comment 时不烧 decision；approve 通过后才加入 finalized 集合。"""
+    cp, _, _ = make_checkpoint(profile, identity)
+    proposal = make_proposal(task, agent, tool_name="send_email")
+    decision = Decision(
+        decision_id=uuid.uuid4().hex,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        verdict="require_approval",
+        reason="needs approval",
+        escalation_target=agent.owner_id,
+        policy_version="v",
+        profile_version="v",
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+    )
+    cp._decision_store.record_decision(decision)
+    request = ApprovalRequest(
+        request_id="r1",
+        decision_id=decision.decision_id,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        agent_id=agent.agent_id,
+        tool_name="send_email",
+        arguments_masked=dict(proposal.arguments),
+        tool_arguments=dict(proposal.arguments),
+        original_decision=decision,
+        reason="approval",
+        requester_id=task.user_id,
+        approver_id=agent.owner_id,
+    )
+
+    # deny 无 comment：校验失败，decision 不应被 finalized
+    with pytest.raises(CheckpointError, match="deny 审批必须提供原因"):
+        cp.finalize_after_approval(
+            decision,
+            ApprovalRecord(
+                request_id=request.request_id,
+                decision_id=decision.decision_id,
+                verdict="deny",
+                approver_id=agent.owner_id,
+                comment="",
+            ),
+            request,
+        )
+    assert not cp._decision_store.is_decision_finalized(decision.decision_id)
+
+    # approve：通过并加入 finalized 集合
+    approved = cp.finalize_after_approval(
+        decision,
+        ApprovalRecord(
+            request_id=request.request_id,
+            decision_id=decision.decision_id,
+            verdict="approve",
+            approver_id=agent.owner_id,
+            comment="ok",
+        ),
+        request,
+    )
+    assert approved.verdict == "allow"
+    assert cp._decision_store.is_decision_finalized(decision.decision_id)
+
+
+def test_finalize_unknown_verdict_rejected(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.29.0：record.verdict 不是 approve/deny 时抛 CheckpointError。"""
+    cp, _, _ = make_checkpoint(profile, identity)
+    proposal = make_proposal(task, agent, tool_name="send_email")
+    decision = Decision(
+        decision_id=uuid.uuid4().hex,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        verdict="require_approval",
+        reason="needs approval",
+        escalation_target=agent.owner_id,
+        policy_version="v",
+        profile_version="v",
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+    )
+    request = ApprovalRequest(
+        request_id="r1",
+        decision_id=decision.decision_id,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        agent_id=agent.agent_id,
+        tool_name="send_email",
+        arguments_masked=dict(proposal.arguments),
+        tool_arguments=dict(proposal.arguments),
+        original_decision=decision,
+        reason="approval",
+        requester_id=task.user_id,
+        approver_id=agent.owner_id,
+    )
+
+    # Pydantic Literal 会在 ApprovalRecord 构造时拦截，故用 model_construct 绕过校验，
+    # 专门测试 finalize_after_approval 内部的未知 verdict 分支。
+    bad_record = ApprovalRecord.model_construct(
+        request_id=request.request_id,
+        decision_id=decision.decision_id,
+        verdict="maybe",
+        approver_id=agent.owner_id,
+        comment="?",
+    )
+    with pytest.raises(CheckpointError, match="未知审批 verdict"):
+        cp.finalize_after_approval(decision, bad_record, request)
+
+
+# ---------------------------------------------------------------------------
+# v0.29.0：forward 异常路径退款与 modify 复核
+# ---------------------------------------------------------------------------
+
+
+async def test_forward_refunds_on_decision_expired(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.29.0（R1）：use_decision 失败前 reservation 已被 refund。"""
+    now = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    budget = InMemoryBudgetLedger()
+    budget.set_budget(task.task_id, 100)
+    cp, _, _ = make_checkpoint(
+        profile,
+        identity,
+        now=now,
+        budget_ledger=budget,
+    )
+    proposal = make_proposal(task, agent)
+    reservation = _make_stale_reservation(
+        task,
+        agent,
+        state="pending",
+        cost=BudgetCost(token_count=10),
+        expires_at=now + timedelta(minutes=5),
+        call_id=proposal.call_id,
+    )
+    cp._save_reservation(reservation)
+    budget.check_and_reserve(task.task_id, reservation.cost)
+
+    decision = Decision(
+        decision_id=uuid.uuid4().hex,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        verdict="allow",
+        reason="ok",
+        policy_version="v",
+        profile_version="v",
+        expires_at=now - timedelta(seconds=1),
+    )
+
+    with pytest.raises(CheckpointError):
+        await cp.forward(proposal, decision)
+
+    updated = cp._reservation_store.get(reservation.reservation_id)
+    assert updated is not None
+    assert updated.state == "refunded"
+    assert budget._reserved[task.task_id] == 0
+
+
+async def test_modify_review_compares_values(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.29.0（R9）：modify 复核改为全量比较，键同值不同也 blocked。"""
+    cp, _, gw = make_checkpoint(profile, identity)
+    proposal = make_proposal(
+        task, agent, tool_name="read_file", arguments={"path": "/data/kb/doc.md"}
+    )
+    decision = Decision(
+        decision_id=uuid.uuid4().hex,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        verdict="modify",
+        reason="modified",
+        modified_args={"path": "/etc/passwd"},
+        policy_version="v",
+        profile_version="v",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    cp._decision_store.record_decision(decision)
+
+    result = await cp.forward(proposal, decision)
+
+    assert result.status == "blocked"
+    assert result.error_code == "modify_recheck_failed"
+    assert gw.calls == []

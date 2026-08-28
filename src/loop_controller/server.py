@@ -33,6 +33,7 @@ from typing import Any
 
 import httpx
 
+from loop_controller.approval_service import ApprovalServiceError, build_approval_record
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
 from loop_controller.identity import (
@@ -680,6 +681,65 @@ class ToolGovernServer:
         )
         return JSONResponse(summary)
 
+    async def _handle_admin_approval(self, request: Request, *, verdict: str) -> JSONResponse:
+        if self._api_key is not None and not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        decision_id = request.path_params["decision_id"]
+        try:
+            body = await request.json() if request.method == "POST" else {}
+        except Exception:  # noqa: BLE001
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        approver_id = str(body.get("approver", "")).strip()
+        comment = str(body.get("comment", "")).strip()
+        if not approver_id:
+            return JSONResponse({"error": "approver is required"}, status_code=422)
+
+        approval_manager = self._controller._runtime.approval_manager
+        store = approval_manager._store
+        store.refresh()
+        req = store.get_request(decision_id)
+        existing = store.get_record(decision_id)
+
+        identity = self._identity_provider
+
+        def _approver_exists(user_id: str) -> bool:
+            if identity is None:
+                return False
+            return identity.get_user(user_id) is not None
+
+        try:
+            record = build_approval_record(
+                req,
+                existing,
+                approver_id,
+                verdict,
+                comment,
+                approver_exists=_approver_exists,
+            )
+        except ApprovalServiceError as exc:
+            status = 409 if "已有审批结果" in str(exc) else 422
+            return JSONResponse({"error": str(exc)}, status_code=status)
+
+        store.record_response(record)
+        if req is not None:
+            self._watcher.notify(req.request_id)
+        await self._audit_admin_operation(
+            request,
+            f"approval_{verdict}",
+            target=f"decision:{decision_id}",
+            metadata={"approver_id": approver_id, "comment": comment},
+        )
+        return JSONResponse({"decision_id": decision_id, "verdict": verdict})
+
+    async def _handle_admin_approvals_approve(self, request: Request) -> JSONResponse:
+        return await self._handle_admin_approval(request, verdict="approve")
+
+    async def _handle_admin_approvals_deny(self, request: Request) -> JSONResponse:
+        return await self._handle_admin_approval(request, verdict="deny")
+
     async def _handle_admin_audit(self, request: Request) -> JSONResponse:
         if self._api_key is not None and not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -780,6 +840,8 @@ def build_app(
             Route("/v1/admin/evidence/anchor/verify", server._handle_admin_evidence_anchor_verify, methods=["POST"]),
             Route("/v1/admin/evidence/anchor/publish", server._handle_admin_evidence_anchor_publish, methods=["POST"]),
             Route("/v1/admin/evidence/anchor/bootstrap", server._handle_admin_evidence_anchor_bootstrap, methods=["POST"]),
+            Route("/v1/admin/approvals/{decision_id}/approve", server._handle_admin_approvals_approve, methods=["POST"]),
+            Route("/v1/admin/approvals/{decision_id}/deny", server._handle_admin_approvals_deny, methods=["POST"]),
             Route("/admin/revoke", server._handle_admin_revoke, methods=["POST", "DELETE"]),
             Route("/admin/revocation-list", server._handle_admin_revocation_list, methods=["GET"]),
             Route("/admin/kill-switch", server._handle_admin_kill_switch, methods=["POST"]),

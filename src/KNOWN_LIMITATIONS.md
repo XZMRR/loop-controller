@@ -346,3 +346,23 @@ PUT 超时、连接中断等不确定结果会通过 `GET /v1/anchors/{stream_id
 
 - **Windows 开发机**：关闭 MCP stdio 子进程时会打 anyio cancel-scope 的 WARNING 日志（mcp SDK 2.x 已知行为），不影响主链路；CI（Linux）下不应出现，出现即说明容错逻辑误吞了正常路径。
 - **CI 的 e2e 测试**：`tests/test_e2e_research_agent.py` 仍使用 FakeGateway 以快速回归；`tests/test_e2e_real_mcp.py` 使用 `build_runtime()` + 真实 `MCPGateway` + 本地 `email_mock` server，作为发布前真实组件 gate。
+
+---
+
+## v0.29.0 边界声明
+
+### V29-1. 审批可见性仍为轮询/重试语义
+
+v0.29.0 修复了跨进程审批结果不可见的问题：Runtime 在每次查询审批状态时通过 `JsonlApprovalStore.refresh()` 增量读取文件。但 Loop Controller **不主动向 Agent 推送**审批结果；Agent 必须继续按既有语义轮询 `resume_after_approval` 或等待 `wait_for_approval` 超时重试。服务内 `ApprovalWatcher.notify()` 仅用于唤醒同一进程内的等待者。
+
+### V29-2. 文件锁不覆盖多 worker 强一致并发
+
+`JsonlApprovalStore._append` 使用 `portalocker` 对追加写加跨进程锁，可防止 CLI 与 Runtime 双进程写冲突。但锁粒度仅保护单条记录追加，不覆盖读-改-写、重放或跨多台机器的并发；多 worker 共享同一 `approvals.jsonl` 仍可能产生竞态。强一致多 writer 需使用外部数据库或分布式锁，归入后续版本。
+
+### V29-3. 预算清扫不自动修复所有孤儿预留
+
+`recover_stale_reservations()` 仅清理状态为 `pending` / `pending_approval` 且 `expires_at` 已过的预留。对于崩溃窗口中产生的其他孤儿 `reserve`（无对应 `commit/refund` 记录），启动期仅产生告警、不自动补账，需人工对账处理。
+
+### V29-4. `DecisionAlreadyConsumed` 仅在同一 Loop Controller 实例内生效
+
+`DecisionAlreadyConsumed` 由内存 `_finalized_decisions` 集合与 `JsonlDecisionStore` 的 `finalized` 记录共同保护。进程重启后 `finalized` 记录会被重放恢复，因此跨重启仍然有效；但在多 worker 场景下，单个实例的 finalized 集合同步仍依赖底层持久化存储，不额外提供分布式协调。
