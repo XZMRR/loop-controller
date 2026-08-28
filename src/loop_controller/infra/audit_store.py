@@ -21,6 +21,7 @@ import logging
 import threading
 import uuid
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -81,7 +82,8 @@ class JsonlAuditStore:
         self._evidence_chain = evidence_chain
         self._alert_store = alert_store
         self._sync_lock = threading.Lock()
-        self._async_lock: asyncio.Lock | None = None
+        self._write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="audit-writer")
+        self._write_blocked = False
         self._path.parent.mkdir(parents=True, exist_ok=True)
         if hash_algo not in ("sha256", "hmac-sha256"):
             raise ValueError(f"不支持的 hash_algo：{hash_algo}")
@@ -192,50 +194,86 @@ class JsonlAuditStore:
             }
         )
 
+    def _mark_evidence_degraded(self, reason: str) -> None:
+        if self._evidence_chain is not None and hasattr(self._evidence_chain, "mark_degraded"):
+            self._evidence_chain.mark_degraded(reason)
+
+    def _handle_checkpoint_failure(self, exc: Exception, event: AuditEvent) -> None:
+        description = f"evidence checkpoint write failed: {type(exc).__name__}"
+        self._mark_evidence_degraded(description)
+        logger.error("证据 checkpoint 写入失败，业务和审计已提交：%s", type(exc).__name__)
+        self._save_evidence_alert(
+            rule_id="evidence_checkpoint_write_failed",
+            title="证据 checkpoint 写入失败",
+            description=description,
+            event=event,
+        )
+
+    def _handle_audit_write_failure(self, exc: Exception, event: AuditEvent) -> None:
+        description = f"audit write failed after evidence commit: {type(exc).__name__}"
+        self._write_blocked = True
+        self._mark_evidence_degraded(description)
+        logger.error("审计写入失败，证据已提交；后续写入已阻断")
+        self._save_evidence_alert(
+            rule_id="audit_write_failed_after_evidence_commit",
+            title="审计写入失败，证据已提交",
+            description=description,
+            event=event,
+        )
+
+    def _append_locked(self, event: AuditEvent) -> None:
+        """追加事件；调用方必须已持有 ``_sync_lock``。"""
+        if self._write_blocked:
+            raise RuntimeError("审计存储因先前写入失败已阻断；请重建 Store 后恢复")
+        to_write, line = self._prepare_event(event)
+        evidence = None
+        if self._evidence_chain is not None:
+            try:
+                evidence = asyncio.run(self._evidence_chain.append(to_write))
+            except Exception as exc:
+                logger.error("签名证据链写入失败，仍写入原审计记录：%s", type(exc).__name__)
+                description = f"evidence append failed: {type(exc).__name__}"
+                self._mark_evidence_degraded(description)
+                self._save_evidence_alert(
+                    rule_id="evidence_chain_append_failed",
+                    title="签名证据链写入失败",
+                    description=description,
+                    event=to_write,
+                )
+        try:
+            self._write_audit_line(line)
+        except Exception as exc:
+            if evidence is not None:
+                self._handle_audit_write_failure(exc, to_write)
+            raise RuntimeError("审计记录写入失败") from None
+        if (
+            evidence is not None
+            and evidence.seq == to_write.seq
+            and self.evidence_status == "healthy"
+        ):
+            try:
+                self._write_checkpoint(evidence.seq, evidence.current_hash)
+            except Exception as exc:
+                self._handle_checkpoint_failure(exc, to_write)
+
+    def _append_serialized(self, event: AuditEvent) -> None:
+        with self._sync_lock:
+            self._append_locked(event)
+
     def append(self, event: AuditEvent) -> None:
         """同步分配序号并依次写入证据、审计和签名尾 checkpoint。"""
-        with self._sync_lock:
-            to_write, line = self._prepare_event(event)
-            evidence = None
-            if self._evidence_chain is not None:
-                try:
-                    evidence = asyncio.run(self._evidence_chain.append(to_write))
-                except Exception as exc:
-                    logger.exception("签名证据链写入失败，仍写入原审计记录")
-                    self._save_evidence_alert(
-                        rule_id="evidence_chain_append_failed",
-                        title="签名证据链写入失败",
-                        description=str(exc),
-                        event=to_write,
-                    )
-            self._write_audit_line(line)
-            if evidence is not None:
-                self._write_checkpoint(evidence.seq, evidence.current_hash)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("运行中的事件循环内不得调用 append()；请使用 await append_async()")
+        self._append_serialized(event)
 
     async def append_async(self, event: AuditEvent) -> None:
-        """异步有序写入，不阻塞调用方事件循环。"""
-        if self._async_lock is None:
-            self._async_lock = asyncio.Lock()
-        async with self._async_lock:
-            to_write, line = self._prepare_event(event)
-            evidence = None
-            if self._evidence_chain is not None:
-                try:
-                    evidence = await self._evidence_chain.append(to_write)
-                except Exception as exc:
-                    logger.exception("签名证据链写入失败，仍写入原审计记录")
-                    await asyncio.to_thread(
-                        self._save_evidence_alert,
-                        rule_id="evidence_chain_append_failed",
-                        title="签名证据链写入失败",
-                        description=str(exc),
-                        event=to_write,
-                    )
-            await asyncio.to_thread(self._write_audit_line, line)
-            if evidence is not None:
-                await asyncio.to_thread(
-                    self._write_checkpoint, evidence.seq, evidence.current_hash
-                )
+        """通过专用单线程执行器异步有序写入，不占用事件循环默认线程池。"""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._write_executor, self._append_serialized, event)
 
     def _save_evidence_alert(
         self,
@@ -273,6 +311,21 @@ class JsonlAuditStore:
                     events.append(AuditEvent.model_validate_json(line))
         return events
 
+    def _audit_hash_at_seq(self, target_seq: int) -> str:
+        if target_seq == 0:
+            return self._GENESIS
+        chain_hash = self._GENESIS
+        with self._path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                chain_hash = self._hash(line, chain_hash)
+                if int(record["seq"]) == target_seq:
+                    return chain_hash
+        raise ValueError("checkpoint 审计序号在历史链中不存在")
+
     async def _verify_evidence_consistency(self) -> None:
         evidence_chain = self._evidence_chain
         if evidence_chain is None:
@@ -302,12 +355,31 @@ class JsonlAuditStore:
         audit_seq = audit_events[-1].seq if audit_events else 0
         evidence_seq = evidence[-1].seq if evidence else 0
         evidence_hash = evidence[-1].current_hash if evidence else ""
-        if audit_seq < int(checkpoint["audit_seq"]) or evidence_seq < int(checkpoint["evidence_seq"]):
+        checkpoint_audit_seq = int(checkpoint["audit_seq"])
+        checkpoint_evidence_seq = int(checkpoint["evidence_seq"])
+        if checkpoint_audit_seq != checkpoint_evidence_seq:
+            raise ValueError("checkpoint 审计与证据序号不一致")
+        if audit_seq != evidence_seq:
+            raise ValueError("审计与证据尾部序号不一致")
+        if audit_seq < checkpoint_audit_seq:
             raise ValueError("审计或证据尾部相对 checkpoint 发生序号回退")
-        if audit_seq == int(checkpoint["audit_seq"]) and self._chain_hash != checkpoint["audit_hash"]:
-            raise ValueError("审计尾哈希与 checkpoint 不一致")
-        if evidence_seq == int(checkpoint["evidence_seq"]) and evidence_hash != checkpoint["evidence_hash"]:
-            raise ValueError("证据尾哈希与 checkpoint 不一致")
+        historical_audit_hash = self._audit_hash_at_seq(checkpoint_audit_seq)
+        historical_evidence_hash = (
+            "" if checkpoint_evidence_seq == 0 else evidence[checkpoint_evidence_seq - 1].current_hash
+        )
+        if historical_audit_hash != checkpoint["audit_hash"]:
+            raise ValueError("审计历史哈希与 checkpoint 不一致")
+        if historical_evidence_hash != checkpoint["evidence_hash"]:
+            raise ValueError("证据历史哈希与 checkpoint 不一致")
+        if audit_seq > checkpoint_audit_seq:
+            evidence_chain.write_checkpoint(
+                {
+                    "audit_seq": audit_seq,
+                    "audit_hash": self._chain_hash,
+                    "evidence_seq": evidence_seq,
+                    "evidence_hash": evidence_hash,
+                }
+            )
 
     async def verify_evidence_chain(self) -> bool:
         """交叉验证审计、签名证据和 checkpoint；失败时降级但不阻塞启动。"""
@@ -316,11 +388,13 @@ class JsonlAuditStore:
         try:
             await self._verify_evidence_consistency()
         except Exception as exc:
-            logger.exception("启动验证签名证据链失败")
-            description = str(exc)
+            logger.error("启动验证签名证据链失败：%s", type(exc).__name__)
+            description = f"evidence chain verification failed: {type(exc).__name__}"
+            self._write_blocked = True
             if hasattr(self._evidence_chain, "mark_degraded"):
                 self._evidence_chain.mark_degraded(description)
         else:
+            self._write_blocked = False
             if hasattr(self._evidence_chain, "status"):
                 self._evidence_chain.status = "healthy"
                 self._evidence_chain.degraded_reason = None
@@ -345,26 +419,27 @@ class JsonlAuditStore:
         包含写入前整个链的累积 HMAC，并用 ``seal_key`` 做域分离签名
         （``seal_signature``），用于事后独立校验。
         """
-        chain_hash = self._chain_hash
-        seal_signature = ""
-        if self._hash_algo == "hmac-sha256":
-            seal_signature = _hmac_text(self._seal_key, chain_hash)
-        event = AuditEvent(
-            event_id="seal",
-            trace_id="",
-            session_id="",
-            actor_type="system",
-            actor_id="audit_store",
-            action="seal",
-            target="audit_chain",
-            reason=reason,
-            metadata={
-                "chain_hash": chain_hash,
-                "seal_signature": seal_signature,
-            },
-        )
-        self.append(event)
-        return event
+        with self._sync_lock:
+            chain_hash = self._chain_hash
+            seal_signature = ""
+            if self._hash_algo == "hmac-sha256":
+                seal_signature = _hmac_text(self._seal_key, chain_hash)
+            event = AuditEvent(
+                event_id="seal",
+                trace_id="",
+                session_id="",
+                actor_type="system",
+                actor_id="audit_store",
+                action="seal",
+                target="audit_chain",
+                reason=reason,
+                metadata={
+                    "chain_hash": chain_hash,
+                    "seal_signature": seal_signature,
+                },
+            )
+            self._append_locked(event)
+            return event
 
     def verify_chain(self) -> bool:
         """重放全文件校验：seq 连续递增、prev_hash 链接正确、每行可解析。

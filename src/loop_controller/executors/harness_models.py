@@ -32,6 +32,7 @@ class HarnessToolSpec(BaseModel):
     input_schema: dict[str, Any] = Field(default_factory=dict)
     default_risk: RiskLevel = "critical"
     cost_per_call: int = 0
+    secret_refs: list[str] = Field(default_factory=list)
     sandbox: HarnessSandboxConfig = Field(default_factory=HarnessSandboxConfig)
 
     def to_tool(self) -> Tool:

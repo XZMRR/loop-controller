@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import yaml
 
+from loop_controller.audit.evidence import EvidenceChain, HMACEvidenceSigner, SignedEvidence
+from loop_controller.audit.evidence_backends import LocalFileEvidenceBackend
 from loop_controller.controller import build_controller
 from loop_controller.identity import MTLSIdentityProvider
 from loop_controller.identity.models import AgentIdentity
@@ -19,6 +21,7 @@ from loop_controller.identity.revocation import (
     RevocationType,
 )
 from loop_controller.infra.approval_store import JsonlApprovalStore
+from loop_controller.infra.audit_store import JsonlAuditStore
 from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.infra.hot_reload import HotReloader
 from loop_controller.models import Agent, ApprovalRecord
@@ -117,8 +120,10 @@ def test_kill_switch_blocks_all_calls_except_configured_tools_and_agents() -> No
 
 
 class _AdminController:
-    def __init__(self, revocations: RevocationList) -> None:
-        self._runtime = SimpleNamespace(revocation_list=revocations)
+    def __init__(self, revocations: RevocationList, audit_store=None) -> None:
+        self._runtime = SimpleNamespace(
+            revocation_list=revocations, audit_store=audit_store
+        )
 
     async def start(self) -> None:
         pass
@@ -132,7 +137,19 @@ def test_http_admin_crud_and_kill_switch(tmp_path: Path) -> None:
     from starlette.testclient import TestClient
 
     revocations = RevocationList(path=tmp_path / "revocation.yaml")
-    app = build_app(_AdminController(revocations), api_key="admin-key", configure_logs=False)  # type: ignore[arg-type]
+    evidence_path = tmp_path / "http-evidence"
+    audit_store = JsonlAuditStore(
+        tmp_path / "http-audit.jsonl",
+        evidence_chain=EvidenceChain(
+            LocalFileEvidenceBackend(evidence_path),
+            HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        ),
+    )
+    app = build_app(
+        _AdminController(revocations, audit_store),
+        api_key="admin-key",
+        configure_logs=False,
+    )  # type: ignore[arg-type]
     with TestClient(app) as client:
         headers = {"x-api-key": "admin-key"}
         assert client.post("/admin/revoke", json={}, headers={"x-api-key": "wrong"}).status_code == 401
@@ -169,6 +186,16 @@ def test_http_admin_crud_and_kill_switch(tmp_path: Path) -> None:
         assert removed.json() == {"removed": True}
         assert client.get("/admin/revocation-list", headers=headers).json()["revocations"] == []
 
+    evidence = [
+        SignedEvidence.model_validate_json(line)
+        for line in (evidence_path / "default.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record.event.reason for record in evidence] == [
+        "revocation_added",
+        "kill_switch_updated",
+        "revocation_removed",
+    ]
+
 
 def test_http_admin_revocation_endpoints_require_api_key_when_unconfigured(tmp_path: Path) -> None:
     pytest.importorskip("starlette")
@@ -183,7 +210,7 @@ def test_http_admin_revocation_endpoints_require_api_key_when_unconfigured(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_grpc_admin_methods() -> None:
+async def test_grpc_admin_methods(tmp_path: Path) -> None:
     grpc = pytest.importorskip("grpc")
     from loop_controller.grpc_server import ToolGovernanceServicer
     from loop_controller.v1 import governance_pb2
@@ -206,7 +233,15 @@ async def test_grpc_admin_methods() -> None:
             self.details = details
 
     revocations = RevocationList()
-    controller = _AdminController(revocations)
+    evidence_backend = LocalFileEvidenceBackend(tmp_path / "grpc-evidence")
+    audit_store = JsonlAuditStore(
+        tmp_path / "grpc-audit.jsonl",
+        evidence_chain=EvidenceChain(
+            evidence_backend,
+            HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        ),
+    )
+    controller = _AdminController(revocations, audit_store)
     admin = Agent(
         agent_id="admin-agent",
         name="Admin",
@@ -244,6 +279,10 @@ async def test_grpc_admin_methods() -> None:
         governance_pb2.SetKillSwitchRequest(enabled=True, reason="emergency"), context
     )
     assert kill_switch.enabled
+    evidence = [record async for record in evidence_backend.iter_evidence(None)]
+    evidence_reasons = [record.event.reason for record in evidence]
+    assert "revocation_added" in evidence_reasons
+    assert "kill_switch_updated" in evidence_reasons
     listing = await servicer.GetRevocationList(
         governance_pb2.GetRevocationListRequest(), context
     )

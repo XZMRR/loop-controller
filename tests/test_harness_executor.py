@@ -3,18 +3,35 @@
 from __future__ import annotations
 
 import json
+import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+import yaml
 
-from loop_controller.executors import ExecutionContext, HarnessExecutor
+from loop_controller.checkpoint import Checkpoint
+from loop_controller.executors import ExecutionContext, ExecutorRegistry, HarnessExecutor
 from loop_controller.executors.harness_models import (
     HarnessToolSpec,
     HTTPBackendConfig,
+    SubprocessBackendConfig,
 )
 from loop_controller.executors.harness_protocol import HarnessExecuteResponse
-from loop_controller.models import CapabilityProfile, Tool, ToolPermission
+from loop_controller.identity.revocation import RevocationEntry, RevocationList
+from loop_controller.infra.audit_store import JsonlAuditStore
+from loop_controller.infra.config_loader import ConfigLoader
+from loop_controller.infra.identity import ConfigIdentityProvider
+from loop_controller.models import (
+    ActionProposal,
+    Agent,
+    CapabilityProfile,
+    Decision,
+    Tool,
+    ToolPermission,
+)
 
 
 def _fake_context() -> ExecutionContext:
@@ -206,3 +223,180 @@ class TestHarnessExecutorRequestShape:
         assert captured["body"]["arguments"] == {"message": "hello"}
         assert captured["body"]["context"]["call_id"] == "c1"
         assert captured["body"]["sandbox"]["timeout_seconds"] == 30.0
+
+
+class TestHarnessSecretRefs:
+    def test_config_loader_parses_explicit_secret_refs(self, tmp_path: Path) -> None:
+        path = tmp_path / "harness_tools.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "backends": {
+                        "remote": {
+                            "type": "http",
+                            "base_url": "https://harness.example",
+                            "api_key_env": "HARNESS_API_KEY",
+                        }
+                    },
+                    "tools": {
+                        "deploy": {
+                            "harness": "remote",
+                            "secret_refs": ["DEPLOY_TOKEN"],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        specs, backends = ConfigLoader()._load_harness_tools(path)
+
+        assert specs["deploy"].secret_refs == ["DEPLOY_TOKEN"]
+        backend = backends["remote"]
+        assert isinstance(backend, HTTPBackendConfig)
+        assert backend.api_key_env == "HARNESS_API_KEY"
+
+    def test_refs_merge_deduplicate_and_remain_backend_isolated(self) -> None:
+        executor = HarnessExecutor(
+            {
+                "deploy": HarnessToolSpec(
+                    tool_name="deploy",
+                    harness="production",
+                    secret_refs=["DEPLOY_TOKEN", "PROD_API_KEY"],
+                ),
+                "report": HarnessToolSpec(
+                    tool_name="report",
+                    harness="reporting",
+                    secret_refs=["REPORT_TOKEN"],
+                ),
+            },
+            {
+                "production": HTTPBackendConfig(
+                    name="production",
+                    base_url="https://prod.example",
+                    api_key_env="PROD_API_KEY",
+                ),
+                "reporting": HTTPBackendConfig(
+                    name="reporting",
+                    base_url="https://report.example",
+                    api_key_env="REPORT_API_KEY",
+                ),
+            },
+        )
+
+        assert executor.secret_refs_for("deploy") == ["DEPLOY_TOKEN", "PROD_API_KEY"]
+        assert executor.secret_refs_for("report") == ["REPORT_API_KEY", "REPORT_TOKEN"]
+        assert executor.secret_refs_for("missing") == []
+
+    def test_subprocess_env_is_not_treated_as_secret(self) -> None:
+        executor = HarnessExecutor(
+            {
+                "echo": HarnessToolSpec(
+                    tool_name="echo",
+                    harness="local",
+                )
+            },
+            {
+                "local": SubprocessBackendConfig(
+                    name="local",
+                    command=["python", "harness.py"],
+                    env={"ORDINARY_SETTING": "visible"},
+                )
+            },
+        )
+
+        assert executor.secret_refs_for("echo") == []
+
+    @pytest.mark.asyncio
+    async def test_revoked_backend_api_key_blocks_request_and_audit_is_redacted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        secret_value = "super-secret-api-key"
+        monkeypatch.setenv("HARNESS_API_KEY", secret_value)
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            assert request.headers["x-harness-api-key"] == secret_value
+            return httpx.Response(200, json={"status": "success", "content": "ok"})
+
+        spec = HarnessToolSpec(tool_name="deploy", harness="remote")
+        config = HTTPBackendConfig(
+            name="remote",
+            base_url="https://harness.example",
+            api_key_env="HARNESS_API_KEY",
+        )
+        executor = HarnessExecutor({"deploy": spec}, {"remote": config})
+        backend = executor._backends["remote"]
+        backend._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        registry = ExecutorRegistry()
+        registry.register("deploy", executor)
+        agent = Agent(
+            agent_id="agent-1",
+            name="Agent",
+            profile_id="profile-1",
+            owner_id="user-1",
+        )
+        audit_path = tmp_path / "audit.jsonl"
+        checkpoint = Checkpoint(
+            profiles={},
+            policy_engine=object(),
+            policy_store=object(),
+            executor_registry=registry,
+            identity=ConfigIdentityProvider(
+                agents={agent.agent_id: agent}, users={"user-1": "User"}
+            ),
+            revocation_list=RevocationList(
+                [
+                    RevocationEntry(
+                        type="secret",
+                        id="HARNESS_API_KEY",
+                        reason="compromised credential",
+                    )
+                ]
+            ),
+            audit_store=JsonlAuditStore(audit_path),
+        )
+        proposal = ActionProposal(
+            task_id="task-1",
+            call_id=uuid.uuid4().hex,
+            agent_id=agent.agent_id,
+            tool_name="deploy",
+            arguments={},
+            task_context="test",
+        )
+        decision = Decision(
+            decision_id=uuid.uuid4().hex,
+            call_id=proposal.call_id,
+            task_id=proposal.task_id,
+            verdict="allow",
+            reason="allowed",
+            policy_version="test",
+            profile_version="test",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        checkpoint._decision_store.record_decision(decision)
+
+        blocked = await checkpoint.forward(proposal, decision, user_id="user-1")
+
+        assert blocked.status == "blocked"
+        assert blocked.error_code == "revoked"
+        assert calls == 0
+        audit_text = audit_path.read_text(encoding="utf-8")
+        assert "HARNESS_API_KEY" in audit_text
+        assert secret_value not in audit_text
+
+        checkpoint._revocation_list = RevocationList()
+        restored_decision = decision.model_copy(
+            update={
+                "decision_id": uuid.uuid4().hex,
+                "expires_at": datetime.now(UTC) + timedelta(minutes=5),
+            }
+        )
+        checkpoint._decision_store.record_decision(restored_decision)
+        restored = await checkpoint.forward(proposal, restored_decision, user_id="user-1")
+
+        assert restored.status == "success"
+        assert calls == 1
+        await executor.stop()

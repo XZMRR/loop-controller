@@ -394,7 +394,7 @@ class LoopControllerProxyServer:
             arguments=arguments,
             task_context="",
         )
-        blocked = self._handle_revocation(
+        blocked = await self._handle_revocation(
             identity=identity,
             agent=agent,
             task=task,
@@ -465,7 +465,7 @@ class LoopControllerProxyServer:
             arguments=arguments,
             task_context="",
         )
-        blocked = self._handle_revocation(
+        blocked = await self._handle_revocation(
             identity=identity,
             agent=agent,
             task=task,
@@ -542,7 +542,7 @@ class LoopControllerProxyServer:
         )
         return match.revoked, match.reason
 
-    def _handle_revocation(
+    async def _handle_revocation(
         self,
         *,
         identity: ProxyIdentity,
@@ -563,7 +563,7 @@ class LoopControllerProxyServer:
         )
         if not match.revoked:
             return None
-        return self._runtime.checkpoint.handle_revocation_block(
+        return await self._runtime.checkpoint.handle_revocation_block(
             identity=verified,
             proposal=proposal,
             task=task,

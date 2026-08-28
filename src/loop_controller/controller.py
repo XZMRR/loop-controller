@@ -145,7 +145,7 @@ class LoopController:
             task_id=task_id,
             task_context=task_context,
         )
-        blocked = self._handle_revocation(task, agent, proposal, "initial")
+        blocked = await self._handle_revocation(task, agent, proposal, "initial")
         if blocked is not None:
             return EvaluationResult(status="blocked", reason=blocked.content)
         return await self._evaluate_proposal(task, agent, proposal)
@@ -342,7 +342,7 @@ class LoopController:
             task_context=task_context,
         )
 
-        blocked = self._handle_revocation(task, agent, proposal, "initial")
+        blocked = await self._handle_revocation(task, agent, proposal, "initial")
         if blocked is not None:
             return GovernanceResult(
                 status="blocked",
@@ -465,7 +465,7 @@ class LoopController:
                 reason=f"unknown agent_id: {request.agent_id}",
                 error_code="unknown_agent",
             )
-        blocked = self._handle_revocation(task, agent, approve_proposal, "approval_resume")
+        blocked = await self._handle_revocation(task, agent, approve_proposal, "approval_resume")
         if blocked is not None:
             return self._revoked_governance_result(approve_proposal, blocked.content)
 
@@ -475,7 +475,7 @@ class LoopController:
         else:
             approve_action = "deny"
             approve_verdict = "deny"
-        self._runtime.audit_store.append(
+        await self._runtime.audit_store.append_async(
             _audit_event(
                 task,
                 action=approve_action,
@@ -522,7 +522,7 @@ class LoopController:
             )
 
         # 记录审批通过 Decision 已被消费
-        self._runtime.audit_store.append(
+        await self._runtime.audit_store.append_async(
             _audit_event(
                 task,
                 action="approval_consumed",
@@ -597,7 +597,7 @@ class LoopController:
         )
         return match.revoked, match.reason
 
-    def _handle_revocation(
+    async def _handle_revocation(
         self,
         task: Task,
         agent: Agent,
@@ -610,7 +610,7 @@ class LoopController:
         )
         if not match.revoked:
             return None
-        return self._runtime.checkpoint.handle_revocation_block(
+        return await self._runtime.checkpoint.handle_revocation_block(
             identity=identity,
             proposal=proposal,
             task=task,
@@ -681,7 +681,7 @@ class LoopController:
         agent = self._runtime.checkpoint._identity.get_agent(proposal.agent_id)
         if agent is None:
             raise CheckpointError(f"unknown agent_id: {proposal.agent_id}")
-        blocked = self._handle_revocation(task, agent, proposal, "pre_execute")
+        blocked = await self._handle_revocation(task, agent, proposal, "pre_execute")
         if blocked is not None:
             return blocked
         session = self._runtime.session_manager.get_session(task.session_id)

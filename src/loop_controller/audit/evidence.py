@@ -110,7 +110,7 @@ class Ed25519EvidenceSigner:
 class EvidenceBackend(Protocol):
     async def append(self, tenant_id: str | None, signed_evidence: SignedEvidence) -> None: ...
 
-    async def last_hash(self, tenant_id: str | None) -> str | None: ...
+    async def tail_state(self, tenant_id: str | None) -> tuple[int, str] | None: ...
 
     def iter_evidence(self, tenant_id: str | None) -> AsyncIterator[SignedEvidence]: ...
 
@@ -179,20 +179,24 @@ class EvidenceChain:
         path = self.checkpoint_path(tenant_id)
         if path is None:
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        signed_payload = dict(payload)
-        signed_payload.update(
-            {
-                "updated_at": datetime.now(UTC).isoformat(),
-                "algorithm": self._signer.algorithm,
-                "key_id": self._signer.key_id,
-            }
-        )
-        signature = self._signer.sign(canonical_json(signed_payload).encode("utf-8"))
-        record = {**signed_payload, "signature": base64.b64encode(signature).decode("ascii")}
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(canonical_json(record) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            signed_payload = dict(payload)
+            signed_payload.update(
+                {
+                    "updated_at": datetime.now(UTC).isoformat(),
+                    "algorithm": self._signer.algorithm,
+                    "key_id": self._signer.key_id,
+                }
+            )
+            signature = self._signer.sign(canonical_json(signed_payload).encode("utf-8"))
+            record = {**signed_payload, "signature": base64.b64encode(signature).decode("ascii")}
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(canonical_json(record) + "\n", encoding="utf-8")
+            os.replace(temporary, path)
+        except Exception as exc:
+            self.mark_degraded(f"checkpoint write failed: {type(exc).__name__}")
+            raise
 
     def read_checkpoint(self, tenant_id: str | None = None) -> dict[str, Any] | None:
         path = self.checkpoint_path(tenant_id)
@@ -216,11 +220,10 @@ class EvidenceChain:
     async def _recover(self, tenant_id: str | None) -> None:
         if tenant_id in self._seq_by_tenant:
             return
-        seq = self._seq_start
-        async for evidence in self._backend.iter_evidence(tenant_id):
-            seq = evidence.seq
-        self._seq_by_tenant[tenant_id] = seq
-        self._prev_hash_by_tenant[tenant_id] = await self._backend.last_hash(tenant_id) or GENESIS_HASH
+        state = await self._backend.tail_state(tenant_id)
+        if state is None:
+            state = (self._seq_start, GENESIS_HASH)
+        self._seq_by_tenant[tenant_id], self._prev_hash_by_tenant[tenant_id] = state
 
     async def append(
         self,
@@ -230,32 +233,38 @@ class EvidenceChain:
     ) -> SignedEvidence:
         lock = self._locks.setdefault(tenant_id, asyncio.Lock())
         async with lock:
-            await self._recover(tenant_id)
-            seq = self._seq_by_tenant[tenant_id] + 1
-            prev_hash = self._prev_hash_by_tenant[tenant_id]
-            timestamp = datetime.now(UTC).isoformat()
-            current_hash = _hash_payload(
-                seq=seq,
-                timestamp=timestamp,
-                tenant_id=tenant_id,
-                event=event,
-                prev_hash=prev_hash,
-                algorithm=self._signer.algorithm,
-                key_id=self._signer.key_id,
-            )
-            signature = base64.b64encode(self._signer.sign(current_hash.encode("ascii"))).decode("ascii")
-            evidence = SignedEvidence(
-                seq=seq,
-                timestamp=timestamp,
-                tenant_id=tenant_id,
-                event=event,
-                prev_hash=prev_hash,
-                current_hash=current_hash,
-                algorithm=self._signer.algorithm,
-                key_id=self._signer.key_id,
-                signature=signature,
-            )
-            await self._backend.append(tenant_id, evidence)
+            try:
+                await self._recover(tenant_id)
+                seq = self._seq_by_tenant[tenant_id] + 1
+                prev_hash = self._prev_hash_by_tenant[tenant_id]
+                timestamp = datetime.now(UTC).isoformat()
+                current_hash = _hash_payload(
+                    seq=seq,
+                    timestamp=timestamp,
+                    tenant_id=tenant_id,
+                    event=event,
+                    prev_hash=prev_hash,
+                    algorithm=self._signer.algorithm,
+                    key_id=self._signer.key_id,
+                )
+                signature = base64.b64encode(
+                    self._signer.sign(current_hash.encode("ascii"))
+                ).decode("ascii")
+                evidence = SignedEvidence(
+                    seq=seq,
+                    timestamp=timestamp,
+                    tenant_id=tenant_id,
+                    event=event,
+                    prev_hash=prev_hash,
+                    current_hash=current_hash,
+                    algorithm=self._signer.algorithm,
+                    key_id=self._signer.key_id,
+                    signature=signature,
+                )
+                await self._backend.append(tenant_id, evidence)
+            except Exception as exc:
+                self.mark_degraded(f"evidence append failed: {type(exc).__name__}")
+                raise
             self._seq_by_tenant[tenant_id] = seq
             self._prev_hash_by_tenant[tenant_id] = current_hash
             return evidence

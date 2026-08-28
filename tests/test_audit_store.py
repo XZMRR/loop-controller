@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -210,6 +212,52 @@ def test_seal_detects_deletion_before_seal(tmp_path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test").verify_chain()
+
+
+def test_append_and_seal_are_atomic_under_concurrency(tmp_path) -> None:
+    """100 轮并发 append/seal 后，每个 seal 均锚定其紧邻前驱且全链有效。"""
+    path = tmp_path / "audit.jsonl"
+    store = JsonlAuditStore(
+        path,
+        hash_algo="hmac-sha256",
+        hmac_key=_hmac_key(),
+        key_id="test",
+    )
+
+    for iteration in range(100):
+        barrier = threading.Barrier(2)
+
+        def append_event() -> None:
+            barrier.wait()
+            store.append(_make_event(trace_id=f"concurrent-{iteration}"))
+
+        def append_seal() -> None:
+            barrier.wait()
+            store.seal(reason=f"concurrent-{iteration}")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(append_event), executor.submit(append_seal)]
+            for future in futures:
+                future.result()
+
+        assert store.verify_chain(), f"第 {iteration + 1} 轮并发后审计链无效"
+
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    records = [json.loads(line) for line in lines]
+    assert len(records) == 200
+    assert [record["seq"] for record in records] == list(range(1, 201))
+    assert sum(record["action"] == "seal" for record in records) == 100
+    for record in records:
+        if record["action"] == "seal":
+            assert record["metadata"]["chain_hash"] == record["prev_hash"]
+
+    verifier = JsonlAuditStore(
+        path,
+        hash_algo="hmac-sha256",
+        hmac_key=_hmac_key(),
+        key_id="test",
+    )
+    assert verifier.verify_chain()
 
 
 def test_seal_signature_domain_separation(tmp_path) -> None:

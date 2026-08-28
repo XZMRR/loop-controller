@@ -253,6 +253,7 @@ class HarnessExecutor(ToolExecutor):
         backends: dict[str, HarnessBackendConfig],
     ) -> None:
         self._tool_specs = tool_specs
+        self._backend_configs = dict(backends)
         self._backends: dict[str, HarnessBackend] = {}
         for name, config in backends.items():
             self._backends[name] = self._build_backend(config)
@@ -271,7 +272,15 @@ class HarnessExecutor(ToolExecutor):
         return spec
 
     def secret_refs_for(self, tool_name: str) -> list[str]:
-        return []
+        spec = self._tool_specs.get(tool_name)
+        if spec is None:
+            return []
+
+        config = self._backend_configs.get(spec.harness)
+        refs = set(spec.secret_refs)
+        if isinstance(config, HTTPBackendConfig) and config.api_key_env:
+            refs.add(config.api_key_env)
+        return sorted(refs)
 
     async def start(self) -> None:
         await asyncio.gather(

@@ -713,7 +713,7 @@ class Checkpoint:
             identity, tool_name, self.resolve_secret_refs(tool_name, arguments)
         )
 
-    def handle_revocation_block(
+    async def handle_revocation_block(
         self,
         *,
         identity: AgentIdentity,
@@ -725,7 +725,7 @@ class Checkpoint:
         """统一退款、结构化审计并返回吊销阻断结果。"""
         self.refund_reservation_for_call(proposal.call_id)
         if self._audit_store is not None:
-            self._audit_store.append(
+            await self._audit_store.append_async(
                 AuditEvent(
                     event_id=uuid.uuid4().hex,
                     trace_id=task.task_id,
@@ -836,7 +836,7 @@ class Checkpoint:
                     description="",
                     tenant_id=tenant_id,
                 )
-                return self.handle_revocation_block(
+                return await self.handle_revocation_block(
                     identity=identity,
                     proposal=proposal,
                     task=task,

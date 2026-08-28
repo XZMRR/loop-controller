@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -179,6 +182,16 @@ def test_audit_append_synchronously_generates_evidence(tmp_path: Path) -> None:
     assert json.loads(evidence)["event"]["seq"] == 1
 
 
+@pytest.mark.asyncio
+async def test_sync_append_rejected_in_running_event_loop(tmp_path: Path) -> None:
+    store = JsonlAuditStore(tmp_path / "audit.jsonl")
+
+    with pytest.raises(RuntimeError, match=r"await append_async\(\)"):
+        store.append(_event())
+
+    assert not (tmp_path / "audit.jsonl").exists()
+
+
 def test_evidence_failure_alerts_before_preserving_audit_event(tmp_path: Path) -> None:
     calls: list[str] = []
 
@@ -206,6 +219,303 @@ def test_evidence_failure_alerts_before_preserving_audit_event(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_runtime_evidence_failure_degrades_and_success_does_not_recover(
+    tmp_path: Path,
+) -> None:
+    class FailsOnceBackend(LocalFileEvidenceBackend):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.fail = True
+
+        async def append(self, tenant_id, signed_evidence) -> None:
+            if self.fail:
+                self.fail = False
+                raise OSError("evidence unavailable")
+            await super().append(tenant_id, signed_evidence)
+
+    alert_store = InMemoryAlertStore()
+    backend = FailsOnceBackend(tmp_path / "evidence")
+    chain = EvidenceChain(backend, HMACEvidenceSigner(b"test-key", key_id="hmac-1"))
+    store = JsonlAuditStore(
+        tmp_path / "audit.jsonl", evidence_chain=chain, alert_store=alert_store
+    )
+
+    await store.append_async(_event(1))
+
+    assert store.evidence_status == "degraded"
+    assert len(store.query_by_trace("trace-1")) == 1
+    alert = alert_store.list_alerts()[0]
+    assert alert.rule_id == "evidence_chain_append_failed"
+    assert alert.severity == "critical"
+
+    await store.append_async(_event(2))
+
+    assert store.evidence_status == "degraded"
+    assert len(store.query_by_trace("trace-1")) == 2
+    assert len(await _records(backend)) == 1
+
+
+@pytest.mark.asyncio
+async def test_success_after_evidence_failure_does_not_overwrite_checkpoint(tmp_path: Path) -> None:
+    class FailsOnceBackend(LocalFileEvidenceBackend):
+        failed = False
+
+        async def append(self, tenant_id, signed_evidence) -> None:
+            if not self.failed:
+                self.failed = True
+                raise OSError("evidence unavailable")
+            await super().append(tenant_id, signed_evidence)
+
+    checkpoint_path = tmp_path / "checkpoint.json"
+    backend = FailsOnceBackend(tmp_path / "evidence")
+    chain = EvidenceChain(
+        backend,
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        checkpoint_path=checkpoint_path,
+    )
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
+
+    await store.append_async(_event(1))
+    await store.append_async(_event(2))
+
+    assert store.evidence_status == "degraded"
+    assert not checkpoint_path.exists()
+    assert len(await _records(backend)) == 1
+    assert [event.seq async for event in store.iter_events()] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_failure_degrades_alerts_and_does_not_propagate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    backend = LocalFileEvidenceBackend(tmp_path / "evidence")
+    alert_store = InMemoryAlertStore()
+    chain = EvidenceChain(
+        backend,
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        checkpoint_path=tmp_path / "checkpoint.json",
+    )
+    store = JsonlAuditStore(
+        tmp_path / "audit.jsonl", evidence_chain=chain, alert_store=alert_store
+    )
+
+    def fail_replace(source, destination) -> None:
+        raise OSError("checkpoint replace failed")
+
+    monkeypatch.setattr("loop_controller.audit.evidence.os.replace", fail_replace)
+
+    await store.append_async(_event())
+
+    assert len(store.query_by_trace("trace-1")) == 1
+    assert len(await _records(backend)) == 1
+    assert store.evidence_status == "degraded"
+    alert = alert_store.list_alerts()[0]
+    assert alert.rule_id == "evidence_checkpoint_write_failed"
+    assert alert.severity == "critical"
+    assert alert.evidence == ["event-1"]
+
+
+@pytest.mark.asyncio
+async def test_degraded_chain_does_not_advance_checkpoint_on_later_success(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "checkpoint.json"
+    backend = LocalFileEvidenceBackend(tmp_path / "evidence")
+    chain = EvidenceChain(
+        backend,
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        checkpoint_path=checkpoint_path,
+    )
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
+    await store.append_async(_event(1))
+    checkpoint = checkpoint_path.read_text(encoding="utf-8")
+    chain.mark_degraded("prior failure")
+
+    await store.append_async(_event(2))
+
+    assert checkpoint_path.read_text(encoding="utf-8") == checkpoint
+    assert json.loads(checkpoint)["audit_seq"] == 1
+    assert len(await _records(backend)) == 2
+
+
+@pytest.mark.asyncio
+async def test_audit_failure_after_evidence_commit_degrades_alerts_and_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    backend = LocalFileEvidenceBackend(tmp_path / "evidence")
+    alert_store = InMemoryAlertStore()
+    chain = EvidenceChain(backend, HMACEvidenceSigner(b"test-key", key_id="hmac-1"))
+    store = JsonlAuditStore(
+        tmp_path / "audit.jsonl", evidence_chain=chain, alert_store=alert_store
+    )
+
+    monkeypatch.setattr(store, "_write_audit_line", Mock(side_effect=OSError("secret-token")))
+
+    with pytest.raises(RuntimeError, match="^审计记录写入失败$") as exc_info:
+        await store.append_async(_event(1))
+
+    assert exc_info.value.__cause__ is None
+    assert "secret-token" not in str(exc_info.value)
+    assert store.evidence_status == "degraded"
+    assert len(await _records(backend)) == 1
+    assert store.query_by_trace("trace-1") == []
+    alert = alert_store.list_alerts()[0]
+    assert alert.rule_id == "audit_write_failed_after_evidence_commit"
+    assert alert.severity == "critical"
+    assert "secret-token" not in alert.description
+
+    with pytest.raises(RuntimeError, match="已阻断"):
+        await store.append_async(_event(2))
+    assert len(await _records(backend)) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_verification_failure_keeps_writes_blocked(tmp_path: Path, monkeypatch) -> None:
+    evidence_path = tmp_path / "evidence"
+    audit_path = tmp_path / "audit.jsonl"
+    signer = HMACEvidenceSigner(b"test-key", key_id="hmac-1")
+    backend = LocalFileEvidenceBackend(evidence_path)
+    store = JsonlAuditStore(audit_path, evidence_chain=EvidenceChain(backend, signer))
+    monkeypatch.setattr(store, "_write_audit_line", Mock(side_effect=OSError("disk failed")))
+
+    with pytest.raises(RuntimeError, match="^审计记录写入失败$"):
+        await store.append_async(_event(1))
+
+    restarted = JsonlAuditStore(
+        audit_path,
+        evidence_chain=EvidenceChain(LocalFileEvidenceBackend(evidence_path), signer),
+    )
+    assert not await restarted.verify_evidence_chain()
+
+    with pytest.raises(RuntimeError, match="已阻断"):
+        await restarted.append_async(_event(2))
+    assert len(await _records(backend)) == 1
+    assert restarted.query_by_trace("trace-1") == []
+
+
+@pytest.mark.asyncio
+async def test_evidence_append_failure_does_not_advance_checkpoint(tmp_path: Path) -> None:
+    class ToggleBackend(LocalFileEvidenceBackend):
+        fail = False
+
+        async def append(self, tenant_id, signed_evidence) -> None:
+            if self.fail:
+                raise OSError("secret-evidence-error")
+            await super().append(tenant_id, signed_evidence)
+
+    checkpoint_path = tmp_path / "checkpoint.json"
+    backend = ToggleBackend(tmp_path / "evidence")
+    chain = EvidenceChain(
+        backend,
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        checkpoint_path=checkpoint_path,
+    )
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
+    await store.append_async(_event(1))
+    checkpoint = checkpoint_path.read_text(encoding="utf-8")
+
+    backend.fail = True
+    await store.append_async(_event(2))
+
+    assert checkpoint_path.read_text(encoding="utf-8") == checkpoint
+    assert json.loads(checkpoint)["audit_seq"] == 1
+    assert len(await _records(backend)) == 1
+    assert [event.seq async for event in store.iter_events()] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_evidence_failures_redact_exception_details(
+    tmp_path: Path, caplog, monkeypatch
+) -> None:
+    secret = "secret-token-from-exception"
+    alert_store = InMemoryAlertStore()
+    chain = EvidenceChain(
+        LocalFileEvidenceBackend(tmp_path / "evidence"),
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+    )
+    store = JsonlAuditStore(
+        tmp_path / "audit.jsonl", evidence_chain=chain, alert_store=alert_store
+    )
+    monkeypatch.setattr(chain, "verify", AsyncMock(side_effect=OSError(secret)))
+
+    assert not await store.verify_evidence_chain()
+
+    alert = alert_store.list_alerts()[0]
+    assert secret not in alert.description
+    assert secret not in (chain.degraded_reason or "")
+    assert secret not in caplog.text
+    assert "OSError" in alert.description
+
+
+@pytest.mark.asyncio
+async def test_lagging_checkpoint_validates_history_and_rebuilds(tmp_path: Path) -> None:
+    backend = LocalFileEvidenceBackend(tmp_path / "evidence")
+    checkpoint_path = tmp_path / "checkpoint.json"
+    signer = HMACEvidenceSigner(b"test-key", key_id="hmac-1")
+    chain = EvidenceChain(backend, signer, checkpoint_path=checkpoint_path)
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
+    await store.append_async(_event(1))
+    historical_checkpoint = checkpoint_path.read_text(encoding="utf-8")
+    await store.append_async(_event(2))
+    checkpoint_path.write_text(historical_checkpoint, encoding="utf-8")
+
+    restarted = JsonlAuditStore(
+        tmp_path / "audit.jsonl",
+        evidence_chain=EvidenceChain(backend, signer, checkpoint_path=checkpoint_path),
+    )
+
+    assert await restarted.verify_evidence_chain()
+    assert restarted.evidence_status == "healthy"
+    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["audit_seq"] == 2
+
+
+@pytest.mark.asyncio
+async def test_lagging_checkpoint_with_wrong_historical_anchor_stays_degraded(
+    tmp_path: Path,
+) -> None:
+    backend = LocalFileEvidenceBackend(tmp_path / "evidence")
+    checkpoint_path = tmp_path / "checkpoint.json"
+    signer = HMACEvidenceSigner(b"test-key", key_id="hmac-1")
+    chain = EvidenceChain(backend, signer, checkpoint_path=checkpoint_path)
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
+    await store.append_async(_event(1))
+    first_evidence = (await _records(backend))[0]
+    chain.write_checkpoint(
+        {
+            "audit_seq": 1,
+            "audit_hash": "wrong",
+            "evidence_seq": 1,
+            "evidence_hash": first_evidence.current_hash,
+        }
+    )
+    bad_checkpoint = checkpoint_path.read_text(encoding="utf-8")
+    await store.append_async(_event(2))
+    checkpoint_path.write_text(bad_checkpoint, encoding="utf-8")
+
+    assert not await store.verify_evidence_chain()
+    assert store.evidence_status == "degraded"
+    assert checkpoint_path.read_text(encoding="utf-8") == bad_checkpoint
+
+
+@pytest.mark.asyncio
+async def test_lagging_checkpoint_rebuild_failure_stays_degraded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    backend = LocalFileEvidenceBackend(tmp_path / "evidence")
+    checkpoint_path = tmp_path / "checkpoint.json"
+    signer = HMACEvidenceSigner(b"test-key", key_id="hmac-1")
+    chain = EvidenceChain(backend, signer, checkpoint_path=checkpoint_path)
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
+    await store.append_async(_event(1))
+    historical_checkpoint = checkpoint_path.read_text(encoding="utf-8")
+    await store.append_async(_event(2))
+    checkpoint_path.write_text(historical_checkpoint, encoding="utf-8")
+    monkeypatch.setattr(chain, "write_checkpoint", Mock(side_effect=OSError("replace failed")))
+
+    assert not await store.verify_evidence_chain()
+    assert store.evidence_status == "degraded"
+    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["audit_seq"] == 1
+
+
+@pytest.mark.asyncio
 async def test_async_concurrent_append_is_ordered_and_checkpointed(tmp_path: Path) -> None:
     backend = LocalFileEvidenceBackend(tmp_path / "evidence")
     chain = EvidenceChain(
@@ -227,12 +537,42 @@ async def test_async_concurrent_append_is_ordered_and_checkpointed(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_slow_evidence_backend_does_not_block_heartbeat(tmp_path: Path) -> None:
-    class SlowBackend(LocalFileEvidenceBackend):
-        async def append(self, tenant_id, signed_evidence) -> None:
-            await asyncio.sleep(0.05)
-            await super().append(tenant_id, signed_evidence)
+async def test_sync_and_async_concurrent_append_share_one_ordered_writer(tmp_path: Path) -> None:
+    backend = LocalFileEvidenceBackend(tmp_path / "evidence")
+    chain = EvidenceChain(
+        backend,
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        checkpoint_path=tmp_path / "checkpoint.json",
+    )
+    store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
 
+    sync_writes = [asyncio.to_thread(store.append, _event(number)) for number in range(1, 51)]
+    async_writes = [store.append_async(_event(number)) for number in range(51, 101)]
+    await asyncio.gather(*sync_writes, *async_writes)
+
+    events = [event async for event in store.iter_events()]
+    evidence = await _records(backend)
+    assert [event.seq for event in events] == list(range(1, 101))
+    assert [record.seq for record in evidence] == list(range(1, 101))
+    assert [(event.event_id, event.seq) for event in events] == [
+        (record.event.event_id, record.event.seq) for record in evidence
+    ]
+    assert store.verify_chain()
+    assert await store.verify_evidence_chain()
+    assert json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))["audit_seq"] == 100
+
+
+@pytest.mark.asyncio
+async def test_blocking_evidence_file_io_does_not_block_heartbeat(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original = LocalFileEvidenceBackend._append_line
+
+    def slow_append(path: Path, line: str) -> None:
+        time.sleep(0.05)
+        original(path, line)
+
+    monkeypatch.setattr(LocalFileEvidenceBackend, "_append_line", staticmethod(slow_append))
     ticks = 0
 
     async def heartbeat() -> None:
@@ -241,10 +581,73 @@ async def test_slow_evidence_backend_does_not_block_heartbeat(tmp_path: Path) ->
             await asyncio.sleep(0.01)
             ticks += 1
 
-    chain = EvidenceChain(SlowBackend(tmp_path / "evidence"), HMACEvidenceSigner(b"k", key_id="k"))
+    chain = EvidenceChain(
+        LocalFileEvidenceBackend(tmp_path / "evidence"), HMACEvidenceSigner(b"k", key_id="k")
+    )
     store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
     await asyncio.gather(store.append_async(_event()), heartbeat())
     assert ticks == 5
+
+
+@pytest.mark.asyncio
+async def test_audit_writer_does_not_starve_default_executor(tmp_path: Path, monkeypatch) -> None:
+    store = JsonlAuditStore(tmp_path / "audit.jsonl")
+    original = store._write_audit_line
+
+    def slow_write(line: str) -> None:
+        time.sleep(0.05)
+        original(line)
+
+    first_write_started = threading.Event()
+
+    def slow_write_with_signal(line: str) -> None:
+        first_write_started.set()
+        slow_write(line)
+
+    monkeypatch.setattr(store, "_write_audit_line", slow_write_with_signal)
+    loop = asyncio.get_running_loop()
+    default_executor = loop._default_executor
+    isolated_default = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(isolated_default)
+    try:
+        writes = [asyncio.create_task(store.append_async(_event(number))) for number in range(1, 6)]
+        assert await asyncio.to_thread(first_write_started.wait, 1)
+        started = time.perf_counter()
+        await asyncio.to_thread(lambda: None)
+        elapsed = time.perf_counter() - started
+        await asyncio.gather(*writes)
+    finally:
+        loop._default_executor = default_executor
+        isolated_default.shutdown(wait=True)
+
+    assert elapsed < 0.1
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_large_tail_with_one_scan(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "evidence"
+    signer = HMACEvidenceSigner(b"test-key", key_id="hmac-1")
+    chain = EvidenceChain(LocalFileEvidenceBackend(path), signer)
+    last = None
+    for number in range(1, 101):
+        last = await chain.append(_event(number))
+    assert last is not None
+
+    backend = LocalFileEvidenceBackend(path)
+    original = backend._read_records_sync
+    scans = 0
+
+    def counted_read(file_path: Path):
+        nonlocal scans
+        scans += 1
+        return original(file_path)
+
+    monkeypatch.setattr(backend, "_read_records_sync", counted_read)
+    recovered = await EvidenceChain(backend, signer).append(_event(101))
+
+    assert scans == 1
+    assert recovered.seq == 101
+    assert recovered.prev_hash == last.current_hash
 
 
 @pytest.mark.asyncio

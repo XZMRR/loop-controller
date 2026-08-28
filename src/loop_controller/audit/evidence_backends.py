@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -14,7 +15,6 @@ class LocalFileEvidenceBackend:
 
     def __init__(self, base_path: str | Path) -> None:
         self._base = Path(base_path)
-        self._base.mkdir(parents=True, exist_ok=True)
 
     def _path(self, tenant_id: str | None) -> Path:
         name = tenant_id or "default"
@@ -24,25 +24,43 @@ class LocalFileEvidenceBackend:
 
     async def append(self, tenant_id: str | None, signed_evidence: SignedEvidence) -> None:
         line = canonical_json(signed_evidence.model_dump(mode="json"))
-        with self._path(tenant_id).open("a", encoding="utf-8") as fh:
+        await asyncio.to_thread(self._append_line, self._path(tenant_id), line)
+
+    @staticmethod
+    def _append_line(path: Path, line: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
             fh.flush()
 
+    async def tail_state(self, tenant_id: str | None) -> tuple[int, str] | None:
+        records = await self._read_records(tenant_id)
+        if not records:
+            return None
+        last = records[-1]
+        return last.seq, last.current_hash
+
     async def last_hash(self, tenant_id: str | None) -> str | None:
-        last: SignedEvidence | None = None
-        async for evidence in self.iter_evidence(tenant_id):
-            last = evidence
-        return last.current_hash if last is not None else None
+        state = await self.tail_state(tenant_id)
+        return state[1] if state is not None else None
+
+    async def _read_records(self, tenant_id: str | None) -> list[SignedEvidence]:
+        return await asyncio.to_thread(self._read_records_sync, self._path(tenant_id))
+
+    @staticmethod
+    def _read_records_sync(path: Path) -> list[SignedEvidence]:
+        if not path.exists():
+            return []
+        with path.open("r", encoding="utf-8") as fh:
+            return [
+                SignedEvidence.model_validate_json(line)
+                for raw_line in fh
+                if (line := raw_line.strip())
+            ]
 
     async def iter_evidence(self, tenant_id: str | None) -> AsyncIterator[SignedEvidence]:
-        path = self._path(tenant_id)
-        if not path.exists():
-            return
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    yield SignedEvidence.model_validate_json(line)
+        for evidence in await self._read_records(tenant_id):
+            yield evidence
 
 
 __all__ = ["LocalFileEvidenceBackend"]

@@ -167,7 +167,7 @@ class ToolGovernServer:
             token
         ) and hmac.compare_digest(token, self._api_key)
 
-    def _audit_admin_operation(
+    async def _audit_admin_operation(
         self,
         request: Request,
         operation: str,
@@ -181,7 +181,7 @@ class ToolGovernServer:
         api_key = self._api_key or ""
         actor_id = f"api-key:{hashlib.sha256(api_key.encode()).hexdigest()[:12]}"
         trace_id = getattr(request.state, "trace_id", uuid.uuid4().hex[:16])
-        audit_store.append(
+        await audit_store.append_async(
             AuditEvent(
                 event_id=uuid.uuid4().hex,
                 trace_id=trace_id,
@@ -499,7 +499,7 @@ class ToolGovernServer:
                     raise ValueError("missing id")
                 tenant_id = request.query_params.get("tenant_id")
                 removed = revocations.remove(entry_type, entry_id, tenant_id)
-                self._audit_admin_operation(
+                await self._audit_admin_operation(
                     request,
                     "revocation_removed",
                     target=f"{entry_type.value}:{entry_id}",
@@ -509,7 +509,7 @@ class ToolGovernServer:
             body = RevokeRequest.model_validate(await request.json())
             entry = body.to_entry()
             revocations.add(entry)
-            self._audit_admin_operation(
+            await self._audit_admin_operation(
                 request,
                 "revocation_added",
                 target=f"{entry.type.value}:{entry.id}",
@@ -541,7 +541,7 @@ class ToolGovernServer:
         except (ValueError, TypeError) as exc:
             return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
         revocations.set_kill_switch(config)
-        self._audit_admin_operation(
+        await self._audit_admin_operation(
             request,
             "kill_switch_updated",
             target="kill_switch",

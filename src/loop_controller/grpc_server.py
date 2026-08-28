@@ -161,7 +161,7 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         if identity.agent_id not in self._grpc_admin_agent_ids():
             context.set_code(grpc.StatusCode.PERMISSION_DENIED)
             context.set_details("admin identity is not authorized")
-            self._audit_admin_operation(
+            await self._audit_admin_operation(
                 identity, "admin_operation_failed", target="grpc_admin",
                 metadata={"reason": "not_authorized"},
             )
@@ -178,14 +178,14 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
             if identity_revoked:
                 context.set_code(grpc.StatusCode.PERMISSION_DENIED)
                 context.set_details("admin identity is revoked")
-                self._audit_admin_operation(
+                await self._audit_admin_operation(
                     identity, "admin_operation_failed", target="grpc_admin",
                     metadata={"reason": "identity_revoked"},
                 )
                 return None
         return identity
 
-    def _audit_admin_operation(
+    async def _audit_admin_operation(
         self,
         identity: AgentIdentity,
         operation: str,
@@ -196,7 +196,7 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         audit_store = getattr(self._controller._runtime, "audit_store", None)
         if audit_store is None:
             return
-        audit_store.append(
+        await audit_store.append_async(
             AuditEvent(
                 event_id=uuid.uuid4().hex,
                 trace_id=uuid.uuid4().hex,
@@ -398,7 +398,7 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
             if request.remove:
                 tenant_id = request.tenant_id or None
                 removed = revocations.remove(entry_type, request.id, tenant_id)
-                self._audit_admin_operation(
+                await self._audit_admin_operation(
                     identity,
                     "revocation_removed",
                     target=f"{entry_type.value}:{request.id}",
@@ -415,7 +415,7 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
                 tenant_id=request.tenant_id or None,
             )
             revocations.add(entry)
-            self._audit_admin_operation(
+            await self._audit_admin_operation(
                 identity,
                 "revocation_added",
                 target=f"{entry.type.value}:{entry.id}",
@@ -446,7 +446,7 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
             except_agents=list(request.except_agents),
         )
         revocations.set_kill_switch(config)
-        self._audit_admin_operation(
+        await self._audit_admin_operation(
             identity,
             "kill_switch_updated",
             target="kill_switch",
