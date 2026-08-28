@@ -1,6 +1,6 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.27.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环；v0.27.0 为远程 HTTP Harness 补齐认证、防重放、进程内并发门控、健康检查、启动校验和风险下限接线。
+企业级 AI Agent 治理层（v0.28.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环；v0.28.0 为审计/证据链引入外部可信锚点，提供 Ed25519 receipt、HTTP 锚点后端、启动交叉验证、冲突/回滚写阻断与管理员锚点操作。
 
 **核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为工具调用治理控制平面，是所有经治理工具调用的**唯一授权出口**。
 
@@ -21,6 +21,7 @@
 - **远程 HTTP Harness 生产出口**（v0.27.0）：`HarnessExecutor` 支持 HMAC/API Key、timestamp + nonce 防重放、TLS/可选 mTLS 客户端、每后端进程内并发门控、健康检查与启动校验；子进程仅供开发/测试，Docker/Kubernetes 由部署层运行独立 HTTP Harness Service；
 - **全局吊销与 Kill Switch**（v0.26.1）：可按 agent、user、tool、secret 阻断调用；可信 Secret 依赖来自执行器当前配置，所有执行路径在最终执行边界复查，阻断会释放未提交预算并写审计；
 - **本地签名证据链**（v0.26.1）：审计事件可写入 HMAC-SHA256 或 Ed25519 签名的链式 JSONL 证据；异步写入保持单进程有序，并通过审计—证据交叉校验和签名本地 checkpoint 检测单边丢失与相对回退；
+- **外部可信锚点**（v0.28.0）：checkpoint 成功后向远程锚点服务发布当前链状态，获取 Ed25519 签名的 receipt；启动时交叉验证远程最新锚点与本地证据/审计；冲突/回滚时进入写阻断并告警；提供 Admin 端点用于 verify / publish / bootstrap；
 - **网络级治理入口**（v0.20.0）：HTTP、gRPC、MCP Proxy 作为生产入口，Agent 不直接持有工具凭证。
 
 ## 架构
@@ -125,12 +126,12 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 | `entrypoints.yaml` | HTTP/gRPC/MCP Proxy 入口认证方式与开关 |
 | `harness_tools.yaml` | Harness 后端与工具配置（v0.27.0，默认注释；生产模板为 HTTPS + HMAC + 健康检查） |
 | `revocation.yaml` | 全局吊销列表与 Kill Switch（v0.26.0，支持热更新） |
-| `evidence.yaml` | 本地签名证据链后端与签名算法（v0.26.0） |
+| `evidence.yaml` | 本地签名证据链后端与锚点配置（v0.28.0） |
 | `policies/default.rego` | 主策略（Rego v1） |
 
 ## 已知局限
 
-**本项目当前为 v0.27.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：Harness 默认不启用；生产仅推荐独立 HTTPS HTTP Harness，参考服务和 subprocess 都不是生产沙箱；并发门控、防重放 nonce store、吊销状态与本地 JSONL 写入均是单进程/单实例语义。远程调用超时后的执行结果可能未知且不会自动重试；远程取消、跨实例长期幂等和分布式配额尚未实现；Harness 只读 Admin 状态端点复用现有 API key 鉴权，专用调用/排队/过载/in-flight/健康指标已接入 Prometheus。签名本地 checkpoint 仍不是 WORM 或远程可信锚点；KMS/HSM、远程证据存储和完整多租户隔离也尚未实现。
+**本项目当前为 v0.28.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：Harness 默认不启用；生产仅推荐独立 HTTPS HTTP Harness，参考服务和 subprocess 都不是生产沙箱；并发门控、防重放 nonce store、吊销状态与本地 JSONL 写入均是单进程/单实例语义。远程调用超时后的执行结果可能未知且不会自动重试；远程取消、跨实例长期幂等和分布式配额尚未实现；Harness 只读 Admin 状态端点复用现有 API key 鉴权，专用调用/排队/过载/in-flight/健康指标已接入 Prometheus。签名本地 checkpoint 可通过外部可信锚点获得 Ed25519 receipt，但锚点服务本身是外部独立可信系统；KMS/HSM、远程证据存储、多签 receipt 和完整多租户隔离也尚未实现。
 
 ## 文档
 
@@ -143,7 +144,8 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `loop_controller_v0.25.0_development.md`——v0.25.0 Harness 作为生产级执行后端
 - `loop_controller_v0.26.0_development.md`——v0.26.0 全局吊销与本地签名证据链
 - `loop_controller_v0.26.1_development.md`——v0.26.1 吊销、Kill Switch 与证据链可靠性修复
-- `loop_controller_v0.27.0_development.md`——v0.27.0 Harness 生产闭环（当前版本依据）
+- `loop_controller_v0.27.0_development.md`——v0.27.0 Harness 生产闭环
+- `loop_controller_v0.28.0_development.md`——v0.28.0 可信锚点与审计链外部闭环（当前版本依据）
 - `development_log.md`——开发记录与决策追溯
 - `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
 - `answer.md`——MVP 审查分析与修复状态追踪

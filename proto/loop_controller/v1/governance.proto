@@ -48,6 +48,11 @@ message HealthResponse {
   bool gateway_ready = 3;
   float uptime_seconds = 4;
   string evidence_status = 5;
+  string anchor_status = 6;
+  string anchor_stream_id = 7;
+  int64 anchor_last_success_seq = 8;
+  int64 anchor_lag_events = 9;
+  string anchor_last_error_code = 10;
 }
 
 message PendingApproval {

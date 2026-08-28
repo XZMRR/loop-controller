@@ -134,6 +134,34 @@ class _MockAuditStore:
             yield event
 
 
+class _MockAuditStoreWithAnchor(_MockAuditStore):
+    """带有 evidence_status 与 anchor_summary 的 mock audit store，用于校验 HealthResponse。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.evidence_status = "healthy"
+        self._summary = {
+            "anchor_status": "healthy",
+            "anchor_stream_id": "deployment/default",
+            "anchor_last_success_seq": 5,
+            "anchor_lag_events": 0,
+            "anchor_last_error_code": "",
+        }
+
+    def anchor_summary(self) -> dict[str, object]:
+        return self._summary.copy()
+
+
+class _MockEvidenceAnchor:
+    """让 gRPC server 的 anchor summary 来源于 audit store。"""
+
+    def __init__(self, store: _MockAuditStoreWithAnchor) -> None:
+        self._store = store
+
+    def sanitized_status(self) -> dict[str, object]:
+        return self._store.anchor_summary()
+
+
 @pytest.fixture
 async def grpc_client():
     controller = _MockController()
@@ -204,10 +232,20 @@ async def test_wait_for_approval_streaming(grpc_client) -> None:
 
 @pytest.mark.asyncio
 async def test_get_health(grpc_client) -> None:
-    client, _controller = grpc_client
+    client, controller = grpc_client
+    store = _MockAuditStoreWithAnchor()
+    controller._runtime.audit_store = store
+    controller._runtime.evidence_anchor = _MockEvidenceAnchor(store)
     response = await client.get_health()
+    summary = store.anchor_summary()
     assert response.status == "ok"
     assert response.gateway_ready is True
+    assert response.evidence_status == store.evidence_status
+    assert response.anchor_status == summary["anchor_status"]
+    assert response.anchor_stream_id == summary["anchor_stream_id"]
+    assert response.anchor_last_success_seq == summary["anchor_last_success_seq"]
+    assert response.anchor_lag_events == summary["anchor_lag_events"]
+    assert response.anchor_last_error_code == summary["anchor_last_error_code"]
 
 
 @pytest.mark.asyncio

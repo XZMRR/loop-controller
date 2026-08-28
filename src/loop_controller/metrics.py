@@ -80,6 +80,49 @@ HARNESS_HEALTH = Gauge(
     ["backend"],
 )
 
+ANCHOR_PUBLISH_TOTAL = Counter(
+    "loop_controller_anchor_publish_total",
+    "Total trusted anchor publish attempts",
+    ["status", "error_code"],
+)
+
+ANCHOR_PUBLISH_DURATION = Histogram(
+    "loop_controller_anchor_publish_duration_seconds",
+    "Trusted anchor publish duration",
+)
+
+ANCHOR_LAST_SUCCESS_SEQ = Gauge(
+    "loop_controller_anchor_last_success_seq",
+    "Last successfully published trusted anchor sequence",
+)
+
+ANCHOR_LAG_EVENTS = Gauge(
+    "loop_controller_anchor_lag_events",
+    "Current local events not covered by the trusted anchor",
+)
+
+ANCHOR_STATUS = Gauge(
+    "loop_controller_anchor_status",
+    "Trusted anchor health (1 for healthy, 0 otherwise)",
+)
+
+ANCHOR_CONFLICTS_TOTAL = Counter(
+    "loop_controller_anchor_conflicts_total",
+    "Total trusted anchor conflicts",
+)
+
+_ANCHOR_ERROR_CODES = {
+    "none",
+    "anchor_authentication_failed",
+    "anchor_conflict",
+    "anchor_http_error",
+    "anchor_rate_limited",
+    "anchor_receipt_invalid",
+    "anchor_rollback_rejected",
+    "anchor_timeout",
+    "anchor_unavailable",
+}
+
 
 trace_id_var: ContextVar[str | None] = ContextVar("trace_id", default=None)
 
@@ -146,6 +189,32 @@ def observe_harness_overloaded(backend: str) -> None:
 def set_harness_health(backend: str, healthy: bool) -> None:
     """设置 Harness 后端健康值。"""
     HARNESS_HEALTH.labels(backend=backend).set(1 if healthy else 0)
+
+
+def observe_anchor_publish(
+    status: str,
+    error_code: str | None,
+    duration: float,
+) -> None:
+    """记录一次 Anchor 发布；未知错误统一归入 other，避免 label 基数失控。"""
+    normalized_code = error_code or "none"
+    if normalized_code not in _ANCHOR_ERROR_CODES:
+        normalized_code = "other"
+    normalized_status = status if status in {"success", "error"} else "error"
+    ANCHOR_PUBLISH_TOTAL.labels(status=normalized_status, error_code=normalized_code).inc()
+    ANCHOR_PUBLISH_DURATION.observe(duration)
+
+
+def set_anchor_state(status: str, last_success_seq: int, lag_events: int) -> None:
+    """更新不带高基数 label 的 Anchor 状态指标。"""
+    ANCHOR_LAST_SUCCESS_SEQ.set(max(0, last_success_seq))
+    ANCHOR_LAG_EVENTS.set(max(0, lag_events))
+    ANCHOR_STATUS.set(1 if status == "healthy" else 0)
+
+
+def observe_anchor_conflict() -> None:
+    """记录一次确定性 Anchor 冲突。"""
+    ANCHOR_CONFLICTS_TOTAL.inc()
 
 
 def render_metrics() -> bytes:

@@ -25,6 +25,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from loop_controller.audit.anchor_backends import AnchorBackendError, EvidenceAnchorBackend
+from loop_controller.audit.anchors import (
+    AnchorPayload,
+    AnchorReceiptVerifier,
+    anchor_idempotency_key,
+)
 from loop_controller.audit.evidence import EvidenceChain
 from loop_controller.infra.alert_store import AlertStore
 from loop_controller.models import AuditAlert, AuditEvent
@@ -77,13 +83,26 @@ class JsonlAuditStore:
         key_id: str | None = None,
         evidence_chain: EvidenceChain | None = None,
         alert_store: AlertStore | None = None,
+        anchor_backend: EvidenceAnchorBackend | None = None,
+        anchor_stream_id: str | None = None,
+        anchor_receipt_verifier: AnchorReceiptVerifier | None = None,
     ) -> None:
         self._path = Path(path)
         self._evidence_chain = evidence_chain
         self._alert_store = alert_store
+        self._anchor_backend = anchor_backend
+        self._evidence_anchor = anchor_backend
+        self._anchor_stream_id = anchor_stream_id
+        self._anchor_receipt_verifier = anchor_receipt_verifier
+        if anchor_backend is not None and (evidence_chain is None or not anchor_stream_id):
+            raise ValueError("Anchor 必须同时配置 EvidenceChain 和 stream_id")
+        self._anchor_status = "healthy" if anchor_backend is not None else "disabled"
+        self._anchor_last_success_seq = 0
+        self._anchor_last_error_code: str | None = None
         self._sync_lock = threading.Lock()
         self._write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="audit-writer")
         self._write_blocked = False
+        self._anchor_write_blocked = False
         self._path.parent.mkdir(parents=True, exist_ok=True)
         if hash_algo not in ("sha256", "hmac-sha256"):
             raise ValueError(f"不支持的 hash_algo：{hash_algo}")
@@ -201,6 +220,8 @@ class JsonlAuditStore:
     def _handle_checkpoint_failure(self, exc: Exception, event: AuditEvent) -> None:
         description = f"evidence checkpoint write failed: {type(exc).__name__}"
         self._mark_evidence_degraded(description)
+        if self._anchor_backend is not None:
+            self._anchor_status = "degraded"
         logger.error("证据 checkpoint 写入失败，业务和审计已提交：%s", type(exc).__name__)
         self._save_evidence_alert(
             rule_id="evidence_checkpoint_write_failed",
@@ -208,6 +229,67 @@ class JsonlAuditStore:
             description=description,
             event=event,
         )
+
+    def _anchor_payload(self, evidence_seq: int, evidence_hash: str) -> AnchorPayload:
+        assert self._anchor_stream_id is not None
+        assert self._evidence_chain is not None
+        return AnchorPayload(
+            stream_id=self._anchor_stream_id,
+            audit_seq=self._seq,
+            audit_hash=self._chain_hash if self._seq else "",
+            evidence_seq=evidence_seq,
+            evidence_hash=evidence_hash,
+            evidence_algorithm=self._evidence_chain.signer.algorithm,
+            evidence_key_id=self._evidence_chain.signer.key_id,
+        )
+
+    def _publish_anchor(self, evidence_seq: int, evidence_hash: str, event: AuditEvent | None) -> None:
+        backend = self._anchor_backend
+        if backend is None:
+            return
+        assert self._anchor_receipt_verifier is not None
+        payload = self._anchor_payload(evidence_seq, evidence_hash)
+        try:
+            receipt = backend.publish(payload, idempotency_key=anchor_idempotency_key(payload))
+            if receipt.payload != payload or not self._anchor_receipt_verifier.verify(receipt):
+                raise AnchorBackendError("anchor_receipt_invalid", retryable=False)
+        except AnchorBackendError as exc:
+            conflict = not exc.retryable
+            self._anchor_status = "anchor_conflict" if conflict else "degraded"
+            self._anchor_last_error_code = exc.code
+            if conflict:
+                self._write_blocked = True
+                self._anchor_write_blocked = True
+            rule_id = (
+                "trusted_anchor_receipt_invalid"
+                if exc.code == "anchor_receipt_invalid"
+                else "trusted_anchor_conflict"
+                if conflict
+                else "trusted_anchor_publish_failed"
+            )
+            self._save_evidence_alert(
+                rule_id=rule_id,
+                title="可信锚点发布失败",
+                description=f"anchor publish failed: {exc.code}",
+                event=event,
+            )
+            logger.error("可信锚点发布失败：%s", exc.code)
+            return
+        except Exception as exc:
+            self._anchor_status = "degraded"
+            self._anchor_last_error_code = "anchor_publish_failed"
+            self._save_evidence_alert(
+                rule_id="trusted_anchor_publish_failed",
+                title="可信锚点发布失败",
+                description=f"anchor publish failed: {type(exc).__name__}",
+                event=event,
+            )
+            logger.error("可信锚点发布失败：%s", type(exc).__name__)
+            return
+        self._anchor_status = "healthy"
+        self._anchor_last_success_seq = payload.audit_seq
+        self._anchor_last_error_code = None
+        self._anchor_write_blocked = False
 
     def _handle_audit_write_failure(self, exc: Exception, event: AuditEvent) -> None:
         description = f"audit write failed after evidence commit: {type(exc).__name__}"
@@ -223,7 +305,9 @@ class JsonlAuditStore:
 
     def _append_locked(self, event: AuditEvent) -> None:
         """追加事件；调用方必须已持有 ``_sync_lock``。"""
-        if self._write_blocked:
+        if self._write_blocked or (
+            self._anchor_write_blocked and not self._anchor_bootstrap_active
+        ):
             raise RuntimeError("审计存储因先前写入失败已阻断；请重建 Store 后恢复")
         to_write, line = self._prepare_event(event)
         evidence = None
@@ -245,7 +329,14 @@ class JsonlAuditStore:
         except Exception as exc:
             if evidence is not None:
                 self._handle_audit_write_failure(exc, to_write)
+            else:
+                self._write_blocked = True
             raise RuntimeError("审计记录写入失败") from None
+        if evidence is None and self._evidence_chain is not None:
+            self._write_blocked = True
+            if self._anchor_backend is not None:
+                self._anchor_status = "degraded"
+            return
         if (
             evidence is not None
             and evidence.seq == to_write.seq
@@ -255,6 +346,8 @@ class JsonlAuditStore:
                 self._write_checkpoint(evidence.seq, evidence.current_hash)
             except Exception as exc:
                 self._handle_checkpoint_failure(exc, to_write)
+                return
+            self._publish_anchor(evidence.seq, evidence.current_hash, to_write)
 
     def _append_serialized(self, event: AuditEvent) -> None:
         with self._sync_lock:
@@ -382,7 +475,7 @@ class JsonlAuditStore:
             )
 
     async def verify_evidence_chain(self) -> bool:
-        """交叉验证审计、签名证据和 checkpoint；失败时降级但不阻塞启动。"""
+        """交叉验证审计、签名证据和 checkpoint；失败时降级并阻断后续写入，但不阻塞启动。"""
         if self._evidence_chain is None:
             return True
         try:
@@ -406,11 +499,285 @@ class JsonlAuditStore:
         )
         return False
 
+    def _verify_anchor_startup_locked(self) -> str:
+        backend = self._anchor_backend
+        if backend is None:
+            self._anchor_status = "disabled"
+            return self._anchor_status
+        assert self._anchor_stream_id is not None
+        assert self._anchor_receipt_verifier is not None
+        assert self._evidence_chain is not None
+        try:
+            remote = backend.latest(self._anchor_stream_id)
+        except AnchorBackendError as exc:
+            if exc.retryable:
+                self._anchor_status = "anchor_unavailable"
+                self._save_evidence_alert(
+                    rule_id="trusted_anchor_unavailable",
+                    title="可信锚点启动验证暂不可用",
+                    description=f"anchor startup failed: {exc.code}",
+                )
+            else:
+                self._anchor_status = "anchor_conflict"
+                self._write_blocked = True
+                self._save_evidence_alert(
+                    rule_id="trusted_anchor_conflict",
+                    title="可信锚点启动验证冲突",
+                    description=f"anchor startup failed: {exc.code}",
+                )
+            return self._anchor_status
+        except Exception as exc:
+            self._anchor_status = "anchor_unavailable"
+            self._save_evidence_alert(
+                rule_id="trusted_anchor_unavailable",
+                title="可信锚点启动验证暂不可用",
+                description=f"anchor startup failed: {type(exc).__name__}",
+            )
+            return self._anchor_status
+
+        evidence = asyncio.run(self._collect_evidence())
+        evidence_seq = evidence[-1].seq if evidence else 0
+        evidence_hash = evidence[-1].current_hash if evidence else ""
+        local = self._anchor_payload(evidence_seq, evidence_hash)
+        if remote is None:
+            if local.audit_seq == 0:
+                self._anchor_status = "healthy"
+                self._write_blocked = False
+            else:
+                self._anchor_status = "bootstrap_required"
+                self._write_blocked = True
+                self._save_evidence_alert(
+                    rule_id="trusted_anchor_bootstrap_required",
+                    title="可信锚点需要显式初始化",
+                    description="remote anchor missing for non-empty local chain",
+                )
+            return self._anchor_status
+        if not self._anchor_receipt_verifier.verify(remote):
+            self._anchor_status = "anchor_conflict"
+            self._write_blocked = True
+            self._save_evidence_alert(
+                rule_id="trusted_anchor_receipt_invalid",
+                title="可信锚点收据无效",
+                description="anchor startup receipt verification failed",
+            )
+            return self._anchor_status
+
+        remote_payload = remote.payload
+        if remote_payload.audit_seq > local.audit_seq:
+            self._anchor_status = "rollback_detected"
+            self._write_blocked = True
+            self._save_evidence_alert(
+                rule_id="trusted_anchor_rollback_detected",
+                title="检测到本地整体回退",
+                description="remote anchor sequence is ahead of local state",
+            )
+            return self._anchor_status
+        if remote_payload.audit_seq == local.audit_seq:
+            if remote_payload != local:
+                self._anchor_status = "anchor_conflict"
+                self._write_blocked = True
+                self._save_evidence_alert(
+                    rule_id="trusted_anchor_conflict",
+                    title="可信锚点与本地链尾冲突",
+                    description="remote anchor does not match local tail",
+                )
+                return self._anchor_status
+        else:
+            historical_audit_hash = self._audit_hash_at_seq(remote_payload.audit_seq)
+            historical_evidence_hash = (
+                "" if remote_payload.evidence_seq == 0
+                else evidence[remote_payload.evidence_seq - 1].current_hash
+            )
+            history_matches = (
+                remote_payload.stream_id == local.stream_id
+                and remote_payload.audit_hash == historical_audit_hash
+                and remote_payload.evidence_hash == historical_evidence_hash
+                and remote_payload.evidence_algorithm == local.evidence_algorithm
+                and remote_payload.evidence_key_id == local.evidence_key_id
+            )
+            if not history_matches:
+                self._anchor_status = "anchor_conflict"
+                self._write_blocked = True
+                self._save_evidence_alert(
+                    rule_id="trusted_anchor_conflict",
+                    title="可信锚点与本地历史分叉",
+                    description="remote anchor is not part of local history",
+                )
+                return self._anchor_status
+            self._publish_anchor(local.evidence_seq, local.evidence_hash, None)
+            return self._anchor_status
+
+        self._anchor_status = "healthy"
+        self._anchor_last_success_seq = remote_payload.audit_seq
+        self._write_blocked = False
+        return self._anchor_status
+
+    async def _collect_evidence(self) -> list:
+        assert self._evidence_chain is not None
+        return [item async for item in self._evidence_chain._backend.iter_evidence(None)]
+
+    async def verify_anchor_startup(self) -> str:
+        """验签远端 latest，并与本地当前或历史联合链状态比较。"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._write_executor,
+            self._verify_anchor_startup_serialized,
+        )
+
+    def _verify_anchor_startup_serialized(self) -> str:
+        with self._sync_lock:
+            return self._verify_anchor_startup_locked()
+
     @property
     def evidence_status(self) -> str:
         if self._evidence_chain is None:
             return "disabled"
         return getattr(self._evidence_chain, "status", "healthy")
+
+    def anchor_summary(self) -> dict[str, object]:
+        local_seq = self._seq
+        return {
+            "evidence_status": self.evidence_status,
+            "anchor_status": self._anchor_status,
+            "anchor_stream_id": self._anchor_stream_id,
+            "anchor_last_success_seq": self._anchor_last_success_seq,
+            "anchor_lag_events": max(0, local_seq - self._anchor_last_success_seq),
+            "anchor_last_error_code": self._anchor_last_error_code,
+        }
+
+    def _verify_anchor_locked(self) -> dict[str, object]:
+        backend = self._anchor_backend
+        if backend is None:
+            return self.anchor_summary()
+        assert self._anchor_stream_id is not None
+        assert self._evidence_chain is not None
+        try:
+            asyncio.run(self._verify_evidence_consistency())
+            checkpoint = self._evidence_chain.read_checkpoint()
+            if checkpoint is None:
+                local_payload = self._anchor_payload(0, "")
+            else:
+                local_payload = self._anchor_payload(
+                    int(checkpoint["evidence_seq"]), str(checkpoint["evidence_hash"])
+                )
+            remote = backend.latest(self._anchor_stream_id)
+            if remote is None:
+                self._anchor_status = (
+                    "healthy" if local_payload.audit_seq == 0 else "bootstrap_required"
+                )
+                self._anchor_write_blocked = local_payload.audit_seq > 0
+                self._anchor_last_success_seq = 0
+                self._anchor_last_error_code = (
+                    "anchor_bootstrap_required" if local_payload.audit_seq > 0 else None
+                )
+                return self.anchor_summary()
+            remote_payload = remote.payload
+            remote_seq = remote_payload.audit_seq
+            if remote_seq > local_payload.audit_seq:
+                self._anchor_status = "rollback_detected"
+                self._anchor_write_blocked = True
+                self._anchor_last_error_code = "anchor_rollback_detected"
+            elif remote_seq == local_payload.audit_seq:
+                if remote_payload != local_payload:
+                    self._anchor_status = "anchor_conflict"
+                    self._anchor_write_blocked = True
+                    self._anchor_last_error_code = "anchor_conflict"
+                else:
+                    self._anchor_status = "healthy"
+                    self._anchor_write_blocked = False
+                    self._anchor_last_success_seq = remote_seq
+                    self._anchor_last_error_code = None
+            else:
+                evidence = asyncio.run(self._collect_evidence())
+                historical = self._anchor_payload(
+                    remote_seq,
+                    "" if remote_seq == 0 else evidence[remote_seq - 1].current_hash,
+                ).model_copy(
+                    update={"audit_hash": self._audit_hash_at_seq(remote_seq)}
+                )
+                if remote_payload != historical:
+                    self._anchor_status = "anchor_conflict"
+                    self._anchor_write_blocked = True
+                    self._anchor_last_error_code = "anchor_conflict"
+                else:
+                    self._anchor_status = "healthy"
+                    self._anchor_write_blocked = False
+                    self._anchor_last_success_seq = remote_seq
+                    self._anchor_last_error_code = None
+        except AnchorBackendError as exc:
+            self._anchor_status = "anchor_unavailable" if exc.retryable else "anchor_conflict"
+            self._anchor_write_blocked = not exc.retryable
+            self._anchor_last_error_code = exc.code
+        except Exception:
+            self._anchor_status = "anchor_conflict"
+            self._anchor_write_blocked = True
+            self._anchor_last_error_code = "anchor_verification_failed"
+        return self.anchor_summary()
+
+    async def verify_anchor(self) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._write_executor, self._verify_anchor_serialized)
+
+    def _verify_anchor_serialized(self) -> dict[str, object]:
+        with self._sync_lock:
+            return self._verify_anchor_locked()
+
+    async def publish_anchor(self) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._write_executor, self._publish_anchor_serialized)
+
+    def _publish_anchor_serialized(self) -> dict[str, object]:
+        with self._sync_lock:
+            if self._anchor_backend is None or self._evidence_chain is None:
+                return self.anchor_summary()
+            if self._anchor_status in {
+                "bootstrap_required",
+                "rollback_detected",
+                "anchor_conflict",
+            }:
+                raise RuntimeError("当前 Anchor 状态不允许普通 publish")
+            asyncio.run(self._verify_evidence_consistency())
+            checkpoint = self._evidence_chain.read_checkpoint()
+            if checkpoint is not None:
+                self._publish_anchor(
+                    int(checkpoint["evidence_seq"]),
+                    str(checkpoint["evidence_hash"]),
+                    None,
+                )
+            return self.anchor_summary()
+
+    async def bootstrap_anchor(self, event: AuditEvent) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._write_executor, self._bootstrap_anchor_serialized, event
+        )
+
+    def _bootstrap_anchor_serialized(self, event: AuditEvent) -> dict[str, object]:
+        with self._sync_lock:
+            if self._anchor_backend is None or self._evidence_chain is None:
+                raise RuntimeError("Anchor 未配置")
+            self._verify_anchor_locked()
+            if self._anchor_status != "bootstrap_required":
+                raise RuntimeError("当前 Anchor 状态不允许 bootstrap")
+            asyncio.run(self._verify_evidence_consistency())
+            self._anchor_bootstrap_active = True
+            try:
+                self._append_locked(event)
+            finally:
+                self._anchor_bootstrap_active = False
+            return self.anchor_summary()
+
+    @property
+    def anchor_status(self) -> str:
+        return self._anchor_status
+
+    @property
+    def anchor_last_success_seq(self) -> int:
+        return self._anchor_last_success_seq
+
+    @property
+    def write_blocked(self) -> bool:
+        return self._write_blocked or self._anchor_write_blocked
 
     def seal(self, reason: str = "periodic_seal") -> AuditEvent:
         """写入 seal 记录，固定当前链累积 HMAC。

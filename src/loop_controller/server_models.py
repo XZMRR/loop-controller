@@ -54,6 +54,11 @@ class HealthResponse(BaseModel):
     evidence_status: str = Field(
         default="disabled", description="签名证据链状态：healthy / degraded / disabled"
     )
+    anchor_status: str = Field(default="disabled", description="可信锚点状态")
+    anchor_stream_id: str | None = Field(default=None, description="锚点流 ID")
+    anchor_last_success_seq: int = Field(default=0, description="最近成功锚定序号")
+    anchor_lag_events: int = Field(default=0, description="尚未被锚定的本地事件数")
+    anchor_last_error_code: str | None = Field(default=None, description="净化后的稳定错误码")
     uptime_seconds: float = Field(default=0.0, description="服务运行秒数")
 
 

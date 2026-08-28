@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from loop_controller.approval_manager import AsyncApprovalManager
+from loop_controller.audit.anchor_backends import HTTPAnchorBackend, HTTPAnchorConfig
+from loop_controller.audit.anchors import AnchorReceiptVerifier
 from loop_controller.audit.evidence import Ed25519EvidenceSigner, EvidenceChain, HMACEvidenceSigner
 from loop_controller.audit.evidence_backends import LocalFileEvidenceBackend
 from loop_controller.audit_analyzer import AuditAnalyzer, RuleBasedAuditAnalyzer
@@ -100,6 +102,7 @@ class Runtime:
     hot_reloader: HotReloader | None = None  # v0.22.0
     harness_executor: HarnessExecutor | None = None  # v0.25.0
     revocation_list: RevocationList = field(default_factory=RevocationList)  # v0.26.0
+    evidence_anchor: HTTPAnchorBackend | None = None  # v0.28.0
 
     def create_task(
         self,
@@ -171,9 +174,13 @@ class Runtime:
         return self.conversation_store.get_context(session_id)
 
     async def start(self) -> None:
-        """拉起 MCP gateway 等异步初始化。"""
+        """完成本地/远端完整性验证后，按锚点状态决定是否拉起执行面。"""
         if isinstance(self.audit_store, JsonlAuditStore):
-            await self.audit_store.verify_evidence_chain()
+            local_valid = await self.audit_store.verify_evidence_chain()
+            if local_valid:
+                await self.audit_store.verify_anchor_startup()
+            if self.audit_store.write_blocked:
+                return
         await self.gateway.start()
         if self.http_client is not None:
             await self.http_client.start()
@@ -191,6 +198,8 @@ class Runtime:
         await self.gateway.aclose()
         if self.http_client is not None:
             await self.http_client.aclose()
+        if self.evidence_anchor is not None:
+            self.evidence_anchor.close()
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +286,45 @@ def _build_evidence_chain(config: AppConfig) -> EvidenceChain | None:
         checkpoint_path = Path(config.policy_dir).parent / checkpoint_path
     return EvidenceChain(
         LocalFileEvidenceBackend(path), signer, checkpoint_path=checkpoint_path
+    )
+
+
+def _build_evidence_anchor(
+    config: AppConfig, alert_store: JsonlAlertStore | None = None
+) -> HTTPAnchorBackend | None:
+    evidence = config.evidence_config.get("evidence", {})
+    anchor = evidence.get("anchor", {})
+    if not anchor.get("enabled", False):
+        return None
+    auth = anchor["auth"]
+    tls = anchor["tls"]
+    receipt = anchor["receipt"]
+    startup = anchor["startup"]
+    root = Path(config.policy_dir).parent
+
+    def resolve_path(value: str | None) -> str | None:
+        if value is None:
+            return None
+        path = Path(value)
+        return str(path if path.is_absolute() else root / path)
+
+    return HTTPAnchorBackend(
+        HTTPAnchorConfig(
+            stream_id=anchor["stream_id"],
+            base_url=anchor["base_url"],
+            connect_timeout_seconds=float(anchor["connect_timeout_seconds"]),
+            request_timeout_seconds=float(anchor["request_timeout_seconds"]),
+            token=os.environ[auth["token_env"]],
+            verify=tls["verify"],
+            ca_file=resolve_path(tls.get("ca_file")),
+            client_cert_file=resolve_path(tls.get("client_cert_file")),
+            client_key_file=resolve_path(tls.get("client_key_file")),
+            service_key_id=receipt["service_key_id"],
+            public_key=ConfigLoader.resolve_anchor_public_key(config),
+            unavailable_policy=startup["unavailable_policy"],
+            conflict_policy=startup["conflict_policy"],
+        ),
+        alert_store=alert_store,
     )
 
 
@@ -406,6 +454,7 @@ def build_runtime(
         audit_key = ConfigLoader.resolve_audit_key(config)
     evidence_chain = _build_evidence_chain(config)
     alert_store = JsonlAlertStore(config.alert_store_path)
+    evidence_anchor = _build_evidence_anchor(config, alert_store)
     audit_store = JsonlAuditStore(
         config.audit_log_path,
         hash_algo=config.audit_hash_algo,
@@ -413,6 +462,15 @@ def build_runtime(
         key_id=config.audit_key_id,
         evidence_chain=evidence_chain,
         alert_store=alert_store,
+        anchor_backend=evidence_anchor,
+        anchor_stream_id=evidence_anchor.stream_id if evidence_anchor is not None else None,
+        anchor_receipt_verifier=(
+            AnchorReceiptVerifier(
+                {evidence_anchor.config.service_key_id: evidence_anchor.config.public_key}
+            )
+            if evidence_anchor is not None and evidence_anchor.config is not None
+            else None
+        ),
     )
     checkpoint._audit_store = audit_store
     approval_manager = AsyncApprovalManager(
@@ -465,4 +523,5 @@ def build_runtime(
         harness_executor=harness_executor,
         # 复用 HotReloader 持有的可变撤销列表，确保热更新对 Runtime 可见。
         revocation_list=revocation_list,
+        evidence_anchor=evidence_anchor,
     )

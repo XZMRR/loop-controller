@@ -1880,3 +1880,67 @@ v0.23.2 已完成 v0.23.1 残留问题的收尾。v0.24.0 根据 `src/audit_repo
 ### 设计文档
 
 - `src/loop_controller_v0.27.0_development.md`
+
+---
+
+## v0.28.0：可信锚点与审计链外部闭环
+
+### 完成内容
+
+- **锚点数据模型与密码学协议**：
+  - 新增 `src/loop_controller/audit/anchors.py`：`AnchorPayload`、`AnchorReceipt` 冻结模型；
+  - canonical JSON、严格 Base64、固定六位微秒 UTC RFC3339；
+  - SHA-256 幂等键与 Ed25519 receipt 签名验证；
+  - 拒绝额外字段、未知 schema version 和非规范时间表示。
+
+- **HTTP 可信锚点后端**：
+  - 新增 `src/loop_controller/audit/anchor_backends.py`：`HTTPAnchorBackend`；
+  - `PUT /v1/anchors/{stream_id}` + `GET .../latest`；
+  - Bearer 认证、企业 CA / mTLS、独立 connect/request 超时；
+  - 稳定脱敏错误码：`anchor_authentication_failed`、`anchor_conflict`、`anchor_rollback_rejected`、`anchor_rate_limited`、`anchor_timeout`、`anchor_unavailable`、`anchor_receipt_invalid`；
+  - PUT 超时等不确定结果通过 `latest` 消解，避免重复提交或错误冲突。
+
+- **AuditStore 集成**：
+  - `JsonlAuditStore` 在 checkpoint 成功后自动向远程锚点发布当前审计链状态；
+  - 启动时交叉验证本地证据/审计与远程最新锚点；远程序号超前时校验历史锚点与本地后缀一致性，合法则重建本地 checkpoint；
+  - 冲突或回滚时进入 `anchor_conflict` / `anchor_rollback_rejected`，阻断后续写入并生成 critical alert；
+  - 支持管理员显式 `verify_anchor`、`publish_anchor`、`bootstrap_anchor`。
+
+- **配置与 Runtime 集成**：
+  - `config/evidence.yaml` 增加 `anchor` 配置块；
+  - `ConfigLoader` 严格校验 anchor enabled 依赖、HTTPS URL、stream ID 路径穿越、timeout、认证、TLS、mTLS、receipt 公钥与启动策略；
+  - `Runtime` 构造 `HTTPAnchorBackend` 并在关闭时释放客户端。
+
+- **管理接口**：
+  - `GET /v1/admin/evidence/anchor`：净化后的锚点摘要；
+  - `POST /v1/admin/evidence/anchor/verify`：手动触发远程校验；
+  - `POST /v1/admin/evidence/anchor/publish`：手动触发锚点发布；
+  - `POST /v1/admin/evidence/anchor/bootstrap`：受控 bootstrap。
+
+- **SQLite 参考锚点服务**：
+  - 新增 `examples/contrib/anchor/anchor_service.py`；
+  - Bearer 认证、请求体限制、严格 payload 校验、幂等键校验；
+  - `BEGIN IMMEDIATE` 事务单调 CAS，同序号分叉与回滚拒绝；
+  - Ed25519 receipt 签发，进程重启后 latest 不回退；
+  - 稳定错误码，不泄露认证 Secret。
+
+- **指标**：
+  - 新增 `loop_controller_anchor_publish_total`、`loop_controller_anchor_publish_duration_seconds`、`loop_controller_anchor_last_success_seq`、`loop_controller_anchor_lag_events`、`loop_controller_anchor_status`、`loop_controller_anchor_conflicts_total`。
+
+### 准确边界
+
+- 锚点服务依赖外部可信运行实例，Loop Controller 只验证 receipt 签名与链一致性，不信任服务端本身；
+- HTTP 后端在不确定结果时通过 `latest` 消解，不自动重试；远端执行中的更新仍可能被视为冲突；
+- 本地 JSONL 证据/审计文件仍是单进程追加写，不提供多 writer 并发安全；
+- bootstrap 需要管理员显式调用，不会在启动时自动执行；
+- 当前 receipt 验证仅支持 Ed25519，不支持多签或 threshold 签名。
+
+### 验证
+
+- `pytest tests/`：**623 passed，1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.28.0_development.md`

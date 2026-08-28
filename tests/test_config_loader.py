@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import shutil
 import socket
@@ -18,6 +19,8 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from loop_controller.infra.config_loader import ConfigLoader, ConfigValidationError
 from tests.conftest import resolve_opa_bin
@@ -140,6 +143,45 @@ def opa_server(tmp_path_factory) -> str:
         proc.kill()
 
 
+def _valid_anchor_config(config_dir: Path) -> dict:
+    public_key = Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    (config_dir / "anchor-service.pub").write_bytes(public_key)
+    return {
+        "evidence": {
+            "enabled": True,
+            "backend": "local",
+            "anchor": {
+                "enabled": True,
+                "type": "http",
+                "stream_id": "deployment-01/default",
+                "base_url": "https://anchor.internal.example",
+                "connect_timeout_seconds": 1.0,
+                "request_timeout_seconds": 3.0,
+                "every_n_events": 1,
+                "auth": {"type": "bearer", "token_env": "TEST_ANCHOR_TOKEN"},
+                "tls": {
+                    "verify": True,
+                    "ca_file": None,
+                    "client_cert_file": None,
+                    "client_key_file": None,
+                },
+                "receipt": {
+                    "algorithm": "ed25519",
+                    "service_key_id": "anchor-service-01",
+                    "public_key_file": "config/anchor-service.pub",
+                },
+                "startup": {
+                    "unavailable_policy": "degrade",
+                    "conflict_policy": "block_writes",
+                },
+            },
+        }
+    }
+
+
 def test_load_valid_config(config_dir):
     config = ConfigLoader().load(config_dir)  # 无 opa_base_url，跳过校验 3
     assert "researcher_001" in config.agents
@@ -151,6 +193,70 @@ def test_load_valid_config(config_dir):
     }
     assert config.tool_mapping["send_email"].mcp_name == "send_email"
     assert config.approval.default == "zhang_manager"
+
+
+def test_anchor_valid_config_loads(config_dir, monkeypatch):
+    monkeypatch.setenv("TEST_ANCHOR_TOKEN", "secret-token")
+    _write_yaml(config_dir / "evidence.yaml", _valid_anchor_config(config_dir))
+
+    config = ConfigLoader().load(config_dir)
+
+    assert config.evidence_config["evidence"]["anchor"]["stream_id"] == "deployment-01/default"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda data: data["evidence"].update(enabled=False), "evidence.enabled"),
+        (lambda data: data["evidence"].update(backend="remote"), "evidence.backend"),
+        (lambda data: data["evidence"]["anchor"].update(type="file"), "只能是 http"),
+        (lambda data: data["evidence"]["anchor"].update(stream_id="../default"), "stream_id"),
+        (lambda data: data["evidence"]["anchor"].update(base_url="http://anchor.example"), "HTTPS URL"),
+        (lambda data: data["evidence"]["anchor"].update(base_url="https://u:p@anchor.example"), "HTTPS URL"),
+        (lambda data: data["evidence"]["anchor"].update(base_url="https://anchor.example?q=1"), "HTTPS URL"),
+        (lambda data: data["evidence"]["anchor"].update(connect_timeout_seconds=0), "connect_timeout"),
+        (lambda data: data["evidence"]["anchor"].update(request_timeout_seconds=61), "request_timeout"),
+        (lambda data: data["evidence"]["anchor"].update(every_n_events=2), "every_n_events"),
+        (lambda data: data["evidence"]["anchor"]["auth"].update(type="none"), "auth.type"),
+        (lambda data: data["evidence"]["anchor"]["tls"].update(verify=False), "tls.verify"),
+        (lambda data: data["evidence"]["anchor"]["tls"].update(ca_file="missing.pem"), "TLS 文件"),
+        (lambda data: data["evidence"]["anchor"]["tls"].update(client_cert_file="cert.pem"), "必须同时配置"),
+        (lambda data: data["evidence"]["anchor"]["receipt"].update(algorithm="hmac-sha256"), "只能是 ed25519"),
+        (lambda data: data["evidence"]["anchor"]["receipt"].update(service_key_id=""), "service_key_id"),
+        (lambda data: data["evidence"]["anchor"]["receipt"].update(public_key_file="missing.pub"), "公钥"),
+        (lambda data: data["evidence"]["anchor"]["startup"].update(unavailable_policy="block"), "unavailable_policy"),
+        (lambda data: data["evidence"]["anchor"]["startup"].update(conflict_policy="ignore"), "conflict_policy"),
+    ],
+)
+def test_anchor_invalid_config_fails_before_runtime(config_dir, monkeypatch, mutate, message):
+    monkeypatch.setenv("TEST_ANCHOR_TOKEN", "secret-token")
+    data = copy.deepcopy(_valid_anchor_config(config_dir))
+    mutate(data)
+    _write_yaml(config_dir / "evidence.yaml", data)
+
+    with pytest.raises(ConfigValidationError, match=message):
+        ConfigLoader().load(config_dir)
+
+
+def test_anchor_missing_token_fails_without_leaking_secret(config_dir, monkeypatch):
+    monkeypatch.delenv("TEST_ANCHOR_TOKEN", raising=False)
+    _write_yaml(config_dir / "evidence.yaml", _valid_anchor_config(config_dir))
+
+    with pytest.raises(ConfigValidationError) as captured:
+        ConfigLoader().load(config_dir)
+
+    assert "secret-token" not in str(captured.value)
+    assert "TEST_ANCHOR_TOKEN" in str(captured.value)
+
+
+def test_anchor_unparseable_public_key_fails(config_dir, monkeypatch):
+    monkeypatch.setenv("TEST_ANCHOR_TOKEN", "secret-token")
+    data = _valid_anchor_config(config_dir)
+    (config_dir / "anchor-service.pub").write_text("not-a-public-key", encoding="utf-8")
+    _write_yaml(config_dir / "evidence.yaml", data)
+
+    with pytest.raises(ConfigValidationError, match="公钥"):
+        ConfigLoader().load(config_dir)
 
 
 # 校验 1：profile_id 存在性

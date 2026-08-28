@@ -167,6 +167,21 @@ class ToolGovernServer:
             token
         ) and hmac.compare_digest(token, self._api_key)
 
+    def _admin_actor_id(self, request: Request) -> str:
+        """从请求中提取管理员 API key 的匿名标识；未认证时返回 unauthenticated。"""
+        if not self._api_key:
+            return "unauthenticated"
+        header = request.headers.get("x-api-key") or ""
+        auth = request.headers.get("authorization") or ""
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+        else:
+            token = ""
+        key = header or token
+        if not key:
+            return "unauthenticated"
+        return f"api-key:{hashlib.sha256(key.encode()).hexdigest()[:12]}"
+
     async def _audit_admin_operation(
         self,
         request: Request,
@@ -178,8 +193,7 @@ class ToolGovernServer:
         audit_store = getattr(self._controller._runtime, "audit_store", None)
         if audit_store is None:
             return
-        api_key = self._api_key or ""
-        actor_id = f"api-key:{hashlib.sha256(api_key.encode()).hexdigest()[:12]}"
+        actor_id = self._admin_actor_id(request)
         trace_id = getattr(request.state, "trace_id", uuid.uuid4().hex[:16])
         await audit_store.append_async(
             AuditEvent(
@@ -228,14 +242,31 @@ class ToolGovernServer:
         gateway_ready = self._controller.started if hasattr(self._controller, "started") else True
         audit_store = self._controller._runtime.audit_store
         evidence_status = getattr(audit_store, "evidence_status", "disabled")
+        anchor = getattr(self._controller._runtime, "evidence_anchor", None)
+        anchor_summary = (
+            anchor.sanitized_status()
+            if anchor is not None
+            else {
+                "anchor_status": "disabled",
+                "anchor_stream_id": None,
+                "anchor_last_success_seq": 0,
+                "anchor_lag_events": 0,
+                "anchor_last_error_code": None,
+            }
+        )
         uptime = time.time() - self._start_time
+        degraded = evidence_status == "degraded" or anchor_summary["anchor_status"] not in {
+            "disabled",
+            "healthy",
+        }
         return JSONResponse(
             HealthResponse(
-                status="degraded" if evidence_status == "degraded" else "ok",
+                status="degraded" if degraded else "ok",
                 opa_reachable=opa_reachable,
                 gateway_ready=gateway_ready,
                 evidence_status=evidence_status,
                 uptime_seconds=round(uptime, 2),
+                **anchor_summary,
             ).model_dump()
         )
 
@@ -565,6 +596,90 @@ class ToolGovernServer:
             }
         )
 
+    async def _handle_admin_evidence_anchor(self, request: Request) -> JSONResponse:
+        if self._api_key is not None and not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        audit_store = self._controller._runtime.audit_store
+        if hasattr(audit_store, "anchor_summary"):
+            return JSONResponse(audit_store.anchor_summary())
+        return JSONResponse(
+            {
+                "evidence_status": "disabled",
+                "anchor_status": "disabled",
+                "anchor_stream_id": None,
+                "anchor_last_success_seq": 0,
+                "anchor_lag_events": 0,
+                "anchor_last_error_code": None,
+            }
+        )
+
+    async def _handle_admin_evidence_anchor_verify(self, request: Request) -> JSONResponse:
+        if self._api_key is not None and not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        audit_store = self._controller._runtime.audit_store
+        if not hasattr(audit_store, "verify_anchor"):
+            return JSONResponse({"error": "anchor unavailable"}, status_code=503)
+        summary = await audit_store.verify_anchor()
+        await self._audit_admin_operation(
+            request,
+            "anchor_verify",
+            target="anchor",
+            metadata={"anchor_status": summary.get("anchor_status")},
+        )
+        return JSONResponse(summary)
+
+    async def _handle_admin_evidence_anchor_publish(self, request: Request) -> JSONResponse:
+        if self._api_key is not None and not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        audit_store = self._controller._runtime.audit_store
+        if not hasattr(audit_store, "publish_anchor"):
+            return JSONResponse({"error": "anchor unavailable"}, status_code=503)
+        try:
+            summary = await audit_store.publish_anchor()
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        await self._audit_admin_operation(
+            request,
+            "anchor_publish",
+            target="anchor",
+            metadata={"anchor_status": summary.get("anchor_status")},
+        )
+        return JSONResponse(summary)
+
+    async def _handle_admin_evidence_anchor_bootstrap(self, request: Request) -> JSONResponse:
+        if self._api_key is not None and not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        audit_store = self._controller._runtime.audit_store
+        if not hasattr(audit_store, "bootstrap_anchor"):
+            return JSONResponse({"error": "anchor unavailable"}, status_code=503)
+
+        trace_id = getattr(request.state, "trace_id", uuid.uuid4().hex[:16])
+        event = AuditEvent(
+            event_id=uuid.uuid4().hex,
+            trace_id=trace_id,
+            session_id="admin",
+            actor_type="system",
+            actor_id=self._admin_actor_id(request),
+            action="anchor_bootstrap",
+            target="anchor",
+            reason="explicit bootstrap",
+        )
+        try:
+            summary = await audit_store.bootstrap_anchor(event)
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        await self._audit_admin_operation(
+            request,
+            "anchor_bootstrap",
+            target="anchor",
+            metadata={"anchor_status": summary.get("anchor_status")},
+        )
+        return JSONResponse(summary)
+
     async def _handle_admin_audit(self, request: Request) -> JSONResponse:
         if self._api_key is not None and not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -661,6 +776,10 @@ def build_app(
             Route("/v1/wait-for-approval/sse", server._handle_wait_for_approval_sse, methods=["GET"]),
             Route("/v1/admin/approvals/pending", server._handle_admin_pending_approvals, methods=["GET"]),
             Route("/v1/admin/harness/backends", server._handle_admin_harness_backends, methods=["GET"]),
+            Route("/v1/admin/evidence/anchor", server._handle_admin_evidence_anchor, methods=["GET"]),
+            Route("/v1/admin/evidence/anchor/verify", server._handle_admin_evidence_anchor_verify, methods=["POST"]),
+            Route("/v1/admin/evidence/anchor/publish", server._handle_admin_evidence_anchor_publish, methods=["POST"]),
+            Route("/v1/admin/evidence/anchor/bootstrap", server._handle_admin_evidence_anchor_bootstrap, methods=["POST"]),
             Route("/admin/revoke", server._handle_admin_revoke, methods=["POST", "DELETE"]),
             Route("/admin/revocation-list", server._handle_admin_revocation_list, methods=["GET"]),
             Route("/admin/kill-switch", server._handle_admin_kill_switch, methods=["POST"]),

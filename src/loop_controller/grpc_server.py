@@ -312,13 +312,31 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         gateway_ready = getattr(self._controller, "started", True)
         audit_store = self._controller._runtime.audit_store
         evidence_status = getattr(audit_store, "evidence_status", "disabled")
+        anchor = getattr(self._controller._runtime, "evidence_anchor", None)
+        anchor_summary = (
+            anchor.sanitized_status()
+            if anchor is not None
+            else {
+                "anchor_status": "disabled",
+                "anchor_stream_id": "",
+                "anchor_last_success_seq": 0,
+                "anchor_lag_events": 0,
+                "anchor_last_error_code": "",
+            }
+        )
+        anchor_summary = {key: value if value is not None else "" for key, value in anchor_summary.items()}
         uptime = time.time() - self._start_time
+        degraded = evidence_status == "degraded" or anchor_summary["anchor_status"] not in {
+            "disabled",
+            "healthy",
+        }
         return governance_pb2.HealthResponse(
-            status="degraded" if evidence_status == "degraded" else "ok",
+            status="degraded" if degraded else "ok",
             opa_reachable=opa_reachable,
             gateway_ready=gateway_ready,
             uptime_seconds=uptime,
             evidence_status=evidence_status,
+            **anchor_summary,
         )
 
     async def ListPendingApprovals(

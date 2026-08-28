@@ -316,6 +316,32 @@ HTTP 请求发送后超时或连接中断时，远端工具可能已经执行；
 
 `harness_tools.yaml` 仍只在启动时加载；认证环境变量、TLS 文件、工具注册和 backend 参数变更后需要重启。旧 `api_key_env` 仅为兼容入口，已弃用且不能与新 `auth` 同时配置。
 
+## v0.28.0 边界声明
+
+### V28-1. 可信锚点是外部独立服务
+
+Loop Controller 的 `HTTPAnchorBackend` 把本地审计/证据链的当前状态发布到外部可信锚点服务，并校验返回的 Ed25519 receipt。它只能验证 receipt 签名和链一致性，不能验证锚点服务进程、存储或管理员操作的可信性。锚点服务必须作为独立高可用系统部署，并自行保护其签名私钥与数据库。
+
+### V28-2. 锚点不提供跨实例分布式一致性
+
+锚点流 ID 与幂等键用于检测重复发布、同序号分叉和回滚，但 Loop Controller 与锚点服务之间仍是 HTTP 请求-响应。多 Loop Controller 实例同时写入同一 stream 时，依赖锚点服务端的原子 CAS 来裁决；Loop Controller 本地不做分布式锁或 leader 选举。
+
+### V28-3. 不确定结果通过 `latest` 消解，不自动重试
+
+PUT 超时、连接中断等不确定结果会通过 `GET /v1/anchors/{stream_id}/latest` 消解。若 latest 与本次发布一致则视为成功；若远端已被其他实例推进到更高序号，则报告冲突或回滚。本版本不会自动重试发布，也不保证远端动作已被执行或取消。
+
+### V28-4. bootstrap 是破坏性管理操作
+
+`POST /v1/admin/evidence/anchor/bootstrap` 会显式覆盖锚点服务当前流状态，仅应在灾难恢复或首次初始化时由管理员执行。误用可能导致远程锚点与本地状态不一致，且会写入 `anchor_bootstrap` 审计事件。
+
+### V28-5. 本地证据文件仍是单进程追加写
+
+即使接入了外部锚点，本地 `audit.jsonl` 与 evidence JSONL 仍然是单进程追加写文件。多 writer 并发访问同一文件不在本版本保证范围内；生产部署应保证每个 Loop Controller 实例使用独立的本地路径，或通过外部共享存储按部署约定协调。
+
+### V28-6. 仅支持 Ed25519 receipt 验证
+
+当前 receipt 签名算法固定为 Ed25519，不支持多签、threshold 签名或密钥轮换后的历史 receipt 兼容。服务公钥在启动时通过配置文件加载，运行期不支持轮换。
+
 ## 环境备注
 
 - **Windows 开发机**：关闭 MCP stdio 子进程时会打 anyio cancel-scope 的 WARNING 日志（mcp SDK 2.x 已知行为），不影响主链路；CI（Linux）下不应出现，出现即说明容错逻辑误吞了正常路径。

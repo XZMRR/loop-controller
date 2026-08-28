@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -508,3 +509,236 @@ def test_lifespan_starts_and_closes_controller() -> None:
         pass
     assert controller.started
     assert controller.closed
+
+
+def test_admin_anchor_endpoints_require_auth() -> None:
+    client, _controller = _build_client(api_key="secret")
+    for path, method in (
+        ("/v1/admin/evidence/anchor", "GET"),
+        ("/v1/admin/evidence/anchor/verify", "POST"),
+        ("/v1/admin/evidence/anchor/publish", "POST"),
+        ("/v1/admin/evidence/anchor/bootstrap", "POST"),
+    ):
+        resp = client.request(method, path)
+        assert resp.status_code == 401, path
+
+
+class _MockAuditStoreWithAnchor(_MockAuditStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._summary = {
+            "evidence_status": "healthy",
+            "anchor_status": "healthy",
+            "anchor_stream_id": "deployment/default",
+            "anchor_last_success_seq": 5,
+            "anchor_lag_events": 0,
+            "anchor_last_error_code": None,
+        }
+
+    async def append_async(self, event: Any) -> None:
+        return None
+
+    def anchor_summary(self) -> dict[str, object]:
+        return self._summary
+
+    async def verify_anchor(self) -> dict[str, object]:
+        self._summary["anchor_status"] = "healthy"
+        return self._summary
+
+    async def publish_anchor(self) -> dict[str, object]:
+        self._summary["anchor_last_success_seq"] = 6
+        return self._summary
+
+    async def bootstrap_anchor(self, event: Any) -> dict[str, object]:
+        self._summary["anchor_status"] = "healthy"
+        self._summary["anchor_last_success_seq"] = 1
+        return self._summary
+
+
+def test_admin_anchor_summary_returns_disabled_when_unconfigured() -> None:
+    client, _controller = _build_client(api_key="secret")
+    resp = client.get("/v1/admin/evidence/anchor", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["anchor_status"] == "disabled"
+
+
+def test_admin_anchor_verify_publish_bootstrap() -> None:
+    client, controller = _build_client(api_key="secret")
+    controller._runtime.audit_store = _MockAuditStoreWithAnchor()
+
+    resp = client.post("/v1/admin/evidence/anchor/verify", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 200
+    assert resp.json()["anchor_status"] == "healthy"
+
+    resp = client.post("/v1/admin/evidence/anchor/publish", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 200
+    assert resp.json()["anchor_last_success_seq"] == 6
+
+    resp = client.post("/v1/admin/evidence/anchor/bootstrap", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 200
+    assert resp.json()["anchor_last_success_seq"] == 1
+
+
+def test_admin_anchor_publish_returns_conflict_when_blocked() -> None:
+    class BlockingStore(_MockAuditStoreWithAnchor):
+        async def publish_anchor(self) -> dict[str, object]:
+            raise RuntimeError("当前 Anchor 状态不允许普通 publish")
+
+    client, controller = _build_client(api_key="secret")
+    controller._runtime.audit_store = BlockingStore()
+    resp = client.post("/v1/admin/evidence/anchor/publish", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 409
+    assert "不允许普通 publish" in resp.json()["error"]
+
+
+def test_admin_anchor_bootstrap_returns_conflict_when_not_allowed() -> None:
+    class BlockingStore(_MockAuditStoreWithAnchor):
+        async def bootstrap_anchor(self, event: Any) -> dict[str, object]:
+            raise RuntimeError("当前 Anchor 状态不允许 bootstrap")
+
+    client, controller = _build_client(api_key="secret")
+    controller._runtime.audit_store = BlockingStore()
+    resp = client.post("/v1/admin/evidence/anchor/bootstrap", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 409
+    assert "不允许 bootstrap" in resp.json()["error"]
+
+
+def test_admin_evidence_anchor_with_real_store(tmp_path: Path) -> None:
+    """使用临时目录、真实 JsonlAuditStore（启用 evidence chain）与内存 EvidenceAnchorBackend
+    覆盖 Admin Anchor HTTP 端点，并校验每次 Admin 操作均写入审计事件。"""
+
+    import asyncio
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from loop_controller.audit.anchors import AnchorReceipt, AnchorReceiptVerifier
+    from loop_controller.audit.evidence import EvidenceChain, HMACEvidenceSigner
+    from loop_controller.audit.evidence_backends import LocalFileEvidenceBackend
+    from loop_controller.infra.audit_store import JsonlAuditStore
+    from loop_controller.models import AuditEvent
+    from loop_controller.utils.canonical import canonical_json
+
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    class _MemoryAnchorBackend:
+        """可切换 latest 行为的内存 EvidenceAnchorBackend，用于构造 healthy /
+        bootstrap_required 两种状态。"""
+
+        def __init__(self, key: Ed25519PrivateKey) -> None:
+            self.key = key
+            self.receipts: dict[str, AnchorReceipt] = {}
+            self.latest_returns_none = False
+
+        def publish(self, payload, *, idempotency_key: str) -> AnchorReceipt:
+            receipt = self._make_receipt(payload)
+            self.receipts[payload.stream_id] = receipt
+            return receipt
+
+        def latest(self, stream_id: str) -> AnchorReceipt | None:
+            if self.latest_returns_none:
+                return None
+            return self.receipts.get(stream_id)
+
+        def close(self) -> None:
+            return None
+
+        def _make_receipt(self, payload) -> AnchorReceipt:
+            unsigned = {
+                "receipt_id": f"receipt-{payload.audit_seq}",
+                "payload": payload.model_dump(mode="json"),
+                "anchored_at": "2026-08-28T12:00:01.000000Z",
+                "service_key_id": "service-1",
+                "algorithm": "ed25519",
+            }
+            signature = self.key.sign(canonical_json(unsigned).encode("utf-8"))
+            return AnchorReceipt.model_validate(
+                {
+                    **unsigned,
+                    "signature": base64.b64encode(signature).decode("ascii"),
+                }
+            )
+
+    backend = _MemoryAnchorBackend(private_key)
+    verifier = AnchorReceiptVerifier({"service-1": public_key})
+
+    def _build_store(path: Path) -> JsonlAuditStore:
+        chain = EvidenceChain(
+            LocalFileEvidenceBackend(path / "evidence"),
+            HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+            checkpoint_path=path / "checkpoint.json",
+        )
+        return JsonlAuditStore(
+            path / "audit.jsonl",
+            evidence_chain=chain,
+            anchor_backend=backend,
+            anchor_stream_id="deployment/default",
+            anchor_receipt_verifier=verifier,
+        )
+
+    async def _collect_events(store: JsonlAuditStore) -> list[AuditEvent]:
+        return [event async for event in store.iter_events()]
+
+    store_dir = tmp_path / "store"
+    store = _build_store(store_dir)
+    store.append(
+        AuditEvent(
+            event_id="event-1",
+            trace_id="trace-1",
+            session_id="session-1",
+            actor_type="agent",
+            actor_id="agent-1",
+            action="execute",
+            target="web_search",
+            reason="seed local chain",
+        )
+    )
+
+    controller = _MockController()
+    controller._runtime.audit_store = store
+    client = TestClient(build_app(controller, api_key="secret", configure_logs=False))
+
+    headers = {"X-API-Key": "secret"}
+
+    # GET /v1/admin/evidence/anchor 返回摘要
+    resp = client.get("/v1/admin/evidence/anchor", headers=headers)
+    assert resp.status_code == 200
+    summary = resp.json()
+    assert summary["anchor_status"] == "healthy"
+    assert summary["evidence_status"] == "healthy"
+    assert summary["anchor_stream_id"] == "deployment/default"
+
+    # POST /v1/admin/evidence/anchor/publish 在 healthy 状态下发布本地尾部
+    resp = client.post("/v1/admin/evidence/anchor/publish", headers=headers)
+    assert resp.status_code == 200
+    publish_summary = resp.json()
+    assert publish_summary["anchor_status"] == "healthy"
+    assert publish_summary["anchor_last_success_seq"] == 1
+
+    events = asyncio.run(_collect_events(store))
+    admin_ops = [e for e in events if e.action == "admin_operation"]
+    assert len(admin_ops) == 1
+    assert admin_ops[0].reason == "anchor_publish"
+    assert admin_ops[0].target == "anchor"
+
+    # 将后端切换为返回 None，使下一次 verify 进入 bootstrap_required
+    backend.latest_returns_none = True
+
+    # POST /v1/admin/evidence/anchor/bootstrap 在 bootstrap_required 状态下写入
+    # bootstrap 锚点和管理事件
+    resp = client.post("/v1/admin/evidence/anchor/bootstrap", headers=headers)
+    assert resp.status_code == 200
+    bootstrap_summary = resp.json()
+    assert bootstrap_summary["anchor_status"] == "healthy"
+    assert bootstrap_summary["anchor_last_success_seq"] == 3
+
+    events = asyncio.run(_collect_events(store))
+    admin_ops = [e for e in events if e.action == "admin_operation"]
+    assert len(admin_ops) == 2
+    assert admin_ops[-1].reason == "anchor_bootstrap"
+    assert admin_ops[-1].target == "anchor"
+    bootstrap_events = [e for e in events if e.action == "anchor_bootstrap"]
+    assert len(bootstrap_events) == 1
+    assert bootstrap_events[0].target == "anchor"

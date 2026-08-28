@@ -29,6 +29,8 @@ from urllib.parse import urlparse
 
 import httpx
 import yaml
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
@@ -370,6 +372,7 @@ class ConfigLoader:
         self._check_harness_config(app_config)
         self._check_identity_config(app_config)
         self._check_entrypoints_config(app_config)
+        self._check_evidence_config(app_config)
         return app_config
 
     # -- 各 YAML 解析 -------------------------------------------------------
@@ -897,6 +900,151 @@ class ConfigLoader:
                     raise ConfigValidationError(
                         f"Harness HTTP 后端 {name} 的 TLS 文件 {field_name} 不存在或不可读"
                     )
+
+    def _check_evidence_config(self, config: AppConfig) -> None:
+        """校验 v0.28 Evidence Anchor 的启动期安全边界。"""
+        evidence = config.evidence_config.get("evidence")
+        if evidence is None:
+            return
+        if not isinstance(evidence, dict):
+            raise ConfigValidationError("evidence 必须是对象")
+        evidence_enabled = evidence.get("enabled", False)
+        if not isinstance(evidence_enabled, bool):
+            raise ConfigValidationError("evidence.enabled 必须是布尔值")
+        if evidence_enabled and evidence.get("backend", "local") != "local":
+            raise ConfigValidationError("evidence.backend 当前只能是 local")
+        anchor = evidence.get("anchor")
+        if anchor is None:
+            return
+        if not isinstance(anchor, dict):
+            raise ConfigValidationError("evidence.anchor 必须是对象")
+        anchor_enabled = anchor.get("enabled", False)
+        if not isinstance(anchor_enabled, bool):
+            raise ConfigValidationError("evidence.anchor.enabled 必须是布尔值")
+        if not anchor_enabled:
+            return
+        if not evidence_enabled:
+            raise ConfigValidationError(
+                "evidence.anchor.enabled=true 时 evidence.enabled 必须为 true"
+            )
+        if anchor.get("type") != "http":
+            raise ConfigValidationError("evidence.anchor.type 当前只能是 http")
+
+        stream_id = anchor.get("stream_id")
+        if not isinstance(stream_id, str) or not stream_id.strip():
+            raise ConfigValidationError("evidence.anchor.stream_id 必须是非空字符串")
+        if (
+            stream_id != stream_id.strip()
+            or "\\" in stream_id
+            or any(part in {"", ".", ".."} for part in stream_id.split("/"))
+            or any(ord(char) < 32 for char in stream_id)
+        ):
+            raise ConfigValidationError("evidence.anchor.stream_id 包含非法路径字符")
+
+        base_url = anchor.get("base_url")
+        if not isinstance(base_url, str):
+            raise ConfigValidationError("evidence.anchor.base_url 必须是有效的 HTTPS URL")
+        parsed = urlparse(base_url)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ConfigValidationError(
+                "evidence.anchor.base_url 必须是无 userinfo、query、fragment 的 HTTPS URL"
+            )
+
+        for name in ("connect_timeout_seconds", "request_timeout_seconds"):
+            value = anchor.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 60:
+                raise ConfigValidationError(f"evidence.anchor.{name} 必须大于 0 且不超过 60 秒")
+        if isinstance(anchor.get("every_n_events"), bool) or anchor.get("every_n_events") != 1:
+            raise ConfigValidationError("evidence.anchor.every_n_events 当前必须严格等于 1")
+
+        auth = anchor.get("auth")
+        if not isinstance(auth, dict) or auth.get("type") != "bearer":
+            raise ConfigValidationError("evidence.anchor.auth.type 当前只能是 bearer")
+        token_env = auth.get("token_env")
+        if not isinstance(token_env, str) or not token_env.strip():
+            raise ConfigValidationError("evidence.anchor.auth.token_env 必须是非空环境变量名")
+        if not os.environ.get(token_env, "").strip():
+            raise ConfigValidationError(
+                f"evidence.anchor 认证环境变量 {token_env!r} 未设置或为空"
+            )
+
+        tls = anchor.get("tls")
+        if not isinstance(tls, dict) or tls.get("verify") is not True:
+            raise ConfigValidationError("evidence.anchor.tls.verify 必须为 true")
+        cert_file = tls.get("client_cert_file")
+        key_file = tls.get("client_key_file")
+        if bool(cert_file) != bool(key_file):
+            raise ConfigValidationError("evidence.anchor TLS 客户端证书和私钥必须同时配置")
+        root = Path(config.policy_dir).parent
+        for name in ("ca_file", "client_cert_file", "client_key_file"):
+            value = tls.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigValidationError(f"evidence.anchor.tls.{name} 必须是非空文件路径")
+            path = Path(value)
+            if not path.is_absolute():
+                path = root / path
+            if not path.is_file() or not os.access(path, os.R_OK):
+                raise ConfigValidationError(
+                    f"evidence.anchor TLS 文件 {name} 不存在或不可读"
+                )
+
+        receipt = anchor.get("receipt")
+        if not isinstance(receipt, dict) or receipt.get("algorithm") != "ed25519":
+            raise ConfigValidationError("evidence.anchor.receipt.algorithm 当前只能是 ed25519")
+        key_id = receipt.get("service_key_id")
+        if not isinstance(key_id, str) or not key_id.strip():
+            raise ConfigValidationError("evidence.anchor.receipt.service_key_id 必须非空")
+        public_key_file = receipt.get("public_key_file")
+        if not isinstance(public_key_file, str) or not public_key_file.strip():
+            raise ConfigValidationError("evidence.anchor.receipt.public_key_file 必须配置")
+        try:
+            self.resolve_anchor_public_key(config)
+        except ValueError:
+            raise ConfigValidationError(
+                "evidence.anchor receipt 公钥不存在、不可读或不是有效 Ed25519 公钥"
+            ) from None
+
+        startup = anchor.get("startup")
+        if not isinstance(startup, dict):
+            raise ConfigValidationError("evidence.anchor.startup 必须是对象")
+        if startup.get("unavailable_policy") != "degrade":
+            raise ConfigValidationError(
+                "evidence.anchor.startup.unavailable_policy 当前只能是 degrade"
+            )
+        if startup.get("conflict_policy") != "block_writes":
+            raise ConfigValidationError(
+                "evidence.anchor.startup.conflict_policy 当前只能是 block_writes"
+            )
+
+    @staticmethod
+    def resolve_anchor_public_key(config: AppConfig) -> Ed25519PublicKey:
+        receipt = config.evidence_config["evidence"]["anchor"]["receipt"]
+        path = Path(receipt["public_key_file"])
+        if not path.is_absolute():
+            path = Path(config.policy_dir).parent / path
+        try:
+            encoded = path.read_bytes()
+            try:
+                key = serialization.load_pem_public_key(encoded)
+            except ValueError:
+                try:
+                    key = serialization.load_ssh_public_key(encoded)
+                except ValueError:
+                    key = Ed25519PublicKey.from_public_bytes(encoded)
+        except (OSError, ValueError):
+            raise ValueError("receipt 公钥无效") from None
+        if not isinstance(key, Ed25519PublicKey):
+            raise ValueError("receipt 公钥算法不是 Ed25519")
+        return key
 
     def _check_identity_config(self, config: AppConfig) -> None:
         """校验 identity provider 配置，避免启动后因配置错误才发现问题。"""

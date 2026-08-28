@@ -14,6 +14,8 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from loop_controller.audit.anchor_backends import AnchorBackendError
+from loop_controller.audit.anchors import AnchorReceipt, AnchorReceiptVerifier
 from loop_controller.audit.evidence import (
     Ed25519EvidenceSigner,
     EvidenceChain,
@@ -23,7 +25,8 @@ from loop_controller.audit.evidence_backends import LocalFileEvidenceBackend
 from loop_controller.infra.alert_store import InMemoryAlertStore
 from loop_controller.infra.audit_store import JsonlAuditStore
 from loop_controller.models import AuditEvent
-from loop_controller.runtime import Runtime, _build_evidence_chain
+from loop_controller.runtime import Runtime, _build_evidence_anchor, _build_evidence_chain
+from loop_controller.utils.canonical import canonical_json
 
 
 def _evidence_config(tmp_path: Path, evidence_config: dict) -> SimpleNamespace:
@@ -51,6 +54,51 @@ async def _records(backend: LocalFileEvidenceBackend):
     return [record async for record in backend.iter_evidence(None)]
 
 
+class _RecordingAnchor:
+    def __init__(self, key: Ed25519PrivateKey) -> None:
+        self.key = key
+        self.payloads = []
+        self.failures: list[AnchorBackendError] = []
+
+    def publish(self, payload, *, idempotency_key):
+        self.payloads.append(payload)
+        if self.failures:
+            raise self.failures.pop(0)
+        unsigned = {
+            "receipt_id": f"receipt-{payload.audit_seq}",
+            "payload": payload.model_dump(mode="json"),
+            "anchored_at": "2026-08-28T12:00:01.000000Z",
+            "service_key_id": "service-1",
+            "algorithm": "ed25519",
+        }
+        signature = self.key.sign(canonical_json(unsigned).encode("utf-8"))
+        return AnchorReceipt.model_validate(
+            {**unsigned, "signature": base64.b64encode(signature).decode("ascii")}
+        )
+
+    def latest(self, stream_id):
+        return None
+
+    def close(self):
+        return None
+
+
+def _anchored_store(tmp_path: Path, anchor: _RecordingAnchor, *, alert_store=None):
+    chain = EvidenceChain(
+        LocalFileEvidenceBackend(tmp_path / "evidence"),
+        HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
+        checkpoint_path=tmp_path / "checkpoint.json",
+    )
+    return JsonlAuditStore(
+        tmp_path / "audit.jsonl",
+        evidence_chain=chain,
+        alert_store=alert_store,
+        anchor_backend=anchor,
+        anchor_stream_id="deployment/default",
+        anchor_receipt_verifier=AnchorReceiptVerifier({"service-1": anchor.key.public_key()}),
+    )
+
+
 @pytest.mark.parametrize(
     "evidence_config",
     [
@@ -65,6 +113,49 @@ def test_evidence_missing_or_not_enabled_does_not_require_key(
     monkeypatch.delenv("LOOP_CONTROLLER_EVIDENCE_PRIVATE_KEY", raising=False)
 
     assert _build_evidence_chain(_evidence_config(tmp_path, evidence_config)) is None
+
+
+def test_build_evidence_anchor_connects_validated_config(tmp_path: Path, monkeypatch) -> None:
+    public_key_path = tmp_path / "anchor.pub"
+    public_key_path.write_bytes(
+        Ed25519PrivateKey.generate().public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    monkeypatch.setenv("TEST_ANCHOR_TOKEN", "secret-token")
+    config = _evidence_config(
+        tmp_path,
+        {
+            "evidence": {
+                "enabled": True,
+                "anchor": {
+                    "enabled": True,
+                    "stream_id": "deployment/default",
+                    "base_url": "https://anchor.example",
+                    "connect_timeout_seconds": 1,
+                    "request_timeout_seconds": 3,
+                    "auth": {"token_env": "TEST_ANCHOR_TOKEN"},
+                    "tls": {"verify": True},
+                    "receipt": {
+                        "service_key_id": "service-1",
+                        "public_key_file": str(public_key_path),
+                    },
+                    "startup": {
+                        "unavailable_policy": "degrade",
+                        "conflict_policy": "block_writes",
+                    },
+                },
+            }
+        },
+    )
+
+    backend = _build_evidence_anchor(config)
+
+    assert backend is not None
+    assert backend.config.stream_id == "deployment/default"
+    assert backend.config.token == "secret-token"
+    backend.close()
 
 
 def test_enabled_evidence_without_private_key_fails(tmp_path: Path, monkeypatch) -> None:
@@ -218,6 +309,58 @@ def test_evidence_failure_alerts_before_preserving_audit_event(tmp_path: Path) -
     assert alert.evidence == ["event-1"]
 
 
+def test_anchor_publishes_after_checkpoint_and_seal_uses_same_path(tmp_path: Path, monkeypatch) -> None:
+    anchor = _RecordingAnchor(Ed25519PrivateKey.generate())
+    store = _anchored_store(tmp_path, anchor)
+    original_publish = anchor.publish
+
+    def assert_checkpoint_then_publish(payload, *, idempotency_key):
+        checkpoint = store._evidence_chain.read_checkpoint()
+        assert checkpoint["audit_seq"] == payload.audit_seq
+        assert checkpoint["audit_hash"] == payload.audit_hash
+        assert checkpoint["evidence_hash"] == payload.evidence_hash
+        return original_publish(payload, idempotency_key=idempotency_key)
+
+    monkeypatch.setattr(anchor, "publish", assert_checkpoint_then_publish)
+    store.append(_event(1))
+    store.seal()
+
+    assert [payload.audit_seq for payload in anchor.payloads] == [1, 2]
+    assert store.anchor_status == "healthy"
+    assert store.anchor_last_success_seq == 2
+
+
+def test_anchor_network_failure_retries_latest_tail_on_next_commit(tmp_path: Path) -> None:
+    anchor = _RecordingAnchor(Ed25519PrivateKey.generate())
+    anchor.failures.append(AnchorBackendError("anchor_unavailable", retryable=True))
+    store = _anchored_store(tmp_path, anchor)
+
+    store.append(_event(1))
+    assert store.anchor_status == "degraded"
+    assert store.anchor_last_success_seq == 0
+    assert not store.write_blocked
+
+    store.append(_event(2))
+    assert [payload.audit_seq for payload in anchor.payloads] == [1, 2]
+    assert store.anchor_status == "healthy"
+    assert store.anchor_last_success_seq == 2
+
+
+def test_anchor_conflict_blocks_following_writes_and_alerts(tmp_path: Path) -> None:
+    anchor = _RecordingAnchor(Ed25519PrivateKey.generate())
+    anchor.failures.append(AnchorBackendError("anchor_conflict", retryable=False))
+    alerts = InMemoryAlertStore()
+    store = _anchored_store(tmp_path, anchor, alert_store=alerts)
+
+    store.append(_event(1))
+
+    assert store.anchor_status == "anchor_conflict"
+    assert store.write_blocked
+    assert alerts.list_alerts()[0].rule_id == "trusted_anchor_conflict"
+    with pytest.raises(RuntimeError, match="已阻断"):
+        store.append(_event(2))
+
+
 @pytest.mark.asyncio
 async def test_runtime_evidence_failure_degrades_and_success_does_not_recover(
     tmp_path: Path,
@@ -248,11 +391,12 @@ async def test_runtime_evidence_failure_degrades_and_success_does_not_recover(
     assert alert.rule_id == "evidence_chain_append_failed"
     assert alert.severity == "critical"
 
-    await store.append_async(_event(2))
+    with pytest.raises(RuntimeError, match="已阻断"):
+        await store.append_async(_event(2))
 
     assert store.evidence_status == "degraded"
-    assert len(store.query_by_trace("trace-1")) == 2
-    assert len(await _records(backend)) == 1
+    assert len(store.query_by_trace("trace-1")) == 1
+    assert len(await _records(backend)) == 0
 
 
 @pytest.mark.asyncio
@@ -276,12 +420,13 @@ async def test_success_after_evidence_failure_does_not_overwrite_checkpoint(tmp_
     store = JsonlAuditStore(tmp_path / "audit.jsonl", evidence_chain=chain)
 
     await store.append_async(_event(1))
-    await store.append_async(_event(2))
+    with pytest.raises(RuntimeError, match="已阻断"):
+        await store.append_async(_event(2))
 
     assert store.evidence_status == "degraded"
     assert not checkpoint_path.exists()
-    assert len(await _records(backend)) == 1
-    assert [event.seq async for event in store.iter_events()] == [1, 2]
+    assert len(await _records(backend)) == 0
+    assert [event.seq async for event in store.iter_events()] == [1]
 
 
 @pytest.mark.asyncio
@@ -728,7 +873,8 @@ async def test_runtime_start_verifies_evidence_and_alerts_without_blocking(tmp_p
 
     await runtime.start()
 
-    gateway.start.assert_awaited_once()
+    gateway.start.assert_not_awaited()
+    assert audit_store.write_blocked
     alert = alert_store.list_alerts()[0]
     assert alert.rule_id == "evidence_chain_verification_failed"
     assert alert.severity == "critical"

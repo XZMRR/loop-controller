@@ -10,3 +10,26 @@ evidence:
   signing:
     algorithm: ed25519
     private_key_env: LOOP_CONTROLLER_EVIDENCE_PRIVATE_KEY
+  anchor:
+    enabled: false
+    type: http
+    stream_id: deployment-01/default
+    base_url: https://anchor.internal.example
+    connect_timeout_seconds: 1.0
+    request_timeout_seconds: 3.0
+    every_n_events: 1
+    auth:
+      type: bearer
+      token_env: LOOP_CONTROLLER_ANCHOR_TOKEN
+    tls:
+      verify: true
+      ca_file: null
+      client_cert_file: null
+      client_key_file: null
+    receipt:
+      algorithm: ed25519
+      service_key_id: anchor-service-01
+      public_key_file: config/anchor-service.pub
+    startup:
+      unavailable_policy: degrade
+      conflict_policy: block_writes
