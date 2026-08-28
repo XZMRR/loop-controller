@@ -187,6 +187,41 @@ async def test_timeout_terminates_and_reaps_process(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
+async def test_cancellation_terminates_and_reaps_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = _FakeProcess(blocked=True)
+
+    async def create(*args: Any, **kwargs: Any) -> _FakeProcess:
+        return proc
+
+    monkeypatch.setattr(harness_server.asyncio, "create_subprocess_exec", create)
+    task = harness_server.asyncio.create_task(
+        harness_server._execute_shell(
+            {"command": "echo", "args": []},
+            type(
+                "Sandbox",
+                (),
+                {
+                    "allowed_hosts": [],
+                    "allowed_paths": [],
+                    "env_whitelist": [],
+                    "max_output_bytes": 1024,
+                    "timeout_seconds": 30,
+                },
+            )(),
+        )
+    )
+    await harness_server.asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(harness_server.asyncio.CancelledError):
+        await task
+    assert proc.killed
+    assert proc.returncode is not None
+
+
+@pytest.mark.asyncio
 async def test_sandbox_fail_closed_and_minimal_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

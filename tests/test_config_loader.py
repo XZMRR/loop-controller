@@ -505,7 +505,20 @@ def test_harness_rejects_invalid_input_schema_type(config_dir):
         {"type": "subprocess", "command": ["python", "runner.py"]},
         {"harness": "remote", "input_schema": {"type": "invalid"}},
     )
-    with pytest.raises(ConfigValidationError, match="input_schema.type 非法"):
+    with pytest.raises(ConfigValidationError, match="不是合法 JSON Schema"):
+        ConfigLoader().load(config_dir)
+
+
+def test_harness_rejects_structurally_invalid_input_schema(config_dir):
+    _write_harness_config(
+        config_dir,
+        {"type": "subprocess", "command": ["python", "runner.py"]},
+        {
+            "harness": "remote",
+            "input_schema": {"type": "object", "required": "not-an-array"},
+        },
+    )
+    with pytest.raises(ConfigValidationError, match="不是合法 JSON Schema"):
         ConfigLoader().load(config_dir)
 
 

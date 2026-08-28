@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 
 import httpx
 import yaml
+from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from loop_controller.executors.harness_models import (
@@ -858,17 +859,11 @@ class ConfigLoader:
                 )
             try:
                 json.dumps(spec.input_schema)
-            except (TypeError, ValueError) as exc:
+                validator_for(spec.input_schema).check_schema(spec.input_schema)
+            except Exception as exc:
                 raise ConfigValidationError(
-                    f"Harness 工具 {tool_name} 的 input_schema 不是合法 JSON Schema 对象"
+                    f"Harness 工具 {tool_name} 的 input_schema 不是合法 JSON Schema：{exc}"
                 ) from exc
-            schema_type = spec.input_schema.get("type")
-            if schema_type is not None and schema_type not in {
-                "array", "boolean", "integer", "null", "number", "object", "string"
-            }:
-                raise ConfigValidationError(
-                    f"Harness 工具 {tool_name} 的 input_schema.type 非法：{schema_type!r}"
-                )
 
         for name, backend in config.harness_backends.items():
             if not isinstance(backend, HTTPBackendConfig):

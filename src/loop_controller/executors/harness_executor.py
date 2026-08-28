@@ -69,6 +69,8 @@ class _HTTPHarnessClient:
     def __init__(self, config: HTTPBackendConfig) -> None:
         self.config = config
         self._base_url = config.base_url.rstrip("/")
+        self._execute_url = f"{self._base_url}{HARNESS_EXECUTE_PATH}"
+        self._execute_path = httpx.URL(self._execute_url).path
         self._client: httpx.AsyncClient | None = None
 
     def _resolve_key(self) -> str | None:
@@ -130,7 +132,7 @@ class _HTTPHarnessClient:
             nonce = secrets.token_urlsafe(24)
             body_hash = hashlib.sha256(body).hexdigest()
             canonical = (
-                f"POST\n{HARNESS_EXECUTE_PATH}\n{HARNESS_PROTOCOL_VERSION}\n"
+                f"POST\n{self._execute_path}\n{HARNESS_PROTOCOL_VERSION}\n"
                 f"{key_id}\n{timestamp}\n{nonce}\n{body_hash}"
             )
             signature = base64.b64encode(
@@ -470,7 +472,11 @@ class HarnessExecutor(ToolExecutor):
                 context, tool_name, "Harness 后端未配置", "harness_backend_not_found"
             ))
         config = self._backend_configs[backend_name]
-        if isinstance(config, HTTPBackendConfig) and config.health.enabled and state.status != "healthy":
+        if (
+            isinstance(config, HTTPBackendConfig)
+            and config.health.enabled
+            and state.status == "unhealthy"
+        ):
             return record_call(_HTTPHarnessClient._error_result(
                 context, tool_name, "Harness 后端当前不可用", "harness_backend_unavailable"
             ))

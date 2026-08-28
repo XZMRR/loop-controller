@@ -590,6 +590,90 @@ class TestHarnessConcurrencyAuthAndHealth:
         assert signed.headers["x-harness-signature"] == expected
 
     @pytest.mark.asyncio
+    async def test_hmac_signature_includes_base_url_path_prefix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HARNESS_KEY", "test-secret")
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, json={"status": "success", "content": "ok"})
+
+        config = HTTPBackendConfig(
+            name="http_harness",
+            base_url="https://harness.example/prefix",
+            auth=HarnessAuthConfig(
+                type="hmac_sha256", key_env="HARNESS_KEY", key_id="key-1"
+            ),
+        )
+        executor = HarnessExecutor(
+            {"harness_echo": _echo_tool_spec()}, {"http_harness": config}
+        )
+        await executor.start()
+        backend = executor._backends["http_harness"]
+        backend._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await executor.execute("harness_echo", {}, _fake_context())
+        await executor.stop()
+
+        signed = captured[0]
+        canonical = "\n".join(
+            [
+                "POST",
+                "/prefix/harness/v1/execute",
+                "1",
+                "key-1",
+                signed.headers["x-harness-timestamp"],
+                signed.headers["x-harness-nonce"],
+                hashlib.sha256(signed.content).hexdigest(),
+            ]
+        )
+        expected = base64.b64encode(
+            hmac.new(b"test-secret", canonical.encode(), hashlib.sha256).digest()
+        ).decode()
+        assert signed.url.path == "/prefix/harness/v1/execute"
+        assert signed.headers["x-harness-signature"] == expected
+
+    @pytest.mark.asyncio
+    async def test_health_threshold_allows_calls_while_degraded(self) -> None:
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            if request.url.path == "/health":
+                return httpx.Response(200)
+            calls += 1
+            return httpx.Response(200, json={"status": "success", "content": "ok"})
+
+        config = HTTPBackendConfig(
+            name="http_harness",
+            base_url="https://harness.example",
+            health=HarnessHealthConfig(
+                enabled=True,
+                startup_required=False,
+                unhealthy_threshold=2,
+            ),
+        )
+        executor = HarnessExecutor(
+            {"harness_echo": _echo_tool_spec()}, {"http_harness": config}
+        )
+        backend = executor._backends["http_harness"]
+        backend._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        executor._record_health("http_harness", False)
+
+        assert executor.backend_statuses()[0].status == "degraded"
+        result = await executor.execute("harness_echo", {}, _fake_context())
+
+        assert result.status == "success"
+        assert calls == 1
+        executor._record_health("http_harness", False)
+        assert executor.backend_statuses()[0].status == "unhealthy"
+        blocked = await executor.execute("harness_echo", {}, _fake_context())
+        assert blocked.error_code == "harness_backend_unavailable"
+        assert calls == 1
+        await executor.stop()
+
+    @pytest.mark.asyncio
     async def test_health_lifecycle_blocks_and_recovers(self) -> None:
         healthy = False
         execute_calls = 0

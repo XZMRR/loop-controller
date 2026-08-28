@@ -278,6 +278,12 @@ async def _execute_shell(arguments: dict[str, Any], sandbox: Any) -> HarnessExec
         return HarnessExecuteResponse(
             status="error", error_code="harness_timeout", content="命令执行超时"
         )
+    except asyncio.CancelledError:
+        for reader in readers:
+            reader.cancel()
+        await _terminate(proc)
+        await asyncio.gather(*readers, return_exceptions=True)
+        raise
 
     if exceeded.is_set():
         await _terminate(proc)
