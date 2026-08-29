@@ -27,7 +27,7 @@ from loop_controller.executors.harness_models import (
     HTTPBackendConfig,
     SubprocessBackendConfig,
 )
-from loop_controller.executors.harness_protocol import HarnessExecuteResponse
+from loop_controller.executors.harness_protocol import HarnessExecuteResponse, HarnessSandbox
 from loop_controller.identity.revocation import RevocationEntry, RevocationList
 from loop_controller.infra.audit_store import JsonlAuditStore
 from loop_controller.infra.config_loader import ConfigLoader
@@ -65,6 +65,15 @@ def _mock_transport(payload: dict[str, Any], status_code: int = 200) -> httpx.Mo
         return httpx.Response(status_code, json=payload)
 
     return httpx.MockTransport(handler)
+
+
+def _success_response(content: Any = "ok") -> dict[str, Any]:
+    """构造包含 effective_sandbox 的 v2 成功响应。"""
+    return HarnessExecuteResponse(
+        status="success",
+        content=content,
+        effective_sandbox=HarnessSandbox(),
+    ).model_dump(mode="json")
 
 
 def _echo_tool_spec() -> HarnessToolSpec:
@@ -105,6 +114,7 @@ class TestHarnessExecutorHTTP:
         response = HarnessExecuteResponse(
             status="success",
             content={"echo": "hello"},
+            effective_sandbox=HarnessSandbox(),
         ).model_dump()
         config = HTTPBackendConfig(
             name="http_harness",
@@ -222,7 +232,7 @@ class TestHarnessExecutorRequestShape:
 
         def handler(request: httpx.Request) -> httpx.Response:
             captured["body"] = json.loads(request.content)
-            return httpx.Response(200, json={"status": "success", "content": "ok"})
+            return httpx.Response(200, json=_success_response())
 
         config = HTTPBackendConfig(
             name="http_harness",
@@ -274,7 +284,7 @@ class TestHarnessSecretRefs:
             encoding="utf-8",
         )
 
-        specs, backends = ConfigLoader()._load_harness_tools(path)
+        specs, backends, _policy = ConfigLoader()._load_harness_tools(path)
 
         assert specs["deploy"].secret_refs == ["DEPLOY_TOKEN"]
         backend = backends["remote"]
@@ -344,7 +354,7 @@ class TestHarnessSecretRefs:
             nonlocal calls
             calls += 1
             assert request.headers["x-harness-api-key"] == secret_value
-            return httpx.Response(200, json={"status": "success", "content": "ok"})
+            return httpx.Response(200, json=_success_response())
 
         spec = HarnessToolSpec(tool_name="deploy", harness="remote")
         config = HTTPBackendConfig(
@@ -353,6 +363,7 @@ class TestHarnessSecretRefs:
             api_key_env="HARNESS_API_KEY",
         )
         executor = HarnessExecutor({"deploy": spec}, {"remote": config})
+        await executor.start()
         backend = executor._backends["remote"]
         backend._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         registry = ExecutorRegistry()
@@ -439,7 +450,7 @@ class TestHarnessConcurrencyAuthAndHealth:
             calls += 1
             entered.set()
             await release.wait()
-            return httpx.Response(200, json={"status": "success", "content": "ok"})
+            return httpx.Response(200, json=_success_response())
 
         config = HTTPBackendConfig(
             name="http_harness",
@@ -473,7 +484,7 @@ class TestHarnessConcurrencyAuthAndHealth:
         async def handler(request: httpx.Request) -> httpx.Response:
             entered.set()
             await release.wait()
-            return httpx.Response(200, json={"status": "success", "content": "ok"})
+            return httpx.Response(200, json=_success_response())
 
         backend_name = f"metrics_{uuid.uuid4().hex}"
         tool_name = f"tool_{uuid.uuid4().hex}"
@@ -550,7 +561,7 @@ class TestHarnessConcurrencyAuthAndHealth:
 
         def handler(request: httpx.Request) -> httpx.Response:
             captured.append(request)
-            return httpx.Response(200, json={"status": "success", "content": "ok"})
+            return httpx.Response(200, json=_success_response())
 
         for auth in (
             HarnessAuthConfig(type="api_key", key_env="HARNESS_KEY"),
@@ -576,8 +587,8 @@ class TestHarnessConcurrencyAuthAndHealth:
         canonical = "\n".join(
             [
                 "POST",
-                "/harness/v1/execute",
-                "1",
+                "/harness/v2/execute",
+                "2",
                 "key-1",
                 signed.headers["x-harness-timestamp"],
                 signed.headers["x-harness-nonce"],
@@ -598,7 +609,7 @@ class TestHarnessConcurrencyAuthAndHealth:
 
         def handler(request: httpx.Request) -> httpx.Response:
             captured.append(request)
-            return httpx.Response(200, json={"status": "success", "content": "ok"})
+            return httpx.Response(200, json=_success_response())
 
         config = HTTPBackendConfig(
             name="http_harness",
@@ -620,8 +631,8 @@ class TestHarnessConcurrencyAuthAndHealth:
         canonical = "\n".join(
             [
                 "POST",
-                "/prefix/harness/v1/execute",
-                "1",
+                "/prefix/harness/v2/execute",
+                "2",
                 "key-1",
                 signed.headers["x-harness-timestamp"],
                 signed.headers["x-harness-nonce"],
@@ -631,7 +642,7 @@ class TestHarnessConcurrencyAuthAndHealth:
         expected = base64.b64encode(
             hmac.new(b"test-secret", canonical.encode(), hashlib.sha256).digest()
         ).decode()
-        assert signed.url.path == "/prefix/harness/v1/execute"
+        assert signed.url.path == "/prefix/harness/v2/execute"
         assert signed.headers["x-harness-signature"] == expected
 
     @pytest.mark.asyncio
@@ -643,7 +654,7 @@ class TestHarnessConcurrencyAuthAndHealth:
             if request.url.path == "/health":
                 return httpx.Response(200)
             calls += 1
-            return httpx.Response(200, json={"status": "success", "content": "ok"})
+            return httpx.Response(200, json=_success_response())
 
         config = HTTPBackendConfig(
             name="http_harness",
@@ -683,7 +694,7 @@ class TestHarnessConcurrencyAuthAndHealth:
             if request.url.path == "/health":
                 return httpx.Response(200 if healthy else 503)
             execute_calls += 1
-            return httpx.Response(200, json={"status": "success", "content": "ok"})
+            return httpx.Response(200, json=_success_response())
 
         config = HTTPBackendConfig(
             name="http_harness",

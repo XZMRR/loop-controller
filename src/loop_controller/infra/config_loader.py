@@ -36,9 +36,11 @@ from pydantic import ValidationError
 
 from loop_controller.executors.harness_models import (
     DockerBackendConfig,
+    HarnessExecutionPolicy,
     HarnessToolSpec,
     HTTPBackendConfig,
     SubprocessBackendConfig,
+    ToolExecutionPolicy,
 )
 from loop_controller.executors.http_models import HTTPToolSpec, resolve_env_refs
 from loop_controller.executors.local_function_models import LocalFunctionSpec
@@ -222,6 +224,7 @@ class AppConfig:
     local_function_specs: dict[str, LocalFunctionSpec]  # v0.23.0 本地函数规格
     harness_tool_specs: dict[str, HarnessToolSpec]  # v0.25.0 Harness 工具规格
     harness_backends: dict[str, SubprocessBackendConfig | DockerBackendConfig | HTTPBackendConfig]  # v0.25.0 Harness 后端
+    harness_execution_policy: HarnessExecutionPolicy  # v0.31.0 执行策略
     permission_rules: list[PermissionRule]
     capability_rules: CapabilityRules  # v0.10.0
     authority_rules: AuthorityRules  # v0.11.0
@@ -280,7 +283,7 @@ class ConfigLoader:
         # mcp_servers.yaml 中的 type: http 条目作为向后兼容补充
         http_tool_specs.update(legacy_http_specs)
         local_function_specs = self._load_local_functions(config_dir / "local_functions.yaml")
-        harness_tool_specs, harness_backends = self._load_harness_tools(
+        harness_tool_specs, harness_backends, harness_execution_policy = self._load_harness_tools(
             config_dir / "harness_tools.yaml"
         )
         secrets_config = self._load_secrets_config(config_dir / "secrets.yaml", root)
@@ -342,6 +345,7 @@ class ConfigLoader:
             local_function_specs=local_function_specs,
             harness_tool_specs=harness_tool_specs,
             harness_backends=harness_backends,
+            harness_execution_policy=harness_execution_policy,
             permission_rules=permission_rules,
             capability_rules=capability_rules,
             authority_rules=authority_rules,
@@ -487,18 +491,24 @@ class ConfigLoader:
     ) -> tuple[
         dict[str, HarnessToolSpec],
         dict[str, SubprocessBackendConfig | DockerBackendConfig | HTTPBackendConfig],
+        HarnessExecutionPolicy,
     ]:
-        """加载 Harness 后端与工具规格（v0.25.0）。
+        """加载 Harness 后端、工具规格与执行策略（v0.31.0）。
 
-        文件缺失时返回空 dict（向后兼容）。
+        文件缺失时使用默认 harness_required 策略（向后兼容但会告警）。
         """
         tool_specs: dict[str, HarnessToolSpec] = {}
         backends: dict[
             str, SubprocessBackendConfig | DockerBackendConfig | HTTPBackendConfig
         ] = {}
         if not path.exists():
-            return tool_specs, backends
+            return tool_specs, backends, HarnessExecutionPolicy()
         data = self._read_yaml(path)
+        execution_raw = data.get("execution") or {}
+        try:
+            policy = HarnessExecutionPolicy(**execution_raw)
+        except ValidationError as exc:
+            raise ConfigValidationError(f"Harness 执行策略配置非法：{exc}") from exc
         for name, entry in (data.get("backends") or {}).items():
             backend_type = entry.get("type", "subprocess")
             try:
@@ -521,7 +531,7 @@ class ConfigLoader:
                 tool_specs[canonical] = HarnessToolSpec(tool_name=canonical, **entry)
             except ValidationError as exc:
                 raise ConfigValidationError(f"Harness 工具 {canonical} 配置非法：{exc}") from exc
-        return tool_specs, backends
+        return tool_specs, backends, policy
 
     def reload_http_tools(self, config_dir: str | Path) -> dict[str, HTTPToolSpec]:
         """热更新：仅重新加载 HTTP 工具规格。"""
@@ -881,7 +891,31 @@ class ConfigLoader:
         return key
 
     def _check_harness_config(self, config: AppConfig) -> None:
-        """校验 Harness backend/tool 引用、传输与认证边界。"""
+        """校验 Harness backend/tool 引用、传输、认证与执行策略边界。"""
+        policy = config.harness_execution_policy
+        all_known_tools = (
+            set(config.tool_mapping)
+            | set(config.http_tool_specs)
+            | set(config.local_function_specs)
+            | set(config.harness_tool_specs)
+        )
+        for tool_name in policy.trusted_local_tools:
+            if tool_name not in all_known_tools:
+                raise ConfigValidationError(
+                    f"trusted_local 工具 {tool_name} 未在 tool_mapping / http_tools / local_functions / harness_tools 中注册"
+                )
+
+        for tool_name, tool_policy in policy.tools.items():
+            if tool_name not in all_known_tools:
+                raise ConfigValidationError(
+                    f"执行策略覆盖的工具 {tool_name} 未在工具注册表中注册"
+                )
+            if tool_policy.mode in ("harness_required", "harness_preferred"):
+                if tool_name not in config.harness_tool_specs:
+                    raise ConfigValidationError(
+                        f"工具 {tool_name} 模式为 {tool_policy.mode}，必须在 harness_tools 中定义"
+                    )
+
         for tool_name, spec in config.harness_tool_specs.items():
             if spec.harness not in config.harness_backends:
                 raise ConfigValidationError(
@@ -894,6 +928,25 @@ class ConfigLoader:
                 raise ConfigValidationError(
                     f"Harness 工具 {tool_name} 的 input_schema 不是合法 JSON Schema：{exc}"
                 ) from exc
+
+        # v0.31.0：默认需要 Harness 时，非 trusted_local 工具必须存在 Harness spec。
+        if policy.default_mode == "harness_required":
+            for tool_name in all_known_tools:
+                if tool_name in policy.trusted_local_tools:
+                    continue
+                override: ToolExecutionPolicy | None = policy.tools.get(tool_name)
+                if override is not None and override.mode == "trusted_local":
+                    continue
+                if tool_name not in config.harness_tool_specs:
+                    raise ConfigValidationError(
+                        f"默认执行策略为 harness_required，工具 {tool_name} 未配置 Harness 规格且不在 trusted_local 白名单"
+                    )
+
+        # v0.31.0：harness_required 模式下必须至少配置一个后端。
+        if policy.default_mode == "harness_required" and not config.harness_backends:
+            raise ConfigValidationError(
+                "默认执行策略为 harness_required，但 harness_tools.yaml 未配置任何 backend"
+            )
 
         for name, backend in config.harness_backends.items():
             if not isinstance(backend, HTTPBackendConfig):

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from loop_controller.models import ApprovalRecord
+from tests.conftest import write_trusted_local_harness_config
 from tests.controller_helpers import controller_for
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -82,6 +83,10 @@ profiles:
         max_calls_per_task: 1
 """,
         encoding="utf-8",
+    )
+    write_trusted_local_harness_config(
+        root / "config",
+        ["query_database", "update_database"],
     )
     return root
 

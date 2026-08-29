@@ -16,7 +16,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from loop_controller.authority import AuthorityManager, NoopAuthorityManager
 from loop_controller.executors.base import ExecutionContext, ExecutorRegistry
@@ -317,6 +317,42 @@ class Checkpoint:
                     },
                 )
             )
+
+    async def _audit_execution(
+        self,
+        proposal: ActionProposal,
+        result: ToolResult,
+        *,
+        session_id: str | None,
+        user_id: str,
+        tenant_id: str | None,
+    ) -> None:
+        """v0.31.0：工具执行成功后把 Harness evidence 摘要写入审计链。"""
+        if self._audit_store is None:
+            return
+        metadata: dict[str, Any] = {
+            "user_id": user_id,
+            "result_status": result.status,
+            "error_code": result.error_code,
+        }
+        harness_evidence = result.metadata.get("harness_evidence")
+        if harness_evidence is not None:
+            metadata["harness_evidence"] = harness_evidence
+        await self._audit_store.append_async(
+            AuditEvent(
+                event_id=uuid.uuid4().hex,
+                trace_id=proposal.task_id,
+                session_id=session_id or proposal.task_id,
+                call_id=proposal.call_id,
+                actor_type="agent",
+                actor_id=proposal.agent_id,
+                action="execute",
+                target=proposal.tool_name,
+                decision="allow",
+                reason="tool executed",
+                metadata=metadata,
+            )
+        )
 
     def _refund_for(self, proposal: ActionProposal) -> None:
         """将当前 proposal 已预留的预算返还（P0：所有非执行路径必须 refund）。"""
@@ -924,13 +960,6 @@ class Checkpoint:
                 raise CheckpointError(f"verdict {decision.verdict!r} 不可执行（仅 allow/modify）")
             if self._now() >= decision.expires_at:
                 raise CheckpointError("decision 已过期（授权作废）")
-            # 校验 4-5：防重放——原子检查决策是否存在、未过期、未超次数并记账。
-            # 运行时假设（v1.1 显式声明，评审#2）：MVP 为单进程 asyncio 事件循环，
-            # 同一时刻不存在并行的 forward 调用，因此 use_decision 内部检查+记账原子。
-            # 若未来引入多 worker/多进程部署，DecisionStore 必须升级为原子语义（§9.3）。
-            if not self._decision_store.use_decision(decision.decision_id, self._now()):
-                raise CheckpointError("decision 已过期、已用完或不存在（防重放）")
-
             # 校验 6：modify 复核（PEP 职责，不抛异常，返回 blocked）
             effective_args = proposal.arguments
             if decision.verdict == "modify":
@@ -976,26 +1005,37 @@ class Checkpoint:
                         stage="pre_execute",
                     )
 
-            authority_cost = self._cost_for(proposal)
-            consumed_authority = self._authority_manager.validate_and_consume(
-                proposal, authority_cost
-            )
-            if consumed_authority is None:
-                raise CheckpointError("Authority token 无效、已过期或预算不足")
-
+            # 解析执行器并确认工具可达，避免在基础设施临时不可用或策略拒绝时
+            # 过早消费 decision。
             try:
-                executor = self._executor_registry.get_executor(proposal.tool_name)
+                executor = self._executor_registry.resolve_executor(proposal.tool_name)
             except Exception:
-                self._authority_manager.refund_consumed(consumed_authority, authority_cost)
-                await self._audit_authority_consumption(
-                    proposal,
-                    consumed_authority,
-                    session_id=session_id,
-                    outcome="pre_execution_failure",
-                    refunded=True,
-                )
                 self._refund_reservation(reservation)
                 raise
+            if executor is None:
+                # v0.31.0：执行策略拒绝该工具（deny）。
+                self._refund_reservation(reservation)
+                return ToolResult(
+                    call_id=proposal.call_id,
+                    task_id=proposal.task_id,
+                    tool_name=proposal.tool_name,
+                    status="blocked",
+                    content="execution mode denied by policy",
+                    error_code="execution_mode_denied",
+                )
+
+            # 校验 4-5：防重放——原子检查决策是否存在、未过期、未超次数并记账。
+            # 必须在确认执行器可达之后消费，确保基础设施/策略失败不会浪费 decision。
+            # 运行时假设（v1.1 显式声明，评审#2）：MVP 为单进程 asyncio 事件循环，
+            # 同一时刻不存在并行的 forward 调用，因此 use_decision 内部检查+记账原子。
+            # 若未来引入多 worker/多进程部署，DecisionStore 必须升级为原子语义（§9.3）。
+            if not self._decision_store.use_decision(decision.decision_id, self._now()):
+                raise CheckpointError("decision 已过期、已用完或不存在（防重放）")
+
+            authority_cost = self._cost_for(proposal)
+            consumed_authority = self._authority_manager.validate_and_consume(proposal, authority_cost)
+            if consumed_authority is None:
+                raise CheckpointError("Authority token 无效、已过期或预算不足")
 
             try:
                 result = await executor.execute(
@@ -1028,6 +1068,13 @@ class Checkpoint:
                 refunded=False,
             )
             self._commit_reservation(reservation)
+            await self._audit_execution(
+                proposal,
+                result,
+                session_id=session_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+            )
         except CheckpointError:
             if reservation is not None:
                 self._refund_reservation(reservation)

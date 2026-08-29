@@ -29,6 +29,27 @@ def resolve_opa_bin(repo_root: Path = REPO_ROOT) -> Path:
             return candidate
     return repo_root / "tools" / "opa"
 
+
+def write_trusted_local_harness_config(
+    config_dir: Path | str,
+    trusted_local_tools: list[str] | None = None,
+) -> None:
+    """为测试临时配置写入默认 trusted_local 的 harness 执行策略。
+
+    v0.31.0 默认策略为 harness_required；测试若未配置 Harness backend，
+    需显式声明 default_mode: trusted_local 并列出允许本地执行的工具。
+    """
+    config_path = Path(config_dir)
+    tools = trusted_local_tools or []
+    lines = [
+        "execution:",
+        "  default_mode: trusted_local",
+    ]
+    if tools:
+        lines.append("trusted_local_tools:")
+        lines.extend(f"  - {tool}" for tool in tools)
+    (config_path / "harness_tools.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
 # P0 HMAC：为全部测试自动注入一个 32 字节测试 key，避免默认 hmac-sha256 模式启动失败。
 # 该 key 仅用于测试，不进入任何日志/审计内容。
 TEST_AUDIT_HMAC_KEY = "a" * 64  # 64 hex chars = 32 bytes

@@ -520,6 +520,7 @@ def test_admin_harness_backends_is_authenticated_and_sanitized() -> None:
                 "consecutive_failures": 0,
                 "last_error_code": None,
                 "in_flight": 2,
+                "draining": False,
             }
         ]
     }
@@ -527,6 +528,120 @@ def test_admin_harness_backends_is_authenticated_and_sanitized() -> None:
     assert "password" not in serialized
     assert "must-not-leak" not in serialized
     assert "HARNESS_SECRET" not in serialized
+
+
+class _HarnessExecutorStub:
+    """用于 drain/reset 测试的 HarnessExecutor mock。"""
+
+    def __init__(self, statuses: list[Any] | None = None) -> None:
+        self._statuses = statuses or []
+        self.drain_calls: list[str] = []
+        self.reset_calls: list[str] = []
+
+    def backend_statuses(self) -> list[Any]:
+        return self._statuses
+
+    async def drain_backend(self, name: str) -> bool:
+        self.drain_calls.append(name)
+        return True
+
+    def reset_backend(self, name: str) -> None:
+        self.reset_calls.append(name)
+
+
+def test_health_aggregates_harness_backends() -> None:
+    from loop_controller.executors.harness_protocol import HarnessBackendStatus
+
+    stub = _HarnessExecutorStub(
+        [
+            HarnessBackendStatus(
+                name="prod", type="http", status="healthy", max_concurrent_calls=20
+            )
+        ]
+    )
+    client, controller = _build_client()
+    controller._runtime.harness_executor = stub
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["harness_backends"]) == 1
+    assert data["harness_backends"][0]["name"] == "prod"
+    assert data["status"] == "ok"
+
+
+def test_health_degraded_when_harness_backend_unhealthy() -> None:
+    from loop_controller.executors.harness_protocol import HarnessBackendStatus
+
+    stub = _HarnessExecutorStub(
+        [
+            HarnessBackendStatus(
+                name="prod", type="http", status="unhealthy", max_concurrent_calls=20
+            )
+        ]
+    )
+    client, controller = _build_client()
+    controller._runtime.harness_executor = stub
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "degraded"
+
+
+def test_admin_harness_drain_and_reset() -> None:
+    from loop_controller.executors.harness_protocol import HarnessBackendStatus
+
+    stub = _HarnessExecutorStub(
+        [
+            HarnessBackendStatus(
+                name="prod", type="http", status="healthy", max_concurrent_calls=20
+            )
+        ]
+    )
+    client, controller = _build_client(api_key="secret")
+    controller._runtime.harness_executor = stub
+
+    resp = client.post("/v1/admin/harness/prod/drain", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 200
+    assert resp.json() == {"backend": "prod", "drained": True}
+    assert stub.drain_calls == ["prod"]
+
+    resp = client.post("/v1/admin/harness/prod/reset", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 200
+    assert resp.json() == {"backend": "prod", "reset": True}
+    assert stub.reset_calls == ["prod"]
+
+    audit = controller._runtime.audit_store._events
+    admin_ops = [e for e in audit if e.action == "admin_operation"]
+    assert len(admin_ops) == 2
+    assert admin_ops[0].reason == "harness_drain"
+    assert admin_ops[1].reason == "harness_reset"
+
+
+def test_admin_harness_drain_reset_returns_404_for_unknown_backend() -> None:
+    class Stub:
+        async def drain_backend(self, name: str) -> bool:
+            raise KeyError(f"Harness 后端 {name!r} 不存在")
+
+        def reset_backend(self, name: str) -> None:
+            raise KeyError(f"Harness 后端 {name!r} 不存在")
+
+        def backend_statuses(self) -> list:
+            return []
+
+    client, controller = _build_client(api_key="secret")
+    controller._runtime.harness_executor = Stub()
+    resp = client.post("/v1/admin/harness/missing/drain", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 404
+    resp = client.post("/v1/admin/harness/missing/reset", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 404
+
+
+def test_admin_harness_drain_reset_returns_503_when_harness_disabled() -> None:
+    client, controller = _build_client(api_key="secret")
+    controller._runtime.harness_executor = None
+    resp = client.post("/v1/admin/harness/prod/drain", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 503
+    resp = client.post("/v1/admin/harness/prod/reset", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 503
 
 
 def test_api_key_auth_header() -> None:
@@ -570,6 +685,9 @@ def test_api_key_protects_admin_and_wait_endpoints() -> None:
     ):
         resp = client.get(path)
         assert resp.status_code == 401, path
+    for path in ("/v1/admin/harness/prod/drain", "/v1/admin/harness/prod/reset"):
+        resp = client.post(path)
+        assert resp.status_code == 401, path
 
 
 def test_empty_api_key_not_bypassed() -> None:
@@ -598,6 +716,8 @@ def test_admin_anchor_and_harness_endpoints_require_auth(api_key: str | None) ->
     client, _controller = _build_client(api_key=api_key)
     for path, method in (
         ("/v1/admin/harness/backends", "GET"),
+        ("/v1/admin/harness/prod/drain", "POST"),
+        ("/v1/admin/harness/prod/reset", "POST"),
         ("/v1/admin/evidence/anchor", "GET"),
         ("/v1/admin/evidence/anchor/verify", "POST"),
         ("/v1/admin/evidence/anchor/publish", "POST"),

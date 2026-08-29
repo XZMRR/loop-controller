@@ -12,14 +12,16 @@ import os
 import secrets
 import subprocess
 import time
+import uuid
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 
 from loop_controller.executors.base import ExecutionContext, ToolExecutor
 from loop_controller.executors.harness_models import (
     HarnessBackendConfig,
+    HarnessExecutionPolicy,
     HarnessSandboxConfig,
     HarnessToolSpec,
     HTTPBackendConfig,
@@ -34,7 +36,10 @@ from loop_controller.executors.harness_protocol import (
     HarnessExecuteResponse,
     HarnessSandbox,
 )
-from loop_controller.models import CapabilityProfile, Tool, ToolResult
+from loop_controller.models import AuditAlert, CapabilityProfile, Tool, ToolResult
+
+if TYPE_CHECKING:
+    from loop_controller.infra.alert_store import AlertStore
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +220,35 @@ class _HTTPHarnessClient:
             return self._error_result(
                 context, tool_name, "Harness 响应格式非法", "harness_invalid_response"
             )
+
+        if result.status == "success" and result.effective_sandbox is None:
+            return self._error_result(
+                context,
+                tool_name,
+                "Harness 响应缺少 effective_sandbox 回执",
+                "harness_sandbox_attestation_missing",
+            )
+
+        if result.status == "success" and not self._sandbox_matches(
+            request.sandbox, result.effective_sandbox
+        ):
+            return self._error_result(
+                context,
+                tool_name,
+                "Harness 实际生效沙箱与请求不一致",
+                "harness_sandbox_violation",
+                {
+                    "requested_sandbox": request.sandbox.model_dump(mode="json"),
+                    "effective_sandbox": result.effective_sandbox.model_dump(mode="json")
+                    if result.effective_sandbox
+                    else None,
+                },
+            )
+
+        metadata = dict(result.metadata)
+        if result.evidence is not None:
+            metadata["harness_evidence"] = result.evidence.model_dump(mode="json")
+
         return ToolResult(
             call_id=context.call_id,
             task_id=context.task_id,
@@ -222,8 +256,15 @@ class _HTTPHarnessClient:
             status=result.status,
             content=result.content,
             error_code=result.error_code,
-            metadata=result.metadata,
+            metadata=metadata,
         )
+
+    @staticmethod
+    def _sandbox_matches(requested: HarnessSandbox, effective: HarnessSandbox | None) -> bool:
+        """v0.31.0：严格比较请求沙箱与实际生效沙箱是否一致。"""
+        if effective is None:
+            return False
+        return requested.model_dump() == effective.model_dump()
 
     @staticmethod
     def _error_result(
@@ -331,7 +372,7 @@ class _BackendState:
         self.consecutive_failures = 0
         self.last_error_code: str | None = None
 
-    def snapshot(self) -> HarnessBackendStatus:
+    def snapshot(self, *, draining: bool = False) -> HarnessBackendStatus:
         return HarnessBackendStatus(
             name=self.name,
             type=self.type,
@@ -341,6 +382,7 @@ class _BackendState:
             consecutive_failures=self.consecutive_failures,
             last_error_code=self.last_error_code,
             in_flight=self.in_flight,
+            draining=draining,
         )
 
 
@@ -351,6 +393,8 @@ class HarnessExecutor(ToolExecutor):
         self,
         tool_specs: dict[str, HarnessToolSpec],
         backends: dict[str, HarnessBackendConfig],
+        execution_policy: HarnessExecutionPolicy | None = None,
+        alert_store: AlertStore | None = None,
     ) -> None:
         self._tool_specs = tool_specs
         self._backend_configs = dict(backends)
@@ -358,6 +402,9 @@ class HarnessExecutor(ToolExecutor):
         self._states = {name: _BackendState(name, config) for name, config in backends.items()}
         self._health_tasks: list[asyncio.Task[None]] = []
         self._started = False
+        self._execution_policy = execution_policy or HarnessExecutionPolicy()
+        self._draining: set[str] = set()
+        self._alert_store = alert_store
 
     def _build_backend(self, config: HarnessBackendConfig) -> HarnessBackend:
         if isinstance(config, SubprocessBackendConfig):
@@ -441,7 +488,89 @@ class HarnessExecutor(ToolExecutor):
         state.last_error_code = "harness_backend_unavailable"
 
     def backend_statuses(self) -> list[HarnessBackendStatus]:
-        return [self._states[name].snapshot() for name in sorted(self._states)]
+        return [
+            self._states[name].snapshot(draining=name in self._draining)
+            for name in sorted(self._states)
+        ]
+
+    def is_tool_available(self, tool_name: str) -> bool:
+        """判断工具是否已注册 Harness spec 且其后端存在。"""
+        spec = self._tool_specs.get(tool_name)
+        if spec is None:
+            return False
+        return spec.harness in self._backends
+
+    def has_healthy_backend(self, tool_name: str) -> bool:
+        """v0.31.0：工具对应 backend 是否可用于执行。"""
+        spec = self._tool_specs.get(tool_name)
+        if spec is None:
+            return False
+        state = self._states.get(spec.harness)
+        if state is None:
+            return False
+        return state.status in ("healthy", "degraded") and state.name not in self._draining
+
+    async def drain_backend(self, name: str, timeout_seconds: float = 30.0) -> bool:
+        """v0.31.0：停止接收新请求并等待在途调用完成。"""
+        if name not in self._states:
+            raise KeyError(f"Harness 后端 {name!r} 不存在")
+        self._draining.add(name)
+        state = self._states[name]
+        deadline = time.perf_counter() + timeout_seconds
+        while state.in_flight > 0 and time.perf_counter() < deadline:
+            await asyncio.sleep(0.1)
+        return state.in_flight == 0
+
+    def reset_backend(self, name: str) -> None:
+        """v0.31.0：清空失败计数并触发一次健康检查。"""
+        if name not in self._states:
+            raise KeyError(f"Harness 后端 {name!r} 不存在")
+        self._draining.discard(name)
+        state = self._states[name]
+        state.consecutive_failures = 0
+        state.last_error_code = None
+        if name in self._backends:
+            asyncio.create_task(self._check_and_record_health(name))
+
+    async def _check_and_record_health(self, name: str) -> None:
+        try:
+            healthy = await self._backends[name].check_health()
+        except Exception:
+            healthy = False
+        self._record_health(name, healthy)
+
+    def _effective_sandbox(self, tool_name: str) -> HarnessSandboxConfig:
+        """优先使用执行策略中工具级沙箱覆盖，否则回退到 HarnessToolSpec 沙箱。"""
+        spec = self._get_spec(tool_name)
+        tool_policy = self._execution_policy.tools.get(tool_name)
+        if tool_policy is not None:
+            return tool_policy.sandbox
+        return spec.sandbox
+
+    def _save_sandbox_alert(self, context: ExecutionContext, tool_name: str, result: ToolResult) -> None:
+        """Harness 沙箱回执缺失或不一致时写入安全告警。"""
+        if self._alert_store is None:
+            return
+        error_code = result.error_code or "harness_sandbox_unknown"
+        title = (
+            "Harness 沙箱回执缺失"
+            if error_code == "harness_sandbox_attestation_missing"
+            else "Harness 沙箱回执与请求不一致"
+        )
+        alert = AuditAlert(
+            alert_id=uuid.uuid4().hex,
+            session_id=context.session_id or context.task_id,
+            task_id=context.task_id,
+            rule_id=error_code,
+            severity="critical",
+            title=title,
+            description=result.content or title,
+            evidence=[context.call_id],
+        )
+        try:
+            self._alert_store.save_alert(alert)
+        except Exception:
+            logger.exception("写入 Harness 沙箱告警失败")
 
     async def execute(
         self,
@@ -450,6 +579,7 @@ class HarnessExecutor(ToolExecutor):
         context: ExecutionContext,
     ) -> ToolResult:
         spec = self._get_spec(tool_name)
+        sandbox = self._effective_sandbox(tool_name)
         backend_name = spec.harness
         backend = self._backends.get(backend_name)
         state = self._states.get(backend_name)
@@ -471,12 +601,11 @@ class HarnessExecutor(ToolExecutor):
             return record_call(_HTTPHarnessClient._error_result(
                 context, tool_name, "Harness 后端未配置", "harness_backend_not_found"
             ))
-        config = self._backend_configs[backend_name]
-        if (
-            isinstance(config, HTTPBackendConfig)
-            and config.health.enabled
-            and state.status == "unhealthy"
-        ):
+        if backend_name in self._draining:
+            return record_call(_HTTPHarnessClient._error_result(
+                context, tool_name, "Harness 后端正在排空", "harness_backend_unavailable"
+            ))
+        if state.status in ("unknown", "unhealthy"):
             return record_call(_HTTPHarnessClient._error_result(
                 context, tool_name, "Harness 后端当前不可用", "harness_backend_unavailable"
             ))
@@ -498,8 +627,14 @@ class HarnessExecutor(ToolExecutor):
         if metrics is not None:
             metrics.set_harness_in_flight(backend_name, state.in_flight)
         try:
-            result = await backend.execute(tool_name, arguments, context, spec.sandbox)
-            return record_call(result)
+            result = await backend.execute(tool_name, arguments, context, sandbox)
+            result = record_call(result)
+            if result.error_code in (
+                "harness_sandbox_attestation_missing",
+                "harness_sandbox_violation",
+            ):
+                self._save_sandbox_alert(context, tool_name, result)
+            return result
         except asyncio.CancelledError:
             if metrics is not None:
                 metrics.observe_harness_call(

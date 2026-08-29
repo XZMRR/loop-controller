@@ -2,6 +2,36 @@
 
 本文件记录 MVP 三次迭代中的关键决策、实现要点与踩坑经验，便于后续维护与开源时追溯。
 
+## v0.31.0：不可信 Agent 外部执行沙箱（Harness）
+
+### 完成内容
+
+- **默认不信任执行策略**：`harness_execution_policy.default_mode` 默认为 `harness_required`；非 `trusted_local_tools` 白名单内的工具必须有 `HarnessToolSpec`，并在 `harness_tools.yaml` 中至少配置一个 backend。
+- **执行模式解析器 `ExecutionModeResolver`**：新增 `loop_controller.execution_mode`，根据策略把工具路由为 `trusted_local`、`harness_required` 或 `deny`。
+- **`ExecutorRegistry.resolve_executor()`**：先解析执行模式再选择执行器；`deny` 返回 `None`；`harness` 返回 `ExecutionModeResolver.harness_executor`。
+- **Checkpoint 策略门控**：`forward()` 在 `resolve_executor()` 返回 `None` 时退回预算/authority/reservation，返回 `error_code="execution_mode_denied"` 的 `ToolResult`。
+- **Harness 协议 v2**：`harness_protocol.py` 升级到 v2，响应必须携带 `effective_sandbox` 回执；新增 `HarnessEvidence`（网络/文件尝试、资源使用、stdout/stderr 哈希）。
+- **Harness 回执校验**：Loop Controller 严格比较请求的 `HarnessSandbox` 与返回的 `effective_sandbox`，不一致返回 `harness_sandbox_violation`。
+- **Fail-Closed Health Gating**：所有 backend 在 `unknown`/`unhealthy` 时阻断调用；`draining` backend 拒绝新请求。
+- **证据写入审计链**：执行成功后，把 `result.metadata["harness_evidence"]` 摘要写入 `AuditEvent(action="execute")` 元数据，并由 `AuditStore.append_async` 进入签名证据链。
+- **Admin 生命周期接口**：`server.py` 新增 `POST /v1/admin/harness/{name}/drain` 与 `POST /v1/admin/harness/{name}/reset`；`GET /health` 聚合 `harness_backends` 状态，异常时标记 `degraded`。
+- **参考 Harness 与配置模板**：`examples/contrib/harness/harness_server.py` 返回 v2 `effective_sandbox`/`evidence`；`config/harness_tools.yaml` 加入 `execution` 策略模板与 v2 沙箱字段。
+
+### 关键决策
+
+- `trusted_local_tools` 显式白名单：Loop Controller 不信任 Agent 默认能力，只有明确列出的工具才允许在本地执行器直接运行。
+- `effective_sandbox` 由 Harness 回执：Loop Controller 不解析进程内沙箱实现，只校验“请求沙箱 == 实际沙箱”，保持治理侧简洁。
+- `drain` 异步等待在途请求完成：返回 `bool` 表示是否在默认超时内完成；未完成仍会把 backend 标记为 `draining`。
+
+### 测试
+
+- `tests/test_harness_executor.py`：v2 响应形状、HMAC canonical 路径、effective_sandbox 校验、fail-closed health gating。
+- `tests/test_harness_server.py` / `tests/test_harness_subprocess.py`：参考 Harness 升级到 v2。
+- `tests/test_config_loader.py`：默认 `harness_required` 的 fail-fast 校验。
+- `tests/test_server.py`：admin drain/reset 认证与 404/503 路径、health 聚合与 degraded。
+
+---
+
 ## 迭代 1：MVP 核心（T1.1–T1.8）
 
 目标：建立可运行的治理闭环，从零重写 `src/`。

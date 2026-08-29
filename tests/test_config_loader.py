@@ -86,6 +86,12 @@ def build_config_dir(root: Path) -> Path:
         },
     })
     _write_yaml(config / "permission_rules.yaml", {"rules": []})
+    _write_yaml(config / "harness_tools.yaml", {
+        "execution": {
+            "default_mode": "trusted_local",
+            "trusted_local_tools": ["read_file", "write_file", "web_search", "send_email"],
+        }
+    })
     _write_yaml(config / "masking_rules.yaml", {
         "field_name_blacklist": ["password"],
         "value_patterns": [{"name": "email_address", "pattern": r"[\w.+-]+@[\w-]+\.[\w.]+",
@@ -519,7 +525,11 @@ def test_entrypoints_require_auth_not_bool(config_dir):
 
 
 def _write_harness_config(config_dir: Path, backend: dict, tool: dict | None = None) -> None:
-    data = {"backends": {"remote": backend}, "tools": {}}
+    data = {
+        "execution": {"default_mode": "trusted_local"},
+        "backends": {"remote": backend},
+        "tools": {},
+    }
     if tool is not None:
         data["tools"] = {"deploy": tool}
     _write_yaml(config_dir / "harness_tools.yaml", data)
@@ -554,7 +564,10 @@ def test_harness_rejects_legacy_and_new_auth_together(config_dir, monkeypatch):
 def test_harness_tool_rejects_missing_backend(config_dir):
     _write_yaml(
         config_dir / "harness_tools.yaml",
-        {"tools": {"deploy": {"harness": "missing", "input_schema": {"type": "object"}}}},
+        {
+            "execution": {"default_mode": "trusted_local"},
+            "tools": {"deploy": {"harness": "missing", "input_schema": {"type": "object"}}},
+        },
     )
     with pytest.raises(ConfigValidationError, match="backend missing 不存在"):
         ConfigLoader().load(config_dir)

@@ -1,10 +1,18 @@
-# Harness 后端与工具配置（v0.27.0）
-# Loop Controller 只负责治理并将调用转发给独立 Harness Service；文件系统、网络、
-# 进程和资源隔离必须由 Harness 及其容器/Kubernetes/VM/专用主机部署环境提供。
+# Harness 后端、工具与执行策略配置（v0.31.0）
+# Loop Controller 默认不信任 Agent：非 trusted_local_tools 中的敏感工具必须
+# 通过外部 Harness 在受限沙箱中执行，网络/文件/命令出口默认全部 deny。
 #
-# 本文件默认全部注释，避免无 Harness 环境启动失败。生产主路径是 HTTPS 远程
-# HTTP Harness；subprocess 仅用于开发/集成测试。Loop Controller 不直接编排 Docker。
-# 启用前还需将工具名加入 profiles.yaml，并通过环境变量注入认证密钥。
+# 生产主路径是 HTTPS 远程 HTTP Harness；subprocess 仅用于开发/集成测试。
+# Loop Controller 不直接编排 Docker。启用前还需将工具名加入 profiles.yaml，
+# 并通过环境变量注入认证密钥。
+
+# execution:
+#   # 默认策略：trusted_local（允许本地 MCP 执行）或 harness_required（默认不信任）。
+#   default_mode: harness_required
+#   # deny 模式下返回的自定义错误信息。
+#   denied_message: "该工具在 deny 策略下被禁止执行"
+#   # 显式允许在本地通过 MCP/HTTP/Executor 执行的工具白名单。
+#   trusted_local_tools: []
 
 # backends:
 #   production_harness:
@@ -59,10 +67,20 @@
 #       required: [action]
 #       additionalProperties: false
 #     sandbox:
+#       # v0.31.0 Harness 协议 v2 沙箱字段
 #       timeout_seconds: 30
 #       max_output_bytes: 65536
+#       network_policy: deny_all
 #       allowed_hosts: []
+#       file_policy: deny_all
 #       allowed_paths: []
+#       readonly_paths: []
 #       env_whitelist: []
-#
+#       process_policy: deny_all
+#       allowed_commands: []
+#       evidence_capture: stdout
+#       resource_limits:
+#         max_memory_bytes: 268435456
+#         max_cpu_cores: 1
+
 # 兼容说明：旧 api_key_env 仍可加载，但已弃用；不要与 auth 同时配置。

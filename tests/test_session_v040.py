@@ -28,6 +28,7 @@ from loop_controller.session import (
     SessionManager,
     SessionStoreError,
 )
+from tests.conftest import write_trusted_local_harness_config
 
 
 class StubPolicyStore:
@@ -106,6 +107,7 @@ def _make_minimal_config(tmp_path: Path) -> None:
     (tmp_path / "config" / "scripted_plan.yaml").write_text(
         "steps: []\n", encoding="utf-8"
     )
+    write_trusted_local_harness_config(tmp_path / "config")
 
 
 def test_jsonl_session_backend_persists_and_reloads(tmp_path: Path) -> None:

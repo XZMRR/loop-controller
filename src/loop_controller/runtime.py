@@ -398,7 +398,13 @@ def build_runtime(
     http_client = HTTPClient()
     http_executor = HTTPExecutor(http_client, config.http_tool_specs, secret_broker=secret_broker)
     local_executor = LocalFunctionExecutor(config.local_function_specs)
-    harness_executor = HarnessExecutor(config.harness_tool_specs, config.harness_backends)
+    alert_store = JsonlAlertStore(config.alert_store_path)
+    harness_executor = HarnessExecutor(
+        config.harness_tool_specs,
+        config.harness_backends,
+        execution_policy=config.harness_execution_policy,
+        alert_store=alert_store,
+    )
     executor_registry = ExecutorRegistry()
     for canonical_name in config.tool_mapping:
         executor_registry.register(canonical_name, mcp_executor)
@@ -408,8 +414,13 @@ def build_runtime(
         executor_registry.register(canonical_name, local_executor)
     for canonical_name in config.harness_tool_specs:
         executor_registry.register(canonical_name, harness_executor)
+
+    from loop_controller.execution_mode import ExecutionModeResolver
+
+    executor_registry.set_mode_resolver(
+        ExecutionModeResolver(config.harness_execution_policy, harness_executor)
+    )
     masker = Masker(config.masking_rules)
-    alert_store = JsonlAlertStore(config.alert_store_path)
     budget_ledger = JsonlBudgetLedger(config.budget_ledger_path, alert_store=alert_store)
     session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
     risk_manager = RiskStateManager(JsonlRiskStateStore(config.risk_state_path))

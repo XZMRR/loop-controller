@@ -56,6 +56,14 @@ def config_dir(tmp_path) -> str:
         encoding="utf-8",
     )
     (base / "llm_planner.yaml").write_text("enabled: false\n", encoding="utf-8")
+    (base / "harness_tools.yaml").write_text(
+        "execution:\n"
+        "  default_mode: trusted_local\n"
+        "trusted_local_tools:\n"
+        "  - web_search\n"
+        "  - send_email\n",
+        encoding="utf-8",
+    )
     return str(base)
 
 

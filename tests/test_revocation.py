@@ -27,6 +27,7 @@ from loop_controller.infra.durable_io import DurableIOError
 from loop_controller.infra.hot_reload import HotReloader
 from loop_controller.models import Agent, ApprovalRecord
 from loop_controller.server import build_app
+from tests.conftest import write_trusted_local_harness_config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -471,6 +472,10 @@ tool_mapping:
   send_email: {server: email_mock, mcp_name: send_email, cost_per_call: 1}
 """,
         encoding="utf-8",
+    )
+    write_trusted_local_harness_config(
+        root / "config",
+        ["send_email"],
     )
     return root
 

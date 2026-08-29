@@ -20,6 +20,7 @@ import pytest
 from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.proxy_server import LoopControllerProxyServer, ProxyIdentity
 from loop_controller.runtime import build_runtime
+from tests.conftest import write_trusted_local_harness_config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -65,6 +66,10 @@ profiles:
         max_calls_per_task: 1
 """,
         encoding="utf-8",
+    )
+    write_trusted_local_harness_config(
+        root / "config",
+        ["web_search", "send_email"],
     )
     return root
 

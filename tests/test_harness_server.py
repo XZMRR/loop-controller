@@ -38,8 +38,8 @@ async def _post(
     transport = httpx.ASGITransport(app=harness_server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         return await client.post(
-            "/harness/v1/execute",
-            headers={"x-harness-protocol-version": "1", **(headers or {})},
+            "/harness/v2/execute",
+            headers={"x-harness-protocol-version": "2", **(headers or {})},
             content=json.dumps(payload, separators=(",", ":")),
         )
 
@@ -49,8 +49,8 @@ def _hmac_headers(body: bytes, nonce: str, timestamp: int | None = None) -> dict
     canonical = "\n".join(
         (
             "POST",
-            "/harness/v1/execute",
-            "1",
+            "/harness/v2/execute",
+            "2",
             "test-key",
             timestamp_text,
             nonce,
@@ -61,7 +61,7 @@ def _hmac_headers(body: bytes, nonce: str, timestamp: int | None = None) -> dict
         hmac.new(b"secret", canonical.encode(), hashlib.sha256).digest()
     ).decode()
     return {
-        "x-harness-protocol-version": "1",
+        "x-harness-protocol-version": "2",
         "x-harness-key-id": "test-key",
         "x-harness-timestamp": timestamp_text,
         "x-harness-nonce": nonce,
@@ -73,7 +73,11 @@ def _hmac_headers(body: bytes, nonce: str, timestamp: int | None = None) -> dict
 async def test_protocol_and_tool_schema_are_strict() -> None:
     transport = httpx.ASGITransport(app=harness_server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        unsupported = await client.post("/harness/v1/execute", json=_payload())
+        unsupported = await client.post(
+            "/harness/v2/execute",
+            json=_payload(),
+            headers={"x-harness-protocol-version": "0"},
+        )
     assert unsupported.json()["error_code"] == "harness_protocol_unsupported"
 
     invalid = await _post(_payload(arguments={"text": 1, "unexpected": True}))
@@ -102,9 +106,9 @@ async def test_hmac_raw_body_signature_and_replay(monkeypatch: pytest.MonkeyPatc
     headers = _hmac_headers(body, "nonce-1")
     transport = httpx.ASGITransport(app=harness_server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        first = await client.post("/harness/v1/execute", headers=headers, content=body)
-        replay = await client.post("/harness/v1/execute", headers=headers, content=body)
-        changed = await client.post("/harness/v1/execute", headers=_hmac_headers(body, "nonce-2"), content=body + b" ")
+        first = await client.post("/harness/v2/execute", headers=headers, content=body)
+        replay = await client.post("/harness/v2/execute", headers=headers, content=body)
+        changed = await client.post("/harness/v2/execute", headers=_hmac_headers(body, "nonce-2"), content=body + b" ")
     assert first.status_code == 200
     assert replay.json()["error_code"] == "harness_replay_detected"
     assert changed.json()["error_code"] == "harness_auth_failed"
@@ -119,7 +123,7 @@ async def test_hmac_rejects_expired_timestamp(monkeypatch: pytest.MonkeyPatch) -
     transport = httpx.ASGITransport(app=harness_server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/harness/v1/execute",
+            "/harness/v2/execute",
             headers=_hmac_headers(body, "old", int(time.time()) - 120),
             content=body,
         )
@@ -203,11 +207,18 @@ async def test_cancellation_terminates_and_reaps_process(
                 "Sandbox",
                 (),
                 {
-                    "allowed_hosts": [],
-                    "allowed_paths": [],
-                    "env_whitelist": [],
-                    "max_output_bytes": 1024,
                     "timeout_seconds": 30,
+                    "max_output_bytes": 1024,
+                    "network_policy": "deny_all",
+                    "allowed_hosts": [],
+                    "file_policy": "deny_all",
+                    "allowed_paths": [],
+                    "readonly_paths": [],
+                    "env_whitelist": [],
+                    "process_policy": "deny_all",
+                    "allowed_commands": [],
+                    "evidence_capture": "none",
+                    "resource_limits": None,
                 },
             )(),
         )
@@ -226,6 +237,7 @@ async def test_sandbox_fail_closed_and_minimal_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     unsupported_payload = _payload("shell", {"command": "echo", "args": []})
+    unsupported_payload["sandbox"]["network_policy"] = "allow_list"
     unsupported_payload["sandbox"]["allowed_hosts"] = ["example.com"]
     unsupported = await _post(unsupported_payload)
     assert unsupported.json()["error_code"] == "harness_sandbox_unsupported"
@@ -259,5 +271,5 @@ async def test_health_does_not_expose_secrets(monkeypatch: pytest.MonkeyPatch) -
     transport = httpx.ASGITransport(app=harness_server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/health")
-    assert response.json() == {"status": "ok", "protocol_version": "1"}
+    assert response.json() == {"status": "ok", "protocol_version": "2"}
     assert "never-return-this" not in response.text

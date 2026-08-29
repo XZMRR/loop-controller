@@ -262,10 +262,20 @@ class ToolGovernServer:
         uptime = time.time() - self._start_time
         persistence = getattr(self._controller._runtime, "persistence_status", None)
         persistence_summary = persistence.as_dict() if persistence is not None else {}
+        executor = getattr(self._controller._runtime, "harness_executor", None)
+        if executor is not None:
+            harness_backends = [status.model_dump(mode="json") for status in executor.backend_statuses()]
+        else:
+            harness_backends = []
+        harness_degraded = any(
+            backend["status"] not in {"healthy", "degraded"} or backend.get("draining", False)
+            for backend in harness_backends
+        )
         degraded = (
             evidence_status == "degraded"
             or anchor_summary["anchor_status"] not in {"disabled", "healthy"}
             or persistence_summary.get("status", "healthy") != "healthy"
+            or harness_degraded
         )
         return JSONResponse(
             HealthResponse(
@@ -275,6 +285,7 @@ class ToolGovernServer:
                 evidence_status=evidence_status,
                 persistence=persistence_summary,
                 uptime_seconds=round(uptime, 2),
+                harness_backends=harness_backends,
                 **anchor_summary,
             ).model_dump()
         )
@@ -619,6 +630,48 @@ class ToolGovernServer:
             {"backends": [status.model_dump(mode="json") for status in executor.backend_statuses()]}
         )
 
+    async def _handle_admin_harness_drain(self, request: Request) -> JSONResponse:
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        executor = getattr(self._controller._runtime, "harness_executor", None)
+        if executor is None:
+            return JSONResponse({"error": "harness unavailable"}, status_code=503)
+
+        name = request.path_params["name"]
+        try:
+            drained = await executor.drain_backend(name)
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        await self._audit_admin_operation(
+            request,
+            "harness_drain",
+            target=f"harness:{name}",
+            metadata={"backend": name, "drained": drained},
+        )
+        return JSONResponse({"backend": name, "drained": drained})
+
+    async def _handle_admin_harness_reset(self, request: Request) -> JSONResponse:
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        executor = getattr(self._controller._runtime, "harness_executor", None)
+        if executor is None:
+            return JSONResponse({"error": "harness unavailable"}, status_code=503)
+
+        name = request.path_params["name"]
+        try:
+            executor.reset_backend(name)
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        await self._audit_admin_operation(
+            request,
+            "harness_reset",
+            target=f"harness:{name}",
+            metadata={"backend": name},
+        )
+        return JSONResponse({"backend": name, "reset": True})
+
     async def _handle_admin_evidence_anchor(self, request: Request) -> JSONResponse:
         if not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -876,6 +929,16 @@ def build_app(
             ),
             Route(
                 "/v1/admin/harness/backends", server._handle_admin_harness_backends, methods=["GET"]
+            ),
+            Route(
+                "/v1/admin/harness/{name}/drain",
+                server._handle_admin_harness_drain,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/admin/harness/{name}/reset",
+                server._handle_admin_harness_reset,
+                methods=["POST"],
             ),
             Route(
                 "/v1/admin/evidence/anchor", server._handle_admin_evidence_anchor, methods=["GET"]

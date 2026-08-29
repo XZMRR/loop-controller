@@ -41,6 +41,7 @@ from loop_controller.policy_engine import OPAPolicyEngine
 from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
 from loop_controller.runtime import Runtime
 from loop_controller.session import SessionManager
+from tests.conftest import write_trusted_local_harness_config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -78,6 +79,10 @@ def workdir(tmp_path: Path) -> Path:
     shutil.copytree(REPO_ROOT / "config", root / "config")
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     (root / "data").mkdir()
+    write_trusted_local_harness_config(
+        root / "config",
+        ["web_search", "read_file", "write_file", "send_email"],
+    )
     return root
 
 

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from loop_controller.execution_mode import ExecutionMode
 from loop_controller.models import CapabilityProfile, Tool, ToolResult
+
+if TYPE_CHECKING:
+    from loop_controller.execution_mode import ExecutionModeResolver
 
 
 def extract_declared_secret_refs(arguments: dict[str, Any]) -> list[str]:
@@ -79,11 +83,16 @@ class ExecutorRegistryError(Exception):
 
 
 class ExecutorRegistry:
-    """工具名到执行器的注册表，支持按工具注册和默认执行器回退。"""
+    """工具名到执行器的注册表，支持按工具注册和默认执行器回退。
+
+    v0.31.0 新增 execution_mode_resolver：当存在时，resolve_executor()
+    根据执行策略决定使用本地执行器还是 Harness 执行器。
+    """
 
     def __init__(self) -> None:
         self._executors: dict[str, ToolExecutor] = {}
         self._default: ToolExecutor | None = None
+        self._mode_resolver: ExecutionModeResolver | None = None
 
     def register(self, tool_name: str, executor: ToolExecutor) -> None:
         """为特定工具名注册执行器。"""
@@ -97,6 +106,10 @@ class ExecutorRegistry:
             raise TypeError(f"执行器 {executor!r} 不符合 ToolExecutor 协议")
         self._default = executor
 
+    def set_mode_resolver(self, resolver: ExecutionModeResolver) -> None:
+        """v0.31.0：注入执行模式解析器。"""
+        self._mode_resolver = resolver
+
     def get_executor(self, tool_name: str) -> ToolExecutor:
         """按工具名获取执行器；不存在且没有默认执行器时抛出异常。"""
         executor = self._executors.get(tool_name)
@@ -105,6 +118,20 @@ class ExecutorRegistry:
         if self._default is not None:
             return self._default
         raise ExecutorRegistryError(f"工具 {tool_name!r} 没有注册执行器")
+
+    def resolve_executor(self, tool_name: str) -> ToolExecutor | None:
+        """v0.31.0：根据执行策略解析最终执行器。
+
+        返回 None 表示该工具被策略拒绝（deny）。
+        """
+        if self._mode_resolver is None:
+            return self.get_executor(tool_name)
+        mode = self._mode_resolver.resolve(tool_name)
+        if mode == ExecutionMode.DENY:
+            return None
+        if mode == ExecutionMode.HARNESS:
+            return self._mode_resolver.harness_executor
+        return self.get_executor(tool_name)
 
     def resolve_secret_refs(
         self, tool_name: str, arguments: dict[str, Any]

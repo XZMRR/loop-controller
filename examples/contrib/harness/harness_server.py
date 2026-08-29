@@ -21,6 +21,7 @@ from starlette.routing import Route
 from loop_controller.executors.harness_protocol import (
     HARNESS_EXECUTE_PATH,
     HARNESS_PROTOCOL_VERSION,
+    HarnessEvidence,
     HarnessExecuteRequest,
     HarnessExecuteResponse,
 )
@@ -160,7 +161,20 @@ def _validate_request_shape(payload: Any) -> None:
     )
     _validate_keys(
         payload.get("sandbox", {}),
-        {"timeout_seconds", "max_output_bytes", "allowed_hosts", "allowed_paths", "env_whitelist"},
+        {
+            "timeout_seconds",
+            "max_output_bytes",
+            "network_policy",
+            "allowed_hosts",
+            "file_policy",
+            "allowed_paths",
+            "readonly_paths",
+            "env_whitelist",
+            "process_policy",
+            "allowed_commands",
+            "evidence_capture",
+            "resource_limits",
+        },
         "sandbox",
     )
 
@@ -180,10 +194,20 @@ def _validate_shell(arguments: dict[str, Any]) -> None:
         raise ValueError("shell.args 必须是字符串数组")
 
 
-async def _execute_echo(arguments: dict[str, Any], sandbox: Any) -> HarnessExecuteResponse:
+async def _execute_echo(
+    arguments: dict[str, Any], sandbox: Any
+) -> HarnessExecuteResponse:
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
     return HarnessExecuteResponse(
         status="success",
         content={"echo": arguments["text"]},
+        effective_sandbox=sandbox,
+        evidence=HarnessEvidence(
+            started_at=now,
+            finished_at=now,
+        ),
         metadata={"tool": "echo"},
     )
 
@@ -228,6 +252,8 @@ async def _read_stream(
 
 
 async def _execute_shell(arguments: dict[str, Any], sandbox: Any) -> HarnessExecuteResponse:
+    from datetime import UTC, datetime
+
     command = arguments["command"].strip()
     allowed = _ALLOWED_SHELL_COMMANDS.get(command)
     if allowed is None:
@@ -236,7 +262,11 @@ async def _execute_shell(arguments: dict[str, Any], sandbox: Any) -> HarnessExec
             error_code="harness_sandbox_violation",
             content="命令不在允许列表中",
         )
-    if sandbox.allowed_hosts or sandbox.allowed_paths:
+    if (
+        sandbox.network_policy != "deny_all"
+        or sandbox.file_policy != "deny_all"
+        or sandbox.process_policy != "deny_all"
+    ):
         return HarnessExecuteResponse(
             status="error",
             error_code="harness_sandbox_unsupported",
@@ -251,6 +281,7 @@ async def _execute_shell(arguments: dict[str, Any], sandbox: Any) -> HarnessExec
             content="请求的环境变量不在服务端允许列表中",
         )
 
+    started_at = datetime.now(UTC)
     proc = await asyncio.create_subprocess_exec(
         *allowed,
         *arguments.get("args", []),
@@ -292,9 +323,16 @@ async def _execute_shell(arguments: dict[str, Any], sandbox: Any) -> HarnessExec
             error_code="harness_output_limit_exceeded",
             content="命令输出超过限制并已终止",
         )
+    finished_at = datetime.now(UTC)
     return HarnessExecuteResponse(
         status="success" if proc.returncode == 0 else "error",
         content={"output": output.decode("utf-8", errors="replace"), "returncode": proc.returncode},
+        effective_sandbox=sandbox,
+        evidence=HarnessEvidence(
+            started_at=started_at,
+            finished_at=finished_at,
+            exit_code=proc.returncode,
+        ),
         metadata={"tool": "shell"},
     )
 
