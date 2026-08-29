@@ -108,6 +108,24 @@ def test_refresh_tail_partial_line_warning(tmp_path, caplog) -> None:
     assert "不完整" in caplog.text
 
 
+def test_record_response_repairs_incomplete_tail_before_refresh_and_write(tmp_path) -> None:
+    path = tmp_path / "approvals.jsonl"
+    store = JsonlApprovalStore(path)
+    request = _make_request("d1")
+    store.submit_request(request)
+    with path.open("ab") as fh:
+        fh.write(b'{"type":"response","decision_id":"stale"')
+
+    record = _make_record("d1", "approve")
+    store.record_response(record)
+
+    assert store.get_record("d1") == record
+    replayed = JsonlApprovalStore(path)
+    assert replayed.get_request("d1") == request
+    assert replayed.get_record("d1") == record
+    assert path.read_bytes().endswith(b"\n")
+
+
 def test_record_response_rejects_overwrite(tmp_path) -> None:
     path = tmp_path / "approvals.jsonl"
     store = JsonlApprovalStore(path)
@@ -132,6 +150,45 @@ def test_record_response_idempotent(tmp_path) -> None:
     assert store.get_record("d1") == record
 
 
+def test_record_response_write_failure_does_not_update_memory(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "approvals.jsonl"
+    store = JsonlApprovalStore(path)
+    store.submit_request(_make_request("d1"))
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError("disk failure")
+
+    monkeypatch.setattr("loop_controller.infra.approval_store.os.fsync", fail_fsync)
+    with pytest.raises(ApprovalStoreError, match="无法写入"):
+        store.record_response(_make_record("d1", "approve"))
+
+    assert store.get_record("d1") is None
+
+
+def test_submit_request_write_failure_does_not_update_memory(tmp_path, monkeypatch) -> None:
+    store = JsonlApprovalStore(tmp_path / "approvals.jsonl")
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError("disk failure")
+
+    monkeypatch.setattr("loop_controller.infra.approval_store.os.fsync", fail_fsync)
+    with pytest.raises(ApprovalStoreError, match="无法写入"):
+        store.submit_request(_make_request("d1"))
+
+    assert store.get_request("d1") is None
+
+
+def test_get_pending_refreshes_external_response(tmp_path) -> None:
+    path = tmp_path / "approvals.jsonl"
+    store_a = JsonlApprovalStore(path)
+    request = _make_request("d1")
+    store_a.submit_request(request)
+    store_b = JsonlApprovalStore(path)
+    store_b.record_response(_make_record("d1", "approve"))
+
+    assert store_a.get_pending() == []
+
+
 def test_replay_keeps_first_response(tmp_path) -> None:
     path = tmp_path / "approvals.jsonl"
     record1 = _make_record("d1", "approve")
@@ -148,7 +205,7 @@ def test_replay_keeps_first_response(tmp_path) -> None:
     assert store.get_record("d1") == record1
 
 
-def test_corrupted_line_writes_alert(tmp_path) -> None:
+def test_corrupted_line_writes_alert_and_fails_closed(tmp_path) -> None:
     path = tmp_path / "approvals.jsonl"
     alert_store = InMemoryAlertStore()
     store = JsonlApprovalStore(path, alert_store=alert_store)
@@ -156,7 +213,8 @@ def test_corrupted_line_writes_alert(tmp_path) -> None:
     with path.open("ab") as fh:
         fh.write(b"{not-json}\n")
 
-    store.refresh()
+    with pytest.raises(ApprovalStoreError, match="损坏"):
+        store.refresh()
 
     alerts = alert_store.list_alerts()
     assert len(alerts) == 1

@@ -21,7 +21,9 @@ from loop_controller.grpc_server import (
     add_servicer_to_server,
     serve,
 )
+from loop_controller.identity import AgentIdentity
 from loop_controller.models import GovernanceResult
+from loop_controller.v1 import governance_pb2
 
 
 class _MockController(LoopController):
@@ -79,11 +81,19 @@ class _MockController(LoopController):
 
 
 class _MockApprovalRequest:
-    def __init__(self, request_id: str, decision_id: str, tool_name: str, requester_id: str):
+    def __init__(
+        self,
+        request_id: str,
+        decision_id: str,
+        tool_name: str,
+        requester_id: str,
+        agent_id: str = "researcher_001",
+    ):
         self.request_id = request_id
         self.decision_id = decision_id
         self.tool_name = tool_name
         self.requester_id = requester_id
+        self.agent_id = agent_id
         self.reason = ""
 
 
@@ -137,6 +147,9 @@ class _MockAuditEvent:
 class _MockAuditStore:
     def __init__(self, events: list[_MockAuditEvent] | None = None):
         self._events = events or []
+
+    async def append_async(self, event: Any) -> None:
+        self._events.append(event)
 
     async def iter_events(self):
         for event in self._events:
@@ -258,30 +271,99 @@ async def test_get_health(grpc_client) -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_pending_approvals(grpc_client) -> None:
-    client, controller = grpc_client
-    store = controller._runtime.approval_manager._store
-    store._pending.append(_MockApprovalRequest("req-1", "d-1", "send_email", "researcher_001"))
-    response = await client.list_pending_approvals()
+async def test_list_pending_approvals_requires_admin_identity() -> None:
+    controller = _MockController()
+    controller._runtime = _MockRuntime()
+    controller._runtime.approval_manager._store._pending.append(
+        _MockApprovalRequest("req-1", "d-1", "send_email", "researcher_001")
+    )
+    servicer = ToolGovernanceServicer(
+        controller,
+        entrypoints_config={"grpc": {"admin_agent_ids": ["admin-agent"]}},
+    )
+    identity = AgentIdentity(
+        agent_id="admin-agent",
+        user_id="admin",
+        profile_id="admin",
+    )
+    servicer._verify_identity = lambda _context: _async_value(identity)  # type: ignore[method-assign]
+    context = _MockGrpcContext()
+
+    response = await servicer.ListPendingApprovals(None, context)  # type: ignore[arg-type]
+
     assert len(response.approvals) == 1
     assert response.approvals[0].request_id == "req-1"
     assert response.approvals[0].tool_name == "send_email"
 
 
+async def _async_value(value: Any) -> Any:
+    return value
+
+
+class _MockGrpcContext:
+    def __init__(self) -> None:
+        self.code = grpc.StatusCode.OK
+        self.details = ""
+
+    def set_code(self, code: grpc.StatusCode) -> None:
+        self.code = code
+
+    def set_details(self, details: str) -> None:
+        self.details = details
+
+
 @pytest.mark.asyncio
-async def test_query_audit_events(grpc_client) -> None:
-    client, controller = grpc_client
+async def test_query_audit_events_requires_admin_identity() -> None:
+    controller = _MockController()
+    controller._runtime = _MockRuntime()
     controller._runtime.audit_store = _MockAuditStore(
         [
             _MockAuditEvent(session_id="s-1", task_id="t-1"),
             _MockAuditEvent(session_id="s-2", task_id="t-2"),
         ]
     )
+    servicer = ToolGovernanceServicer(
+        controller,
+        entrypoints_config={"grpc": {"admin_agent_ids": ["admin-agent"]}},
+    )
+    identity = AgentIdentity(agent_id="admin-agent", user_id="admin", profile_id="admin")
+    servicer._verify_identity = lambda _context: _async_value(identity)  # type: ignore[method-assign]
+    context = _MockGrpcContext()
+
     events = []
-    async for event in client.query_audit_events(session_id="s-1", limit=10):
+    async for event in servicer.QueryAuditEvents(
+        governance_pb2.QueryAuditEventsRequest(session_id="s-1", limit=10), context
+    ):
         events.append(event)
+
+    assert context.code == grpc.StatusCode.OK
     assert len(events) == 1
     assert "s-1" in events[0].payload_json
+
+
+@pytest.mark.asyncio
+async def test_query_audit_events_rejects_non_admin_identity() -> None:
+    controller = _MockController()
+    controller._runtime = _MockRuntime()
+    controller._runtime.audit_store = _MockAuditStore(
+        [_MockAuditEvent(session_id="s-1", task_id="t-1")]
+    )
+    servicer = ToolGovernanceServicer(
+        controller,
+        entrypoints_config={"grpc": {"admin_agent_ids": ["admin-agent"]}},
+    )
+    identity = AgentIdentity(agent_id="regular-agent", user_id="alice", profile_id="p1")
+    servicer._verify_identity = lambda _context: _async_value(identity)  # type: ignore[method-assign]
+    context = _MockGrpcContext()
+
+    events = []
+    async for event in servicer.QueryAuditEvents(
+        governance_pb2.QueryAuditEventsRequest(limit=10), context
+    ):
+        events.append(event)
+
+    assert events == []
+    assert context.code == grpc.StatusCode.PERMISSION_DENIED
 
 
 @pytest.fixture

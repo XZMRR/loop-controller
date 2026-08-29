@@ -183,7 +183,7 @@ def _valid_anchor_config(config_dir: Path) -> dict:
 
 
 def test_load_valid_config(config_dir):
-    config = ConfigLoader().load(config_dir)  # 无 opa_base_url，跳过校验 3
+    config = ConfigLoader().load(config_dir)  # 无 opa_base_url，仅跳过 OPA 试查询
     assert "researcher_001" in config.agents
     assert config.agents["researcher_001"].profile_id == "research_assistant_v1"
     assert "research_assistant_v1" in config.profiles
@@ -193,6 +193,48 @@ def test_load_valid_config(config_dir):
     }
     assert config.tool_mapping["send_email"].mcp_name == "send_email"
     assert config.approval.default == "zhang_manager"
+    assert config.persistence.fsync_enabled is True
+    assert config.persistence.lock_timeout_seconds == 5.0
+    assert config.persistence.repair_incomplete_tail is True
+
+
+def test_persistence_config_loads(config_dir):
+    _write_yaml(config_dir / "persistence.yaml", {
+        "persistence": {
+            "fsync_enabled": False,
+            "lock_timeout_seconds": 2.5,
+            "repair_incomplete_tail": False,
+            "enforce_permissions": False,
+            "fail_on_unsafe_permissions": False,
+        }
+    })
+
+    config = ConfigLoader().load(config_dir)
+
+    assert config.persistence.fsync_enabled is False
+    assert config.persistence.lock_timeout_seconds == 2.5
+    assert config.persistence.repair_incomplete_tail is False
+    assert config.persistence.enforce_permissions is False
+    assert config.persistence.fail_on_unsafe_permissions is False
+
+
+@pytest.mark.parametrize("timeout", [0, -1])
+def test_persistence_lock_timeout_must_be_positive(config_dir, timeout):
+    _write_yaml(config_dir / "persistence.yaml", {
+        "persistence": {"lock_timeout_seconds": timeout}
+    })
+
+    with pytest.raises(ConfigValidationError, match="lock_timeout_seconds 必须大于 0"):
+        ConfigLoader().load(config_dir)
+
+
+def test_persistence_unknown_option_is_rejected(config_dir):
+    _write_yaml(config_dir / "persistence.yaml", {
+        "persistence": {"unknown": True}
+    })
+
+    with pytest.raises(ConfigValidationError, match="persistence 配置非法"):
+        ConfigLoader().load(config_dir)
 
 
 def test_anchor_valid_config_loads(config_dir, monkeypatch):

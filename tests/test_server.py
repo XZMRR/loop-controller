@@ -17,7 +17,7 @@ from starlette.testclient import TestClient
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
 from loop_controller.identity import ConfigIdentityProvider
-from loop_controller.models import ApprovalRequest, GovernanceResult
+from loop_controller.models import Agent, ApprovalRequest, GovernanceResult
 from loop_controller.server import build_app
 
 
@@ -56,11 +56,13 @@ class _MockApprovalRequest:
         tool_name: str,
         requester_id: str,
         reason: str = "",
+        agent_id: str = "researcher_001",
     ):
         self.request_id = request_id
         self.decision_id = decision_id
         self.tool_name = tool_name
         self.requester_id = requester_id
+        self.agent_id = agent_id
         self.reason = reason
 
 
@@ -313,6 +315,49 @@ def test_wait_for_approval_pending_timeout() -> None:
     assert data["request_id"] == "req-missing"
 
 
+def test_wait_and_resume_reject_request_from_other_identity() -> None:
+    provider = ConfigIdentityProvider(
+        agents={
+            "researcher_001": Agent(
+                agent_id="researcher_001",
+                name="Researcher",
+                profile_id="default",
+                owner_id="alice",
+            ),
+            "other_agent": Agent(
+                agent_id="other_agent",
+                name="Other",
+                profile_id="default",
+                owner_id="mallory",
+            ),
+        },
+        users={"alice": "Alice", "mallory": "Mallory"},
+        allowed_tokens=[
+            {"token": "other-token", "agent_id": "other_agent", "user_id": "mallory"}
+        ],
+    )
+    client, controller = _build_client(identity_provider=provider)
+    controller._runtime.approval_manager._store._pending.append(
+        _MockApprovalRequest("req-1", "d-1", "send_email", "alice")
+    )
+    headers = {"Authorization": "Bearer other-token"}
+
+    wait = client.get(
+        "/v1/wait-for-approval",
+        params={"request_id": "req-1", "max_wait": 1},
+        headers=headers,
+    )
+    resume = client.post(
+        "/v1/govern/resume-after-approval",
+        json={"request_id": "req-1"},
+        headers=headers,
+    )
+
+    assert wait.status_code == 403
+    assert resume.status_code == 403
+    assert controller.resume_calls == []
+
+
 def test_wait_for_approval_sse_returns_result() -> None:
     watcher = ApprovalWatcher()
     client, controller = _build_client(watcher=watcher)
@@ -384,7 +429,7 @@ def test_metrics_endpoint() -> None:
 
 
 def test_admin_pending_approvals() -> None:
-    client, controller = _build_client()
+    client, controller = _build_client(api_key="secret")
     store = controller._runtime.approval_manager._store
     store._pending.append(
         _MockApprovalRequest(
@@ -395,7 +440,7 @@ def test_admin_pending_approvals() -> None:
             reason="needs approval",
         )
     )
-    resp = client.get("/v1/admin/approvals/pending")
+    resp = client.get("/v1/admin/approvals/pending", headers={"X-API-Key": "secret"})
     assert resp.status_code == 200
     data = resp.json()
     assert len(data["approvals"]) == 1
@@ -404,25 +449,34 @@ def test_admin_pending_approvals() -> None:
 
 
 def test_admin_audit_query() -> None:
-    client, controller = _build_client()
+    client, controller = _build_client(api_key="secret")
     controller._runtime.audit_store = _MockAuditStore(
         [
             _MockAuditEvent(session_id="s-1", task_id="t-1"),
             _MockAuditEvent(session_id="s-2", task_id="t-2"),
         ]
     )
-    resp = client.get("/v1/admin/audit", params={"session_id": "s-1", "limit": 10})
+    resp = client.get(
+        "/v1/admin/audit",
+        params={"session_id": "s-1", "limit": 10},
+        headers={"X-API-Key": "secret"},
+    )
     assert resp.status_code == 200
     data = resp.json()
     assert len(data["events"]) == 1
     assert data["events"][0]["session_id"] == "s-1"
 
 
-def test_existing_admin_endpoints_allow_unconfigured_api_key() -> None:
+def test_admin_pending_requires_configured_api_key() -> None:
     client, _controller = _build_client()
 
-    assert client.get("/v1/admin/approvals/pending").status_code == 200
-    assert client.get("/v1/admin/audit").status_code == 200
+    assert client.get("/v1/admin/approvals/pending").status_code == 401
+
+
+def test_admin_audit_requires_configured_api_key() -> None:
+    client, _controller = _build_client()
+
+    assert client.get("/v1/admin/audit").status_code == 401
 
 
 def test_admin_harness_backends_is_authenticated_and_sanitized() -> None:
@@ -539,9 +593,11 @@ def test_lifespan_starts_and_closes_controller() -> None:
     assert controller.closed
 
 
-def test_admin_anchor_endpoints_require_auth() -> None:
-    client, _controller = _build_client(api_key="secret")
+@pytest.mark.parametrize("api_key", [None, "secret"])
+def test_admin_anchor_and_harness_endpoints_require_auth(api_key: str | None) -> None:
+    client, _controller = _build_client(api_key=api_key)
     for path, method in (
+        ("/v1/admin/harness/backends", "GET"),
         ("/v1/admin/evidence/anchor", "GET"),
         ("/v1/admin/evidence/anchor/verify", "POST"),
         ("/v1/admin/evidence/anchor/publish", "POST"),

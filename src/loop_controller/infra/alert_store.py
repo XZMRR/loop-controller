@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from loop_controller.infra.durable_io import DurableIOError, DurableJsonlFile
 from loop_controller.models import AuditAlert, AuditReport
 
 logger = logging.getLogger(__name__)
@@ -85,10 +86,11 @@ class JsonlAlertStore:
     _path: Path = field(init=False, repr=False)
     _alerts: dict[str, AuditAlert] = field(init=False, repr=False, default_factory=dict)
     _reports: dict[str, AuditReport] = field(init=False, repr=False, default_factory=dict)
+    _durable: DurableJsonlFile = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._path = Path(str(self.path))
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._durable = DurableJsonlFile(self._path)
         self._replay()
 
     def save_alert(self, alert: AuditAlert) -> None:
@@ -128,10 +130,11 @@ class JsonlAlertStore:
 
     def _append(self, record: dict) -> None:
         try:
-            with self._path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-                fh.flush()
-        except OSError as exc:
+            with self._durable.transaction() as transaction:
+                transaction.repair_incomplete_tail()
+                transaction.read_complete_lines()
+                transaction.append_json(record)
+        except DurableIOError as exc:
             raise AlertStoreError(f"无法写入 AlertStore {self._path}: {exc}") from exc
 
     def _replay(self) -> None:

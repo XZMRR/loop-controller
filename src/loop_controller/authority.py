@@ -57,6 +57,12 @@ class AuthorityManager(Protocol):
 
     def consume(self, token_id: str, cost: BudgetCost) -> AuthorityToken | None: ...
 
+    def validate_and_consume(
+        self, proposal: ActionProposal, cost: BudgetCost
+    ) -> list[AuthorityToken] | None: ...
+
+    def refund_consumed(self, tokens: list[AuthorityToken], cost: BudgetCost) -> None: ...
+
     def revoke_token(self, token_id: str, reason: str) -> bool: ...
 
     def revoke_expired_tokens(self, now: datetime | None = None) -> list[str]: ...
@@ -80,6 +86,14 @@ class NoopAuthorityManager:
         return []
 
     def consume(self, token_id: str, cost: BudgetCost) -> AuthorityToken | None:
+        return None
+
+    def validate_and_consume(
+        self, proposal: ActionProposal, cost: BudgetCost
+    ) -> list[AuthorityToken] | None:
+        return [] if not proposal.authority_token_ids else None
+
+    def refund_consumed(self, tokens: list[AuthorityToken], cost: BudgetCost) -> None:
         return None
 
     def revoke_token(self, token_id: str, reason: str) -> bool:
@@ -119,19 +133,6 @@ class EarnedAuthorityManager:
             if capability not in self._rules.grants:
                 return DenyReason(f"capability {capability!r} has no grant rule")
 
-        # 防止同一任务对同一能力重复授予
-        active_for_task = [
-            t
-            for t in self._store.list_by_task(request.task_id)
-            if _is_active(t, self._now())
-        ]
-        active_caps = set()
-        for token in active_for_task:
-            active_caps.update(token.granted_capabilities)
-        for capability in request.requested_capabilities:
-            if capability in active_caps:
-                return DenyReason(f"capability {capability!r} already granted for task")
-
         # 评估每个能力的条件（全部能力都必须满足各自条件）
         for capability in request.requested_capabilities:
             rule = self._rules.grants[capability]
@@ -163,7 +164,9 @@ class EarnedAuthorityManager:
             revoked_at=None,
             audit_record_id=uuid.uuid4().hex,
         )
-        self._store.save(token, "token_created")
+        if not self._store.create_if_capabilities_available(token, now):
+            duplicated = request.requested_capabilities[0]
+            return DenyReason(f"capability {duplicated!r} already granted for task")
         logger.info(
             "Granted authority token %s for capabilities %s to task %s",
             token.token_id,
@@ -235,19 +238,29 @@ class EarnedAuthorityManager:
         token = self._store.get(token_id)
         if token is None:
             return None
-        now = self._now()
-        if not _is_active(token, now):
-            return None
-        remaining = token.remaining_budget.token_count - cost.token_count
-        if remaining < 0:
-            return None
-        updated = token.model_copy(
-            update={
-                "remaining_budget": BudgetCost(token_count=remaining),
-            }
+        return self._store.validate_and_consume(
+            token_id, cost, self._now(), token.task_id, token.agent_id
         )
-        self._store.save(updated, "token_used")
-        return updated
+
+    def validate_and_consume(
+        self, proposal: ActionProposal, cost: BudgetCost
+    ) -> list[AuthorityToken] | None:
+        """执行前逐个原子校验并消费；任一失败则安全返还已消费 token。"""
+        consumed: list[AuthorityToken] = []
+        for token_id in proposal.authority_token_ids:
+            token = self._store.validate_and_consume(
+                token_id, cost, self._now(), proposal.task_id, proposal.agent_id
+            )
+            if token is None:
+                self.refund_consumed(consumed, cost)
+                return None
+            consumed.append(token)
+        return consumed
+
+    def refund_consumed(self, tokens: list[AuthorityToken], cost: BudgetCost) -> None:
+        """仅当 token 未被后续修改时返还本次消费，避免覆盖其他 worker 状态。"""
+        for token in tokens:
+            self._store.refund_if_unchanged(token, cost)
 
     def revoke_token(self, token_id: str, reason: str) -> bool:
         """撤销指定 token。"""

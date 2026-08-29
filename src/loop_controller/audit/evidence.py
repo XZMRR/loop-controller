@@ -11,12 +11,13 @@ import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import BaseModel, ConfigDict
 
+from loop_controller.infra.durable_io import durable_atomic_replace
 from loop_controller.models import AuditEvent
 from loop_controller.utils.canonical import canonical_json
 
@@ -191,9 +192,10 @@ class EvidenceChain:
             )
             signature = self._signer.sign(canonical_json(signed_payload).encode("utf-8"))
             record = {**signed_payload, "signature": base64.b64encode(signature).decode("ascii")}
-            temporary = path.with_suffix(path.suffix + ".tmp")
-            temporary.write_text(canonical_json(record) + "\n", encoding="utf-8")
-            os.replace(temporary, path)
+            durable_atomic_replace(
+                path,
+                (canonical_json(record) + "\n").encode("utf-8"),
+            )
         except Exception as exc:
             self.mark_degraded(f"checkpoint write failed: {type(exc).__name__}")
             raise
@@ -234,34 +236,55 @@ class EvidenceChain:
         lock = self._locks.setdefault(tenant_id, asyncio.Lock())
         async with lock:
             try:
-                await self._recover(tenant_id)
-                seq = self._seq_by_tenant[tenant_id] + 1
-                prev_hash = self._prev_hash_by_tenant[tenant_id]
-                timestamp = datetime.now(UTC).isoformat()
-                current_hash = _hash_payload(
-                    seq=seq,
-                    timestamp=timestamp,
-                    tenant_id=tenant_id,
-                    event=event,
-                    prev_hash=prev_hash,
-                    algorithm=self._signer.algorithm,
-                    key_id=self._signer.key_id,
-                )
-                signature = base64.b64encode(
-                    self._signer.sign(current_hash.encode("ascii"))
-                ).decode("ascii")
-                evidence = SignedEvidence(
-                    seq=seq,
-                    timestamp=timestamp,
-                    tenant_id=tenant_id,
-                    event=event,
-                    prev_hash=prev_hash,
-                    current_hash=current_hash,
-                    algorithm=self._signer.algorithm,
-                    key_id=self._signer.key_id,
-                    signature=signature,
-                )
-                await self._backend.append(tenant_id, evidence)
+                def build(state: tuple[int, str] | None) -> SignedEvidence:
+                    if state is None:
+                        state = (self._seq_start, GENESIS_HASH)
+                    seq = state[0] + 1
+                    prev_hash = state[1]
+                    timestamp = datetime.now(UTC).isoformat()
+                    current_hash = _hash_payload(
+                        seq=seq,
+                        timestamp=timestamp,
+                        tenant_id=tenant_id,
+                        event=event,
+                        prev_hash=prev_hash,
+                        algorithm=self._signer.algorithm,
+                        key_id=self._signer.key_id,
+                    )
+                    signature = base64.b64encode(
+                        self._signer.sign(current_hash.encode("ascii"))
+                    ).decode("ascii")
+                    return SignedEvidence(
+                        seq=seq,
+                        timestamp=timestamp,
+                        tenant_id=tenant_id,
+                        event=event,
+                        prev_hash=prev_hash,
+                        current_hash=current_hash,
+                        algorithm=self._signer.algorithm,
+                        key_id=self._signer.key_id,
+                        signature=signature,
+                    )
+
+                append_from_tail = getattr(self._backend, "append_from_tail", None)
+                append_impl = getattr(getattr(self._backend, "append", None), "__func__", None)
+                if (
+                    append_from_tail is not None
+                    and getattr(append_impl, "__qualname__", "")
+                    == "LocalFileEvidenceBackend.append"
+                ):
+                    evidence = cast(SignedEvidence, await append_from_tail(tenant_id, build))
+                else:
+                    await self._recover(tenant_id)
+                    evidence = build(
+                        (
+                            self._seq_by_tenant[tenant_id],
+                            self._prev_hash_by_tenant[tenant_id],
+                        )
+                    )
+                    await self._backend.append(tenant_id, evidence)
+                seq = evidence.seq
+                current_hash = evidence.current_hash
             except Exception as exc:
                 self.mark_degraded(f"evidence append failed: {type(exc).__name__}")
                 raise

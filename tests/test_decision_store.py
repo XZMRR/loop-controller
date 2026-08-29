@@ -83,8 +83,8 @@ def test_append_only_format(tmp_path) -> None:
 
     lines = path.read_text(encoding="utf-8").strip().split("\n")
     assert len(lines) == 2
-    assert "\"type\": \"proposal\"" in lines[0]
-    assert "\"type\": \"decision\"" in lines[1]
+    assert '"type":"proposal"' in lines[0]
+    assert '"type":"decision"' in lines[1]
 
 
 def test_corrupt_log_fail_closed(tmp_path) -> None:

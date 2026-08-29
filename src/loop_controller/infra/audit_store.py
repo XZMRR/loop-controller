@@ -33,6 +33,7 @@ from loop_controller.audit.anchors import (
 )
 from loop_controller.audit.evidence import EvidenceChain
 from loop_controller.infra.alert_store import AlertStore
+from loop_controller.infra.durable_io import DurableJsonlFile, DurableJsonlTransaction
 from loop_controller.models import AuditAlert, AuditEvent
 from loop_controller.utils.canonical import canonical_json
 
@@ -103,7 +104,10 @@ class JsonlAuditStore:
         self._write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="audit-writer")
         self._write_blocked = False
         self._anchor_write_blocked = False
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._durable = DurableJsonlFile(self._path)
+        self._active_transaction: DurableJsonlTransaction | None = None
+        self._anchor_bootstrap_active = False
+        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if hash_algo not in ("sha256", "hmac-sha256"):
             raise ValueError(f"不支持的 hash_algo：{hash_algo}")
         self._hash_algo = hash_algo
@@ -129,46 +133,25 @@ class JsonlAuditStore:
                 f"但当前配置为 {self._hash_algo}。请先归档旧文件后再切换算法。"
             )
 
-    def _load_tail(self) -> tuple[int, str, str, str | None]:
-        """启动时重放文件末行，恢复 ``seq``、``prev_hash``、``_chain_hash`` 与最后算法。
-
-        保证重启后续写不断链；seal 记录也会被重放并更新 ``_chain_hash``。
-        返回的 ``last_algo`` 为 ``None`` 表示文件为空或不存在。
-        """
-        if not self._path.exists():
+    def _tail_from_lines(self, raw_lines: list[bytes]) -> tuple[int, str, str, str | None]:
+        if not raw_lines:
             return 0, self._GENESIS, self._GENESIS, None
-        with self._path.open("r", encoding="utf-8") as fh:
-            lines = [line.strip() for line in fh if line.strip()]
-        if not lines:
-            return 0, self._GENESIS, self._GENESIS, None
-
-        # 过滤掉不完整行（崩溃残留），但保留完整行用于恢复状态。
-        valid_lines: list[str] = []
-        for line in lines:
-            try:
-                json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            valid_lines.append(line)
-
-        if not valid_lines:
-            return 0, self._GENESIS, self._GENESIS, None
-
-        last = json.loads(valid_lines[-1])
+        lines = [line.decode("utf-8") for line in raw_lines]
+        last = json.loads(lines[-1])
         seq = int(last.get("seq", 0))
         last_algo = last.get("hash_algo", "sha256")
-
-        # 重放完整文件恢复 chain_hash；chain_hash 即为最后一行的 hash，
-        # 它同时是下一行的 prev_hash（sha256 与 hmac 模式均一致）。
         chain_hash = self._GENESIS
-        for line in valid_lines:
-            record = json.loads(line)
-            if record.get("action") == "seal":
-                # seal 记录自身的 chain_hash 写入 metadata，但 seal 行也参与链。
-                chain_hash = self._hash(line, chain_hash)
-            else:
-                chain_hash = self._hash(line, chain_hash)
+        for line in lines:
+            chain_hash = self._hash(line, chain_hash)
         return seq, chain_hash, chain_hash, last_algo
+
+    def _load_tail(self) -> tuple[int, str, str, str | None]:
+        """锁内修复残尾并恢复经验证的磁盘链尾。"""
+        if not self._path.exists():
+            return 0, self._GENESIS, self._GENESIS, None
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            return self._tail_from_lines(transaction.read_complete_lines())
 
     def _hash(self, text: str, chain_hash: str | None = None) -> str:
         """计算单行文本的哈希。
@@ -195,9 +178,13 @@ class JsonlAuditStore:
         return to_write, canonical_json(to_write.model_dump(mode="json", exclude_none=True))
 
     def _write_audit_line(self, line: str) -> None:
-        with self._path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
+        if self._active_transaction is not None:
+            self._active_transaction.append_json(json.loads(line))
+        else:
+            with self._durable.transaction() as transaction:
+                transaction.repair_incomplete_tail()
+                transaction.read_complete_lines()
+                transaction.append_json(json.loads(line))
         self._prev_hash = self._hash(line, self._chain_hash)
         self._chain_hash = self._prev_hash
 
@@ -350,8 +337,20 @@ class JsonlAuditStore:
             self._publish_anchor(evidence.seq, evidence.current_hash, to_write)
 
     def _append_serialized(self, event: AuditEvent) -> None:
-        with self._sync_lock:
-            self._append_locked(event)
+        with self._sync_lock, self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            tail = self._tail_from_lines(transaction.read_complete_lines())
+            disk_seq, disk_prev_hash, disk_chain_hash, last_algo = tail
+            if last_algo is not None and last_algo != self._hash_algo:
+                raise RuntimeError("审计磁盘链算法与当前配置不一致")
+            self._seq = disk_seq
+            self._prev_hash = disk_prev_hash
+            self._chain_hash = disk_chain_hash
+            self._active_transaction = transaction
+            try:
+                self._append_locked(event)
+            finally:
+                self._active_transaction = None
 
     def append(self, event: AuditEvent) -> None:
         """同步分配序号并依次写入证据、审计和签名尾 checkpoint。"""
@@ -477,7 +476,10 @@ class JsonlAuditStore:
     async def verify_evidence_chain(self) -> bool:
         """交叉验证审计、签名证据和 checkpoint；失败时降级并阻断后续写入，但不阻塞启动。"""
         if self._evidence_chain is None:
-            return True
+            valid = self.verify_chain()
+            if not valid:
+                self._write_blocked = True
+            return valid
         try:
             await self._verify_evidence_consistency()
         except Exception as exc:
@@ -753,19 +755,31 @@ class JsonlAuditStore:
         )
 
     def _bootstrap_anchor_serialized(self, event: AuditEvent) -> dict[str, object]:
-        with self._sync_lock:
-            if self._anchor_backend is None or self._evidence_chain is None:
-                raise RuntimeError("Anchor 未配置")
-            self._verify_anchor_locked()
-            if self._anchor_status != "bootstrap_required":
-                raise RuntimeError("当前 Anchor 状态不允许 bootstrap")
-            asyncio.run(self._verify_evidence_consistency())
-            self._anchor_bootstrap_active = True
+        with self._sync_lock, self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            tail = self._tail_from_lines(transaction.read_complete_lines())
+            disk_seq, disk_prev_hash, disk_chain_hash, last_algo = tail
+            if last_algo is not None and last_algo != self._hash_algo:
+                raise RuntimeError("审计磁盘链算法与当前配置不一致")
+            self._seq = disk_seq
+            self._prev_hash = disk_prev_hash
+            self._chain_hash = disk_chain_hash
+            self._active_transaction = transaction
             try:
-                self._append_locked(event)
+                if self._anchor_backend is None or self._evidence_chain is None:
+                    raise RuntimeError("Anchor 未配置")
+                self._verify_anchor_locked()
+                if self._anchor_status != "bootstrap_required":
+                    raise RuntimeError("当前 Anchor 状态不允许 bootstrap")
+                asyncio.run(self._verify_evidence_consistency())
+                self._anchor_bootstrap_active = True
+                try:
+                    self._append_locked(event)
+                finally:
+                    self._anchor_bootstrap_active = False
+                return self.anchor_summary()
             finally:
-                self._anchor_bootstrap_active = False
-            return self.anchor_summary()
+                self._active_transaction = None
 
     @property
     def anchor_status(self) -> str:
@@ -786,7 +800,13 @@ class JsonlAuditStore:
         包含写入前整个链的累积 HMAC，并用 ``seal_key`` 做域分离签名
         （``seal_signature``），用于事后独立校验。
         """
-        with self._sync_lock:
+        with self._sync_lock, self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            self._seq, self._prev_hash, self._chain_hash, last_algo = self._tail_from_lines(
+                transaction.read_complete_lines()
+            )
+            if last_algo is not None and last_algo != self._hash_algo:
+                raise RuntimeError("审计磁盘链算法与当前配置不一致")
             chain_hash = self._chain_hash
             seal_signature = ""
             if self._hash_algo == "hmac-sha256":
@@ -805,7 +825,11 @@ class JsonlAuditStore:
                     "seal_signature": seal_signature,
                 },
             )
-            self._append_locked(event)
+            self._active_transaction = transaction
+            try:
+                self._append_locked(event)
+            finally:
+                self._active_transaction = None
             return event
 
     def verify_chain(self) -> bool:

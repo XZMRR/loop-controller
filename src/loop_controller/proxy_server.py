@@ -366,6 +366,10 @@ class LoopControllerProxyServer:
         if request is None:
             return self._error_result(f"approval request not found for decision_id={decision_id}")
 
+        # 审批凭证只能由原始请求身份使用，不能被其他 Agent/用户跨租户复用。
+        if request.agent_id != identity.agent_id or request.requester_id != identity.user_id:
+            return self._error_result("approval request does not belong to caller")
+
         # 参数一致性校验：防止 decision_id 被复用于不同参数调用。
         if request.tool_name != tool_name or request.tool_arguments != arguments:
             return self._error_result("retry parameters mismatch original approved request")
@@ -382,6 +386,15 @@ class LoopControllerProxyServer:
             return self._error_result(
                 "original task not available; please retry without decision_id"
             )
+        if (
+            task.task_id != request.task_id
+            or task.agent_id != request.agent_id
+            or task.user_id != request.requester_id
+            or task.agent_id != identity.agent_id
+            or task.user_id != identity.user_id
+            or task.tenant_id != agent.tenant_id
+        ):
+            return self._error_result("approval request task identity or tenant mismatch")
 
         resume_proposal = ActionProposal(
             task_id=task.task_id,

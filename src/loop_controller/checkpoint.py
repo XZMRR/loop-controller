@@ -286,6 +286,38 @@ class Checkpoint:
             if updated is None:
                 logger.warning("Authority token %s budget exhausted or invalid", token_id)
 
+    async def _audit_authority_consumption(
+        self,
+        proposal: ActionProposal,
+        tokens: list,
+        *,
+        session_id: str | None,
+        outcome: str,
+        refunded: bool,
+    ) -> None:
+        if self._audit_store is None:
+            return
+        for token in tokens:
+            await self._audit_store.append_async(
+                AuditEvent(
+                    event_id=uuid.uuid4().hex,
+                    trace_id=proposal.task_id,
+                    session_id=session_id or proposal.task_id,
+                    call_id=proposal.call_id,
+                    actor_type="checkpoint",
+                    actor_id=proposal.agent_id,
+                    action="authority_used",
+                    target=proposal.tool_name,
+                    reason=f"external execution outcome: {outcome}",
+                    metadata={
+                        "token_id": token.token_id,
+                        "remaining_budget": token.remaining_budget.model_dump(mode="json"),
+                        "execution_outcome": outcome,
+                        "refunded": refunded,
+                    },
+                )
+            )
+
     def _refund_for(self, proposal: ActionProposal) -> None:
         """将当前 proposal 已预留的预算返还（P0：所有非执行路径必须 refund）。"""
         self._budget_ledger.refund(proposal.task_id, self._cost_for(proposal))
@@ -944,8 +976,28 @@ class Checkpoint:
                         stage="pre_execute",
                     )
 
+            authority_cost = self._cost_for(proposal)
+            consumed_authority = self._authority_manager.validate_and_consume(
+                proposal, authority_cost
+            )
+            if consumed_authority is None:
+                raise CheckpointError("Authority token 无效、已过期或预算不足")
+
             try:
                 executor = self._executor_registry.get_executor(proposal.tool_name)
+            except Exception:
+                self._authority_manager.refund_consumed(consumed_authority, authority_cost)
+                await self._audit_authority_consumption(
+                    proposal,
+                    consumed_authority,
+                    session_id=session_id,
+                    outcome="pre_execution_failure",
+                    refunded=True,
+                )
+                self._refund_reservation(reservation)
+                raise
+
+            try:
                 result = await executor.execute(
                     tool_name=proposal.tool_name,
                     arguments=effective_args,
@@ -959,8 +1011,22 @@ class Checkpoint:
                     ),
                 )
             except Exception:
+                await self._audit_authority_consumption(
+                    proposal,
+                    consumed_authority,
+                    session_id=session_id,
+                    outcome="uncertain",
+                    refunded=False,
+                )
                 self._refund_reservation(reservation)
                 raise
+            await self._audit_authority_consumption(
+                proposal,
+                consumed_authority,
+                session_id=session_id,
+                outcome="success" if result.status == "success" else "failed",
+                refunded=False,
+            )
             self._commit_reservation(reservation)
         except CheckpointError:
             if reservation is not None:
@@ -972,8 +1038,6 @@ class Checkpoint:
             if decision.verdict == "modify" and decision.modified_args is not None:
                 history_proposal = proposal.model_copy(update={"arguments": decision.modified_args})
             self._history.setdefault(proposal.task_id, []).append(history_proposal)
-            # v0.11.0：动作成功后消费 token 预算
-            self._consume_authority_tokens(proposal)
             # v1.2：allow 且风险低时按低风险成功衰减会话风险分
             if (
                 session_id is not None

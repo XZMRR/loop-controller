@@ -211,7 +211,23 @@ def test_seal_detects_deletion_before_seal(tmp_path) -> None:
     del lines[-2]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test").verify_chain()
+    assert not JsonlAuditStore(
+        path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test"
+    ).verify_chain()
+
+
+def test_two_store_instances_refresh_tail_before_allocating_seq(tmp_path) -> None:
+    path = tmp_path / "audit.jsonl"
+    first = JsonlAuditStore(path, hash_algo="sha256")
+    second = JsonlAuditStore(path, hash_algo="sha256")
+
+    first.append(_make_event(trace_id="first"))
+    second.append(_make_event(trace_id="second"))
+
+    assert second.verify_chain()
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [record["seq"] for record in records] == [1, 2]
+    assert records[1]["prev_hash"] != first._GENESIS
 
 
 def test_append_and_seal_are_atomic_under_concurrency(tmp_path) -> None:
@@ -327,8 +343,8 @@ def test_hmac_key_not_in_audit_log(tmp_path) -> None:
     assert key.decode("latin-1") not in raw  # 也检查原始 bytes 形态
 
 
-def test_truncated_file_fails_verification(tmp_path) -> None:
-    """文件末尾被截断成不完整 JSON 行时，verify_chain 应失败。"""
+def test_truncated_file_is_repaired_before_verification(tmp_path) -> None:
+    """物理末尾半行在启动锁内截断，保留此前完整链。"""
     path = tmp_path / "audit.jsonl"
     store = JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test")
     store.append(_make_event())
@@ -336,7 +352,11 @@ def test_truncated_file_fails_verification(tmp_path) -> None:
 
     raw = path.read_bytes()
     path.write_bytes(raw[:-10])  # 截断最后 10 字节
-    assert not JsonlAuditStore(path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test").verify_chain()
+    repaired = JsonlAuditStore(
+        path, hash_algo="hmac-sha256", hmac_key=_hmac_key(), key_id="test"
+    )
+    assert repaired.verify_chain()
+    assert repaired._seq == 1
 
 
 def test_forged_seal_metadata_fails(tmp_path) -> None:

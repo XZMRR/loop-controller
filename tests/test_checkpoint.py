@@ -28,6 +28,7 @@ from loop_controller.models import (
     Agent,
     ApprovalRecord,
     ApprovalRequest,
+    AuthorityToken,
     BudgetCost,
     BudgetReservation,
     CapabilityProfile,
@@ -90,6 +91,27 @@ class FakePolicyEngine:
         assert package == PACKAGE
         self.calls.append(input_doc)
         return dict(self._by_tool.get(input_doc["tool_name"], self._default))
+
+
+class FakeAuthorityManager:
+    def __init__(self, token: AuthorityToken) -> None:
+        self.token = token
+        self.refunds = 0
+
+    def validate_for_proposal(self, proposal, required_capabilities):
+        return [self.token]
+
+    def validate_and_consume(self, proposal, cost):
+        self.token = self.token.model_copy(
+            update={"remaining_budget": BudgetCost(token_count=8)}
+        )
+        return [self.token]
+
+    def refund_consumed(self, tokens, cost):
+        self.refunds += 1
+        self.token = self.token.model_copy(
+            update={"remaining_budget": BudgetCost(token_count=10)}
+        )
 
 
 class FakeGateway:
@@ -194,6 +216,7 @@ def make_checkpoint(
     risk_manager: RiskStateManager | None = None,
     reservation_store=None,
     audit_store=None,
+    authority_manager=None,
 ) -> tuple[Checkpoint, FakePolicyEngine, FakeGateway]:
     engine = FakePolicyEngine(
         decision=engine_decision,
@@ -213,6 +236,7 @@ def make_checkpoint(
         budget_ledger=budget_ledger or InMemoryBudgetLedger(),
         reservation_store=reservation_store,
         permission_analyzer=permission_analyzer,
+        authority_manager=authority_manager,
         tool_costs=tool_costs,
         masker=masker,
         audit_store=audit_store,
@@ -1422,6 +1446,97 @@ def test_finalize_unknown_verdict_rejected(
     )
     with pytest.raises(CheckpointError, match="未知审批 verdict"):
         cp.finalize_after_approval(decision, bad_record, request)
+
+
+# ---------------------------------------------------------------------------
+# Authority 执行结果扣费语义
+# ---------------------------------------------------------------------------
+
+
+def _authority_token(task: Task, agent: Agent) -> AuthorityToken:
+    now = datetime.now(UTC)
+    return AuthorityToken(
+        token_id="authority-1",
+        request_id="request-1",
+        agent_id=agent.agent_id,
+        task_id=task.task_id,
+        granted_capabilities=["network_external"],
+        budget=BudgetCost(token_count=10),
+        remaining_budget=BudgetCost(token_count=10),
+        expires_at=now + timedelta(minutes=5),
+        created_at=now,
+        audit_record_id="audit-1",
+    )
+
+
+async def test_forward_external_failure_does_not_refund_authority(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    class FailedGateway(FakeGateway):
+        async def call_tool(self, tool_name, arguments, call_id, task_id, **kwargs):
+            return ToolResult(
+                call_id=call_id,
+                task_id=task_id,
+                tool_name=tool_name,
+                status="error",
+                content="remote rejected request",
+            )
+
+    authority = FakeAuthorityManager(_authority_token(task, agent))
+    audit = StubAuditStore()
+    cp, _, _ = make_checkpoint(
+        profile,
+        identity,
+        gateway=FailedGateway(),
+        authority_manager=authority,
+        audit_store=audit,
+        tool_costs={"web_search": BudgetCost(token_count=2)},
+    )
+    proposal = make_proposal(
+        task, agent, authority_token_ids=[authority.token.token_id]
+    )
+    decision = await cp.evaluate(task, agent, proposal)
+
+    result = await cp.forward(proposal, decision, session_id=task.session_id)
+
+    assert result.status == "error"
+    assert authority.refunds == 0
+    assert authority.token.remaining_budget.token_count == 8
+    event = next(event for event in audit.events if event.action == "authority_used")
+    assert event.metadata["execution_outcome"] == "failed"
+    assert event.metadata["refunded"] is False
+
+
+async def test_forward_uncertain_exception_does_not_refund_authority(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    class UncertainGateway(FakeGateway):
+        async def call_tool(self, tool_name, arguments, call_id, task_id, **kwargs):
+            raise TimeoutError("response timed out")
+
+    authority = FakeAuthorityManager(_authority_token(task, agent))
+    audit = StubAuditStore()
+    cp, _, _ = make_checkpoint(
+        profile,
+        identity,
+        gateway=UncertainGateway(),
+        authority_manager=authority,
+        audit_store=audit,
+        tool_costs={"web_search": BudgetCost(token_count=2)},
+    )
+    proposal = make_proposal(
+        task, agent, authority_token_ids=[authority.token.token_id]
+    )
+    decision = await cp.evaluate(task, agent, proposal)
+
+    with pytest.raises(TimeoutError):
+        await cp.forward(proposal, decision, session_id=task.session_id)
+
+    assert authority.refunds == 0
+    assert authority.token.remaining_budget.token_count == 8
+    event = next(event for event in audit.events if event.action == "authority_used")
+    assert event.metadata["execution_outcome"] == "uncertain"
+    assert event.metadata["refunded"] is False
 
 
 # ---------------------------------------------------------------------------

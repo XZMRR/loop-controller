@@ -261,6 +261,18 @@ async def test_restart_recovers_tail_and_continues_chain(tmp_path: Path) -> None
     assert await restarted.verify()
 
 
+@pytest.mark.asyncio
+async def test_disabled_evidence_still_verifies_audit_chain(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    store = JsonlAuditStore(path)
+    await store.append_async(_event(1))
+    content = path.read_text(encoding="utf-8")
+    path.write_text(content.replace('"seq":1', '"seq":2'), encoding="utf-8")
+
+    assert not await store.verify_evidence_chain()
+    assert store.write_blocked
+
+
 def test_audit_append_synchronously_generates_evidence(tmp_path: Path) -> None:
     backend = LocalFileEvidenceBackend(tmp_path / "evidence")
     chain = EvidenceChain(backend, HMACEvidenceSigner(b"test-key", key_id="hmac-1"))

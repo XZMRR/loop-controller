@@ -46,6 +46,11 @@ from loop_controller.infra.conversation_store import (
 )
 from loop_controller.infra.decision_store import JsonlDecisionStore
 from loop_controller.infra.hot_reload import HotReloader
+from loop_controller.infra.persistence_probe import (
+    PersistenceProbe,
+    PersistenceStatus,
+    PersistenceTarget,
+)
 from loop_controller.infra.policy_store import FilePolicyStore
 from loop_controller.infra.reservation_store import (
     InMemoryReservationStore,
@@ -103,6 +108,15 @@ class Runtime:
     harness_executor: HarnessExecutor | None = None  # v0.25.0
     revocation_list: RevocationList = field(default_factory=RevocationList)  # v0.26.0
     evidence_anchor: HTTPAnchorBackend | None = None  # v0.28.0
+    persistence_status: PersistenceStatus = field(default_factory=PersistenceStatus)
+
+    def require_execution_ready(self) -> None:
+        if self.persistence_status.status not in {"healthy", "tail_repaired"}:
+            raise RuntimeError(
+                f"持久化状态 {self.persistence_status.status} 不允许执行工具"
+            )
+        if isinstance(self.audit_store, JsonlAuditStore) and self.audit_store.write_blocked:
+            raise RuntimeError("审计完整性状态不允许执行工具")
 
     def create_task(
         self,
@@ -116,11 +130,11 @@ class Runtime:
             session = self.session_manager.get_session(session_id)
             if session is None or self.session_manager.is_session_expired(session_id):
                 raise ValueError(f"session {session_id} not found or expired")
-            if session.user_id != user_id:
-                raise ValueError(
-                    f"session {session_id} user_id mismatch: {session.user_id} != {user_id}"
-                )
-            session = self.session_manager.touch_session(session_id)
+            session = self.session_manager.touch_session(
+                session_id,
+                user_id=user_id,
+                agent_id=agent_id,
+            )
         else:
             session = self.session_manager.get_or_create_session(
                 user_id=user_id,
@@ -171,6 +185,13 @@ class Runtime:
 
     async def start(self) -> None:
         """完成本地/远端完整性验证后，按锚点状态决定是否拉起执行面。"""
+        persistence = getattr(self, "persistence_status", None)
+        if persistence is not None and persistence.status in {
+            "write_blocked",
+            "lock_unavailable",
+            "degraded",
+        }:
+            return
         if isinstance(self.audit_store, JsonlAuditStore):
             local_valid = await self.audit_store.verify_evidence_chain()
             if local_valid:
@@ -403,6 +424,39 @@ def build_runtime(
         store=JsonlAuthorityStore(config.authority_log_path),
     )
     revocation_path = Path(config.policy_dir).parent / "config" / "revocation.yaml"
+    evidence_chain = _build_evidence_chain(config)
+    evidence_paths: list[PersistenceTarget] = []
+    if evidence_chain is not None:
+        backend_path = getattr(evidence_chain._backend, "_base", None)
+        if backend_path is not None:
+            evidence_paths.append(PersistenceTarget("evidence", Path(backend_path) / "default.jsonl"))
+        evidence_checkpoint = evidence_chain.checkpoint_path()
+        if evidence_checkpoint is not None:
+            evidence_paths.append(
+                PersistenceTarget("evidence_checkpoint", evidence_checkpoint, replace=True)
+            )
+    persistence_status = PersistenceProbe(
+        [
+            PersistenceTarget("audit", Path(config.audit_log_path)),
+            PersistenceTarget("decision", Path(config.decision_log_path)),
+            PersistenceTarget("approval", Path(config.approval_store_path)),
+            PersistenceTarget("budget", Path(config.budget_ledger_path)),
+            PersistenceTarget("reservation", Path(config.reservation_store_path)),
+            PersistenceTarget("authority", Path(config.authority_log_path)),
+            PersistenceTarget("alert", Path(config.alert_store_path)),
+            PersistenceTarget("task", Path(config.task_store_path)),
+            PersistenceTarget("session", Path(config.session_path), critical=False),
+            PersistenceTarget("conversation", Path(config.conversation_path), critical=False),
+            PersistenceTarget("risk_state", Path(config.risk_state_path)),
+            PersistenceTarget("revocation", revocation_path, replace=True),
+            *evidence_paths,
+        ],
+        fsync_enabled=config.persistence.fsync_enabled,
+        lock_timeout_seconds=config.persistence.lock_timeout_seconds,
+        repair_incomplete_tail=config.persistence.repair_incomplete_tail,
+        enforce_permissions=config.persistence.enforce_permissions,
+        fail_on_unsafe_permissions=config.persistence.fail_on_unsafe_permissions,
+    ).run()
     revocation_list = RevocationList.from_file(revocation_path)
     checkpoint = Checkpoint(
         profiles=config.profiles,
@@ -445,7 +499,6 @@ def build_runtime(
     audit_key: bytes | None = None
     if config.audit_hash_algo == "hmac-sha256":
         audit_key = ConfigLoader.resolve_audit_key(config)
-    evidence_chain = _build_evidence_chain(config)
     evidence_anchor = _build_evidence_anchor(config, alert_store)
     audit_store = JsonlAuditStore(
         config.audit_log_path,
@@ -513,4 +566,5 @@ def build_runtime(
         # 复用 HotReloader 持有的可变撤销列表，确保热更新对 Runtime 可见。
         revocation_list=revocation_list,
         evidence_anchor=evidence_anchor,
+        persistence_status=persistence_status,
     )

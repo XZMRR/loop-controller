@@ -23,6 +23,7 @@ from loop_controller.identity.revocation import (
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import JsonlAuditStore
 from loop_controller.infra.config_loader import ConfigLoader
+from loop_controller.infra.durable_io import DurableIOError
 from loop_controller.infra.hot_reload import HotReloader
 from loop_controller.models import Agent, ApprovalRecord
 from loop_controller.server import build_app
@@ -346,6 +347,31 @@ async def test_persistence_and_hot_reload(tmp_path: Path) -> None:
     assert revocations.kill_switch.reason == "reloaded"
 
 
+def test_match_refreshes_latest_yaml_before_decision(tmp_path: Path) -> None:
+    path = tmp_path / "revocation.yaml"
+    path.write_text("revocations: []\n", encoding="utf-8")
+    revocations = RevocationList.from_file(path)
+
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "revocations": [
+                    {
+                        "type": "tool",
+                        "id": "search",
+                        "reason": "revoked by another process",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    match = revocations.match(_identity(), "search")
+    assert match.revoked
+    assert match.reason == "revoked by another process"
+
+
 @pytest.mark.parametrize("operation", ["remove", "disable_kill_switch"])
 def test_persistence_failure_keeps_memory_protection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
@@ -357,12 +383,12 @@ def test_persistence_failure_keeps_memory_protection(
         path=tmp_path / "revocation.yaml",
     )
 
-    def fail_replace(self: Path, target: Path) -> None:
+    def fail_replace(source: Path, target: Path) -> None:
         raise OSError("disk unavailable")
 
-    monkeypatch.setattr(Path, "replace", fail_replace)
+    monkeypatch.setattr("loop_controller.infra.durable_io.os.replace", fail_replace)
 
-    with pytest.raises(OSError, match="disk unavailable"):
+    with pytest.raises(DurableIOError, match="durable atomic replace failed"):
         if operation == "remove":
             revocations.remove("tool", "search")
         else:
@@ -408,7 +434,9 @@ async def test_hot_reload_error_or_deletion_keeps_memory_protection(
     await reloader._reload()
 
     assert revocations.entries == [entry]
-    assert revocations.is_revoked(_identity(), "search") == (True, "protected")
+    revoked, reason = revocations.is_revoked(_identity(), "search")
+    assert revoked
+    assert reason == "protected" or reason.startswith("revocation config unavailable:")
 
 
 @pytest.fixture

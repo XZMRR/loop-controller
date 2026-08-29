@@ -16,6 +16,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from loop_controller.infra.durable_io import CorruptedJsonlError, DurableJsonlFile
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,6 +74,27 @@ class SessionBackend(Protocol):
         """保存或更新 session。"""
         ...
 
+    def touch(
+        self,
+        session_id: str,
+        last_task_at: datetime,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> Session:
+        """刷新活跃 session，并可校验绑定。"""
+        ...
+
+    def close(self, session_id: str) -> Session:
+        """将 session 原子转换为关闭终态。"""
+        ...
+
+    def get_or_create_active(
+        self, user_id: str, agent_id: str, now: datetime, timeout: timedelta
+    ) -> Session:
+        """在单个事务中查询并复用或创建活跃 session。"""
+        ...
+
 
 class InMemorySessionBackend:
     """内存版 Session 后端（P1 单进程假设）。"""
@@ -94,6 +117,52 @@ class InMemorySessionBackend:
         self._sessions[session.session_id] = session
         self._index[(session.user_id, session.agent_id)] = session.session_id
 
+    def touch(
+        self,
+        session_id: str,
+        last_task_at: datetime,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> Session:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"session {session_id} 不存在")
+        if not session.active:
+            raise ValueError(f"session {session_id} 已结束")
+        if user_id is not None and (session.user_id != user_id or session.agent_id != agent_id):
+            raise ValueError(
+                f"session {session_id} 绑定 ({session.user_id}, {session.agent_id}) "
+                f"与 task 的 ({user_id}, {agent_id}) 不一致"
+            )
+        session.last_task_at = last_task_at
+        self.put(session)
+        return session
+
+    def close(self, session_id: str) -> Session:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"session {session_id} 不存在")
+        session.active = False
+        self.put(session)
+        return session
+
+    def get_or_create_active(
+        self, user_id: str, agent_id: str, now: datetime, timeout: timedelta
+    ) -> Session:
+        session = self.get_active(user_id, agent_id)
+        if session is not None and session.active and (now - session.last_task_at) <= timeout:
+            return session
+        session = Session(
+            session_id=uuid.uuid4().hex,
+            user_id=user_id,
+            agent_id=agent_id,
+            created_at=now,
+            last_task_at=now,
+        )
+        self.put(session)
+        return session
+
 
 class JsonlSessionBackend:
     """JSONL 追加写 + 启动重放的 Session 后端（v0.4.0）。
@@ -106,6 +175,7 @@ class JsonlSessionBackend:
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
+        self._durable = DurableJsonlFile(self._path)
         self._ensure_writable()
         self._sessions: dict[str, Session] = {}
         self._index: dict[tuple[str, str], str] = {}
@@ -131,47 +201,135 @@ class JsonlSessionBackend:
         """启动时重放全量日志，恢复内存状态。"""
         if not self._path.exists():
             return
-        raw_lines = self._path.read_text(encoding="utf-8").splitlines(keepends=True)
-        for line_no, raw in enumerate(raw_lines, start=1):
-            line = raw.strip()
-            if not line:
-                continue
+        try:
+            with self._durable.transaction() as transaction:
+                transaction.repair_incomplete_tail()
+                self._refresh_locked(transaction.read_complete_lines())
+        except CorruptedJsonlError as exc:
+            line_no = str(exc).rsplit(" ", 1)[-1]
+            raise SessionStoreError(
+                f"sessions.jsonl 第 {line_no} 行损坏：{self._path}"
+            ) from exc
+
+    def _refresh_locked(self, lines: list[bytes]) -> None:
+        sessions: dict[str, Session] = {}
+        index: dict[tuple[str, str], str] = {}
+        for line_no, raw in enumerate(lines, start=1):
             try:
-                data = json.loads(line)
-                session = Session.from_dict(data)
+                session = Session.from_dict(json.loads(raw))
             except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                is_last = line_no == len(raw_lines)
-                if is_last:
-                    logger.warning(
-                        "sessions.jsonl 末行（第 %d 行）不完整，已忽略：%s",
-                        line_no,
-                        exc,
-                    )
-                    continue
                 raise SessionStoreError(
                     f"sessions.jsonl 第 {line_no} 行损坏：{self._path}"
                 ) from exc
-            self._sessions[session.session_id] = session
+            sessions[session.session_id] = session
             if session.active:
-                self._index[(session.user_id, session.agent_id)] = session.session_id
+                index[(session.user_id, session.agent_id)] = session.session_id
+            elif index.get((session.user_id, session.agent_id)) == session.session_id:
+                index.pop((session.user_id, session.agent_id), None)
+        self._sessions, self._index = sessions, index
 
     def get_active(self, user_id: str, agent_id: str) -> Session | None:
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            self._refresh_locked(transaction.read_complete_lines())
         session_id = self._index.get((user_id, agent_id))
         if session_id is None:
             return None
         return self._sessions.get(session_id)
 
     def get_by_id(self, session_id: str) -> Session | None:
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            self._refresh_locked(transaction.read_complete_lines())
         return self._sessions.get(session_id)
+
+    def get_or_create_active(
+        self, user_id: str, agent_id: str, now: datetime, timeout: timedelta
+    ) -> Session:
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            self._refresh_locked(transaction.read_complete_lines())
+            session_id = self._index.get((user_id, agent_id))
+            session = self._sessions.get(session_id) if session_id is not None else None
+            if session is not None and session.active and (now - session.last_task_at) <= timeout:
+                return session
+            session = Session(
+                session_id=uuid.uuid4().hex,
+                user_id=user_id,
+                agent_id=agent_id,
+                created_at=now,
+                last_task_at=now,
+            )
+            transaction.append_json(session.to_dict())
+            self._update_index(session)
+            return session
 
     def put(self, session: Session) -> None:
         """追加写 session 状态，并更新内存索引。"""
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            self._refresh_locked(transaction.read_complete_lines())
+            existing = self._sessions.get(session.session_id)
+            if existing is not None and not existing.active and session.active:
+                raise ValueError(f"session {session.session_id} 已结束")
+            transaction.append_json(session.to_dict())
+            self._update_index(session)
+
+    def touch(
+        self,
+        session_id: str,
+        last_task_at: datetime,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> Session:
+        error: ValueError | None = None
+        updated: Session | None = None
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            self._refresh_locked(transaction.read_complete_lines())
+            session = self._sessions.get(session_id)
+            if session is None:
+                error = ValueError(f"session {session_id} 不存在")
+            elif not session.active:
+                error = ValueError(f"session {session_id} 已结束")
+            elif user_id is not None and (
+                session.user_id != user_id or session.agent_id != agent_id
+            ):
+                error = ValueError(
+                    f"session {session_id} 绑定 ({session.user_id}, {session.agent_id}) "
+                    f"与 task 的 ({user_id}, {agent_id}) 不一致"
+                )
+            else:
+                session.last_task_at = last_task_at
+                transaction.append_json(session.to_dict())
+                self._update_index(session)
+                updated = session
+        if error is not None:
+            raise error
+        assert updated is not None
+        return updated
+
+    def close(self, session_id: str) -> Session:
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            self._refresh_locked(transaction.read_complete_lines())
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise ValueError(f"session {session_id} 不存在")
+            if session.active:
+                session.active = False
+                transaction.append_json(session.to_dict())
+                self._update_index(session)
+            return session
+
+    def _update_index(self, session: Session) -> None:
         self._sessions[session.session_id] = session
+        key = (session.user_id, session.agent_id)
         if session.active:
-            self._index[(session.user_id, session.agent_id)] = session.session_id
-        with self._path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(session.to_dict(), ensure_ascii=False) + "\n")
-            fh.flush()
+            self._index[key] = session.session_id
+        elif self._index.get(key) == session.session_id:
+            self._index.pop(key, None)
 
 
 class SessionManager:
@@ -212,54 +370,36 @@ class SessionManager:
 
     def get_or_create_session(self, user_id: str, agent_id: str) -> Session:
         """查询活跃 session；不存在或上一任务结束超过 timeout 则创建新 session_id（uuid hex）。"""
-        now = self._now()
-        session = self._backend.get_active(user_id, agent_id)
-        if session is not None and session.active and (now - session.last_task_at) <= self._timeout:
-            return session
-        # 超时或不活跃则新建，旧 session 在持久化中保留（审计可回放），但索引会被新 session 覆盖。
-        new_session = Session(
-            session_id=uuid.uuid4().hex,
-            user_id=user_id,
-            agent_id=agent_id,
-            created_at=now,
-            last_task_at=now,
-            active=True,
-        )
-        self._backend.put(new_session)
-        return new_session
+        return self._backend.get_or_create_active(user_id, agent_id, self._now(), self._timeout)
 
     def validate_and_touch(self, task) -> bool:
         """校验 task.session_id 存在且活跃，且绑定 (user_id, agent_id) 与 task 一致。
 
         验证通过更新 last_task_at；不一致则抛 ValueError（fail-closed）。
         """
-        session = self._backend.get_by_id(task.session_id)
-        if session is None:
-            raise ValueError(f"session {task.session_id} 不存在")
-        if not session.active:
-            raise ValueError(f"session {task.session_id} 已结束")
-        if session.user_id != task.user_id or session.agent_id != task.agent_id:
-            raise ValueError(
-                f"session {task.session_id} 绑定 ({session.user_id}, {session.agent_id}) "
-                f"与 task 的 ({task.user_id}, {task.agent_id}) 不一致"
-            )
-        session.last_task_at = self._now()
-        self._backend.put(session)
+        self._backend.touch(
+            task.session_id,
+            self._now(),
+            user_id=task.user_id,
+            agent_id=task.agent_id,
+        )
         return True
 
-    def touch_session(self, session_id: str) -> Session:
-        """刷新 session 活跃时间；不存在则抛 ValueError。"""
-        session = self._backend.get_by_id(session_id)
-        if session is None:
-            raise ValueError(f"session {session_id} 不存在")
-        session.last_task_at = self._now()
-        self._backend.put(session)
-        return session
+    def touch_session(
+        self,
+        session_id: str,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> Session:
+        """刷新 session 活跃时间，并可在同一操作中校验身份绑定。"""
+        return self._backend.touch(
+            session_id,
+            self._now(),
+            user_id=user_id,
+            agent_id=agent_id,
+        )
 
     def close_session(self, session_id: str) -> None:
         """标记 session 结束（任务正常结束时调用，或保留等待自然过期）。"""
-        session = self._backend.get_by_id(session_id)
-        if session is None:
-            raise ValueError(f"session {session_id} 不存在")
-        session.active = False
-        self._backend.put(session)
+        self._backend.close(session_id)

@@ -260,16 +260,20 @@ class ToolGovernServer:
             }
         )
         uptime = time.time() - self._start_time
-        degraded = evidence_status == "degraded" or anchor_summary["anchor_status"] not in {
-            "disabled",
-            "healthy",
-        }
+        persistence = getattr(self._controller._runtime, "persistence_status", None)
+        persistence_summary = persistence.as_dict() if persistence is not None else {}
+        degraded = (
+            evidence_status == "degraded"
+            or anchor_summary["anchor_status"] not in {"disabled", "healthy"}
+            or persistence_summary.get("status", "healthy") != "healthy"
+        )
         return JSONResponse(
             HealthResponse(
                 status="degraded" if degraded else "ok",
                 opa_reachable=opa_reachable,
                 gateway_ready=gateway_ready,
                 evidence_status=evidence_status,
+                persistence=persistence_summary,
                 uptime_seconds=round(uptime, 2),
                 **anchor_summary,
             ).model_dump()
@@ -365,7 +369,7 @@ class ToolGovernServer:
         return JSONResponse(response.model_dump())
 
     async def _handle_resume_after_approval(self, request: Request) -> JSONResponse:
-        authorized, _identity = await self._check_agent_auth(request)
+        authorized, identity = await self._check_agent_auth(request)
         if not authorized:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
@@ -373,6 +377,9 @@ class ToolGovernServer:
             body = ResumeApprovalRequest(**await request.json())
         except Exception as exc:
             return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+
+        if identity is not None and not self._approval_request_belongs_to(body.request_id, identity):
+            return JSONResponse({"error": "approval request does not belong to caller"}, status_code=403)
 
         logger.info("resume_after_approval request_id=%s", body.request_id)
         result = await self._controller.resume_after_approval(body.request_id)
@@ -389,13 +396,15 @@ class ToolGovernServer:
         )
 
     async def _handle_wait_for_approval(self, request: Request) -> JSONResponse:
-        authorized, _identity = await self._check_agent_auth(request)
+        authorized, identity = await self._check_agent_auth(request)
         if not authorized:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         request_id = request.query_params.get("request_id")
         if not request_id:
             return JSONResponse({"error": "missing request_id"}, status_code=422)
+        if identity is not None and not self._approval_request_belongs_to(request_id, identity):
+            return JSONResponse({"error": "approval request does not belong to caller"}, status_code=403)
 
         max_wait = float(request.query_params.get("max_wait", "30"))
         max_wait = max(1.0, min(max_wait, 300.0))
@@ -427,7 +436,7 @@ class ToolGovernServer:
 
     async def _handle_wait_for_approval_sse(self, request: Request) -> StreamingResponse:
         """SSE 实时审批等待。"""
-        authorized, _identity = await self._check_agent_auth(request)
+        authorized, identity = await self._check_agent_auth(request)
         if not authorized:
             return StreamingResponse(
                 self._sse_error("unauthorized"),
@@ -440,6 +449,12 @@ class ToolGovernServer:
             return StreamingResponse(
                 self._sse_error("missing request_id"),
                 status_code=422,
+                media_type="text/event-stream",
+            )
+        if identity is not None and not self._approval_request_belongs_to(request_id, identity):
+            return StreamingResponse(
+                self._sse_error("approval request does not belong to caller"),
+                status_code=403,
                 media_type="text/event-stream",
             )
 
@@ -492,6 +507,13 @@ class ToolGovernServer:
 
         yield f"event: error\ndata: {json.dumps({'error': message}, ensure_ascii=False)}\n\n".encode()
 
+    def _approval_request_belongs_to(self, request_id: str, identity: AgentIdentity) -> bool:
+        approval_request = self._controller._runtime.approval_manager.get_request_by_id(request_id)
+        return approval_request is not None and (
+            approval_request.agent_id == identity.agent_id
+            and approval_request.requester_id == identity.user_id
+        )
+
     async def _try_resume(self, request_id: str) -> Any | None:
         """尝试恢复审批；若审批不存在则返回 None。"""
         approval_manager = self._controller._runtime.approval_manager
@@ -504,10 +526,11 @@ class ToolGovernServer:
         return await self._controller.resume_after_approval(request_id)
 
     async def _handle_admin_pending_approvals(self, request: Request) -> JSONResponse:
-        if self._api_key is not None and not self._check_api_key(request):
+        if not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         store = self._controller._runtime.approval_manager._store
+        store.refresh()
         pending = store.get_pending()
         items = [
             PendingApprovalItem(
@@ -586,7 +609,7 @@ class ToolGovernServer:
         return JSONResponse(config.model_dump(mode="json"))
 
     async def _handle_admin_harness_backends(self, request: Request) -> JSONResponse:
-        if self._api_key is not None and not self._check_api_key(request):
+        if not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         executor = getattr(self._controller._runtime, "harness_executor", None)
@@ -597,7 +620,7 @@ class ToolGovernServer:
         )
 
     async def _handle_admin_evidence_anchor(self, request: Request) -> JSONResponse:
-        if self._api_key is not None and not self._check_api_key(request):
+        if not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         audit_store = self._controller._runtime.audit_store
@@ -615,7 +638,7 @@ class ToolGovernServer:
         )
 
     async def _handle_admin_evidence_anchor_verify(self, request: Request) -> JSONResponse:
-        if self._api_key is not None and not self._check_api_key(request):
+        if not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         audit_store = self._controller._runtime.audit_store
@@ -631,7 +654,7 @@ class ToolGovernServer:
         return JSONResponse(summary)
 
     async def _handle_admin_evidence_anchor_publish(self, request: Request) -> JSONResponse:
-        if self._api_key is not None and not self._check_api_key(request):
+        if not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         audit_store = self._controller._runtime.audit_store
@@ -650,7 +673,7 @@ class ToolGovernServer:
         return JSONResponse(summary)
 
     async def _handle_admin_evidence_anchor_bootstrap(self, request: Request) -> JSONResponse:
-        if self._api_key is not None and not self._check_api_key(request):
+        if not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         audit_store = self._controller._runtime.audit_store
@@ -745,7 +768,7 @@ class ToolGovernServer:
         return await self._handle_admin_approval(request, verdict="deny")
 
     async def _handle_admin_audit(self, request: Request) -> JSONResponse:
-        if self._api_key is not None and not self._check_api_key(request):
+        if not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         session_id = request.query_params.get("session_id")

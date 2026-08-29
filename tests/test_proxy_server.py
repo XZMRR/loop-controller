@@ -205,6 +205,51 @@ async def test_proxy_retry_approved_executes(
 
 
 @pytest.mark.asyncio
+async def test_proxy_retry_other_user_denied(
+    proxy_ctx: LoopControllerProxyServer,
+) -> None:
+    first = await proxy_ctx._handle_call_tool_impl(
+        name="send_email",
+        arguments={
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
+    )
+    pending = json.loads(first.content[0].text)
+    decision_id = pending["decision_id"]
+    request_id = pending["request_id"]
+
+    from loop_controller.models import ApprovalRecord
+
+    runtime = proxy_ctx._runtime
+    runtime.approval_manager._store.record_response(
+        ApprovalRecord(
+            request_id=request_id,
+            decision_id=decision_id,
+            verdict="approve",
+            approver_id="zhang_manager",
+            comment="approved",
+        )
+    )
+    agent = runtime.checkpoint._identity.get_agent("researcher_001")
+    retry = await proxy_ctx._handle_retry(
+        decision_id,
+        "send_email",
+        {
+            "to": "boss@company.com",
+            "subject": "report",
+            "body": "please review",
+        },
+        ProxyIdentity(agent_id="researcher_001", user_id="mallory"),
+        agent,
+    )
+
+    assert retry.isError
+    assert "does not belong" in retry.content[0].text
+
+
+@pytest.mark.asyncio
 async def test_proxy_retry_param_mismatch_denied(
     proxy_ctx: LoopControllerProxyServer,
 ) -> None:

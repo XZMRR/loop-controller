@@ -1,17 +1,10 @@
-"""预算记账（§3.8 / 开发指南 T2.4）。
-
-``InMemoryBudgetLedger`` 为每个 ``task_id`` 独立维护已 reserve / 已 commit 的 token 计数；
-``check_and_reserve`` 在额度内预占，``commit`` 在 forward 成功后确认消耗，
-``refund`` 在 forward 异常时返还预占额度。
-
-v0.6.0 新增 ``JsonlBudgetLedger``：通过 append-only JSONL 持久化预算事件，
-启动时重放事件恢复状态。
-"""
+"""预算记账。"""
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -20,10 +13,10 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from loop_controller.infra.alert_store import AlertStore
+from loop_controller.infra.durable_io import DurableIOError, DurableJsonlFile
 from loop_controller.models import AuditAlert, BudgetCost
 
 logger = logging.getLogger(__name__)
-
 PathLike = str | Path
 
 
@@ -33,8 +26,6 @@ class BudgetLedgerError(Exception):
 
 @runtime_checkable
 class BudgetLedger(Protocol):
-    """预算记账协议。"""
-
     def set_budget(self, task_id: str, max_budget_token: int) -> None: ...
     def check_and_reserve(self, task_id: str, cost: BudgetCost) -> bool: ...
     def commit(self, task_id: str, cost: BudgetCost) -> None: ...
@@ -42,8 +33,6 @@ class BudgetLedger(Protocol):
 
 
 class InMemoryBudgetLedger:
-    """内存版预算记账：per-task 计数，进程重启清零（MVP 可接受）。"""
-
     def __init__(self, default_max_budget_token: int = 1_000_000) -> None:
         self._default_max = default_max_budget_token
         self._max: dict[str, int] = {}
@@ -51,44 +40,25 @@ class InMemoryBudgetLedger:
         self._committed: dict[str, int] = defaultdict(int)
 
     def set_budget(self, task_id: str, max_budget_token: int) -> None:
-        """为指定任务设置/更新预算上限（运行期调用，非 Protocol 方法）。"""
         self._max[task_id] = max_budget_token
 
     def check_and_reserve(self, task_id: str, cost: BudgetCost) -> bool:
-        """预占预算；成功返回 True，超支返回 False。"""
-        max_budget = self._max.get(task_id, self._default_max)
-        used = self._committed[task_id] + self._reserved[task_id]
-        if used + cost.token_count > max_budget:
+        maximum = self._max.get(task_id, self._default_max)
+        if self._committed[task_id] + self._reserved[task_id] + cost.token_count > maximum:
             return False
         self._reserved[task_id] += cost.token_count
         return True
 
     def commit(self, task_id: str, cost: BudgetCost) -> None:
-        """确认消耗：把预占额度移入已提交。"""
         self._reserved[task_id] -= cost.token_count
         self._committed[task_id] += cost.token_count
 
     def refund(self, task_id: str, cost: BudgetCost) -> None:
-        """返还预占额度（forward 异常路径，防止只进不出）。"""
-        self._reserved[task_id] -= cost.token_count
-        # 不允许 reserve 为负；但这里按正确调用路径不会出现负值。
-        if self._reserved[task_id] < 0:
-            self._reserved[task_id] = 0
+        self._reserved[task_id] = max(0, self._reserved[task_id] - cost.token_count)
 
 
 @dataclass
 class JsonlBudgetLedger:
-    """基于 JSONL 的持久化预算记账。
-
-    事件类型：
-    - ``set_budget``：设置 task 预算上限；
-    - ``reserve``：预占额度；
-    - ``commit``：确认消耗；
-    - ``refund``：返还预占。
-
-    启动时重放所有事件恢复内存状态；重放发现未闭环 reserve 时写入 alert_store（不 fail）。
-    """
-
     path: PathLike
     default_max_budget_token: int = 1_000_000
     alert_store: AlertStore | None = None
@@ -96,121 +66,129 @@ class JsonlBudgetLedger:
 
     def __post_init__(self) -> None:
         self._path = Path(str(self.path))
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._durable = DurableJsonlFile(self._path)
+        self._lock = threading.RLock()
         self._alert_store = self.alert_store
         self._max: dict[str, int] = {}
         self._reserved: dict[str, int] = defaultdict(int)
         self._committed: dict[str, int] = defaultdict(int)
-        self._replay()
+        self._write_blocked = False
+        self._refresh(emit_alerts=True)
+
+    def _refresh_locked(self, transaction) -> None:
+        maximum: dict[str, int] = {}
+        reserved: dict[str, int] = defaultdict(int)
+        committed: dict[str, int] = defaultdict(int)
+        try:
+            for raw in transaction.read_complete_lines():
+                record = json.loads(raw)
+                event_type = record.get("type")
+                task_id = record.get("task_id", "")
+                token_count = int(record.get("token_count", 0))
+                if event_type == "set_budget" and isinstance(record.get("max_budget_token"), int):
+                    maximum[task_id] = record["max_budget_token"]
+                elif event_type == "reserve":
+                    reserved[task_id] += token_count
+                elif event_type == "commit":
+                    reserved[task_id] -= token_count
+                    committed[task_id] += token_count
+                elif event_type == "refund":
+                    reserved[task_id] = max(0, reserved[task_id] - token_count)
+        except (TypeError, ValueError, json.JSONDecodeError, DurableIOError) as exc:
+            raise BudgetLedgerError(f"BudgetLedger {self._path} 损坏: {exc}") from exc
+        self._max, self._reserved, self._committed = maximum, reserved, committed
+
+    def _refresh(self, *, emit_alerts: bool = False) -> None:
+        with self._lock:
+            try:
+                with self._durable.transaction() as transaction:
+                    self._refresh_locked(transaction)
+            except DurableIOError as exc:
+                raise BudgetLedgerError(f"无法读取 BudgetLedger {self._path}: {exc}") from exc
+            if emit_alerts and self._alert_store is not None:
+                for task_id, reserved in self._reserved.items():
+                    if reserved > 0:
+                        self._emit_orphan_alert(task_id, reserved)
+
+    def _ensure_writable(self) -> None:
+        if self._write_blocked:
+            raise BudgetLedgerError(
+                f"BudgetLedger {self._path} 写入结果不确定，已阻断后续写入"
+            )
+
+    def _write_event(self, record: dict, update) -> None:
+        with self._lock:
+            self._ensure_writable()
+            try:
+                with self._durable.transaction() as transaction:
+                    self._refresh_locked(transaction)
+                    transaction.append_json(record)
+                    update()
+            except DurableIOError as exc:
+                self._write_blocked = True
+                raise BudgetLedgerError(
+                    f"无法确认 BudgetLedger {self._path} 写入持久化，已阻断后续写入: {exc}"
+                ) from exc
+
+    @property
+    def write_blocked(self) -> bool:
+        return self._write_blocked
 
     def set_budget(self, task_id: str, max_budget_token: int) -> None:
-        """为指定任务设置/更新预算上限。"""
-        self._max[task_id] = max_budget_token
-        self._append({
-            "type": "set_budget",
-            "task_id": task_id,
-            "max_budget_token": max_budget_token,
-            "timestamp": datetime.now(UTC).isoformat(),
-        })
+        self._write_event({
+            "type": "set_budget", "task_id": task_id,
+            "max_budget_token": max_budget_token, "timestamp": datetime.now(UTC).isoformat(),
+        }, lambda: self._max.__setitem__(task_id, max_budget_token))
 
     def check_and_reserve(self, task_id: str, cost: BudgetCost) -> bool:
-        """预占预算；成功返回 True，超支返回 False。"""
-        max_budget = self._max.get(task_id, self.default_max_budget_token)
-        used = self._committed[task_id] + self._reserved[task_id]
-        if used + cost.token_count > max_budget:
-            return False
-        self._reserved[task_id] += cost.token_count
-        self._append({
-            "type": "reserve",
-            "task_id": task_id,
-            "token_count": cost.token_count,
-            "timestamp": datetime.now(UTC).isoformat(),
-        })
-        return True
+        with self._lock:
+            self._ensure_writable()
+            try:
+                with self._durable.transaction() as transaction:
+                    transaction.repair_incomplete_tail()
+                    self._refresh_locked(transaction)
+                    maximum = self._max.get(task_id, self.default_max_budget_token)
+                    used = self._committed[task_id] + self._reserved[task_id]
+                    if used + cost.token_count > maximum:
+                        return False
+                    transaction.append_json({
+                        "type": "reserve", "task_id": task_id,
+                        "token_count": cost.token_count, "timestamp": datetime.now(UTC).isoformat(),
+                    })
+                    self._reserved[task_id] += cost.token_count
+                    return True
+            except DurableIOError as exc:
+                self._write_blocked = True
+                raise BudgetLedgerError(
+                    f"无法确认 BudgetLedger {self._path} 写入持久化，已阻断后续写入: {exc}"
+                ) from exc
 
     def commit(self, task_id: str, cost: BudgetCost) -> None:
-        """确认消耗：把预占额度移入已提交。"""
-        self._reserved[task_id] -= cost.token_count
-        self._committed[task_id] += cost.token_count
-        self._append({
-            "type": "commit",
-            "task_id": task_id,
-            "token_count": cost.token_count,
-            "timestamp": datetime.now(UTC).isoformat(),
-        })
+        def update() -> None:
+            self._reserved[task_id] -= cost.token_count
+            self._committed[task_id] += cost.token_count
+        self._write_event({
+            "type": "commit", "task_id": task_id,
+            "token_count": cost.token_count, "timestamp": datetime.now(UTC).isoformat(),
+        }, update)
 
     def refund(self, task_id: str, cost: BudgetCost) -> None:
-        """返还预占额度。"""
-        self._reserved[task_id] -= cost.token_count
-        if self._reserved[task_id] < 0:
-            self._reserved[task_id] = 0
-        self._append({
-            "type": "refund",
-            "task_id": task_id,
-            "token_count": cost.token_count,
-            "timestamp": datetime.now(UTC).isoformat(),
-        })
+        self._write_event({
+            "type": "refund", "task_id": task_id,
+            "token_count": cost.token_count, "timestamp": datetime.now(UTC).isoformat(),
+        }, lambda: self._reserved.__setitem__(
+            task_id, max(0, self._reserved[task_id] - cost.token_count)
+        ))
 
-    def _append(self, record: dict) -> None:
-        try:
-            with self._path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-                fh.flush()
-        except OSError as exc:
-            raise BudgetLedgerError(f"无法写入 BudgetLedger {self._path}: {exc}") from exc
-
-    def _replay(self) -> None:
-        """启动时重放事件恢复状态。"""
-        if not self._path.exists():
+    def _emit_orphan_alert(self, task_id: str, reserved: int) -> None:
+        if self._alert_store is None:
             return
         try:
-            lines = self._path.read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
-            raise BudgetLedgerError(f"无法读取 BudgetLedger {self._path}: {exc}") from exc
-
-        for lineno, line in enumerate(lines, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise BudgetLedgerError(
-                    f"BudgetLedger {self._path} 第 {lineno} 行非法 JSON: {exc}"
-                ) from exc
-            event_type = record.get("type")
-            task_id = record.get("task_id", "")
-            token_count = int(record.get("token_count", 0))
-            max_budget_token = record.get("max_budget_token")
-
-            if event_type == "set_budget" and isinstance(max_budget_token, int):
-                self._max[task_id] = max_budget_token
-            elif event_type == "reserve":
-                self._reserved[task_id] += token_count
-            elif event_type == "commit":
-                self._reserved[task_id] -= token_count
-                self._committed[task_id] += token_count
-            elif event_type == "refund":
-                self._reserved[task_id] -= token_count
-                if self._reserved[task_id] < 0:
-                    self._reserved[task_id] = 0
-
-        # v0.29.0：未闭环 reserve 仅告警，不阻断启动。
-        if self._alert_store is not None:
-            for task_id, reserved in self._reserved.items():
-                if reserved > 0:
-                    try:
-                        self._alert_store.save_alert(
-                            AuditAlert(
-                                alert_id=uuid.uuid4().hex,
-                                session_id="",
-                                task_id=task_id,
-                                rule_id="budget_orphan_reserve",
-                                severity="high",
-                                title="未闭环预算预留",
-                                description=f"task {task_id} 有 {reserved} token 的 reserve 未匹配 commit/refund",
-                                evidence=[],
-                            )
-                        )
-                    except Exception as exc:
-                        logger.warning("orphan reserve 告警写入失败: %s", exc)
+            self._alert_store.save_alert(AuditAlert(
+                alert_id=uuid.uuid4().hex, session_id="", task_id=task_id,
+                rule_id="budget_orphan_reserve", severity="high", title="未闭环预算预留",
+                description=f"task {task_id} 有 {reserved} token 的 reserve 未匹配 commit/refund",
+                evidence=[],
+            ))
+        except Exception as exc:
+            logger.warning("orphan reserve 告警写入失败: %s", exc)

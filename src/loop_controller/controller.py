@@ -414,8 +414,7 @@ class LoopController:
         通过 ``request_id`` 从 ApprovalManager 恢复原始 Decision 与 ApprovalRequest，
         完成 ``finalize_after_approval`` 后执行。
         """
-        store = self._runtime.approval_manager._store
-        request = store.get_request_by_id(request_id)
+        request = self._runtime.approval_manager.get_request_by_id(request_id)
 
         if request is None:
             return GovernanceResult(
@@ -700,6 +699,10 @@ class LoopController:
         decision: Decision,
     ) -> ToolResult:
         """调用 Checkpoint.forward 执行 Decision，并写审计事件。"""
+        try:
+            self._runtime.require_execution_ready()
+        except RuntimeError as exc:
+            raise CheckpointError(str(exc)) from exc
         agent = self._runtime.checkpoint._identity.get_agent(proposal.agent_id)
         if agent is None:
             raise CheckpointError(f"unknown agent_id: {proposal.agent_id}")

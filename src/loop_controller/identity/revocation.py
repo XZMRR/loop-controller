@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -12,6 +13,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from loop_controller.identity.models import AgentIdentity
+from loop_controller.infra.durable_io import durable_atomic_replace, durable_locked_read
 
 
 class RevocationType(StrEnum):
@@ -80,15 +82,20 @@ class RevocationList:
     @classmethod
     def from_file(cls, path: str | Path) -> RevocationList:
         target = Path(path)
-        if not target.exists():
+        current = durable_locked_read(target)
+        if current is None:
             return cls(path=target)
-        data = yaml.safe_load(target.read_text(encoding="utf-8"))
+        entries, kill_switch = cls._parse(current)
+        return cls(entries=entries, kill_switch=kill_switch, path=target)
+
+    @staticmethod
+    def _parse(content: bytes) -> tuple[list[RevocationEntry], KillSwitchConfig]:
+        data = yaml.safe_load(content)
         if not isinstance(data, dict) or not data:
             raise ValueError("revocation config must be a non-empty mapping")
-        return cls(
-            entries=[RevocationEntry.model_validate(item) for item in data.get("revocations", [])],
-            kill_switch=KillSwitchConfig.model_validate(data.get("kill_switch") or {}),
-            path=target,
+        return (
+            [RevocationEntry.model_validate(item) for item in data.get("revocations", [])],
+            KillSwitchConfig.model_validate(data.get("kill_switch") or {}),
         )
 
     @staticmethod
@@ -124,18 +131,26 @@ class RevocationList:
         tool_name: str,
         secret_refs: list[str] | None = None,
     ) -> RevocationMatch:
-        killed, reason = self.check_kill_switch(identity, tool_name)
-        if killed:
+        with self._lock:
+            try:
+                self._refresh_from_disk()
+                refresh_error: Exception | None = None
+            except Exception as exc:
+                refresh_error = exc
+            config = self._kill_switch
+            entries = list(self._entries.values())
+        if config.enabled and (
+            tool_name not in config.except_tools
+            and identity.agent_id not in config.except_agents
+        ):
             return RevocationMatch(
                 revoked=True,
-                reason=reason,
+                reason=config.reason or "global kill switch enabled",
                 type="kill_switch",
                 id="global",
             )
         now = datetime.now(UTC)
         refs = set(secret_refs or [])
-        with self._lock:
-            entries = list(self._entries.values())
         for entry in entries:
             if entry.expires_at is not None and entry.expires_at <= now:
                 continue
@@ -158,6 +173,11 @@ class RevocationList:
                     type=entry.type,
                     id=entry.id,
                 )
+        if refresh_error is not None:
+            return RevocationMatch(
+                revoked=True,
+                reason=f"revocation config unavailable: {refresh_error}",
+            )
         return RevocationMatch(revoked=False)
 
     def is_revoked(
@@ -172,39 +192,55 @@ class RevocationList:
 
     def add(self, entry: RevocationEntry) -> None:
         with self._lock:
-            updated = dict(self._entries)
-            updated[self._key(entry.type, entry.id, entry.tenant_id)] = entry
-            self._persist(entries=updated, kill_switch=self._kill_switch)
-            self._entries = updated
+            self._replace(lambda entries, config: (
+                {**entries, self._key(entry.type, entry.id, entry.tenant_id): entry},
+                config,
+            ))
 
     def remove(
         self, entry_type: RevocationType | str, entry_id: str, tenant_id: str | None = None
     ) -> bool:
         normalized = RevocationType(entry_type)
+        key = self._key(normalized, entry_id, tenant_id)
+        removed = False
+
+        def remove_entry(
+            entries: dict[tuple[RevocationType, str, str | None], RevocationEntry],
+            config: KillSwitchConfig,
+        ) -> tuple[
+            dict[tuple[RevocationType, str, str | None], RevocationEntry], KillSwitchConfig
+        ]:
+            nonlocal removed
+            removed = key in entries
+            updated = dict(entries)
+            updated.pop(key, None)
+            return updated, config
+
         with self._lock:
-            key = self._key(normalized, entry_id, tenant_id)
-            if key not in self._entries:
-                return False
-            updated = dict(self._entries)
-            del updated[key]
-            self._persist(entries=updated, kill_switch=self._kill_switch)
-            self._entries = updated
-            return True
+            self._replace(remove_entry)
+        return removed
 
     def set_kill_switch(self, config: KillSwitchConfig) -> None:
         with self._lock:
-            self._persist(entries=self._entries, kill_switch=config)
-            self._kill_switch = config
+            self._replace(lambda entries, _current: (entries, config))
 
     def reload(self) -> None:
+        with self._lock:
+            self._refresh_from_disk(require_exists=True)
+
+    def _refresh_from_disk(self, *, require_exists: bool = False) -> None:
         if self._path is None:
             return
-        if not self._path.exists():
-            raise FileNotFoundError(self._path)
-        loaded = self.from_file(self._path)
-        with self._lock:
-            self._entries = loaded._entries
-            self._kill_switch = loaded._kill_switch
+        current = durable_locked_read(self._path)
+        if current is None:
+            if require_exists:
+                raise FileNotFoundError(self._path)
+            return
+        entries, kill_switch = self._parse(current)
+        self._entries = {
+            self._key(entry.type, entry.id, entry.tenant_id): entry for entry in entries
+        }
+        self._kill_switch = kill_switch
 
     def as_dict(self) -> dict[str, Any]:
         with self._lock:
@@ -213,21 +249,49 @@ class RevocationList:
                 "revocations": [entry.model_dump(mode="json") for entry in self._entries.values()],
             }
 
-    def _persist(
+    def _replace(
         self,
-        *,
-        entries: dict[tuple[RevocationType, str, str | None], RevocationEntry],
-        kill_switch: KillSwitchConfig,
+        update: Callable[
+            [dict[tuple[RevocationType, str, str | None], RevocationEntry], KillSwitchConfig],
+            tuple[dict[tuple[RevocationType, str, str | None], RevocationEntry], KillSwitchConfig],
+        ],
     ) -> None:
         if self._path is None:
+            self._entries, self._kill_switch = update(dict(self._entries), self._kill_switch)
             return
-        data = {
-            "kill_switch": kill_switch.model_dump(mode="json"),
-            "revocations": [entry.model_dump(mode="json") for entry in entries.values()],
-        }
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._path.with_suffix(f"{self._path.suffix}.tmp")
-        temporary.write_text(
-            yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
-        )
-        temporary.replace(self._path)
+
+        result: tuple[
+            dict[tuple[RevocationType, str, str | None], RevocationEntry], KillSwitchConfig
+        ] | None = None
+
+        def merge(current: bytes | None) -> bytes:
+            nonlocal result
+            if current is None:
+                entries: dict[
+                    tuple[RevocationType, str, str | None], RevocationEntry
+                ] = {}
+                config = KillSwitchConfig()
+            else:
+                data = yaml.safe_load(current)
+                if not isinstance(data, dict) or not data:
+                    raise ValueError("revocation config must be a non-empty mapping")
+                parsed = [
+                    RevocationEntry.model_validate(item) for item in data.get("revocations", [])
+                ]
+                entries = {
+                    self._key(entry.type, entry.id, entry.tenant_id): entry for entry in parsed
+                }
+                config = KillSwitchConfig.model_validate(data.get("kill_switch") or {})
+            result = update(entries, config)
+            updated_entries, updated_config = result
+            payload = {
+                "kill_switch": updated_config.model_dump(mode="json"),
+                "revocations": [
+                    entry.model_dump(mode="json") for entry in updated_entries.values()
+                ],
+            }
+            return yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).encode("utf-8")
+
+        durable_atomic_replace(self._path, merge)
+        assert result is not None
+        self._entries, self._kill_switch = result

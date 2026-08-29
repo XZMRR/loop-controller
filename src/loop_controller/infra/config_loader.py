@@ -199,6 +199,15 @@ class ApprovalConfig:
     rules: list[ApprovalRule] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class PersistenceConfig:
+    fsync_enabled: bool = True
+    lock_timeout_seconds: float = 5.0
+    repair_incomplete_tail: bool = True
+    enforce_permissions: bool = True
+    fail_on_unsafe_permissions: bool = True
+
+
 AuditHashAlgorithm = Literal["sha256", "hmac-sha256"]
 
 
@@ -219,6 +228,7 @@ class AppConfig:
     audit_rules: AuditRules  # v0.12.0
     masking_rules: MaskingRules
     approval: ApprovalConfig
+    persistence: PersistenceConfig
     policy_dir: str
     audit_log_path: str
     decision_log_path: str
@@ -276,6 +286,7 @@ class ConfigLoader:
         secrets_config = self._load_secrets_config(config_dir / "secrets.yaml", root)
         revocation_config = self._load_optional_config(config_dir / "revocation.yaml")
         evidence_config = self._load_optional_config(config_dir / "evidence.yaml")
+        persistence = self._load_persistence(config_dir / "persistence.yaml")
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
         identity_config = self._load_identity_config(config_dir / "identity.yaml")
@@ -337,6 +348,7 @@ class ConfigLoader:
             audit_rules=audit_rules,
             masking_rules=masking_rules,
             approval=approval,
+            persistence=persistence,
             policy_dir=str(root / "policies"),
             audit_log_path=str(root / "data" / "audit.jsonl"),
             decision_log_path=str(root / "data" / "decisions.jsonl"),
@@ -538,6 +550,21 @@ class ConfigLoader:
         if not path.exists():
             return {}
         return self._read_yaml(path)
+
+    def _load_persistence(self, path: Path) -> PersistenceConfig:
+        if not path.exists():
+            return PersistenceConfig()
+        data = self._read_yaml(path)
+        raw = data.get("persistence", data)
+        if not isinstance(raw, dict):
+            raise ConfigValidationError("persistence 配置必须是映射")
+        try:
+            config = PersistenceConfig(**raw)
+        except TypeError as exc:
+            raise ConfigValidationError(f"persistence 配置非法：{exc}") from exc
+        if config.lock_timeout_seconds <= 0:
+            raise ConfigValidationError("persistence.lock_timeout_seconds 必须大于 0")
+        return config
 
     def _load_permission_rules(self, path: Path) -> list[PermissionRule]:
         data = self._read_yaml(path)

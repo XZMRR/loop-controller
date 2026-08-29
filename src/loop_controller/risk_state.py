@@ -7,15 +7,13 @@ RiskStateStore Protocol 写入 JSONL；启动时重放历史事件恢复状态�
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from loop_controller.infra.durable_io import DurableJsonlFile
 from loop_controller.models import RiskProfile
-
-logger = logging.getLogger(__name__)
 
 # 风险证据标签集合：只有这些事件进入 recent_tags
 _RISK_EVIDENCE_TAGS = {"deny", "critical", "require_approval", "approval_denied", "approval_granted"}
@@ -81,8 +79,8 @@ class RiskStateStore(Protocol):
         """加载全部历史事件（启动重放用）。"""
         ...
 
-    def append_event(self, event: RiskEvent) -> None:
-        """追加单条事件。"""
+    def append_event(self, event: RiskEvent) -> list[RiskEvent]:
+        """追加单条事件并返回锁内刷新的全部历史。"""
         ...
 
 
@@ -95,8 +93,9 @@ class InMemoryRiskStateStore:
     def load_all(self) -> list[RiskEvent]:
         return list(self._events)
 
-    def append_event(self, event: RiskEvent) -> None:
+    def append_event(self, event: RiskEvent) -> list[RiskEvent]:
         self._events.append(event)
+        return list(self._events)
 
 
 class JsonlRiskStateStore:
@@ -110,6 +109,7 @@ class JsonlRiskStateStore:
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
+        self._durable = DurableJsonlFile(self._path)
         self._ensure_writable()
 
     def _ensure_writable(self) -> None:
@@ -130,39 +130,21 @@ class JsonlRiskStateStore:
                 raise PermissionError(f"risk_state 文件 {self._path} 不可追加：{exc}") from exc
 
     def load_all(self) -> list[RiskEvent]:
-        """启动重放：逐行解析 JSONL；最后一行不完整则忽略并 WARNING。"""
-        events: list[RiskEvent] = []
-        if not self._path.exists():
-            return events
-        raw_lines = self._path.read_text(encoding="utf-8").splitlines(keepends=True)
-        for line_no, raw in enumerate(raw_lines, start=1):
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                events.append(RiskEvent.from_dict(data))
-            except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                is_last = line_no == len(raw_lines)
-                if is_last:
-                    logger.warning(
-                        "risk_state.jsonl 末行（第 %d 行）不完整，已忽略：%s",
-                        line_no,
-                        exc,
-                    )
-                else:
-                    logger.warning(
-                        "risk_state.jsonl 第 %d 行解析失败（%s），已忽略",
-                        line_no,
-                        exc,
-                    )
-        return events
+        """锁内重放；仅允许忽略损坏的物理末行，中间损坏时 fail-closed。"""
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            raw_lines = transaction.read_complete_lines(allow_corrupt_last=True)
+        return [RiskEvent.from_dict(json.loads(raw)) for raw in raw_lines]
 
-    def append_event(self, event: RiskEvent) -> None:
-        """追加单条事件并落盘。"""
-        with self._path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
-            fh.flush()
+    def append_event(self, event: RiskEvent) -> list[RiskEvent]:
+        """锁内刷新历史并追加单条事件。"""
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            lines = transaction.read_complete_lines()
+            events = [RiskEvent.from_dict(json.loads(raw)) for raw in lines]
+            transaction.append_json(event.to_dict())
+            events.append(event)
+            return events
 
 
 class RiskStateManager:
@@ -245,11 +227,16 @@ class RiskStateManager:
             score_delta=delta,
             tag=tag,
         )
-        self._store.append_event(event)
-        self._apply_in_memory(event)
+        events = self._store.append_event(event)
+        self._profiles.clear()
+        for stored_event in events:
+            self._apply_in_memory(stored_event)
 
     def get_profile(self, session_id: str) -> RiskProfile:
         """获取 session 的风险画像；不存在则返回零分画像。"""
+        self._profiles.clear()
+        for event in self._store.load_all():
+            self._apply_in_memory(event)
         return self._profiles.get(session_id, RiskProfile(session_id=session_id))
 
     def reset(self, session_id: str) -> None:

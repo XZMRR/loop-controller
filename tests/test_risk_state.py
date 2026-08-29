@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from loop_controller.infra.durable_io import CorruptedJsonlError
 from loop_controller.risk_state import (
     JsonlRiskStateStore,
     RiskEvent,
@@ -123,7 +124,38 @@ class TestJsonlRiskStateStore:
         manager = RiskStateManager(JsonlRiskStateStore(path))
         profile = manager.get_profile("s1")
         assert profile.cumulative_risk_score == pytest.approx(0.20)
-        assert "末行" in caplog.text or "第 2 行" in caplog.text
+        assert "final JSONL record" in caplog.text
+
+    def test_middle_corrupt_line_fails_closed(self, tmp_path: Path):
+        path = tmp_path / "risk_state.jsonl"
+        event = {
+            "session_id": "s1",
+            "event_type": "deny",
+            "score_delta": 0.20,
+            "tag": "deny",
+        }
+        path.write_text(
+            json.dumps(event) + "\nnot-json\n" + json.dumps(event) + "\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(CorruptedJsonlError, match="line 2"):
+            RiskStateManager(JsonlRiskStateStore(path))
+
+    def test_get_profile_refreshes_under_durable_lock(self, tmp_path: Path, monkeypatch):
+        path = tmp_path / "risk_state.jsonl"
+        manager = RiskStateManager(JsonlRiskStateStore(path))
+        calls = 0
+        transaction = manager._store._durable.transaction
+
+        def tracked_transaction():
+            nonlocal calls
+            calls += 1
+            return transaction()
+
+        monkeypatch.setattr(manager._store._durable, "transaction", tracked_transaction)
+        manager.get_profile("s1")
+        assert calls == 1
 
     def test_parent_dir_unwritable_raises(self, tmp_path: Path):
         # Windows 下不易构造真正不可写目录；此测试验证父路径为已存在文件时 mkdir 失败

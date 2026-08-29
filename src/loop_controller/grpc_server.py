@@ -262,8 +262,12 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         request: governance_pb2.ResumeAfterApprovalRequest,
         context: grpc_aio.ServicerContext,
     ) -> governance_pb2.EvaluateToolCallResponse:
-        await self._require_identity(context)
-        if context.code() == grpc.StatusCode.UNAUTHENTICATED:
+        identity = await self._require_identity(context)
+        if self._grpc_require_auth() and identity is None:
+            return governance_pb2.EvaluateToolCallResponse()
+        if identity is not None and not self._approval_request_belongs_to(request.request_id, identity):
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("approval request does not belong to caller")
             return governance_pb2.EvaluateToolCallResponse()
         result = await self._controller.resume_after_approval(request.request_id)
         return _governance_result(result)
@@ -277,6 +281,10 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         if self._grpc_require_auth() and identity is None:
             return
         request_id = request.request_id
+        if identity is not None and not self._approval_request_belongs_to(request_id, identity):
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details("approval request does not belong to caller")
+            return
         max_wait = request.max_wait_seconds or 60
         max_wait = max(1, min(max_wait, 300))
 
@@ -348,10 +356,11 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         request: governance_pb2.ListPendingApprovalsRequest,
         context: grpc_aio.ServicerContext,
     ) -> governance_pb2.ListPendingApprovalsResponse:
-        await self._require_identity(context)
-        if context.code() == grpc.StatusCode.UNAUTHENTICATED:
+        identity = await self._require_admin_identity(context)
+        if identity is None:
             return governance_pb2.ListPendingApprovalsResponse()
         store = self._controller._runtime.approval_manager._store
+        store.refresh()
         pending = store.get_pending()
         approvals = [
             governance_pb2.PendingApproval(
@@ -370,8 +379,8 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         request: governance_pb2.QueryAuditEventsRequest,
         context: grpc_aio.ServicerContext,
     ):
-        identity = await self._require_identity(context)
-        if self._grpc_require_auth() and identity is None:
+        identity = await self._require_admin_identity(context)
+        if identity is None:
             return
         audit_store = self._controller._runtime.audit_store
         session_id = request.session_id or None
@@ -503,6 +512,13 @@ class ToolGovernanceServicer(governance_pb2_grpc.ToolGovernanceServicer):
         return governance_pb2.RevocationListResponse(
             revocations=entries,
             kill_switch=governance_pb2.KillSwitchResponse(**config.model_dump()),
+        )
+
+    def _approval_request_belongs_to(self, request_id: str, identity: AgentIdentity) -> bool:
+        approval_request = self._controller._runtime.approval_manager.get_request_by_id(request_id)
+        return approval_request is not None and (
+            approval_request.agent_id == identity.agent_id
+            and approval_request.requester_id == identity.user_id
         )
 
     async def _try_resume(self, request_id: str) -> Any | None:

@@ -105,6 +105,38 @@ def test_jsonl_ledger_corrupted_file_fail_closed(tmp_path) -> None:
         JsonlBudgetLedger(path)
 
 
+def test_commit_fsync_uncertainty_raises_and_blocks_retry(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "budget.jsonl"
+    ledger = JsonlBudgetLedger(path, default_max_budget_token=10)
+    cost = BudgetCost(token_count=3)
+    assert ledger.check_and_reserve("t1", cost)
+
+    from loop_controller.infra import durable_io
+
+    calls = 0
+
+    def fail_fsync(fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        raise OSError("fsync result unknown")
+
+    monkeypatch.setattr(durable_io.os, "fsync", fail_fsync)
+    with pytest.raises(BudgetLedgerError, match="已阻断后续写入"):
+        ledger.commit("t1", cost)
+
+    assert ledger.write_blocked
+    assert calls == 1
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert sum(record["type"] == "commit" for record in records) == 1
+    assert ledger._committed["t1"] == 0
+
+    with pytest.raises(BudgetLedgerError, match="写入结果不确定"):
+        ledger.commit("t1", cost)
+    assert calls == 1
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert sum(record["type"] == "commit" for record in records) == 1
+
+
 def test_replay_orphan_reserve_emits_alert(tmp_path) -> None:
     """v0.29.0：JsonlBudgetLedger._replay 对未闭环 reserve 产生 alert_store 告警（不 fail）。"""
     path = tmp_path / "budget.jsonl"

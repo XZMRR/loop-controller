@@ -245,6 +245,28 @@ def test_runtime_create_task_reuses_session(tmp_path: Path) -> None:
     assert task2.session_id == session1.session_id
 
 
+def test_runtime_create_task_rejects_agent_mismatch_before_writes(tmp_path: Path) -> None:
+    from loop_controller.runtime import build_runtime
+
+    _make_minimal_config(tmp_path)
+    config = ConfigLoader().load(tmp_path / "config", opa_base_url=None)
+    runtime = build_runtime(config)
+    _, session = runtime.create_task("alice", "a1", "first task")
+    tasks_before = Path(config.task_store_path).read_bytes()
+    conversations_before = Path(config.conversation_path).read_bytes()
+
+    with pytest.raises(ValueError, match="不一致"):
+        runtime.create_task(
+            "alice",
+            "a2",
+            "must not persist",
+            session_id=session.session_id,
+        )
+
+    assert Path(config.task_store_path).read_bytes() == tasks_before
+    assert Path(config.conversation_path).read_bytes() == conversations_before
+
+
 def test_risk_state_persists_across_restart(tmp_path: Path) -> None:
     """S7：风险状态在进程重启后通过 JSONL 恢复。"""
     path = tmp_path / "risk_state.jsonl"

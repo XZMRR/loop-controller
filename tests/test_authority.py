@@ -250,6 +250,30 @@ def test_consume_budget() -> None:
     assert over is None
 
 
+def test_validate_and_consume_failure_refunds_prior_token() -> None:
+    rules = AuthorityRules(
+        enabled=True,
+        grants={"email_external": _email_external_rule()},
+    )
+    manager = _manager(rules)
+    token = manager.request_authority(_request(["email_external"]), _context())
+    assert isinstance(token, AuthorityToken)
+    proposal = ActionProposal(
+        task_id="t1",
+        call_id="c2",
+        agent_id="a1",
+        tool_name="send_email",
+        arguments={},
+        task_context="",
+        authority_token_ids=[token.token_id, "missing"],
+    )
+
+    assert manager.validate_and_consume(proposal, BudgetCost(token_count=2)) is None
+    restored = manager._store.get(token.token_id)
+    assert restored is not None
+    assert restored.remaining_budget == token.remaining_budget
+
+
 def test_revoke_token() -> None:
     rules = AuthorityRules(
         enabled=True,
