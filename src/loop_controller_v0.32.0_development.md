@@ -186,11 +186,7 @@ Agent 代码
 ```python
 from loop_controller import governed
 
-@governed(
-    tool_name="write_file",           # 可选，默认用函数名
-    mode="harness_required",          # 可选，默认从全局策略读取
-    budget_unit="file_write",         # 可选
-)
+@governed(tool_name="write_file")  # 可选，默认使用函数名
 def write_file(path: str, content: str) -> dict:
     ...
 ```
@@ -201,6 +197,8 @@ def write_file(path: str, content: str) -> dict:
 - 调用时自动把调用路由到 Loop Controller；
 - 等待 Loop Controller 审批通过后执行；
 - 返回原始返回值。
+
+> 注意：v0.32.0 的装饰器只暴露 `tool_name` 参数。`mode` 和 `budget_unit` 等策略覆盖能力将随 v0.34.0 策略引擎统一支持，避免在 SDK 公共签名中留下未生效的字段。
 
 支持同步和异步函数：
 
