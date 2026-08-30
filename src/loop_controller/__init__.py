@@ -4,6 +4,12 @@
 渐进式构建；`models.py` 是唯一权威 Schema 来源。
 """
 
+from loop_controller.agent_sdk import (
+    GovernanceDeniedError,
+    GovernanceRuntime,
+    governed,
+    launch_agent,
+)
 from loop_controller.approval_manager import AsyncApprovalManager
 from loop_controller.checkpoint import Checkpoint, CheckpointError
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
@@ -56,8 +62,12 @@ __all__ = [
     "ExecutionContext",
     "ExecutorRegistry",
     "format_governance_result",
+    "GovernanceDeniedError",
+    "GovernanceRuntime",
+    "governed",
     "IdentityCredential",
     "IdentityProvider",
+    "launch_agent",
     "LightweightClassifier",
     "LoopController",
     "MCPExecutor",

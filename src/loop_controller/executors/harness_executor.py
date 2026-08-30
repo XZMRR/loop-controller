@@ -20,11 +20,13 @@ import httpx
 
 from loop_controller.executors.base import ExecutionContext, ToolExecutor
 from loop_controller.executors.harness_models import (
+    DockerBackendConfig,
     HarnessBackendConfig,
     HarnessExecutionPolicy,
     HarnessSandboxConfig,
     HarnessToolSpec,
     HTTPBackendConfig,
+    IsolatedSubprocessBackendConfig,
     SubprocessBackendConfig,
 )
 from loop_controller.executors.harness_protocol import (
@@ -411,6 +413,14 @@ class HarnessExecutor(ToolExecutor):
             return _SubprocessHarnessBackend(config)
         if isinstance(config, HTTPBackendConfig):
             return _HTTPHarnessClient(config)
+        if isinstance(config, DockerBackendConfig):
+            from loop_controller.executors.docker_harness_backend import DockerHarnessBackend
+            return DockerHarnessBackend(config)
+        if isinstance(config, IsolatedSubprocessBackendConfig):
+            from loop_controller.executors.isolated_subprocess_harness import (
+                IsolatedSubprocessHarnessBackend,
+            )
+            return IsolatedSubprocessHarnessBackend(config)
         raise ValueError(f"不支持的 Harness 后端类型: {type(config).__name__}")
 
     def _get_spec(self, tool_name: str) -> HarnessToolSpec:

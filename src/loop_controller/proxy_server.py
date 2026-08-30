@@ -24,6 +24,7 @@ import logging
 import os
 import ssl
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -55,6 +56,16 @@ logger = logging.getLogger(__name__)
 # v0.7.0：内部 MCP 工具名，用于查询审批状态。
 _APPROVAL_STATUS_TOOL_NAME = "loop_controller_approval_status"
 
+# v0.32.0：内部 MCP admin/审计工具名。
+_ADMIN_STATUS_TOOL_NAME = "harness_backend_status"
+_ADMIN_DRAIN_TOOL_NAME = "harness_backend_drain"
+_ADMIN_RESET_TOOL_NAME = "harness_backend_reset"
+_ADMIN_RECENT_DECISIONS_TOOL_NAME = "list_recent_decisions"
+_ADMIN_DECISION_STATUS_TOOL_NAME = "get_decision_status"
+_ADMIN_RECENT_AUDIT_TOOL_NAME = "list_recent_audit_events"
+_ADMIN_TRIGGER_KILL_SWITCH_TOOL_NAME = "trigger_kill_switch"
+_ADMIN_REVOKE_DECISION_TOOL_NAME = "revoke_decision"
+
 _APPROVAL_STATUS_SCHEMA = {
     "type": "object",
     "properties": {
@@ -64,6 +75,50 @@ _APPROVAL_STATUS_SCHEMA = {
         }
     },
     "required": ["decision_id"],
+}
+
+_ADMIN_NAME_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "backend 名称"},
+    },
+    "required": ["name"],
+}
+
+_ADMIN_LIMIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "limit": {"type": "integer", "description": "返回条数上限", "default": 10},
+    },
+}
+
+_ADMIN_DECISION_ID_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision_id": {"type": "string", "description": "decision ID"},
+    },
+    "required": ["decision_id"],
+}
+
+_ADMIN_KILL_SWITCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "enabled": {"type": "boolean"},
+        "reason": {"type": "string"},
+        "except_tools": {"type": "array", "items": {"type": "string"}, "default": []},
+        "except_agents": {"type": "array", "items": {"type": "string"}, "default": []},
+    },
+    "required": ["enabled"],
+}
+
+_ADMIN_REVOKE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": ["agent", "user", "tool", "secret"]},
+        "id": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": ["type", "id"],
 }
 
 
@@ -288,6 +343,154 @@ class LoopControllerProxyServer:
             ],
         )
 
+    @property
+    def _admin_tool_handlers(self) -> dict[str, Callable[[dict[str, Any]], Awaitable[types.CallToolResult]]]:
+        """v0.32.0：admin/审计 MCP 工具路由表。"""
+        return {
+            _ADMIN_STATUS_TOOL_NAME: self._handle_admin_harness_status,
+            _ADMIN_DRAIN_TOOL_NAME: self._handle_admin_harness_drain,
+            _ADMIN_RESET_TOOL_NAME: self._handle_admin_harness_reset,
+            _ADMIN_RECENT_DECISIONS_TOOL_NAME: self._handle_admin_recent_decisions,
+            _ADMIN_DECISION_STATUS_TOOL_NAME: self._handle_admin_decision_status,
+            _ADMIN_RECENT_AUDIT_TOOL_NAME: self._handle_admin_recent_audit,
+            _ADMIN_TRIGGER_KILL_SWITCH_TOOL_NAME: self._handle_admin_kill_switch,
+            _ADMIN_REVOKE_DECISION_TOOL_NAME: self._handle_admin_revoke,
+        }
+
+    async def _handle_admin_harness_status(self, _arguments: dict[str, Any]) -> types.CallToolResult:
+        executor = getattr(self._runtime, "harness_executor", None)
+        if executor is None:
+            return types.CallToolResult(content=[types.TextContent(type="text", text="[]")])
+        statuses = [status.model_dump(mode="json") for status in executor.backend_statuses()]
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(statuses, ensure_ascii=False))]
+        )
+
+    async def _handle_admin_harness_drain(self, arguments: dict[str, Any]) -> types.CallToolResult:
+        executor = getattr(self._runtime, "harness_executor", None)
+        if executor is None:
+            return self._error_result("harness unavailable")
+        name = arguments.get("name", "")
+        try:
+            drained = await executor.drain_backend(name)
+        except KeyError as exc:
+            return self._error_result(str(exc))
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps({"backend": name, "drained": drained}, ensure_ascii=False))]
+        )
+
+    async def _handle_admin_harness_reset(self, arguments: dict[str, Any]) -> types.CallToolResult:
+        executor = getattr(self._runtime, "harness_executor", None)
+        if executor is None:
+            return self._error_result("harness unavailable")
+        name = arguments.get("name", "")
+        try:
+            executor.reset_backend(name)
+        except KeyError as exc:
+            return self._error_result(str(exc))
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps({"backend": name, "reset": True}, ensure_ascii=False))]
+        )
+
+    async def _handle_admin_recent_decisions(self, arguments: dict[str, Any]) -> types.CallToolResult:
+        limit = arguments.get("limit", 10)
+        items = self._runtime.approval_manager.list_recent(limit=limit)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(items, ensure_ascii=False))]
+        )
+
+    async def _handle_admin_decision_status(self, arguments: dict[str, Any]) -> types.CallToolResult:
+        decision_id = arguments.get("decision_id", "")
+        status = self._runtime.approval_manager.get_decision_status(decision_id)
+        if status is None:
+            return self._error_result("decision not found")
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(status, ensure_ascii=False))]
+        )
+
+    async def _handle_admin_recent_audit(self, arguments: dict[str, Any]) -> types.CallToolResult:
+        limit = arguments.get("limit", 10)
+        store = getattr(self._runtime, "audit_store", None)
+        if store is None or not hasattr(store, "list_recent"):
+            return types.CallToolResult(content=[types.TextContent(type="text", text="[]")])
+        events = store.list_recent(limit=limit)
+        summaries = []
+        for event in events:
+            summary = {
+                "event_id": event.event_id,
+                "trace_id": event.trace_id,
+                "session_id": event.session_id,
+                "actor_type": event.actor_type,
+                "action": event.action,
+                "target": event.target,
+                "decision": event.decision,
+                "timestamp": event.timestamp.isoformat(),
+            }
+            metadata = dict(event.metadata)
+            # 脱敏：不暴露敏感参数和完整结果
+            metadata.pop("arguments", None)
+            metadata.pop("content", None)
+            metadata.pop("result_content", None)
+            if "harness_evidence" in metadata:
+                summary["harness_evidence"] = metadata["harness_evidence"]
+            summaries.append(summary)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(summaries, ensure_ascii=False))]
+        )
+
+    async def _handle_admin_kill_switch(self, arguments: dict[str, Any]) -> types.CallToolResult:
+        from loop_controller.identity.revocation import KillSwitchConfig
+        from loop_controller.models import AuditEvent
+
+        config = KillSwitchConfig(
+            enabled=bool(arguments.get("enabled", False)),
+            reason=arguments.get("reason", ""),
+            except_tools=arguments.get("except_tools", []),
+            except_agents=arguments.get("except_agents", []),
+        )
+        revocation_list = getattr(self._runtime, "revocation_list", None)
+        if revocation_list is None:
+            return self._error_result("revocation list unavailable")
+        revocation_list.set_kill_switch(config)
+        if self._runtime.audit_store is not None:
+            await self._runtime.audit_store.append_async(
+                AuditEvent(
+                    event_id="",
+                    trace_id="",
+                    session_id="",
+                    call_id="",
+                    actor_type="agent",
+                    actor_id=self._identity.agent_id,
+                    action="admin_operation",
+                    target="kill_switch",
+                    decision="allow",
+                    reason="trigger_kill_switch",
+                    metadata={"enabled": config.enabled},
+                )
+            )
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps({"kill_switch": config.enabled}, ensure_ascii=False))]
+        )
+
+    async def _handle_admin_revoke(self, arguments: dict[str, Any]) -> types.CallToolResult:
+        from loop_controller.identity.revocation import RevocationEntry, RevocationType
+
+        revocation_list = getattr(self._runtime, "revocation_list", None)
+        if revocation_list is None:
+            return self._error_result("revocation list unavailable")
+        try:
+            entry = RevocationEntry(
+                type=RevocationType(arguments["type"]),
+                id=arguments["id"],
+                reason=arguments.get("reason", ""),
+            )
+        except (KeyError, ValueError) as exc:
+            return self._error_result(str(exc))
+        revocation_list.add(entry)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps({"revoked": True, "type": entry.type, "id": entry.id}, ensure_ascii=False))]
+        )
+
     # -- 请求处理 -----------------------------------------------------------
 
     async def _handle_list_tools_impl(self) -> types.ListToolsResult:
@@ -309,6 +512,51 @@ class LoopControllerProxyServer:
                 inputSchema=_APPROVAL_STATUS_SCHEMA,
             )
         )
+        # v0.32.0：注入 admin/审计工具
+        mcp_tools.extend(
+            [
+                types.Tool(
+                    name=_ADMIN_STATUS_TOOL_NAME,
+                    description="查询所有 Harness backend 状态。",
+                    inputSchema={"type": "object", "properties": {}},
+                ),
+                types.Tool(
+                    name=_ADMIN_DRAIN_TOOL_NAME,
+                    description="排空指定 Harness backend。",
+                    inputSchema=_ADMIN_NAME_SCHEMA,
+                ),
+                types.Tool(
+                    name=_ADMIN_RESET_TOOL_NAME,
+                    description="reset 指定 Harness backend。",
+                    inputSchema=_ADMIN_NAME_SCHEMA,
+                ),
+                types.Tool(
+                    name=_ADMIN_RECENT_DECISIONS_TOOL_NAME,
+                    description="查询最近审批/决策请求。",
+                    inputSchema=_ADMIN_LIMIT_SCHEMA,
+                ),
+                types.Tool(
+                    name=_ADMIN_DECISION_STATUS_TOOL_NAME,
+                    description="查询某个 decision 的状态。",
+                    inputSchema=_ADMIN_DECISION_ID_SCHEMA,
+                ),
+                types.Tool(
+                    name=_ADMIN_RECENT_AUDIT_TOOL_NAME,
+                    description="查询最近审计事件（元数据摘要，不含敏感参数）。",
+                    inputSchema=_ADMIN_LIMIT_SCHEMA,
+                ),
+                types.Tool(
+                    name=_ADMIN_TRIGGER_KILL_SWITCH_TOOL_NAME,
+                    description="触发或解除全局 kill switch。",
+                    inputSchema=_ADMIN_KILL_SWITCH_SCHEMA,
+                ),
+                types.Tool(
+                    name=_ADMIN_REVOKE_DECISION_TOOL_NAME,
+                    description="吊销某个 agent / user / tool / secret。",
+                    inputSchema=_ADMIN_REVOKE_SCHEMA,
+                ),
+            ]
+        )
         return types.ListToolsResult(tools=mcp_tools)
 
     async def _handle_call_tool_impl(
@@ -326,6 +574,11 @@ class LoopControllerProxyServer:
         # v0.7.0：内部工具优先路由，不进入治理流程。
         if name == _APPROVAL_STATUS_TOOL_NAME:
             return self._handle_approval_status(raw_arguments)
+
+        # v0.32.0：admin/审计工具优先路由。
+        admin_handler = self._admin_tool_handlers.get(name)
+        if admin_handler is not None:
+            return await admin_handler(raw_arguments)
 
         retry_decision_id = self._extract_retry_decision_id(raw_arguments)
 

@@ -683,10 +683,21 @@ def test_harness_rejects_structurally_invalid_input_schema(config_dir):
         ConfigLoader().load(config_dir)
 
 
-def test_harness_rejects_docker_at_load_time(config_dir):
+def test_harness_loads_docker_backend(config_dir):
     _write_harness_config(
         config_dir,
         {"type": "docker", "image": "example/harness:latest"},
     )
-    with pytest.raises(ConfigValidationError, match="不受支持的 docker 类型"):
-        ConfigLoader().load(config_dir)
+    config = ConfigLoader().load(config_dir)
+    assert config.harness_backends["remote"].type == "docker"
+    assert config.harness_backends["remote"].image == "example/harness:latest"
+
+
+def test_harness_loads_isolated_subprocess_backend(config_dir):
+    _write_harness_config(
+        config_dir,
+        {"type": "isolated_subprocess", "python_path": "python"},
+    )
+    config = ConfigLoader().load(config_dir)
+    assert config.harness_backends["remote"].type == "isolated_subprocess"
+    assert config.harness_backends["remote"].python_path == "python"

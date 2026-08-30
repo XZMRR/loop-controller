@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from loop_controller.infra.approval_store import ApprovalStore
 from loop_controller.models import ApprovalRecord, ApprovalRequest, Decision
 
@@ -46,3 +48,34 @@ class AsyncApprovalManager:
         self._store.refresh()
         request = self._store.get_request(decision_id)
         return request.original_decision if request is not None else None
+
+    def list_recent(self, limit: int = 100) -> list[dict[str, Any]]:
+        """v0.32.0：返回最近的审批请求摘要（按提交时间倒序）。"""
+        self._store.refresh()
+        requests = getattr(self._store, "_requests", {})
+        records = getattr(self._store, "_records", {})
+        items: list[dict[str, Any]] = []
+        for decision_id, request in requests.items():
+            record = records.get(decision_id)
+            items.append(
+                {
+                    "decision_id": decision_id,
+                    "request_id": request.request_id,
+                    "tool_name": request.tool_name,
+                    "status": record.verdict if record is not None else "pending",
+                    "created_at": request.created_at.isoformat(),
+                }
+            )
+        items.sort(key=lambda d: d["created_at"], reverse=True)
+        return items[:limit]
+
+    def get_decision_status(self, decision_id: str) -> dict[str, Any] | None:
+        """v0.32.0：返回 decision 状态摘要。"""
+        self._store.refresh()
+        record = self._store.get_record(decision_id)
+        if record is not None:
+            return {"decision_id": decision_id, "status": record.verdict, "reason": record.comment}
+        request = self._store.get_request(decision_id)
+        if request is not None:
+            return {"decision_id": decision_id, "status": "pending", "reason": ""}
+        return None

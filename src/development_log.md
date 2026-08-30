@@ -2,6 +2,37 @@
 
 本文件记录 MVP 三次迭代中的关键决策、实现要点与踩坑经验，便于后续维护与开源时追溯。
 
+## v0.32.0：Agent 接入体验优化与 Harness 后端完善
+
+### 完成内容
+
+- **Agent SDK 友好化**：新增 `@governed` 装饰器，在工具函数定义处完成治理接入，保持原函数签名，自动打包参数，支持同步/异步。
+- **GovernanceRuntime**：封装 `LoopController` + `ToolGovernor`，提供类级当前运行时上下文（`current()` / `set_current()` / `from_config()`），支持 `hook_tool_registry()` 批量包装统一工具注册表。
+- **Agent 启动器**：`launch_agent()` 在治理上下文中运行 Agent 入口函数，作为快速接入入口（不强隔离）。
+- **框架集成**：
+  - `govern_langchain_tools()` 包装 LangChain `BaseTool` 列表；
+  - `@governed_route` 与 `GovernedFastAPI` 提供 FastAPI 路由级治理。
+- **MCP Proxy 运维/审计工具**：在 `tools/list` 中注入 8 个 admin/审计工具：`harness_backend_status`、`harness_backend_drain`、`harness_backend_reset`、`list_recent_decisions`、`get_decision_status`、`list_recent_audit_events`、`trigger_kill_switch`、`revoke_decision`。
+- **Harness backend 补齐**：实现 `DockerHarnessBackend`（`docker run --rm -i` 一次性容器）与 `IsolatedSubprocessHarnessBackend`（受限 Python 子进程，白名单 builtins/工具）。
+- **配置与审计支持**：`IsolatedSubprocessBackendConfig` 加入 `HarnessBackendConfig` 联合类型；`ConfigLoader` 支持加载 `docker` / `isolated_subprocess` backend；`ApprovalManager` / `AuditStore` 新增 `list_recent` / `get_decision_status` 查询。
+- **Agent 接入示例**：`examples/agent_sdk/` 下提供函数式 Agent、LangChain Agent、FastAPI Service 三个最小可运行示例。
+
+### 关键决策
+
+- 接入成本最低优先：优先在工具定义处接入，而非改造每个调用点；只有 MCP 形态工具才推荐 MCP Proxy。
+- MCP Proxy admin 工具作为可选补充，不替代 HTTP/gRPC admin 入口。
+- Docker backend 默认 `--network none`，生产单机部署推荐；Isolated Subprocess 用于跨平台开发/CI 兜底。
+
+### 测试
+
+- `tests/test_agent_sdk.py`：`@governed` sync/async、`GovernanceDeniedError`、`hook_tool_registry`、`launch_agent`。
+- `tests/test_isolated_subprocess_harness.py`：Isolated Subprocess backend 白名单执行与参数打包。
+- `tests/test_docker_harness_backend.py`：Docker backend 命令构造、协议处理、错误路径（mock Docker CLI）。
+- `tests/test_mcp_proxy_admin_tools.py`：MCP Proxy admin/审计工具注入与调用路由。
+- `tests/test_integrations.py`：LangChain / FastAPI 集成（条件 skip 未安装环境）。
+
+---
+
 ## v0.31.0：不可信 Agent 外部执行沙箱（Harness）
 
 ### 完成内容

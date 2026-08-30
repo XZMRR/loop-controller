@@ -25,6 +25,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from pydantic import ValidationError
+
 from loop_controller.audit.anchor_backends import AnchorBackendError, EvidenceAnchorBackend
 from loop_controller.audit.anchors import (
     AnchorPayload,
@@ -51,6 +53,7 @@ class AuditStore(Protocol):
     def query_by_session(self, session_id: str) -> list[AuditEvent]: ...  # v0.12.0
     def query_by_task(self, task_id: str) -> list[AuditEvent]: ...  # v0.12.0
     def iter_events(self) -> AsyncIterator[AuditEvent]: ...  # v0.18.0
+    def list_recent(self, limit: int = 100) -> list[AuditEvent]: ...  # v0.32.0
 
 
 def _derive_key(root_key: bytes, label: bytes) -> bytes:
@@ -886,6 +889,24 @@ class JsonlAuditStore:
     def query_by_task(self, task_id: str) -> list[AuditEvent]:
         """按 task_id 全文件扫描并返回 AuditEvent 列表（v0.12.0）。"""
         return self._query_by_field("task_id", task_id)
+
+    def list_recent(self, limit: int = 100) -> list[AuditEvent]:
+        """返回最近的审计事件列表（v0.32.0）。"""
+        results: list[AuditEvent] = []
+        if not self._path.exists():
+            return results
+        with self._path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    event_data = record.get("event") or record
+                    results.append(AuditEvent(**event_data))
+                except (json.JSONDecodeError, ValidationError):
+                    continue
+        return results[-limit:]
 
     def _query_by_field(self, field: str, value: str) -> list[AuditEvent]:
         """通用全文件扫描查询。"""

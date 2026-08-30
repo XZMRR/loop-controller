@@ -137,7 +137,7 @@ class HarnessBackendStatus(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     name: str
-    type: Literal["subprocess", "docker", "http"]
+    type: Literal["subprocess", "docker", "isolated_subprocess", "http"]
     status: Literal["unknown", "healthy", "degraded", "unhealthy"]
     max_concurrent_calls: int
     checked_at: datetime | None = None

@@ -107,7 +107,18 @@ async def test_proxy_list_tools(proxy_ctx: LoopControllerProxyServer) -> None:
     """tools/list 返回按 Profile 过滤后的工具，并注入内部工具。"""
     result = await proxy_ctx._handle_list_tools_impl()
     names = {tool.name for tool in result.tools}
-    assert names == {"web_search", "send_email", "loop_controller_approval_status"}
+    assert {"web_search", "send_email", "loop_controller_approval_status"}.issubset(names)
+    for name in (
+        "harness_backend_status",
+        "harness_backend_drain",
+        "harness_backend_reset",
+        "list_recent_decisions",
+        "get_decision_status",
+        "list_recent_audit_events",
+        "trigger_kill_switch",
+        "revoke_decision",
+    ):
+        assert name in names
 
 
 @pytest.mark.asyncio

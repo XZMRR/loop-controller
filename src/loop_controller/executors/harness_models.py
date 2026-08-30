@@ -139,6 +139,19 @@ class DockerBackendConfig(BaseModel):
     acquire_timeout_seconds: float = Field(default=2.0, gt=0)
 
 
+class IsolatedSubprocessBackendConfig(BaseModel):
+    """受限 Python 子进程 Harness 后端配置（跨平台开发/CI 兜底）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    type: Literal["isolated_subprocess"] = "isolated_subprocess"
+    python_path: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    max_concurrent_calls: int = Field(default=3, ge=1)
+    acquire_timeout_seconds: float = Field(default=2.0, gt=0)
+
+
 class HTTPBackendConfig(BaseModel):
     """远程 HTTP Harness 后端配置。"""
 
@@ -191,5 +204,5 @@ class HarnessExecutionPolicy(BaseModel):
 
 
 HarnessBackendConfig = (
-    SubprocessBackendConfig | DockerBackendConfig | HTTPBackendConfig
+    SubprocessBackendConfig | DockerBackendConfig | IsolatedSubprocessBackendConfig | HTTPBackendConfig
 )

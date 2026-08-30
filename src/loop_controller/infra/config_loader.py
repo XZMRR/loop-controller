@@ -39,6 +39,7 @@ from loop_controller.executors.harness_models import (
     HarnessExecutionPolicy,
     HarnessToolSpec,
     HTTPBackendConfig,
+    IsolatedSubprocessBackendConfig,
     SubprocessBackendConfig,
     ToolExecutionPolicy,
 )
@@ -223,7 +224,10 @@ class AppConfig:
     http_tool_specs: dict[str, HTTPToolSpec]  # v0.21.0 HTTP 工具规格
     local_function_specs: dict[str, LocalFunctionSpec]  # v0.23.0 本地函数规格
     harness_tool_specs: dict[str, HarnessToolSpec]  # v0.25.0 Harness 工具规格
-    harness_backends: dict[str, SubprocessBackendConfig | DockerBackendConfig | HTTPBackendConfig]  # v0.25.0 Harness 后端
+    harness_backends: dict[
+        str,
+        SubprocessBackendConfig | DockerBackendConfig | IsolatedSubprocessBackendConfig | HTTPBackendConfig,
+    ]  # v0.25.0 Harness 后端
     harness_execution_policy: HarnessExecutionPolicy  # v0.31.0 执行策略
     permission_rules: list[PermissionRule]
     capability_rules: CapabilityRules  # v0.10.0
@@ -490,7 +494,10 @@ class ConfigLoader:
         self, path: Path
     ) -> tuple[
         dict[str, HarnessToolSpec],
-        dict[str, SubprocessBackendConfig | DockerBackendConfig | HTTPBackendConfig],
+        dict[
+            str,
+            SubprocessBackendConfig | DockerBackendConfig | IsolatedSubprocessBackendConfig | HTTPBackendConfig,
+        ],
         HarnessExecutionPolicy,
     ]:
         """加载 Harness 后端、工具规格与执行策略（v0.31.0）。
@@ -499,7 +506,8 @@ class ConfigLoader:
         """
         tool_specs: dict[str, HarnessToolSpec] = {}
         backends: dict[
-            str, SubprocessBackendConfig | DockerBackendConfig | HTTPBackendConfig
+            str,
+            SubprocessBackendConfig | DockerBackendConfig | IsolatedSubprocessBackendConfig | HTTPBackendConfig,
         ] = {}
         if not path.exists():
             return tool_specs, backends, HarnessExecutionPolicy()
@@ -515,9 +523,9 @@ class ConfigLoader:
                 if backend_type == "subprocess":
                     backends[name] = SubprocessBackendConfig(name=name, **entry)
                 elif backend_type == "docker":
-                    raise ConfigValidationError(
-                        f"Harness 后端 {name} 使用不受支持的 docker 类型；请由部署层启动 HTTP Harness Service"
-                    )
+                    backends[name] = DockerBackendConfig(name=name, **entry)
+                elif backend_type == "isolated_subprocess":
+                    backends[name] = IsolatedSubprocessBackendConfig(name=name, **entry)
                 elif backend_type == "http":
                     backends[name] = HTTPBackendConfig(name=name, **entry)
                 else:
