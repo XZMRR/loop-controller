@@ -18,7 +18,7 @@ from loop_controller.models import GovernanceResult
 
 @pytest.fixture(autouse=True)
 def _reset_current_runtime() -> None:
-    GovernanceRuntime._current = None
+    GovernanceRuntime.reset_current()
 
 
 def _make_runtime(mock_result: GovernanceResult) -> GovernanceRuntime:

@@ -43,12 +43,16 @@ def governed_route(
 
         async def _invoke(*args: Any, **kwargs: Any) -> Any:
             rt = GovernanceRuntime.current()
-            # 优先取 FastAPI 注入的 Request body；否则把关键字参数整体作为 arguments。
+            # 支持 FastAPI Request、Pydantic model 与裸 dict 三种 body 形态。
+            body = kwargs
             request_obj = kwargs.get("request")
-            if request_obj is not None and hasattr(request_obj, "json"):
-                body = await request_obj.json()
-            else:
-                body = kwargs
+            if request_obj is not None:
+                if hasattr(request_obj, "json"):
+                    body = await request_obj.json()
+                elif hasattr(request_obj, "model_dump"):
+                    body = request_obj.model_dump()
+                elif isinstance(request_obj, dict):
+                    body = request_obj
             return await rt.call(name, dict(body))
 
         if is_async:

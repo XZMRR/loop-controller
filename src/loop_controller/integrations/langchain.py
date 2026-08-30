@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import functools
-import inspect
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -54,26 +52,31 @@ def govern_langchain_tools(
             governed_tools.append(tool)
             continue
 
-        @functools.wraps(tool._run, assigned=["__name__", "__doc__"])
-        def _make_wrapper(original: Any, t: BaseTool) -> Callable[..., Any]:
-            async def _invoke(**kwargs: Any) -> Any:
-                result = await rt.call(t.name, kwargs)
-                return result
+        t = tool
 
+        async def _invoke(tool_name: str, **kwargs: Any) -> Any:
+            return await rt.call(tool_name, kwargs)
+
+        def _make_sync_wrapper(tool_name: str) -> Callable[..., Any]:
             def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
                 from loop_controller.agent_sdk import _run_async
-                return _run_async(_invoke(**kwargs))
+                return _run_async(_invoke(tool_name, **kwargs))
 
-            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                return await _invoke(**kwargs)
-
-            if inspect.iscoroutinefunction(original):
-                return async_wrapper
+            sync_wrapper.__name__ = "_run"
+            sync_wrapper.__doc__ = f"Governed wrapper for {tool_name}"
             return sync_wrapper
 
-        tool._run = _make_wrapper(tool._run, tool)
+        def _make_async_wrapper(tool_name: str) -> Callable[..., Any]:
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                return await _invoke(tool_name, **kwargs)
+
+            async_wrapper.__name__ = "_arun"
+            async_wrapper.__doc__ = f"Governed async wrapper for {tool_name}"
+            return async_wrapper
+
+        tool._run = _make_sync_wrapper(t.name)
         if hasattr(tool, "_arun"):
-            tool._arun = _make_wrapper(tool._arun, tool)
+            tool._arun = _make_async_wrapper(t.name)
         governed_tools.append(tool)
 
     return governed_tools

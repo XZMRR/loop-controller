@@ -9,10 +9,9 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-import weakref
 from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 
 from loop_controller.controller import LoopController, build_controller
 from loop_controller.infra.config_loader import ConfigLoader
@@ -37,7 +36,7 @@ class GovernanceRuntime:
     提供 ``@governed`` 装饰器所需的当前运行时上下文。
     """
 
-    _current: weakref.ref[Any] | None = None
+    _current: GovernanceRuntime | None = None
 
     def __init__(
         self,
@@ -74,17 +73,16 @@ class GovernanceRuntime:
                 "当前没有活动的 GovernanceRuntime；"
                 "请先调用 GovernanceRuntime.from_config() 或 set_current()"
             )
-        rt = cast(GovernanceRuntime | None, cls._current())
-        if rt is None:
-            raise RuntimeError(
-                "当前没有活动的 GovernanceRuntime；"
-                "请先调用 GovernanceRuntime.from_config() 或 set_current()"
-            )
-        return rt
+        return cls._current
 
     @classmethod
     def set_current(cls, runtime: GovernanceRuntime) -> None:
-        cls._current = weakref.ref(runtime)
+        cls._current = runtime
+
+    @classmethod
+    def reset_current(cls) -> None:
+        """清除当前全局运行时；主要用于测试和显式生命周期管理。"""
+        cls._current = None
 
     @classmethod
     async def from_config(
@@ -195,12 +193,20 @@ class GovernanceRuntime:
 
 
 def _run_async[T](coro: Coroutine[Any, Any, T]) -> T:
-    """在当前线程运行一个协程；兼容已有/无事件循环的情况。"""
+    """在当前线程运行一个协程；兼容无事件循环的情况。
+
+    如果调用处已经在一个运行中的事件循环里，同步等待协程会导致事件循环死锁或
+    RuntimeError，因此显式抛出清晰异常，提示用户改用 async 函数或在非 async 上下文
+    中调用。
+    """
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
-    return loop.run_until_complete(coro)
+    raise RuntimeError(
+        "在已有事件循环中无法同步等待治理结果；"
+        "请把被 @governed 装饰的函数改为 async，或在非 async 上下文中调用。"
+    )
 
 
 def _pack_arguments(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -310,10 +316,12 @@ async def launch_agent(
 
         mod = import_module(module_path)
         entry = getattr(mod, func_name)
+        # workspace 通过环境变量 LOOP_CONTROLLER_WORKSPACE 透传给 Agent，
+        # 避免修改本进程全局工作目录（os.chdir 线程不安全且副作用不可控）。
         if workspace is not None:
             import os
 
-            os.chdir(str(workspace))
+            os.environ["LOOP_CONTROLLER_WORKSPACE"] = str(workspace)
         runner = _run or entry
         if inspect.iscoroutinefunction(runner):
             return await runner()

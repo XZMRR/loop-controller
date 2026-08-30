@@ -24,7 +24,7 @@ def _make_runtime(mock_result: GovernanceResult) -> GovernanceRuntime:
 
 @pytest.fixture(autouse=True)
 def _reset_current_runtime() -> None:
-    GovernanceRuntime._current = None
+    GovernanceRuntime.reset_current()
 
 
 @pytest.mark.asyncio

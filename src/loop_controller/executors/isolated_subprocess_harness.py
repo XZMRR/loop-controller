@@ -88,8 +88,10 @@ def main():
         print(json.dumps(result))
         return
     try:
-        env = {"__builtins__": SAFE_BUILTINS}
-        content = eval(f"_TOOLS[{tool!r}](args)", env, {"_TOOLS": _TOOLS, "args": args})
+        executor = _TOOLS.get(tool)
+        if executor is None:
+            raise KeyError(f"未知工具: {tool}")
+        content = executor(args)
         end = datetime.now(UTC)
         result = {
             "status": "success",
@@ -168,12 +170,16 @@ class IsolatedSubprocessHarnessBackend:
             f.write(_RUNNER)
             runner_path = f.name
         try:
+            # 仅保留 PATH 与显式配置的环境变量，避免子进程继承当前进程中的秘密。
+            safe_env = {"PATH": os.environ.get("PATH", "")}
+            if self.config.env:
+                safe_env.update(self.config.env)
             proc = await asyncio.create_subprocess_exec(
                 self._python, runner_path,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **self.config.env},
+                env=safe_env,
             )
             input_bytes = request.model_dump_json().encode("utf-8")
             try:
