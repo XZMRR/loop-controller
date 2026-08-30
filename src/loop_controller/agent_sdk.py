@@ -146,8 +146,6 @@ class GovernanceRuntime:
         registry: Any,
         *,
         exclude: set[str] | None = None,
-        mode: str | None = None,
-        budget_unit: str | None = None,
     ) -> None:
         """批量为统一工具注册表中的所有工具加上治理包装。
 
@@ -181,11 +179,7 @@ class GovernanceRuntime:
         for name, fn in items:
             if name in exclude:
                 continue
-            governed_fn = governed(
-                tool_name=name,
-                mode=mode,
-                budget_unit=budget_unit,
-            )(fn)
+            governed_fn = governed(tool_name=name)(fn)
             if register is not None:
                 register(name, governed_fn)
             elif tools is not None and isinstance(tools, dict):
@@ -221,8 +215,6 @@ def _make_governed_wrapper(
     fn: Callable[..., Any],
     *,
     tool_name: str,
-    mode: str | None,
-    budget_unit: str | None,
 ) -> Callable[..., Any]:
     """根据原函数是否 async，返回保持签名的治理包装函数。"""
     name = tool_name or fn.__name__
@@ -251,8 +243,6 @@ def governed[T](
     fn: Callable[..., T] | None = None,
     *,
     tool_name: str | None = None,
-    mode: str | None = None,
-    budget_unit: str | None = None,
 ) -> Callable[..., Any] | Callable[[Callable[..., T]], Callable[..., Any]]:
     """标记一个工具函数需要经过 Loop Controller 治理。
 
@@ -260,8 +250,6 @@ def governed[T](
 
     Args:
         tool_name: 在 Loop Controller 中注册的 canonical_name；默认使用函数名。
-        mode: 执行模式覆盖（保留字段，当前从全局策略解析）。
-        budget_unit: 预算单元（保留字段）。
 
     Raises:
         GovernanceDeniedError: 当 Loop Controller 返回 deny / blocked / error / require_approval。
@@ -271,8 +259,6 @@ def governed[T](
         return _make_governed_wrapper(
             func,
             tool_name=tool_name or func.__name__,
-            mode=mode,
-            budget_unit=budget_unit,
         )
 
     if fn is not None:
