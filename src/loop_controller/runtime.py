@@ -22,7 +22,7 @@ from loop_controller.audit.evidence_backends import LocalFileEvidenceBackend
 from loop_controller.audit_analyzer import AuditAnalyzer, RuleBasedAuditAnalyzer
 from loop_controller.authority import EarnedAuthorityManager
 from loop_controller.budget import JsonlBudgetLedger
-from loop_controller.checkpoint import Checkpoint
+from loop_controller.checkpoint import Checkpoint, DecisionStore
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
 from loop_controller.executors import (
     ExecutorRegistry,
@@ -32,6 +32,7 @@ from loop_controller.executors import (
 )
 from loop_controller.executors.http_client import HTTPClient
 from loop_controller.executors.http_executor import HTTPExecutor
+from loop_controller.go_kernel_bridge import AgentCard, AgentEntrypoint, GoKernelBridge
 from loop_controller.identity import ConfigIdentityProvider, IdentityProvider
 from loop_controller.identity.revocation import RevocationList
 from loop_controller.infra.alert_store import JsonlAlertStore
@@ -57,6 +58,9 @@ from loop_controller.infra.reservation_store import (
     JsonlReservationStore,
     ReservationStore,
 )
+from loop_controller.infra.sqlite_decision_store import SqliteDecisionStore
+from loop_controller.infra.sqlite_risk_state_store import SqliteRiskStateStore
+from loop_controller.infra.state_db import StateDatabase
 from loop_controller.infra.task_store import InMemoryTaskStore, JsonlTaskStore, TaskStore
 from loop_controller.masker import Masker
 from loop_controller.mcp_gateway import MCPGateway
@@ -67,7 +71,7 @@ from loop_controller.permission_interaction import (
     ConfigPermissionInteractionAnalyzer,
 )
 from loop_controller.policy_engine import OPAPolicyEngine
-from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager
+from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager, RiskStateStore
 from loop_controller.secrets import (
     EncryptedFileSecretBackend,
     FileSecretBackend,
@@ -109,6 +113,7 @@ class Runtime:
     revocation_list: RevocationList = field(default_factory=RevocationList)  # v0.26.0
     evidence_anchor: HTTPAnchorBackend | None = None  # v0.28.0
     persistence_status: PersistenceStatus = field(default_factory=PersistenceStatus)
+    go_kernel_bridge: GoKernelBridge | None = None  # v0.36.0 A2A 交互治理桥接
 
     def require_execution_ready(self) -> None:
         if self.persistence_status.status not in {"healthy", "tail_repaired"}:
@@ -207,6 +212,24 @@ class Runtime:
             await self.hot_reloader.start()
         if self.harness_executor is not None:
             await self.harness_executor.start()
+        if self.go_kernel_bridge is not None:
+            await self._register_local_agent_card()
+
+    async def _register_local_agent_card(self) -> None:
+        """向 Go 内核注册本地 Agent Card（v0.36.0）。"""
+        try:
+            # 使用当前运行时的入口信息；实际部署时应从 entrypoints_config 读取。
+            await self.go_kernel_bridge.register_agent(
+                AgentCard(
+                    agent_id="loop-controller-local",
+                    name="Loop Controller Python Runtime",
+                    entrypoint=AgentEntrypoint("http", "http://127.0.0.1:8000"),
+                    capabilities=["delegate_execution"],
+                    version="0.36.0",
+                )
+            )
+        except Exception as exc:
+            logger.warning("Failed to register local Agent Card with Go kernel: %s", exc)
 
     async def aclose(self) -> None:
         """关闭 MCP gateway 等异步资源。"""
@@ -219,6 +242,8 @@ class Runtime:
             await self.http_client.aclose()
         if self.evidence_anchor is not None:
             self.evidence_anchor.close()
+        if self.go_kernel_bridge is not None:
+            await self.go_kernel_bridge.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +391,16 @@ def _build_secret_broker(config: AppConfig) -> SecretBroker:
 # ---------------------------------------------------------------------------
 
 
+def _build_go_kernel_bridge(config: AppConfig) -> GoKernelBridge | None:
+    """根据 config.go_kernel_config 构造 Go 内核桥接；未启用时返回 None。"""
+    gk = config.go_kernel_config.get("go_kernel", {})
+    if not gk.get("enabled", False):
+        return None
+    base_url = gk.get("base_url", "http://127.0.0.1:8080")
+    timeout = float(gk.get("timeout", 5.0))
+    return GoKernelBridge(base_url=base_url, timeout=timeout)
+
+
 def build_runtime(
     config: AppConfig,
     *,
@@ -382,6 +417,33 @@ def build_runtime(
     identity = _build_identity_provider(config)
     policy_store = FilePolicyStore(config.policy_dir)
     policy_engine = OPAPolicyEngine(base_url=opa_url, timeout=2.0)
+
+    # v0.34.0：根据路径扩展名自动选择 SQLite 或 JSONL 状态后端
+    _state_db_cache: dict[str, StateDatabase] = {}
+
+    def _state_db_for(path: str) -> StateDatabase:
+        normalized = str(Path(path).resolve())
+        if normalized not in _state_db_cache:
+            _state_db_cache[normalized] = StateDatabase(path)
+        return _state_db_cache[normalized]
+
+    def _is_sqlite_path(path: str) -> bool:
+        return path.lower().endswith((".db", ".sqlite", ".sqlite3"))
+
+    decision_store: DecisionStore
+    if _is_sqlite_path(config.decision_log_path):
+        decision_store = SqliteDecisionStore(_state_db_for(config.decision_log_path))
+    else:
+        decision_store = JsonlDecisionStore(config.decision_log_path)
+
+    risk_state_store: RiskStateStore
+    if _is_sqlite_path(config.risk_state_path):
+        if config.risk_state_path == config.decision_log_path:
+            risk_state_store = SqliteRiskStateStore(_state_db_for(config.decision_log_path))
+        else:
+            risk_state_store = SqliteRiskStateStore(_state_db_for(config.risk_state_path))
+    else:
+        risk_state_store = JsonlRiskStateStore(config.risk_state_path)
 
     project_root = Path(config.policy_dir).parent
     mcp_env = {"PYTHONPATH": str(project_root / "src")}
@@ -423,7 +485,7 @@ def build_runtime(
     masker = Masker(config.masking_rules)
     budget_ledger = JsonlBudgetLedger(config.budget_ledger_path, alert_store=alert_store)
     session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
-    risk_manager = RiskStateManager(JsonlRiskStateStore(config.risk_state_path))
+    risk_manager = RiskStateManager(risk_state_store)
     conversation_store = JsonlConversationStore(
         config.conversation_path,
         max_messages_per_session=config.conversation_max_messages_per_session,
@@ -478,7 +540,7 @@ def build_runtime(
         identity=identity,
         session_manager=session_manager,
         risk_manager=risk_manager,
-        decision_store=JsonlDecisionStore(config.decision_log_path),
+        decision_store=decision_store,
         budget_ledger=budget_ledger,
         reservation_store=reservation_store,
         permission_analyzer=CompositePermissionInteractionAnalyzer(
@@ -511,6 +573,14 @@ def build_runtime(
     if config.audit_hash_algo == "hmac-sha256":
         audit_key = ConfigLoader.resolve_audit_key(config)
     evidence_anchor = _build_evidence_anchor(config, alert_store)
+    anchor_receipt_verifier = (
+        AnchorReceiptVerifier(
+            {evidence_anchor.config.service_key_id: evidence_anchor.config.public_key}
+        )
+        if evidence_anchor is not None and evidence_anchor.config is not None
+        else None
+    )
+    audit_index_path = Path(config.audit_log_path).with_suffix(".index.db")
     audit_store = JsonlAuditStore(
         config.audit_log_path,
         hash_algo=config.audit_hash_algo,
@@ -519,14 +589,9 @@ def build_runtime(
         evidence_chain=evidence_chain,
         alert_store=alert_store,
         anchor_backend=evidence_anchor,
-        anchor_stream_id=evidence_anchor.stream_id if evidence_anchor is not None else None,
-        anchor_receipt_verifier=(
-            AnchorReceiptVerifier(
-                {evidence_anchor.config.service_key_id: evidence_anchor.config.public_key}
-            )
-            if evidence_anchor is not None and evidence_anchor.config is not None
-            else None
-        ),
+        anchor_stream_id=config.evidence_config.get("evidence", {}).get("anchor", {}).get("stream_id"),
+        anchor_receipt_verifier=anchor_receipt_verifier,
+        index_path=audit_index_path,
     )
     checkpoint._audit_store = audit_store
     approval_manager = AsyncApprovalManager(
@@ -540,8 +605,9 @@ def build_runtime(
 
     hot_reload_config = config.secrets_config.get("hot_reload", {})
     config_dir = Path(config.policy_dir).parent / "config"
-    # 与 Runtime 共享同一可变集合，确保 HTTP 工具热更新后 controller 可见。
+    # 与 Runtime 共享同一可变集合，确保 HTTP/Harness 工具热更新后 controller 可见。
     http_tool_names = set(config.http_tool_specs)
+    harness_tool_names = set(config.harness_tool_specs)
     hot_reloader = HotReloader(
         config_dir=config_dir,
         config_loader=ConfigLoader(),
@@ -549,9 +615,13 @@ def build_runtime(
         secret_broker=secret_broker,
         http_tool_names=http_tool_names,
         revocation_list=revocation_list,
+        harness_executor=harness_executor,
+        harness_tool_names=harness_tool_names,
         enabled=hot_reload_config.get("enabled", True),
         poll_interval_seconds=hot_reload_config.get("poll_interval_seconds", 30),
     )
+
+    go_kernel_bridge = _build_go_kernel_bridge(config)
 
     return Runtime(
         classifier=RuleBasedClassifier(
@@ -578,4 +648,5 @@ def build_runtime(
         revocation_list=revocation_list,
         evidence_anchor=evidence_anchor,
         persistence_status=persistence_status,
+        go_kernel_bridge=go_kernel_bridge,
     )

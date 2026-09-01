@@ -2,6 +2,9 @@
 
 演示如何把 LangChain BaseTool 列表批量接入 Loop Controller。
 本示例不强制依赖 langchain_core；如未安装则直接返回原工具列表。
+
+注意：loop_controller.integrations.langchain 已移除，govern_langchain_tools
+现在位于 examples/integrations/langchain_example.py。
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ except ImportError:
     StructuredTool = None  # type: ignore[misc,assignment]
 
 from loop_controller import GovernanceRuntime
-from loop_controller.integrations.langchain import govern_langchain_tools
+from examples.integrations.langchain_example import govern_langchain_tools
 
 
 def _make_tools() -> list[Any]:

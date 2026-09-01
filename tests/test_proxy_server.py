@@ -148,7 +148,9 @@ async def test_proxy_deny_tool_rejected(proxy_ctx: LoopControllerProxyServer) ->
         },
     )
     assert result.isError
-    assert result.content[0].text.startswith("[loop-controller] DENIED:")
+    payload = json.loads(result.content[0].text)
+    assert payload["error"] == "deny"
+    assert payload["message"].startswith("DENIED:")
 
 
 @pytest.mark.asyncio
@@ -334,7 +336,9 @@ async def test_proxy_retry_not_approved_still_blocked(
         },
     )
     assert retry.isError
-    assert "not approved" in retry.content[0].text.lower()
+    payload = json.loads(retry.content[0].text)
+    assert payload["error"] == "retry_not_approved"
+    assert "not approved" in payload["message"].lower()
 
 
 @pytest.mark.asyncio

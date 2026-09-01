@@ -1,0 +1,263 @@
+"""Python bridge to the Go interaction governance kernel (v0.35.0)."""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import AsyncIterator
+from typing import Any
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+
+class AgentEntrypoint:
+    """Go 内核返回的目标 Agent 入口。"""
+
+    def __init__(self, type_: str, url: str) -> None:
+        self.type = type_
+        self.url = url
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AgentEntrypoint:
+        return cls(type_=data.get("type", "http"), url=data.get("url", ""))
+
+
+class AgentCard:
+    """A2A Agent Card。"""
+
+    def __init__(
+        self,
+        agent_id: str,
+        *,
+        name: str = "",
+        description: str = "",
+        entrypoint: AgentEntrypoint | None = None,
+        capabilities: list[str] | None = None,
+        trust_domain: str = "",
+        version: str = "0.35.0",
+    ) -> None:
+        self.agent_id = agent_id
+        self.name = name
+        self.description = description
+        self.entrypoint = entrypoint or AgentEntrypoint("http", "")
+        self.capabilities = capabilities or []
+        self.trust_domain = trust_domain
+        self.version = version
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "name": self.name,
+            "description": self.description,
+            "entrypoint": {"type": self.entrypoint.type, "url": self.entrypoint.url},
+            "capabilities": self.capabilities,
+            "trust_domain": self.trust_domain,
+            "version": self.version,
+        }
+
+
+class A2AMessage:
+    """A2A 消息。"""
+
+    def __init__(
+        self,
+        *,
+        message_id: str,
+        task_id: str,
+        from_agent_id: str,
+        to_agent_id: str,
+        role: str = "user",
+        parts: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.message_id = message_id
+        self.task_id = task_id
+        self.from_agent_id = from_agent_id
+        self.to_agent_id = to_agent_id
+        self.role = role
+        self.parts = parts or []
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "message_id": self.message_id,
+            "task_id": self.task_id,
+            "from_agent_id": self.from_agent_id,
+            "to_agent_id": self.to_agent_id,
+            "role": self.role,
+            "parts": self.parts,
+        }
+
+
+class DelegationRequest:
+    """委托请求。"""
+
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        initiator_agent_id: str,
+        target_agent_id: str,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        session_id: str = "",
+        task_id: str = "",
+        risk_level: str = "critical",
+    ) -> None:
+        self.request_id = request_id
+        self.initiator_agent_id = initiator_agent_id
+        self.target_agent_id = target_agent_id
+        self.tool_name = tool_name
+        self.arguments = arguments or {}
+        self.session_id = session_id
+        self.task_id = task_id
+        self.risk_level = risk_level
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "initiator_agent_id": self.initiator_agent_id,
+            "target_agent_id": self.target_agent_id,
+            "tool_name": self.tool_name,
+            "arguments_json": json.dumps(self.arguments, ensure_ascii=False),
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "risk_level": self.risk_level,
+        }
+
+
+class DelegationResponse:
+    """委托响应。"""
+
+    def __init__(
+        self,
+        *,
+        allowed: bool,
+        task_id: str = "",
+        target_entrypoint: AgentEntrypoint | None = None,
+        delegation_token: str = "",
+        reason: str = "",
+    ) -> None:
+        self.allowed = allowed
+        self.task_id = task_id
+        self.target_entrypoint = target_entrypoint
+        self.delegation_token = delegation_token
+        self.reason = reason
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DelegationResponse:
+        ep = data.get("target_entrypoint")
+        return cls(
+            allowed=data.get("allowed", False),
+            task_id=data.get("task_id", ""),
+            target_entrypoint=AgentEntrypoint.from_dict(ep) if ep else None,
+            delegation_token=data.get("delegation_token", ""),
+            reason=data.get("reason", ""),
+        )
+
+
+class GoKernelBridge:
+    """与 Go 交互治理内核通信的 HTTP/JSON 桥接客户端。
+
+    当 Go 内核不可用时，所有请求 fail-closed（返回 allowed=False 或抛出可识别的异常）。
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8080",
+        *,
+        timeout: float = 5.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self._client = client
+        self._owned_client = client is None
+
+    async def _client_context(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self._timeout))
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._owned_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def register_agent(self, card: AgentCard) -> bool:
+        """向 Go 内核注册 Agent Card。"""
+        url = f"{self._base_url}/a2a/v1/agents"
+        try:
+            client = await self._client_context()
+            response = await client.post(url, json=card.to_dict())
+            return response.status_code in (200, 201)
+        except httpx.RequestError as exc:
+            logger.warning("Go kernel register_agent unreachable: %s", exc)
+            return False
+
+    async def request_delegation(self, req: DelegationRequest) -> DelegationResponse:
+        """请求委托执行；Go 内核不可用时返回 allowed=False。"""
+        url = f"{self._base_url}/a2a/v1/delegations"
+        try:
+            client = await self._client_context()
+            response = await client.post(url, json=req.to_dict())
+            response.raise_for_status()
+            return DelegationResponse.from_dict(response.json())
+        except httpx.HTTPStatusError as exc:
+            logger.warning("Go kernel delegation rejected: %s", exc)
+            return DelegationResponse(allowed=False, reason="go_kernel_rejected")
+        except httpx.RequestError as exc:
+            logger.warning("Go kernel unreachable, fail-closed: %s", exc)
+            return DelegationResponse(
+                allowed=False,
+                reason="go_kernel_unreachable",
+            )
+
+    async def route_message(self, msg: A2AMessage) -> bool:
+        """向目标 Agent 路由一条消息。"""
+        url = f"{self._base_url}/a2a/v1/messages"
+        try:
+            client = await self._client_context()
+            response = await client.post(url, json=msg.to_dict())
+            if response.status_code != 200:
+                return False
+            data = response.json()
+            return data.get("accepted", False)
+        except httpx.RequestError as exc:
+            logger.warning("Go kernel route_message unreachable: %s", exc)
+            return False
+
+    async def query_task(self, task_id: str) -> dict[str, Any] | None:
+        """查询任务状态。"""
+        url = f"{self._base_url}/a2a/v1/tasks/{task_id}"
+        try:
+            client = await self._client_context()
+            response = await client.get(url)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            return response.json()
+        except httpx.RequestError as exc:
+            logger.warning("Go kernel query_task unreachable: %s", exc)
+            return None
+
+    async def stream_task(
+        self, task_id: str, timeout: float = 30.0
+    ) -> AsyncIterator[dict[str, Any]]:
+        """订阅任务 SSE 流式更新。"""
+        url = f"{self._base_url}/a2a/v1/tasks/{task_id}/stream"
+        try:
+            client = await self._client_context()
+            async with client.stream("GET", url, timeout=timeout) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        payload = line[len("data: "):]
+                        try:
+                            yield json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+        except httpx.RequestError as exc:
+            logger.warning("Go kernel stream_task unreachable: %s", exc)
+        except httpx.HTTPStatusError as exc:
+            logger.warning("Go kernel stream_task rejected: %s", exc)

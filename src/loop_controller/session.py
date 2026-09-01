@@ -187,7 +187,7 @@ class JsonlSessionBackend:
         probe = self._path.parent / ".write_probe_session"
         try:
             probe.write_text("", encoding="utf-8")
-            probe.unlink()
+            probe.unlink(missing_ok=True)
         except OSError as exc:
             raise PermissionError(f"session 父目录 {self._path.parent} 不可写：{exc}") from exc
         if self._path.exists():

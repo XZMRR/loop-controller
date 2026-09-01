@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 HARNESS_PROTOCOL_VERSION = "2"
 HARNESS_EXECUTE_PATH = "/harness/v2/execute"
+HARNESS_CANCEL_PATH = "/harness/v2/cancel"
 HarnessErrorCode = Literal[
     "harness_backend_unavailable",
     "harness_overloaded",
@@ -129,6 +130,14 @@ class HarnessExecuteResponse(BaseModel):
     effective_sandbox: HarnessSandbox | None = None
     evidence: HarnessEvidence | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class HarnessCancelRequest(BaseModel):
+    """Loop Controller → Harness 取消请求。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    call_id: str
 
 
 class HarnessBackendStatus(BaseModel):

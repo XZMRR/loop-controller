@@ -1,0 +1,11 @@
+# v0.36.0 Go 交互治理内核配置样例。
+# 默认禁用；启用后 Python Runtime 会自动连接 Go 内核并注册本地 Agent Card。
+go_kernel:
+  enabled: false
+  base_url: "http://127.0.0.1:8080"
+  timeout: 5.0
+  discovery:
+    static_file: "config/agents.json"
+  # token_secret 优先读取环境变量 GO_KERNEL_TOKEN_SECRET；
+  # 未设置时使用默认值（仅用于本地测试，生产环境务必设置环境变量）。
+  token_secret: "${GO_KERNEL_TOKEN_SECRET:-change-me-in-production}"

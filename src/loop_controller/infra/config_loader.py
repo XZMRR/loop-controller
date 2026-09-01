@@ -21,6 +21,7 @@ import binascii
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
@@ -258,6 +259,7 @@ class AppConfig:
     secrets_config: dict[str, Any] = field(default_factory=dict)  # v0.22.0 Secret Broker 配置
     revocation_config: dict[str, Any] = field(default_factory=dict)  # v0.26.0 吊销配置
     evidence_config: dict[str, Any] = field(default_factory=dict)  # v0.26.0 证据链配置
+    go_kernel_config: dict[str, Any] = field(default_factory=dict)  # v0.36.0 Go 交互治理内核配置
 
 # ---------------------------------------------------------------------------
 # ConfigLoader
@@ -298,6 +300,7 @@ class ConfigLoader:
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
         identity_config = self._load_identity_config(config_dir / "identity.yaml")
         entrypoints_config = self._load_entrypoints_config(config_dir / "entrypoints.yaml")
+        go_kernel_config = self._load_optional_config(config_dir / "go_kernel.yaml")
         permission_rules = self._load_permission_rules(config_dir / "permission_rules.yaml")
         capability_rules = self._load_capability_rules(config_dir / "capability_rules.yaml")
         authority_rules = self._load_authority_rules(config_dir / "authority_rules.yaml")
@@ -377,6 +380,7 @@ class ConfigLoader:
             secrets_config=secrets_config,
             revocation_config=revocation_config,
             evidence_config=evidence_config,
+            go_kernel_config=go_kernel_config,
         )
 
         self._check_profile_exists(app_config)
@@ -401,7 +405,9 @@ class ConfigLoader:
         data = self._read_yaml(path)
         agents: dict[str, Agent] = {}
         for item in data.get("agents", []):
-            agent = Agent(**item)
+            agent = self._construct(
+                path, "Agent", lambda item=item: Agent(**item)
+            )
             agents[agent.agent_id] = agent
         users: dict[str, str] = {}
         for item in data.get("users", []):
@@ -416,8 +422,20 @@ class ConfigLoader:
             tools_raw = item.pop("tools", {})
             tools: dict[str, ToolPermission] = {}
             for tool_name, perm in tools_raw.items():
-                tools[tool_name] = ToolPermission(tool_name=tool_name, **perm)
-            profile = CapabilityProfile(version=version, tools=tools, **item)
+                tools[tool_name] = self._construct(
+                    path,
+                    f"Profile tool {tool_name}",
+                    lambda perm=perm, tool_name=tool_name: ToolPermission(
+                        tool_name=tool_name, **perm
+                    ),
+                )
+            profile = self._construct(
+                path,
+                f"Profile {item.get('profile_id', '<unknown>')}",
+                lambda item=item, tools=tools, version=version: CapabilityProfile(
+                    version=version, tools=tools, **item
+                ),
+            )
             profiles[profile.profile_id] = profile
         return profiles
 
@@ -427,7 +445,11 @@ class ConfigLoader:
         data = self._read_yaml(path)
         servers: dict[str, MCPServerConfig] = {}
         for name, conf in data.get("servers", {}).items():
-            servers[name] = MCPServerConfig(name=name, **conf)
+            servers[name] = self._construct(
+                path,
+                f"MCP server {name}",
+                lambda conf=conf, name=name: MCPServerConfig(name=name, **conf),
+            )
         mapping: dict[str, ToolMappingEntry] = {}
         http_specs: dict[str, HTTPToolSpec] = {}
         for canonical, entry in data.get("tool_mapping", {}).items():
@@ -435,9 +457,19 @@ class ConfigLoader:
             if entry_type == "http":
                 # 解析 ${ENV} 引用，然后构造 HTTPToolSpec
                 resolved = resolve_env_refs(entry)
-                http_specs[canonical] = HTTPToolSpec(tool_name=canonical, **resolved)
+                http_specs[canonical] = self._construct(
+                    path,
+                    f"HTTP tool {canonical}",
+                    lambda canonical=canonical, resolved=resolved: HTTPToolSpec(
+                        tool_name=canonical, **resolved
+                    ),
+                )
             else:
-                mapping[canonical] = ToolMappingEntry(**entry)
+                mapping[canonical] = self._construct(
+                    path,
+                    f"Tool mapping {canonical}",
+                    lambda entry=entry: ToolMappingEntry(**entry),
+                )
         return servers, mapping, http_specs
 
     def _load_http_tools(self, path: Path) -> dict[str, HTTPToolSpec]:
@@ -451,7 +483,13 @@ class ConfigLoader:
         data = self._read_yaml(path)
         for canonical, entry in (data.get("tools") or {}).items():
             resolved = resolve_env_refs(entry)
-            specs[canonical] = HTTPToolSpec(tool_name=canonical, **resolved)
+            specs[canonical] = self._construct(
+                path,
+                f"HTTP tool {canonical}",
+                lambda canonical=canonical, resolved=resolved: HTTPToolSpec(
+                    tool_name=canonical, **resolved
+                ),
+            )
         return specs
 
     def _load_secrets_config(
@@ -487,7 +525,13 @@ class ConfigLoader:
             return specs
         data = self._read_yaml(path)
         for canonical, entry in (data.get("tools") or {}).items():
-            specs[canonical] = LocalFunctionSpec(tool_name=canonical, **entry)
+            specs[canonical] = self._construct(
+                path,
+                f"Local function {canonical}",
+                lambda canonical=canonical, entry=entry: LocalFunctionSpec(
+                    tool_name=canonical, **entry
+                ),
+            )
         return specs
 
     def _load_harness_tools(
@@ -551,6 +595,19 @@ class ConfigLoader:
             http_specs.update(legacy_http_specs)
         return http_specs
 
+    def reload_harness_tools(
+        self, config_dir: str | Path
+    ) -> tuple[
+        dict[str, HarnessToolSpec],
+        dict[
+            str,
+            SubprocessBackendConfig | DockerBackendConfig | IsolatedSubprocessBackendConfig | HTTPBackendConfig,
+        ],
+        HarnessExecutionPolicy,
+    ]:
+        """热更新：重新加载 Harness 工具、后端与执行策略。"""
+        return self._load_harness_tools(Path(config_dir) / "harness_tools.yaml")
+
     def reload_secrets_config(
         self, config_dir: str | Path
     ) -> dict[str, Any]:
@@ -578,7 +635,7 @@ class ConfigLoader:
             raise ConfigValidationError("persistence 配置必须是映射")
         try:
             config = PersistenceConfig(**raw)
-        except TypeError as exc:
+        except (ValidationError, TypeError) as exc:
             raise ConfigValidationError(f"persistence 配置非法：{exc}") from exc
         if config.lock_timeout_seconds <= 0:
             raise ConfigValidationError("persistence.lock_timeout_seconds 必须大于 0")
@@ -588,16 +645,27 @@ class ConfigLoader:
         data = self._read_yaml(path)
         rules: list[PermissionRule] = []
         for item in data.get("rules", []):
-            conditions = [PermissionCondition(**c) for c in item.get("when_all", [])]
+            conditions = [
+                self._construct(
+                    path,
+                    "Permission rule condition",
+                    lambda c=c: PermissionCondition(**c),
+                )
+                for c in item.get("when_all", [])
+            ]
             rules.append(
-                PermissionRule(
-                    id=item["id"],
-                    description=item.get("description", ""),
-                    when_all=conditions,
-                    action=item["action"],
-                    reason=item.get("reason", ""),
-                    risk_tags=item.get("risk_tags", []),
-                    score=item.get("score", 0),
+                self._construct(
+                    path,
+                    f"Permission rule {item.get('id', '<unknown>')}",
+                    lambda item=item, conditions=conditions: PermissionRule(
+                        id=item["id"],
+                        description=item.get("description", ""),
+                        when_all=conditions,
+                        action=item["action"],
+                        reason=item.get("reason", ""),
+                        risk_tags=item.get("risk_tags", []),
+                        score=item.get("score", 0),
+                    ),
                 )
             )
         return rules
@@ -610,29 +678,49 @@ class ConfigLoader:
         capabilities: dict[str, CapabilityDef] = {}
         for name, cap in (data.get("capabilities") or {}).items():
             producers = [
-                CapabilityProducer(
-                    tool=p["tool"],
-                    arg_match=p.get("arg_match"),
-                    arg_not_match=p.get("arg_not_match"),
+                self._construct(
+                    path,
+                    f"Capability producer for {name}",
+                    lambda p=p: CapabilityProducer(
+                        tool=p["tool"],
+                        arg_match=p.get("arg_match"),
+                        arg_not_match=p.get("arg_not_match"),
+                    ),
                 )
                 for p in cap.get("produced_by", [])
             ]
-            capabilities[name] = CapabilityDef(name=name, produced_by=producers)
+            capabilities[name] = self._construct(
+                path,
+                f"Capability {name}",
+                lambda name=name, producers=producers: CapabilityDef(
+                    name=name, produced_by=producers
+                ),
+            )
         combination_rules: list[CapabilityCombinationRule] = []
         for item in data.get("combination_rules", []):
             combination_rules.append(
-                CapabilityCombinationRule(
-                    id=item["id"],
-                    description=item.get("description", ""),
-                    requires_any=list(item.get("requires_any", [])),
-                    triggers_any=list(item.get("triggers_any", [])),
-                    action=item["action"],
-                    reason=item.get("reason", ""),
-                    risk_tags=list(item.get("risk_tags", [])),
-                    score=item.get("score", 0),
+                self._construct(
+                    path,
+                    f"Capability combination rule {item.get('id', '<unknown>')}",
+                    lambda item=item: CapabilityCombinationRule(
+                        id=item["id"],
+                        description=item.get("description", ""),
+                        requires_any=list(item.get("requires_any", [])),
+                        triggers_any=list(item.get("triggers_any", [])),
+                        action=item["action"],
+                        reason=item.get("reason", ""),
+                        risk_tags=list(item.get("risk_tags", [])),
+                        score=item.get("score", 0),
+                    ),
                 )
             )
-        return CapabilityRules(capabilities=capabilities, combination_rules=combination_rules)
+        return self._construct(
+            path,
+            "Capability rules",
+            lambda: CapabilityRules(
+                capabilities=capabilities, combination_rules=combination_rules
+            ),
+        )
 
     def _load_authority_rules(self, path: Path) -> AuthorityRules:
         """加载动态权限规则配置；文件缺失时返回空规则（向后兼容）。"""
@@ -642,21 +730,40 @@ class ConfigLoader:
         grants: dict[str, AuthorityGrantRule] = {}
         for capability, item in (data.get("authority_grants") or {}).items():
             cond = item.get("conditions", {})
-            grants[capability] = AuthorityGrantRule(
-                capability=capability,
-                description=item.get("description", ""),
-                conditions=AuthorityConditions(
-                    user_confirmation=cond.get("user_confirmation", False),
-                    budget_remaining=cond.get("budget_remaining"),
-                    no_recent_denials_within_steps=cond.get("no_recent_denials_within_steps"),
-                    require_task_context_regex=cond.get("require_task_context_regex"),
+            grants[capability] = self._construct(
+                path,
+                f"Authority grant {capability}",
+                lambda capability=capability, item=item, cond=cond: AuthorityGrantRule(
+                    capability=capability,
+                    description=item.get("description", ""),
+                    conditions=self._construct(
+                        path,
+                        f"Authority conditions for {capability}",
+                        lambda cond=cond: AuthorityConditions(
+                            user_confirmation=cond.get("user_confirmation", False),
+                            budget_remaining=cond.get("budget_remaining"),
+                            no_recent_denials_within_steps=cond.get(
+                                "no_recent_denials_within_steps"
+                            ),
+                            require_task_context_regex=cond.get(
+                                "require_task_context_regex"
+                            ),
+                        ),
+                    ),
+                    max_duration_seconds=item.get("max_duration_seconds", 300),
+                    budget_limit=self._construct(
+                        path,
+                        f"Authority budget limit for {capability}",
+                        lambda: BudgetCost(
+                            **item.get("budget_limit", {"token_count": 0})
+                        ),
+                    ),
                 ),
-                max_duration_seconds=item.get("max_duration_seconds", 300),
-                budget_limit=BudgetCost(**item.get("budget_limit", {"token_count": 0})),
             )
-        return AuthorityRules(
-            enabled=data.get("enabled", True),
-            grants=grants,
+        return self._construct(
+            path,
+            "Authority rules",
+            lambda: AuthorityRules(enabled=data.get("enabled", True), grants=grants),
         )
 
     def _load_audit_rules(self, path: Path) -> AuditRules:
@@ -668,43 +775,85 @@ class ConfigLoader:
         for item in data.get("rules", []):
             cond = item.get("conditions", {})
             rules.append(
-                AuditRule(
-                    rule_id=item["id"],
-                    description=item.get("description", ""),
-                    severity=item.get("severity", "medium"),
-                    conditions=AuditRuleConditions(
-                        min_denies_count=cond.get("min_denies_count"),
-                        min_denies_within_seconds=cond.get("min_denies_within_seconds"),
-                        consecutive_denies=cond.get("consecutive_denies"),
-                        action_sequence=cond.get("action_sequence"),
-                        has_any_action=cond.get("has_any_action"),
-                        has_all_actions=cond.get("has_all_actions"),
-                        authority_token_exhausted=cond.get("authority_token_exhausted", False),
+                self._construct(
+                    path,
+                    f"Audit rule {item.get('id', '<unknown>')}",
+                    lambda item=item, cond=cond: AuditRule(
+                        rule_id=item["id"],
+                        description=item.get("description", ""),
+                        severity=item.get("severity", "medium"),
+                        conditions=self._construct(
+                            path,
+                            f"Audit conditions for {item.get('id', '<unknown>')}",
+                            lambda cond=cond: AuditRuleConditions(
+                                min_denies_count=cond.get("min_denies_count"),
+                                min_denies_within_seconds=cond.get(
+                                    "min_denies_within_seconds"
+                                ),
+                                consecutive_denies=cond.get("consecutive_denies"),
+                                action_sequence=cond.get("action_sequence"),
+                                has_any_action=cond.get("has_any_action"),
+                                has_all_actions=cond.get("has_all_actions"),
+                                authority_token_exhausted=cond.get(
+                                    "authority_token_exhausted", False
+                                ),
+                            ),
+                        ),
                     ),
                 )
             )
-        return AuditRules(enabled=data.get("enabled", True), rules=rules)
+        return self._construct(
+            path,
+            "Audit rules",
+            lambda: AuditRules(enabled=data.get("enabled", True), rules=rules),
+        )
 
     def _load_masking_rules(self, path: Path) -> MaskingRules:
         data = self._read_yaml(path)
-        patterns = [ValuePattern(**p) for p in data.get("value_patterns", [])]
-        return MaskingRules(
-            field_name_blacklist=data.get("field_name_blacklist", []),
-            value_patterns=patterns,
-            masking_applies_to=data.get("masking_applies_to", {}),
+        patterns = [
+            self._construct(
+                path,
+                f"Masking value pattern {p.get('name', '<unknown>')}",
+                lambda p=p: ValuePattern(**p),
+            )
+            for p in data.get("value_patterns", [])
+        ]
+        return self._construct(
+            path,
+            "Masking rules",
+            lambda: MaskingRules(
+                field_name_blacklist=data.get("field_name_blacklist", []),
+                value_patterns=patterns,
+                masking_applies_to=data.get("masking_applies_to", {}),
+            ),
         )
 
     def _load_approval(self, path: Path) -> ApprovalConfig:
         data = self._read_yaml(path)
-        rules = [ApprovalRule(**r) for r in data.get("rules", [])]
-        return ApprovalConfig(default=data.get("approvers", {}).get("default", ""), rules=rules)
+        rules = [
+            self._construct(
+                path,
+                f"Approval rule {r.get('tool_name', '<unknown>')}",
+                lambda r=r: ApprovalRule(**r),
+            )
+            for r in data.get("rules", [])
+        ]
+        return self._construct(
+            path,
+            "Approval config",
+            lambda: ApprovalConfig(
+                default=data.get("approvers", {}).get("default", ""), rules=rules
+            ),
+        )
 
     def _load_llm_planner(self, path: Path) -> LLMPlannerConfig | None:
         """加载 LLMPlanner 配置；文件缺失时返回 None 以兼容旧配置树（测试用）。"""
         if not path.exists():
             return None
         data = self._read_yaml(path)
-        return LLMPlannerConfig(**data)
+        return self._construct(
+            path, "LLM planner", lambda: LLMPlannerConfig(**data)
+        )
 
     def _load_identity_config(self, path: Path) -> dict[str, Any]:
         """加载身份 Provider 配置；文件缺失返回空 dict（向后兼容）。"""
@@ -714,11 +863,14 @@ class ConfigLoader:
         return cast(dict[str, Any], data.get("identity", {}))
 
     def _load_entrypoints_config(self, path: Path) -> dict[str, Any]:
-        """加载入口认证配置；文件缺失返回空 dict（向后兼容）。"""
+        """加载入口认证配置；文件缺失返回空 dict（向后兼容）。
+
+        返回整个 YAML 内容，以便同时支持 ``entrypoints.*`` 与顶层 ``admin`` 等扩展配置。
+        """
         if not path.exists():
             return {}
         data = self._read_yaml(path)
-        return cast(dict[str, Any], data.get("entrypoints", {}))
+        return cast(dict[str, Any], data)
 
     # -- 7 条启动校验 -------------------------------------------------------
 
@@ -780,14 +932,25 @@ class ConfigLoader:
         return cast(dict[str, Any], result)
 
     def _check_dirs_writable(self, config: AppConfig) -> None:
-        for label, path_str in (
+        paths = [
             ("audit_log", config.audit_log_path),
             ("decision_log", config.decision_log_path),
             ("risk_state", config.risk_state_path),
             ("conversation", config.conversation_path),
             ("approval_store", config.approval_store_path),
-        ):
+            ("session", config.session_path),
+            ("task_store", config.task_store_path),
+            ("budget_ledger", config.budget_ledger_path),
+            ("reservation_store", config.reservation_store_path),
+            ("authority_log", config.authority_log_path),
+            ("alert_store", config.alert_store_path),
+        ]
+        seen: set[Path] = set()
+        for label, path_str in paths:
             path = Path(path_str)
+            if path.parent in seen:
+                continue
+            seen.add(path.parent)
             probe = path.parent / f".write_probe_{label}"
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -1182,8 +1345,14 @@ class ConfigLoader:
         entrypoints = config.entrypoints_config
         if not entrypoints:
             return
+
+        # 兼容直接传入 inner dict 的测试/旧用法
+        inner = entrypoints.get("entrypoints", entrypoints)
+        if not isinstance(inner, dict):
+            raise ConfigValidationError("entrypoints 必须是对象")
+
         allowed_auths = {"jwt", "mtls", "static_token", "none"}
-        for name, cfg in entrypoints.items():
+        for name, cfg in inner.items():
             if not isinstance(cfg, dict):
                 raise ConfigValidationError(f"entrypoints.{name} 必须是对象")
             auth = cfg.get("auth")
@@ -1206,7 +1375,28 @@ class ConfigLoader:
                     "entrypoints.grpc.admin_agent_ids 必须是非空字符串列表"
                 )
 
+        # v0.33.0 admin profile 白名单
+        admin = entrypoints.get("admin")
+        if admin is None:
+            return
+        if not isinstance(admin, dict):
+            raise ConfigValidationError("admin 必须是对象")
+        profiles = admin.get("agent_profiles")
+        if profiles is not None and (
+            not isinstance(profiles, list)
+            or any(not isinstance(p, str) or not p for p in profiles)
+        ):
+            raise ConfigValidationError("admin.agent_profiles 必须是非空字符串列表")
+
     # -- 工具 ---------------------------------------------------------------
+
+    @staticmethod
+    def _construct(path: Path, context: str, build: Callable[[], Any]) -> Any:
+        """统一包装模型/数据类构造异常，确保启动期给出 ConfigValidationError。"""
+        try:
+            return build()
+        except (ValidationError, TypeError) as exc:
+            raise ConfigValidationError(f"{context} 配置非法：{exc}") from exc
 
     @staticmethod
     def _read_yaml(path: Path) -> dict[str, Any]:

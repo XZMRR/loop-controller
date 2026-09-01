@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package loop_controller.a2a.v1;
+
+option go_package = "github.com/loop-controller/go/internal/a2a";
+
+// A2A 最小协议（v0.35.0）。
+// 本文件作为规范存在；v0.35.0 的 Go 实现使用等价 JSON 模型，
+// 未来版本可生成 *_pb2.go 与 *_grpc.pb.go。
+
+service A2AKernel {
+  // 注册 / 更新 Agent Card
+  rpc RegisterAgent(RegisterAgentRequest) returns (AgentReference);
+  // 查询 Agent Card
+  rpc GetAgent(GetAgentRequest) returns (AgentCard);
+  // 列出已注册 Agent
+  rpc ListAgents(ListAgentsRequest) returns (AgentList);
+  // 创建交互任务
+  rpc CreateTask(CreateTaskRequest) returns (Task);
+  // 查询任务状态
+  rpc GetTask(GetTaskRequest) returns (Task);
+  // 发送消息到目标 Agent
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  // 请求委托执行
+  rpc RequestDelegation(DelegationRequest) returns (DelegationResponse);
+}
+
+// Agent Card：描述一个可被治理的 Agent 的能力与入口。
+message AgentCard {
+  string agent_id = 1;
+  string name = 2;
+  string description = 3;
+  AgentEntrypoint entrypoint = 4;
+  repeated string capabilities = 5;
+  string trust_domain = 6;
+  string version = 7;
+}
+
+message AgentEntrypoint {
+  string type = 1;  // "http" | "grpc" | "mcp"
+  string url = 2;
+}
+
+message RegisterAgentRequest {
+  AgentCard card = 1;
+}
+
+message AgentReference {
+  string agent_id = 1;
+}
+
+message GetAgentRequest {
+  string agent_id = 1;
+}
+
+message ListAgentsRequest {}
+
+message AgentList {
+  repeated AgentCard agents = 1;
+}
+
+// Task：一次 Agent 间交互的上下文。
+message Task {
+  string task_id = 1;
+  string session_id = 2;
+  string initiator_agent_id = 3;
+  string target_agent_id = 4;
+  string status = 5;  // "pending" | "active" | "completed" | "failed" | "cancelled"
+  string created_at = 6;
+  string updated_at = 7;
+}
+
+message CreateTaskRequest {
+  string session_id = 1;
+  string initiator_agent_id = 2;
+  string target_agent_id = 3;
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+}
+
+// Message：Agent 之间传递的内容单元。
+message Message {
+  string message_id = 1;
+  string task_id = 2;
+  string from_agent_id = 3;
+  string to_agent_id = 4;
+  string role = 5;  // "user" | "agent"
+  repeated Part parts = 6;
+  string timestamp = 7;
+}
+
+message Part {
+  string type = 1;  // "text" | "data"
+  string text = 2;
+  string data_json = 3;
+}
+
+message SendMessageRequest {
+  Message message = 1;
+}
+
+message SendMessageResponse {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+// Delegation：把一次工具调用委托给另一个 Agent 的治理请求。
+message DelegationRequest {
+  string request_id = 1;
+  string initiator_agent_id = 2;
+  string target_agent_id = 3;
+  string tool_name = 4;
+  string arguments_json = 5;
+  string session_id = 6;
+  string task_id = 7;
+  string risk_level = 8;  // "low" | "medium" | "high" | "critical"
+}
+
+message DelegationResponse {
+  bool allowed = 1;
+  string task_id = 2;
+  AgentEntrypoint target_entrypoint = 3;
+  string delegation_token = 4;
+  string reason = 5;
+}

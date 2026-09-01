@@ -13,6 +13,7 @@ import secrets
 import subprocess
 import time
 import uuid
+from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -30,9 +31,11 @@ from loop_controller.executors.harness_models import (
     SubprocessBackendConfig,
 )
 from loop_controller.executors.harness_protocol import (
+    HARNESS_CANCEL_PATH,
     HARNESS_EXECUTE_PATH,
     HARNESS_PROTOCOL_VERSION,
     HarnessBackendStatus,
+    HarnessCancelRequest,
     HarnessContext,
     HarnessExecuteRequest,
     HarnessExecuteResponse,
@@ -78,6 +81,7 @@ class _HTTPHarnessClient:
         self._base_url = config.base_url.rstrip("/")
         self._execute_url = f"{self._base_url}{HARNESS_EXECUTE_PATH}"
         self._execute_path = httpx.URL(self._execute_url).path
+        self._cancel_url = f"{self._base_url}{HARNESS_CANCEL_PATH}"
         self._client: httpx.AsyncClient | None = None
 
     def _resolve_key(self) -> str | None:
@@ -268,6 +272,22 @@ class _HTTPHarnessClient:
             return False
         return requested.model_dump() == effective.model_dump()
 
+    async def cancel_call(self, call_id: str) -> bool:
+        """向远端 Harness 发送取消请求；仅 HTTP backend 支持。"""
+        if self._client is None:
+            return False
+        body = HarnessCancelRequest(call_id=call_id).model_dump_json().encode("utf-8")
+        try:
+            response = await self._client.post(
+                self._cancel_url,
+                headers=self._headers(body),
+                content=body,
+                timeout=5.0,
+            )
+            return response.status_code in (200, 202, 204)
+        except httpx.RequestError:
+            return False
+
     @staticmethod
     def _error_result(
         context: ExecutionContext,
@@ -402,11 +422,24 @@ class HarnessExecutor(ToolExecutor):
         self._backend_configs = dict(backends)
         self._backends = {name: self._build_backend(config) for name, config in backends.items()}
         self._states = {name: _BackendState(name, config) for name, config in backends.items()}
-        self._health_tasks: list[asyncio.Task[None]] = []
+        self._health_tasks: dict[str, asyncio.Task[None]] = {}
         self._started = False
         self._execution_policy = execution_policy or HarnessExecutionPolicy()
         self._draining: set[str] = set()
         self._alert_store = alert_store
+        # v0.34.0：按 call_id 缓存已完成结果，提供跨重试幂等基础。
+        self._idempotency_cache: OrderedDict[str, ToolResult] = OrderedDict()
+        # call_id -> backend_name，用于远程取消。
+        self._in_flight_calls: dict[str, str] = {}
+
+    def _cache_result(self, call_id: str, result: ToolResult) -> None:
+        """保留最近 1000 条结果，超出时按 LRU 淘汰。"""
+        if call_id in self._idempotency_cache:
+            self._idempotency_cache.move_to_end(call_id)
+            return
+        self._idempotency_cache[call_id] = result
+        while len(self._idempotency_cache) > 1000:
+            self._idempotency_cache.popitem(last=False)
 
     def _build_backend(self, config: HarnessBackendConfig) -> HarnessBackend:
         if isinstance(config, SubprocessBackendConfig):
@@ -460,16 +493,17 @@ class HarnessExecutor(ToolExecutor):
             self._started = True
             for name, config in self._backend_configs.items():
                 if isinstance(config, HTTPBackendConfig) and config.health.enabled:
-                    self._health_tasks.append(asyncio.create_task(self._health_loop(name, config)))
+                    self._health_tasks[name] = asyncio.create_task(self._health_loop(name, config))
         except BaseException:
             await asyncio.gather(*(backend.stop() for backend in reversed(started)))
             raise
 
     async def stop(self) -> None:
-        for task in self._health_tasks:
+        tasks = list(self._health_tasks.values())
+        for task in tasks:
             task.cancel()
-        if self._health_tasks:
-            await asyncio.gather(*self._health_tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._health_tasks.clear()
         await asyncio.gather(*(backend.stop() for backend in self._backends.values()))
         self._started = False
@@ -549,6 +583,107 @@ class HarnessExecutor(ToolExecutor):
             healthy = False
         self._record_health(name, healthy)
 
+    async def update_specs(
+        self,
+        tool_specs: dict[str, HarnessToolSpec],
+        backend_configs: dict[str, HarnessBackendConfig],
+        execution_policy: HarnessExecutionPolicy | None = None,
+    ) -> None:
+        """热更新 Harness 工具规格、后端配置与执行策略。
+
+        平滑替换：新后端先启动 health check，旧后端 drain 后移除。
+        更新失败时保留旧配置并抛异常。
+        """
+        self._tool_specs = dict(tool_specs)
+        if execution_policy is not None:
+            self._execution_policy = execution_policy
+
+        old_configs = self._backend_configs
+        old_backends = self._backends
+        old_states = self._states
+
+        old_names = set(old_configs)
+        new_names = set(backend_configs)
+        changed_names = {
+            name
+            for name in old_names & new_names
+            if old_configs[name].model_dump() != backend_configs[name].model_dump()
+        }
+        kept_names = (old_names & new_names) - changed_names
+        added_names = new_names - old_names
+        removed_names = old_names - new_names
+
+        new_backends: dict[str, HarnessBackend] = {}
+        new_states: dict[str, _BackendState] = {}
+        for name in kept_names:
+            new_backends[name] = old_backends[name]
+            new_states[name] = old_states[name]
+        for name in added_names | changed_names:
+            config = backend_configs[name]
+            new_backends[name] = self._build_backend(config)
+            new_states[name] = _BackendState(name, config)
+
+        self._backend_configs = dict(backend_configs)
+        self._backends = new_backends
+        self._states = new_states
+
+        started_names: list[str] = []
+        try:
+            for name in sorted(added_names | changed_names):
+                backend = self._backends[name]
+                if self._started:
+                    await backend.start()
+                config = self._backend_configs[name]
+                if self._started:
+                    healthy = await backend.check_health()
+                    self._record_health(name, healthy)
+                    if (
+                        isinstance(config, HTTPBackendConfig)
+                        and config.health.enabled
+                        and config.health.startup_required
+                        and not healthy
+                    ):
+                        raise RuntimeError(f"Harness 后端 {name!r} 热更新健康检查失败")
+                started_names.append(name)
+        except BaseException:
+            logger.warning("Harness 热更新失败，回滚到旧配置")
+            self._backend_configs = old_configs
+            self._backends = old_backends
+            self._states = old_states
+            for name in started_names:
+                await self._backends[name].stop()
+            raise
+
+        await self._restart_health_loops(removed_names | changed_names)
+
+        drain_names = removed_names | changed_names
+        for name in drain_names:
+            old_state = old_states.get(name)
+            if old_state is not None and self._started:
+                deadline = time.perf_counter() + old_state.acquire_timeout
+                while old_state.in_flight > 0 and time.perf_counter() < deadline:
+                    await asyncio.sleep(0.1)
+            old_backend = old_backends.get(name)
+            if old_backend is not None:
+                await old_backend.stop()
+            self._draining.discard(name)
+
+    async def _restart_health_loops(self, names_to_cancel: set[str]) -> None:
+        """取消指定后端的健康轮询，并按当前配置重新创建需要的任务。"""
+        for name in names_to_cancel:
+            task = self._health_tasks.pop(name, None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        if not self._started:
+            return
+        for name, config in self._backend_configs.items():
+            if isinstance(config, HTTPBackendConfig) and config.health.enabled and name not in self._health_tasks:
+                self._health_tasks[name] = asyncio.create_task(self._health_loop(name, config))
+
     def _effective_sandbox(self, tool_name: str) -> HarnessSandboxConfig:
         """优先使用执行策略中工具级沙箱覆盖，否则回退到 HarnessToolSpec 沙箱。"""
         spec = self._get_spec(tool_name)
@@ -588,6 +723,11 @@ class HarnessExecutor(ToolExecutor):
         arguments: dict[str, Any],
         context: ExecutionContext,
     ) -> ToolResult:
+        # v0.34.0：按 call_id 返回缓存结果，提供幂等基础。
+        cached = self._idempotency_cache.get(context.call_id)
+        if cached is not None:
+            return cached.model_copy(update={"metadata": {**cached.metadata, "idempotent": True}})
+
         spec = self._get_spec(tool_name)
         sandbox = self._effective_sandbox(tool_name)
         backend_name = spec.harness
@@ -636,9 +776,11 @@ class HarnessExecutor(ToolExecutor):
         state.in_flight += 1
         if metrics is not None:
             metrics.set_harness_in_flight(backend_name, state.in_flight)
+        self._in_flight_calls[context.call_id] = backend_name
         try:
             result = await backend.execute(tool_name, arguments, context, sandbox)
             result = record_call(result)
+            self._cache_result(context.call_id, result)
             if result.error_code in (
                 "harness_sandbox_attestation_missing",
                 "harness_sandbox_violation",
@@ -669,6 +811,7 @@ class HarnessExecutor(ToolExecutor):
             state.in_flight -= 1
             if metrics is not None:
                 metrics.set_harness_in_flight(backend_name, state.in_flight)
+            self._in_flight_calls.pop(context.call_id, None)
             state.semaphore.release()
 
     async def list_tools(self, profile: CapabilityProfile) -> list[Tool]:
@@ -678,3 +821,13 @@ class HarnessExecutor(ToolExecutor):
             for name, spec in self._tool_specs.items()
             if allowed is None or name in allowed
         ]
+
+    async def cancel_call(self, call_id: str) -> bool:
+        """取消指定 call_id 的在途 Harness 调用；当前仅 HTTP backend 支持远程取消。"""
+        backend_name = self._in_flight_calls.get(call_id)
+        if backend_name is None:
+            return False
+        backend = self._backends.get(backend_name)
+        if backend is None or not isinstance(backend, _HTTPHarnessClient):
+            return False
+        return await backend.cancel_call(call_id)

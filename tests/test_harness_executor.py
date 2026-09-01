@@ -679,7 +679,9 @@ class TestHarnessConcurrencyAuthAndHealth:
         assert calls == 1
         executor._record_health("http_harness", False)
         assert executor.backend_statuses()[0].status == "unhealthy"
-        blocked = await executor.execute("harness_echo", {}, _fake_context())
+        ctx2 = _fake_context()
+        ctx2.call_id = "c2"
+        blocked = await executor.execute("harness_echo", {}, ctx2)
         assert blocked.error_code == "harness_backend_unavailable"
         assert calls == 1
         await executor.stop()

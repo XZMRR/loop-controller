@@ -15,8 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def env_extra() -> dict[str, str]:
-    """确保 MCP 子进程能找到项目源码。"""
-    return {"PYTHONPATH": str(REPO_ROOT / "src")}
+    """确保 MCP 子进程能找到项目源码和 tests 包。"""
+    return {"PYTHONPATH": f"{REPO_ROOT}{os.pathsep}{REPO_ROOT / 'src'}"}
 
 
 def _set_hmac_key() -> None:

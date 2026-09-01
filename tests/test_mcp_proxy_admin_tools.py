@@ -89,6 +89,21 @@ tools:
 """,
         encoding="utf-8",
     )
+    (root / "config" / "entrypoints.yaml").write_text(
+        """
+entrypoints:
+  mcp_proxy_stdio:
+    auth: none
+    require_auth: false
+  mcp_proxy_sse:
+    auth: none
+    require_auth: false
+admin:
+  agent_profiles:
+    - research_assistant_v1
+""",
+        encoding="utf-8",
+    )
     return root
 
 
@@ -105,6 +120,7 @@ async def admin_proxy_ctx(admin_workdir: Path, opa_server: str):
         proxy = LoopControllerProxyServer(
             runtime,
             ProxyIdentity(agent_id="researcher_001", user_id="alice"),
+            entrypoints_config=config.entrypoints_config,
         )
         yield proxy
     finally:
@@ -171,7 +187,9 @@ async def test_admin_harness_drain_missing_backend_errors(
         "harness_backend_drain", {"name": "missing"}
     )
     assert result.isError
-    assert "missing" in result.content[0].text
+    payload = json.loads(result.content[0].text)
+    assert payload["error"] == "not_found"
+    assert "missing" in payload["message"]
 
 
 @pytest.mark.asyncio

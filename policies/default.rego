@@ -48,6 +48,31 @@ session_risk_above_threshold if {
     input.session_risk.score >= input.session_risk.threshold
 }
 
+# ---- local_functions：集成测试用简单本地函数 ----
+decision := {"verdict": "allow", "reason": "local function add allowed", "policy_hits": ["add_allow"]} if {
+    input.tool_name == "add"
+    input.risk_level != "critical"
+    not session_risk_above_threshold
+}
+
+decision := {"verdict": "allow", "reason": "local function echo allowed", "policy_hits": ["echo_allow"]} if {
+    input.tool_name == "echo"
+    input.risk_level != "critical"
+    not session_risk_above_threshold
+}
+
+decision := {"verdict": "allow", "reason": "local function raise_error allowed", "policy_hits": ["raise_error_allow"]} if {
+    input.tool_name == "raise_error"
+    input.risk_level != "critical"
+    not session_risk_above_threshold
+}
+
+decision := {"verdict": "allow", "reason": "local function hang_forever allowed", "policy_hits": ["hang_forever_allow"]} if {
+    input.tool_name == "hang_forever"
+    input.risk_level != "critical"
+    not session_risk_above_threshold
+}
+
 # ---- web_search ----
 decision := {"verdict": "allow", "reason": "web search allowed", "policy_hits": ["web_search_allow"]} if {
     input.tool_name == "web_search"

@@ -1,0 +1,137 @@
+// Package delegation decides whether an agent may delegate a tool call to another agent.
+package delegation
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/loop-controller/go/internal/models"
+	"github.com/loop-controller/go/internal/token"
+)
+
+// AgentQuerier is the subset of registry.Registry used by the delegator.
+type AgentQuerier interface {
+	Get(agentID string) (models.AgentCard, error)
+}
+
+// TaskStore is the subset of task.Manager used by the delegator.
+type TaskStore interface {
+	Create(sessionID, initiatorAgentID, targetAgentID string) models.Task
+	Get(taskID string) (models.Task, error)
+}
+
+// TokenIssuer issues delegation tokens.
+type TokenIssuer interface {
+	Issue(claims token.DelegationClaims, ttl time.Duration) (string, error)
+}
+
+// TaskEventPublisher publishes task updates.
+type TaskEventPublisher interface {
+	Publish(ctx context.Context, task models.Task) error
+}
+
+// Delegator performs delegation decisions.
+type Delegator struct {
+	registry  AgentQuerier
+	tasks     TaskStore
+	issuer    TokenIssuer
+	publisher TaskEventPublisher
+	tokenTTL  time.Duration
+}
+
+// New creates a Delegator backed by the given dependencies.
+func New(
+	registry AgentQuerier,
+	tasks TaskStore,
+	issuer TokenIssuer,
+	publisher TaskEventPublisher,
+	tokenTTL time.Duration,
+) *Delegator {
+	if tokenTTL <= 0 {
+		tokenTTL = 5 * time.Minute
+	}
+	return &Delegator{
+		registry:  registry,
+		tasks:     tasks,
+		issuer:    issuer,
+		publisher: publisher,
+		tokenTTL:  tokenTTL,
+	}
+}
+
+// Request evaluates a delegation request.
+func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (models.DelegationResponse, error) {
+	if req.RequestID == "" || req.InitiatorAgentID == "" || req.TargetAgentID == "" || req.ToolName == "" {
+		return models.DelegationResponse{
+			Allowed: false,
+			Reason:  "request_id, initiator_agent_id, target_agent_id and tool_name are required",
+		}, errors.New("missing required fields")
+	}
+
+	target, err := d.registry.Get(req.TargetAgentID)
+	if err != nil {
+		return models.DelegationResponse{
+			Allowed: false,
+			Reason:  "target agent not registered",
+		}, nil
+	}
+
+	if !hasCapability(target.Capabilities, "delegate_execution") {
+		return models.DelegationResponse{
+			Allowed: false,
+			Reason:  "target agent does not support delegate_execution",
+		}, nil
+	}
+
+	taskID := req.TaskID
+	var task models.Task
+	if taskID == "" {
+		task = d.tasks.Create(req.SessionID, req.InitiatorAgentID, req.TargetAgentID)
+		taskID = task.TaskID
+	} else {
+		var err error
+		task, err = d.tasks.Get(taskID)
+		if err != nil {
+			return models.DelegationResponse{
+				Allowed: false,
+				Reason:  "delegation task not found",
+			}, nil
+		}
+	}
+
+	if d.publisher != nil {
+		_ = d.publisher.Publish(ctx, task)
+	}
+
+	tokenStr := ""
+	if d.issuer != nil {
+		claims := token.DelegationClaims{
+			RequestID:        req.RequestID,
+			InitiatorAgentID: req.InitiatorAgentID,
+			TargetAgentID:    req.TargetAgentID,
+			ToolName:         req.ToolName,
+			TaskID:           taskID,
+		}
+		if tok, err := d.issuer.Issue(claims, d.tokenTTL); err == nil {
+			tokenStr = tok
+		}
+	}
+
+	return models.DelegationResponse{
+		Allowed:          true,
+		TaskID:           taskID,
+		TargetEntrypoint: target.Entrypoint,
+		DelegationToken:  tokenStr,
+		Reason:           "target agent trusted and capable",
+	}, nil
+}
+
+func hasCapability(caps []string, target string) bool {
+	for _, c := range caps {
+		if c == target {
+			return true
+		}
+	}
+	return false
+}

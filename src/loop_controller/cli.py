@@ -32,8 +32,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import ssl
 import sys
 from datetime import UTC, datetime
+from typing import Any
 
 from loop_controller.approval_service import ApprovalServiceError, build_approval_record
 from loop_controller.audit_analyzer import RuleBasedAuditAnalyzer
@@ -111,6 +113,11 @@ def _build_parser() -> argparse.ArgumentParser:
     proxy.add_argument("--host", default="127.0.0.1", help="SSE 模式 host（默认 127.0.0.1）")
     proxy.add_argument("--port", type=int, default=8080, help="SSE 模式端口（默认 8080）")
     proxy.add_argument(
+        "--opa-url",
+        default="http://127.0.0.1:8181",
+        help="OPA 服务地址（默认 http://127.0.0.1:8181）",
+    )
+    proxy.add_argument(
         "--identity-cert",
         default=None,
         help="SSE 模式服务器 TLS 证书路径",
@@ -140,34 +147,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="覆盖 entrypoints.http.require_auth",
     )
-
-    grpc_server = subparsers.add_parser("grpc-server", help="启动 gRPC 治理服务（v0.19.0）")
-    grpc_server.add_argument("--port", type=int, default=50051, help="监听端口（默认 50051）")
-    grpc_server.add_argument(
-        "--opa-url",
-        default="http://127.0.0.1:8181",
-        help="OPA 服务地址（默认 http://127.0.0.1:8181）",
-    )
-    grpc_server.add_argument(
-        "--require-auth",
-        action=argparse.BooleanOptionalAction,
+    server.add_argument(
+        "--ssl-certfile",
         default=None,
-        help="覆盖 entrypoints.grpc.require_auth",
+        help="服务器 TLS 证书路径",
     )
-    grpc_server.add_argument(
-        "--key",
+    server.add_argument(
+        "--ssl-keyfile",
         default=None,
-        help="gRPC 服务端 TLS 私钥路径",
+        help="服务器 TLS 私钥路径",
     )
-    grpc_server.add_argument(
-        "--cert",
+    server.add_argument(
+        "--ssl-client-ca",
         default=None,
-        help="gRPC 服务端 TLS 证书路径",
-    )
-    grpc_server.add_argument(
-        "--client-ca",
-        default=None,
-        help="gRPC 客户端 mTLS CA 证书路径",
+        help="要求客户端 mTLS 的 CA 证书路径",
     )
 
     return parser
@@ -290,9 +283,11 @@ def _cmd_audit_list_alerts(config: AppConfig, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_proxy(config: AppConfig, args: argparse.Namespace) -> int:
+def _cmd_proxy(
+    config: AppConfig, args: argparse.Namespace, *, opa_url: str | None = None
+) -> int:
     """启动 MCP Proxy。"""
-    runtime = build_runtime(config)
+    runtime = build_runtime(config, opa_url=opa_url or "http://127.0.0.1:8181")
 
     async def start_and_run() -> None:
         await runtime.start()
@@ -343,55 +338,30 @@ def _cmd_server(config_dir: str, args: argparse.Namespace) -> int:
         entrypoints_config = config.entrypoints_config
         if args.require_auth is not None:
             entrypoints_config = dict(entrypoints_config)
-            http_cfg = dict(entrypoints_config.get("http") or {})
+            inner = dict(entrypoints_config.get("entrypoints") or {})
+            http_cfg = dict(inner.get("http") or {})
             http_cfg["require_auth"] = args.require_auth
-            entrypoints_config["http"] = http_cfg
+            inner["http"] = http_cfg
+            entrypoints_config["entrypoints"] = inner
         controller = await build_controller(config, opa_url=args.opa_url)
         app = build_app(
             controller,
             api_key=load_api_key(),
             entrypoints_config=entrypoints_config,
         )
-        server = uvicorn.Server(
-            uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
-        )
+        uvicorn_kwargs: dict[str, Any] = {
+            "host": args.host,
+            "port": args.port,
+            "log_level": "info",
+        }
+        if args.ssl_certfile and args.ssl_keyfile:
+            uvicorn_kwargs["ssl_keyfile"] = args.ssl_keyfile
+            uvicorn_kwargs["ssl_certfile"] = args.ssl_certfile
+            if args.ssl_client_ca:
+                uvicorn_kwargs["ssl_ca_certs"] = args.ssl_client_ca
+                uvicorn_kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
+        server = uvicorn.Server(uvicorn.Config(app, **uvicorn_kwargs))
         await server.serve()
-
-    asyncio.run(run())
-    return 0
-
-
-def _cmd_grpc_server(config_dir: str, args: argparse.Namespace) -> int:
-    """启动 gRPC 治理服务。"""
-    try:
-        from loop_controller.controller import build_controller
-        from loop_controller.grpc_server import serve
-    except ImportError:
-        print(
-            "错误：启动 grpc-server 需要安装 grpc 依赖：uv pip install 'loop-controller[grpc]'",
-            file=sys.stderr,
-        )
-        return 1
-
-    async def run() -> None:
-        config = ConfigLoader().load(config_dir, opa_base_url=args.opa_url)
-        entrypoints_config = config.entrypoints_config
-        if args.require_auth is not None:
-            entrypoints_config = dict(entrypoints_config)
-            grpc_cfg = dict(entrypoints_config.get("grpc") or {})
-            grpc_cfg["require_auth"] = args.require_auth
-            entrypoints_config["grpc"] = grpc_cfg
-        controller = await build_controller(config, opa_url=args.opa_url)
-        server = await serve(
-            controller,
-            port=args.port,
-            entrypoints_config=entrypoints_config,
-            server_key=args.key,
-            server_cert=args.cert,
-            client_ca_cert=args.client_ca,
-            require_client_cert=args.client_ca is not None,
-        )
-        await server.wait_for_termination()
 
     asyncio.run(run())
     return 0
@@ -404,14 +374,11 @@ def main(argv: list[str] | None = None) -> int:
     config_dir = args.config_dir
 
     if args.command == "proxy":
-        config = ConfigLoader().load(config_dir)
-        return _cmd_proxy(config, args)
+        config = ConfigLoader().load(config_dir, opa_base_url=args.opa_url)
+        return _cmd_proxy(config, args, opa_url=args.opa_url)
 
     if args.command == "server":
         return _cmd_server(config_dir, args)
-
-    if args.command == "grpc-server":
-        return _cmd_grpc_server(config_dir, args)
 
     config = ConfigLoader().load(config_dir)
 

@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from loop_controller.executors.harness_executor import HarnessExecutor
 from loop_controller.executors.http_executor import HTTPExecutor
 from loop_controller.identity.revocation import RevocationList
 from loop_controller.infra.config_loader import ConfigLoader
@@ -32,6 +33,8 @@ class HotReloader:
         secret_broker: SecretBroker,
         http_tool_names: set[str] | None = None,
         revocation_list: RevocationList | None = None,
+        harness_executor: HarnessExecutor | None = None,
+        harness_tool_names: set[str] | None = None,
         poll_interval_seconds: float = 30.0,
         enabled: bool = True,
     ) -> None:
@@ -42,6 +45,9 @@ class HotReloader:
         # 与 Runtime 共享的可变集合；热更新 HTTP 工具后同步刷新。
         self._http_tool_names = http_tool_names
         self._revocation_list = revocation_list
+        self._harness_executor = harness_executor
+        # 与 Runtime 共享的可变集合；热更新 Harness 工具后同步刷新。
+        self._harness_tool_names = harness_tool_names
         self._poll_interval = poll_interval_seconds
         self._enabled = enabled
         self._task: asyncio.Task[Any] | None = None
@@ -116,6 +122,9 @@ class HotReloader:
         http_tools = self._config_dir / "http_tools.yaml"
         if http_tools.exists():
             paths.append(http_tools)
+        harness_tools = self._config_dir / "harness_tools.yaml"
+        if harness_tools.exists():
+            paths.append(harness_tools)
         secrets_yaml = self._config_dir / "secrets.yaml"
         if secrets_yaml.exists():
             paths.append(secrets_yaml)
@@ -157,6 +166,17 @@ class HotReloader:
             logger.info("HTTP 工具规格热更新完成，共 %d 个工具", len(new_specs))
         except Exception as exc:  # noqa: BLE001
             logger.warning("HTTP 工具规格热更新失败，保留旧配置：%s", exc)
+
+        if self._harness_executor is not None:
+            try:
+                specs, backends, policy = self._loader.reload_harness_tools(self._config_dir)
+                await self._harness_executor.update_specs(specs, backends, policy)
+                if self._harness_tool_names is not None:
+                    self._harness_tool_names.clear()
+                    self._harness_tool_names.update(specs.keys())
+                logger.info("Harness 工具规格热更新完成，共 %d 个工具，%d 个后端", len(specs), len(backends))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Harness 工具规格热更新失败，保留旧配置：%s", exc)
 
         if self._revocation_list is not None:
             try:

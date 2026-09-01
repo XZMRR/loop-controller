@@ -35,6 +35,7 @@ from loop_controller.audit.anchors import (
 )
 from loop_controller.audit.evidence import EvidenceChain
 from loop_controller.infra.alert_store import AlertStore
+from loop_controller.infra.audit_index import AuditIndex, AuditIndexError
 from loop_controller.infra.durable_io import DurableJsonlFile, DurableJsonlTransaction
 from loop_controller.models import AuditAlert, AuditEvent
 from loop_controller.utils.canonical import canonical_json
@@ -90,6 +91,7 @@ class JsonlAuditStore:
         anchor_backend: EvidenceAnchorBackend | None = None,
         anchor_stream_id: str | None = None,
         anchor_receipt_verifier: AnchorReceiptVerifier | None = None,
+        index_path: str | Path | None = None,
     ) -> None:
         self._path = Path(path)
         self._evidence_chain = evidence_chain
@@ -103,6 +105,12 @@ class JsonlAuditStore:
         self._anchor_status = "healthy" if anchor_backend is not None else "disabled"
         self._anchor_last_success_seq = 0
         self._anchor_last_error_code: str | None = None
+        self._audit_index: AuditIndex | None = None
+        if index_path is not None:
+            try:
+                self._audit_index = AuditIndex(index_path)
+            except AuditIndexError as exc:
+                logger.warning("审计索引初始化失败，将降级为纯 JSONL 查询: %s", exc)
         self._sync_lock = threading.Lock()
         self._write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="audit-writer")
         self._write_blocked = False
@@ -322,6 +330,11 @@ class JsonlAuditStore:
             else:
                 self._write_blocked = True
             raise RuntimeError("审计记录写入失败") from None
+        if self._audit_index is not None:
+            try:
+                self._audit_index.append(to_write)
+            except AuditIndexError as exc:
+                logger.warning("审计索引追加失败，索引已降级: %s", exc)
         if evidence is None and self._evidence_chain is not None:
             self._write_blocked = True
             if self._anchor_backend is not None:
@@ -891,7 +904,12 @@ class JsonlAuditStore:
         return self._query_by_field("task_id", task_id)
 
     def list_recent(self, limit: int = 100) -> list[AuditEvent]:
-        """返回最近的审计事件列表（v0.32.0）。"""
+        """返回最近的审计事件列表（v0.32.0）；v0.34.0 优先使用 SQLite 索引。"""
+        if self._audit_index is not None and not self._audit_index.degraded:
+            try:
+                return self._audit_index.list_recent(limit)
+            except AuditIndexError as exc:
+                logger.warning("审计索引查询失败，回退 JSONL 扫描: %s", exc)
         results: list[AuditEvent] = []
         if not self._path.exists():
             return results
@@ -909,7 +927,15 @@ class JsonlAuditStore:
         return results[-limit:]
 
     def _query_by_field(self, field: str, value: str) -> list[AuditEvent]:
-        """通用全文件扫描查询。"""
+        """通用查询；v0.34.0 优先使用 SQLite 索引。"""
+        if self._audit_index is not None and not self._audit_index.degraded:
+            try:
+                if field == "trace_id":
+                    return self._audit_index.query_by_trace(value)
+                if field == "session_id":
+                    return self._audit_index.query_by_session(value)
+            except AuditIndexError as exc:
+                logger.warning("审计索引查询失败，回退 JSONL 扫描: %s", exc)
         results: list[AuditEvent] = []
         if not self._path.exists():
             return results

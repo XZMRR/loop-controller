@@ -19,10 +19,12 @@ v0.7.0 变更：
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import ssl
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -131,6 +133,80 @@ class ProxyIdentity:
     session_id: str | None = None
 
 
+DEFAULT_MAX_MCP_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
+DEFAULT_MAX_SSE_CONNECTIONS = 100
+
+
+class _MCPBodySizeMiddleware(BaseHTTPMiddleware):
+    """限制 MCP Proxy 单条 POST /messages 请求体大小。"""
+
+    def __init__(self, app: Any, max_size: int = DEFAULT_MAX_MCP_BODY_SIZE) -> None:
+        super().__init__(app)
+        self._max_size = max_size
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                size = int(content_length)
+            except ValueError:
+                return Response(
+                    content=json.dumps({"error": "invalid_parameter", "message": "invalid Content-Length"}),
+                    status_code=400,
+                    media_type="application/json",
+                )
+            if size > self._max_size:
+                return Response(
+                    content=json.dumps({"error": "payload_too_large", "message": "request body too large"}),
+                    status_code=413,
+                    media_type="application/json",
+                )
+        return cast(Response, await call_next(request))
+
+
+class _MCPRateLimitMiddleware(BaseHTTPMiddleware):
+    """基于内存的 MCP Proxy 限流（按 client IP + 路径）。"""
+
+    def __init__(
+        self,
+        app: Any,
+        requests_per_minute: int = 120,
+        burst: int = 20,
+        window_seconds: int = 60,
+    ) -> None:
+        super().__init__(app)
+        self._limit = max(1, requests_per_minute)
+        self._burst = max(1, burst)
+        self._window = window_seconds
+        self._requests: dict[str, list[float]] = {}
+
+    def _key(self, request: Request) -> str:
+        client = request.client.host if request.client else "unknown"
+        return f"{client}:{request.url.path}"
+
+    def _is_allowed(self, key: str, now: float) -> bool:
+        cutoff = now - self._window
+        timestamps = self._requests.setdefault(key, [])
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.pop(0)
+        if len(timestamps) < self._limit + self._burst:
+            timestamps.append(now)
+            return True
+        return False
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        now = time.time()
+        key = self._key(request)
+        if not self._is_allowed(key, now):
+            return Response(
+                content=json.dumps({"error": "rate_limited", "message": "too many requests"}),
+                status_code=429,
+                media_type="application/json",
+                headers={"Retry-After": str(self._window)},
+            )
+        return cast(Response, await call_next(request))
+
+
 class _IdentityExtractionMiddleware(BaseHTTPMiddleware):
     """SSE 模式下从请求中提取并验证 mTLS 身份，写入 scope 供 MCP handler 使用。"""
 
@@ -181,6 +257,8 @@ class LoopControllerProxyServer:
         self._agent = runtime.checkpoint._identity.get_agent(identity.agent_id)
         if self._agent is None:
             raise ValueError(f"agent_id {identity.agent_id!r} 不存在于 agents.yaml")
+        self._sse_semaphore = asyncio.Semaphore(DEFAULT_MAX_SSE_CONNECTIONS)
+        self._max_mcp_body_size = DEFAULT_MAX_MCP_BODY_SIZE
         profile = runtime.profiles.get(self._agent.profile_id)
         if profile is None:
             raise ValueError(f"profile {self._agent.profile_id!r} 不存在")
@@ -194,12 +272,29 @@ class LoopControllerProxyServer:
         return getattr(checkpoint, "_identity", None)
 
     def _stdio_require_auth(self) -> bool:
-        cfg = self._entrypoints_config.get("mcp_proxy_stdio") or {}
+        entrypoints = self._entrypoints_config.get("entrypoints") or self._entrypoints_config
+        cfg = entrypoints.get("mcp_proxy_stdio") or {}
         return bool(cfg.get("require_auth", False))
 
     def _sse_require_auth(self) -> bool:
-        cfg = self._entrypoints_config.get("mcp_proxy_sse") or {}
+        entrypoints = self._entrypoints_config.get("entrypoints") or self._entrypoints_config
+        cfg = entrypoints.get("mcp_proxy_sse") or {}
         return bool(cfg.get("require_auth", False))
+
+    def _admin_agent_profiles(self) -> list[str]:
+        """读取 entrypoints.yaml 中配置的 admin profile 白名单。"""
+        cfg = self._entrypoints_config.get("admin") or {}
+        return list(cfg.get("agent_profiles") or [])
+
+    def _is_admin_identity(self, identity: ProxyIdentity) -> bool:
+        """校验当前身份是否属于 admin profile。"""
+        admin_profiles = self._admin_agent_profiles()
+        if not admin_profiles:
+            return False
+        agent = self._runtime.checkpoint._identity.get_agent(identity.agent_id)
+        if agent is None:
+            return False
+        return agent.profile_id in admin_profiles
 
     async def _verify_stdio_identity(self) -> None:
         """stdio 模式下校验外部身份 token；require_auth 为 false 时跳过。"""
@@ -295,7 +390,11 @@ class LoopControllerProxyServer:
             [s.strip() for s in cert_san_header.split(",") if s.strip()] if cert_san_header else []
         )
         mtls_terminated = self._client_ca_cert is not None and request.url.scheme == "https"
-        if mtls_terminated and provider is not None and (cert_cn or cert_sans):
+        entrypoints = self._entrypoints_config.get("entrypoints") or self._entrypoints_config
+        trust_proxy_headers = (
+            entrypoints.get("mcp_proxy_sse") or {}
+        ).get("trust_proxy_headers", False)
+        if mtls_terminated and trust_proxy_headers and provider is not None and (cert_cn or cert_sans):
             credential = IdentityCredential(cert_cn=cert_cn, cert_sans=cert_sans)
             verified = await provider.verify(credential)
             if verified is not None:
@@ -310,6 +409,10 @@ class LoopControllerProxyServer:
                     ),
                 )
             # 提供了 mTLS header 但验证失败：拒绝，避免 header 伪造后 fallback 到默认身份。
+            return None
+        # 若服务端配置要求客户端证书（client_ca_cert 已设置），则必须成功提取 mTLS 身份；
+        # 不允许 fallback 到默认身份，否则存在绕过风险。
+        if mtls_terminated:
             return None
         identity = self._resolve_identity()
         agent = self._runtime.checkpoint._identity.get_agent(identity.agent_id)
@@ -331,17 +434,46 @@ class LoopControllerProxyServer:
         server = self._build_server()
 
         async def handle_sse(request: Request) -> Response:
-            async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-                await server.run(streams[0], streams[1], server.create_initialization_options())
+            async with self._sse_semaphore:
+                try:
+                    async with sse.connect_sse(
+                        request.scope, request.receive, request._send
+                    ) as streams:
+                        try:
+                            await server.run(
+                                streams[0], streams[1], server.create_initialization_options()
+                            )
+                        except asyncio.CancelledError:
+                            logger.debug("SSE connection cancelled")
+                            raise
+                except Exception:
+                    logger.exception("SSE handler failed")
+                    raise
             return Response()
 
-        return Starlette(
-            middleware=[Middleware(_IdentityExtractionMiddleware, proxy=self)],
+        middleware: list[Middleware] = [
+            Middleware(_MCPBodySizeMiddleware, max_size=self._max_mcp_body_size),
+        ]
+        middleware.append(Middleware(_IdentityExtractionMiddleware, proxy=self))
+
+        app = Starlette(
+            middleware=middleware,
             routes=[
                 Route("/sse", endpoint=handle_sse, methods=["GET"]),
                 Mount("/messages/", app=sse.handle_post_message),
             ],
         )
+
+        async def _unhandled_exception_handler(request: Request, exc: Exception) -> Response:
+            logger.exception("Unhandled MCP Proxy HTTP exception: %s", exc)
+            return Response(
+                content=json.dumps({"error": "internal_error"}),
+                status_code=500,
+                media_type="application/json",
+            )
+
+        app.add_exception_handler(Exception, _unhandled_exception_handler)
+        return app
 
     @property
     def _admin_tool_handlers(self) -> dict[str, Callable[[dict[str, Any]], Awaitable[types.CallToolResult]]]:
@@ -374,7 +506,7 @@ class LoopControllerProxyServer:
         try:
             drained = await executor.drain_backend(name)
         except KeyError as exc:
-            return self._error_result(str(exc))
+            return self._error_result(str(exc), error_code="not_found")
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=json.dumps({"backend": name, "drained": drained}, ensure_ascii=False))]
         )
@@ -387,7 +519,7 @@ class LoopControllerProxyServer:
         try:
             executor.reset_backend(name)
         except KeyError as exc:
-            return self._error_result(str(exc))
+            return self._error_result(str(exc), error_code="not_found")
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=json.dumps({"backend": name, "reset": True}, ensure_ascii=False))]
         )
@@ -403,7 +535,7 @@ class LoopControllerProxyServer:
         decision_id = arguments.get("decision_id", "")
         status = self._runtime.approval_manager.get_decision_status(decision_id)
         if status is None:
-            return self._error_result("decision not found")
+            return self._error_result("decision not found", error_code="not_found")
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=json.dumps(status, ensure_ascii=False))]
         )
@@ -578,6 +710,11 @@ class LoopControllerProxyServer:
         # v0.32.0：admin/审计工具优先路由。
         admin_handler = self._admin_tool_handlers.get(name)
         if admin_handler is not None:
+            if not self._is_admin_identity(identity):
+                return self._error_result(
+                    "admin access denied",
+                    error_code="admin_forbidden",
+                )
             return await admin_handler(raw_arguments)
 
         retry_decision_id = self._extract_retry_decision_id(raw_arguments)
@@ -592,9 +729,9 @@ class LoopControllerProxyServer:
                     identity,
                     agent,
                 )
-            except Exception as exc:
+            except Exception:
                 logger.exception("Proxy retry 失败")
-                return self._error_result(f"retry failed: {exc}")
+                return self._error_result("internal error", error_code="internal_error")
 
         # 正常路径：创建 Task、判定、执行或提交审批。
         return await self._handle_normal_call(name, raw_arguments, identity, agent)
@@ -610,34 +747,51 @@ class LoopControllerProxyServer:
         """v0.5.1：审批通过后携带 decision_id 重试。"""
         record = self._runtime.approval_manager.check(decision_id)
         if record is None:
-            return self._error_result(f"decision_id={decision_id} not approved or not found")
+            return self._error_result(
+                f"decision_id={decision_id} not approved or not found",
+                error_code="retry_not_approved",
+            )
 
         if record.verdict == "deny":
-            return self._error_result(f"approval denied for decision_id={decision_id}")
+            return self._error_result(
+                f"approval denied for decision_id={decision_id}",
+                error_code="deny",
+            )
 
         request = self._runtime.approval_manager.get_request(decision_id)
         if request is None:
-            return self._error_result(f"approval request not found for decision_id={decision_id}")
+            return self._error_result(
+                f"approval request not found for decision_id={decision_id}",
+                error_code="retry_not_found",
+            )
 
         # 审批凭证只能由原始请求身份使用，不能被其他 Agent/用户跨租户复用。
         if request.agent_id != identity.agent_id or request.requester_id != identity.user_id:
-            return self._error_result("approval request does not belong to caller")
+            return self._error_result(
+                "approval request does not belong to caller",
+                error_code="retry_forbidden",
+            )
 
         # 参数一致性校验：防止 decision_id 被复用于不同参数调用。
         if request.tool_name != tool_name or request.tool_arguments != arguments:
-            return self._error_result("retry parameters mismatch original approved request")
+            return self._error_result(
+                "retry parameters mismatch original approved request",
+                error_code="retry_mismatch",
+            )
 
         original_decision = request.original_decision
         if original_decision is None:
             return self._error_result(
-                f"original decision not recorded for decision_id={decision_id}"
+                f"original decision not recorded for decision_id={decision_id}",
+                error_code="retry_not_found",
             )
 
         # v0.6.0：通过持久化 TaskStore 恢复原始 Task。
         task = self._runtime.get_task(request.task_id)
         if task is None:
             return self._error_result(
-                "original task not available; please retry without decision_id"
+                "original task not available; please retry without decision_id",
+                error_code="retry_not_found",
             )
         if (
             task.task_id != request.task_id
@@ -647,7 +801,10 @@ class LoopControllerProxyServer:
             or task.user_id != identity.user_id
             or task.tenant_id != agent.tenant_id
         ):
-            return self._error_result("approval request task identity or tenant mismatch")
+            return self._error_result(
+                "approval request task identity or tenant mismatch",
+                error_code="retry_forbidden",
+            )
 
         resume_proposal = ActionProposal(
             task_id=task.task_id,
@@ -672,26 +829,21 @@ class LoopControllerProxyServer:
             finalized_decision = self._runtime.checkpoint.finalize_after_approval(
                 original_decision, record, request
             )
-        except DecisionAlreadyConsumed as exc:
+        except DecisionAlreadyConsumed:
             return self._error_result(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "error_code": "decision_already_consumed",
-                        "message": str(exc),
-                    },
-                    ensure_ascii=False,
-                )
+                "decision already consumed",
+                error_code="decision_already_consumed",
             )
-        except CheckpointError as exc:
-            return self._error_result(str(exc))
-        except Exception as exc:
+        except CheckpointError:
+            return self._error_result("internal error", error_code="internal_error")
+        except Exception:
             logger.exception("Proxy finalize_after_approval 失败")
-            return self._error_result(f"finalize failed: {exc}")
+            return self._error_result("internal error", error_code="internal_error")
 
         if finalized_decision.verdict == "deny":
             return self._error_result(
-                f"approval denied for decision_id={decision_id}: {finalized_decision.reason}"
+                f"approval denied for decision_id={decision_id}: {finalized_decision.reason}",
+                error_code="deny",
             )
 
         # 重试时必须复用原始 call_id，否则 forward 会判定 decision.call_id 不一致。
@@ -705,11 +857,11 @@ class LoopControllerProxyServer:
                 user_id=task.user_id,
                 tenant_id=task.tenant_id,
             )
-        except CheckpointError as exc:
-            return self._error_result(str(exc))
-        except Exception as exc:
+        except CheckpointError:
+            return self._error_result("internal error", error_code="internal_error")
+        except Exception:
             logger.exception("Proxy retry forward 失败")
-            return self._error_result(f"execution failed: {exc}")
+            return self._error_result("internal error", error_code="internal_error")
 
         return self._tool_result_to_mcp(result)
 
@@ -728,8 +880,9 @@ class LoopControllerProxyServer:
                 description=f"proxy call: {tool_name}",
                 session_id=identity.session_id,
             )
-        except ValueError as exc:
-            return self._error_result(str(exc))
+        except Exception:
+            logger.exception("Proxy create_task 失败")
+            return self._error_result("internal error", error_code="internal_error")
 
         proposal = ActionProposal(
             task_id=task.task_id,
@@ -751,9 +904,9 @@ class LoopControllerProxyServer:
 
         try:
             decision = await self._runtime.checkpoint.evaluate(task, agent, proposal)
-        except Exception as exc:
+        except Exception:
             logger.exception("Proxy evaluate 失败")
-            return self._error_result(f"governance evaluation failed: {exc}")
+            return self._error_result("internal error", error_code="internal_error")
 
         if decision.verdict == "require_approval":
             try:
@@ -765,7 +918,7 @@ class LoopControllerProxyServer:
             return self._require_approval_response(decision, request)
 
         if decision.verdict == "deny":
-            return self._error_result(f"DENIED: {decision.reason}")
+            return self._error_result(f"DENIED: {decision.reason}", error_code="deny")
 
         try:
             result = await self._runtime.checkpoint.forward(
@@ -775,9 +928,9 @@ class LoopControllerProxyServer:
                 user_id=task.user_id,
                 tenant_id=task.tenant_id,
             )
-        except Exception as exc:
+        except Exception:
             logger.exception("Proxy forward 失败")
-            return self._error_result(f"execution failed: {exc}")
+            return self._error_result("internal error", error_code="internal_error")
 
         return self._tool_result_to_mcp(result)
 
@@ -986,9 +1139,16 @@ class LoopControllerProxyServer:
         )
 
     @staticmethod
-    def _error_result(message: str) -> types.CallToolResult:
+    def _error_result(
+        message: str,
+        *,
+        error_code: str = "internal_error",
+    ) -> types.CallToolResult:
         """构造错误响应；所有治理拦截和执行失败统一通过 TextContent 返回。"""
+        payload: dict[str, Any] = {"error": error_code}
+        if error_code != "internal_error":
+            payload["message"] = message
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=f"[loop-controller] {message}")],
+            content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
             isError=True,
         )

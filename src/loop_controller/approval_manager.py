@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from loop_controller.infra.approval_store import ApprovalStore
+from loop_controller.infra.approval_store import ApprovalStore, ApprovalStoreError
 from loop_controller.models import ApprovalRecord, ApprovalRequest, Decision
 
 
@@ -68,6 +68,29 @@ class AsyncApprovalManager:
             )
         items.sort(key=lambda d: d["created_at"], reverse=True)
         return items[:limit]
+
+    async def cancel_request(self, request_id: str) -> ApprovalRecord | None:
+        """因超时等原因取消待审批请求；若已有审批结果则返回该结果。"""
+        self._store.refresh()
+        request = self._store.get_request_by_id(request_id)
+        if request is None:
+            return None
+        existing = self._store.get_record(request.decision_id)
+        if existing is not None:
+            return existing
+        record = ApprovalRecord(
+            request_id=request_id,
+            decision_id=request.decision_id,
+            verdict="deny",
+            approver_id="system",
+            comment="cancelled by wait_for_approval timeout",
+        )
+        try:
+            self._store.record_response(record)
+        except ApprovalStoreError:
+            # 竞争：取消前已有审批结果写入
+            return self._store.get_record(request.decision_id)
+        return record
 
     def get_decision_status(self, decision_id: str) -> dict[str, Any] | None:
         """v0.32.0：返回 decision 状态摘要。"""

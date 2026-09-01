@@ -70,8 +70,10 @@ from loop_controller.server_models import (
 
 try:
     from starlette.applications import Starlette
+    from starlette.exceptions import HTTPException
     from starlette.middleware import Middleware
     from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+    from starlette.middleware.cors import CORSMiddleware
     from starlette.requests import Request
     from starlette.responses import (
         JSONResponse,
@@ -122,6 +124,82 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         return response
 
 
+DEFAULT_MAX_HTTP_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
+
+
+class BodySizeLimitMiddleware(BaseHTTPMiddleware):
+    """限制单个 HTTP 请求体大小，超过时直接返回 413。"""
+
+    def __init__(self, app: Any, max_size: int = DEFAULT_MAX_HTTP_BODY_SIZE) -> None:
+        super().__init__(app)
+        self._max_size = max_size
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                size = int(content_length)
+            except ValueError:
+                return JSONResponse(
+                    {"error": "invalid_parameter", "message": "invalid Content-Length"},
+                    status_code=400,
+                )
+            if size > self._max_size:
+                return JSONResponse(
+                    {"error": "payload_too_large", "message": "request body too large"},
+                    status_code=413,
+                )
+        return await call_next(request)
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """基于内存的滑动窗口限流（按 client IP + 路径）。
+
+    未配置时默认放行；适用于单进程部署。
+    """
+
+    def __init__(
+        self,
+        app: Any,
+        requests_per_minute: int = 120,
+        burst: int = 20,
+        window_seconds: int = 60,
+    ) -> None:
+        super().__init__(app)
+        self._limit = max(1, requests_per_minute)
+        self._burst = max(1, burst)
+        self._window = window_seconds
+        self._requests: dict[str, list[float]] = {}
+
+    def _key(self, request: Request) -> str:
+        client = request.client.host if request.client else "unknown"
+        return f"{client}:{request.url.path}"
+
+    def _is_allowed(self, key: str, now: float) -> bool:
+        window = self._window
+        cutoff = now - window
+        timestamps = self._requests.setdefault(key, [])
+        # 清理过期记录
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.pop(0)
+        # 突发容量 = 窗口内请求数 < limit + burst
+        if len(timestamps) < self._limit + self._burst:
+            timestamps.append(now)
+            return True
+        return False
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        now = time.time()
+        key = self._key(request)
+        if not self._is_allowed(key, now):
+            return JSONResponse(
+                {"error": "rate_limited", "message": "too many requests"},
+                status_code=429,
+                headers={"Retry-After": str(self._window)},
+            )
+        return await call_next(request)
+
+
 class ToolGovernServer:
     """HTTP 治理服务封装。
 
@@ -152,7 +230,8 @@ class ToolGovernServer:
 
     def _http_require_auth(self) -> bool:
         """读取 entrypoints.http.require_auth；缺省 false 保持向后兼容。"""
-        http_cfg = self._entrypoints_config.get("http") or {}
+        entrypoints = self._entrypoints_config.get("entrypoints") or self._entrypoints_config
+        http_cfg = entrypoints.get("http") or {}
         return bool(http_cfg.get("require_auth", False))
 
     def _check_api_key(self, request: Request) -> bool:
@@ -161,16 +240,14 @@ class ToolGovernServer:
             return False
         header = request.headers.get("x-api-key") or ""
         auth = request.headers.get("authorization") or ""
+        token = ""
         if auth.lower().startswith("bearer "):
             token = auth[7:].strip()
-        else:
-            token = ""
-        return (
-            bool(header)
-            and hmac.compare_digest(header, self._api_key)
-            or bool(token)
-            and hmac.compare_digest(token, self._api_key)
-        )
+        for candidate in (header, token):
+            if candidate and len(candidate) == len(self._api_key):
+                if hmac.compare_digest(candidate, self._api_key):
+                    return True
+        return False
 
     def _admin_actor_id(self, request: Request) -> str:
         """从请求中提取管理员 API key 的匿名标识；未认证时返回 unauthenticated。"""
@@ -417,7 +494,13 @@ class ToolGovernServer:
         if identity is not None and not self._approval_request_belongs_to(request_id, identity):
             return JSONResponse({"error": "approval request does not belong to caller"}, status_code=403)
 
-        max_wait = float(request.query_params.get("max_wait", "30"))
+        try:
+            max_wait = float(request.query_params.get("max_wait", "30"))
+        except ValueError:
+            return JSONResponse(
+                {"error": "invalid_parameter", "message": "max_wait must be a number"},
+                status_code=400,
+            )
         max_wait = max(1.0, min(max_wait, 300.0))
 
         # 轮询 ApprovalStore，等待审批记录出现；watcher 可在同进程内立即唤醒
@@ -469,7 +552,14 @@ class ToolGovernServer:
                 media_type="text/event-stream",
             )
 
-        max_wait = float(request.query_params.get("max_wait", "60"))
+        try:
+            max_wait = float(request.query_params.get("max_wait", "60"))
+        except ValueError:
+            return StreamingResponse(
+                self._sse_error("max_wait must be a number"),
+                status_code=400,
+                media_type="text/event-stream",
+            )
         max_wait = max(1.0, min(max_wait, 300.0))
 
         async def event_stream():
@@ -826,7 +916,14 @@ class ToolGovernServer:
 
         session_id = request.query_params.get("session_id")
         task_id = request.query_params.get("task_id")
-        limit = int(request.query_params.get("limit", "100"))
+        try:
+            limit = int(request.query_params.get("limit", "100"))
+        except ValueError:
+            return JSONResponse(
+                {"error": "invalid_parameter", "message": "limit must be an integer"},
+                status_code=400,
+            )
+        limit = max(1, min(limit, 1000))
 
         audit_store = self._controller._runtime.audit_store
         events = []
@@ -903,10 +1000,38 @@ def build_app(
         logger.info("Loop Controller HTTP server shutting down")
         await controller.aclose()
 
-    return Starlette(
+    entrypoints = entrypoints_config or {}
+    http_cfg = (entrypoints.get("entrypoints") or entrypoints).get("http") or {}
+    cors_cfg = http_cfg.get("cors") or {}
+    rate_limit_cfg = http_cfg.get("rate_limit") or {}
+    max_body_size = int(http_cfg.get("max_body_size", DEFAULT_MAX_HTTP_BODY_SIZE))
+
+    middleware: list[Middleware] = [
+        Middleware(BodySizeLimitMiddleware, max_size=max_body_size)
+    ]
+    if rate_limit_cfg:
+        middleware.append(
+            Middleware(
+                RateLimitMiddleware,
+                requests_per_minute=int(rate_limit_cfg.get("requests_per_minute", 120)),
+                burst=int(rate_limit_cfg.get("burst", 20)),
+            )
+        )
+    middleware.append(Middleware(MetricsMiddleware))
+    if cors_cfg.get("origins"):
+        middleware.append(
+            Middleware(
+                CORSMiddleware,
+                allow_origins=list(cors_cfg["origins"]),
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+        )
+
+    app = Starlette(
         debug=False,
         lifespan=lifespan,
-        middleware=[Middleware(MetricsMiddleware)],
+        middleware=middleware,
         routes=[
             Route("/health", server._handle_health, methods=["GET"]),
             Route("/v1/identity", server._handle_identity, methods=["GET"]),
@@ -974,6 +1099,23 @@ def build_app(
             Route("/v1/admin/audit", server._handle_admin_audit, methods=["GET"]),
         ],
     )
+
+    async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        return JSONResponse(
+            {"error": "http_error", "message": str(exc.detail)},
+            status_code=exc.status_code,
+        )
+
+    async def _generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception("Unhandled HTTP exception: %s", exc)
+        return JSONResponse(
+            {"error": "internal_error"},
+            status_code=500,
+        )
+
+    app.add_exception_handler(HTTPException, _http_exception_handler)
+    app.add_exception_handler(Exception, _generic_exception_handler)
+    return app
 
 
 def load_api_key() -> str | None:

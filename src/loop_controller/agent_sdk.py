@@ -1,4 +1,4 @@
-"""Agent 接入 SDK（v0.32.0）：@governed 装饰器与 GovernanceRuntime。
+"""Agent 接入 SDK（v0.33.0）：@governed 装饰器与 GovernanceRuntime。
 
 目标：让愿意接入 Loop Controller 的 Agent 在**工具定义处**完成治理，
 无需改造每个调用点。支持同步/异步函数、统一工具注册表 Hook。
@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import inspect
 from collections.abc import Callable, Coroutine, Mapping
@@ -15,18 +16,15 @@ from typing import Any, TypeVar
 
 from loop_controller.controller import LoopController, build_controller
 from loop_controller.infra.config_loader import ConfigLoader
-from loop_controller.models import GovernanceResult
+from loop_controller.models import GovernanceDeniedError, GovernanceResult
 from loop_controller.tool_governor import ToolGovernor
 
 T = TypeVar("T")
 
-
-class GovernanceDeniedError(Exception):
-    """Loop Controller 拒绝、阻断或执行出错时抛出。"""
-
-    def __init__(self, result: GovernanceResult) -> None:
-        self.result = result
-        super().__init__(f"{result.status}: {result.reason}")
+# 当前线程/协程内的 GovernanceRuntime 上下文；替代全局类变量，避免并发覆盖。
+_RUNTIME_CTX: contextvars.ContextVar[GovernanceRuntime | None] = contextvars.ContextVar(
+    "loop_controller_runtime", default=None
+)
 
 
 class GovernanceRuntime:
@@ -35,8 +33,6 @@ class GovernanceRuntime:
     封装 ``LoopController`` 与 ``ToolGovernor`` 的构造和生命周期，
     提供 ``@governed`` 装饰器所需的当前运行时上下文。
     """
-
-    _current: GovernanceRuntime | None = None
 
     def __init__(
         self,
@@ -56,6 +52,7 @@ class GovernanceRuntime:
             user_id=user_id,
             default_task_context=default_task_context,
         )
+        self._ctx_token: contextvars.Token[GovernanceRuntime | None] | None = None
 
     @property
     def controller(self) -> LoopController:
@@ -67,22 +64,40 @@ class GovernanceRuntime:
 
     @classmethod
     def current(cls) -> GovernanceRuntime:
-        """返回最近一次 ``from_config``/``set_current`` 设置的运行时。"""
-        if cls._current is None:
+        """返回当前上下文中的 GovernanceRuntime。"""
+        rt = _RUNTIME_CTX.get()
+        if rt is None:
             raise RuntimeError(
                 "当前没有活动的 GovernanceRuntime；"
                 "请先调用 GovernanceRuntime.from_config() 或 set_current()"
             )
-        return cls._current
+        return rt
 
     @classmethod
-    def set_current(cls, runtime: GovernanceRuntime) -> None:
-        cls._current = runtime
+    def set_current(cls, runtime: GovernanceRuntime) -> contextvars.Token[GovernanceRuntime | None]:
+        """设置当前上下文中的运行时；返回 token 供精确恢复。"""
+        return _RUNTIME_CTX.set(runtime)
 
     @classmethod
-    def reset_current(cls) -> None:
-        """清除当前全局运行时；主要用于测试和显式生命周期管理。"""
-        cls._current = None
+    def reset_current(cls, token: contextvars.Token[GovernanceRuntime | None] | None = None) -> None:
+        """清除当前上下文中的运行时。
+
+        若传入 ``token``，则精确恢复到设置之前的状态；否则仅置空当前上下文。
+        """
+        if token is not None:
+            _RUNTIME_CTX.reset(token)
+        else:
+            _RUNTIME_CTX.set(None)
+
+    async def __aenter__(self) -> GovernanceRuntime:
+        self._ctx_token = self.set_current(self)
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.aclose()
+        if self._ctx_token is not None:
+            self.reset_current(self._ctx_token)
+            self._ctx_token = None
 
     @classmethod
     async def from_config(
@@ -123,7 +138,12 @@ class GovernanceRuntime:
         session_id: str | None = None,
         task_id: str | None = None,
     ) -> Any:
-        """提交工具调用并返回原始执行结果；非 allow 状态抛出 GovernanceDeniedError。"""
+        """提交工具调用并返回结果。
+
+        - ``allow``：返回工具执行结果；
+        - ``require_approval``：返回 ``GovernanceResult``，由 Agent 呈现审批 UI；
+        - 其他状态（deny/blocked/error）抛出 ``GovernanceDeniedError``。
+        """
         result = await self._controller.evaluate_and_execute(
             agent_id=self._agent_id,
             user_id=self._user_id,
@@ -135,6 +155,8 @@ class GovernanceRuntime:
         )
         if result.status == "allow":
             return result.content
+        if result.status == "require_approval":
+            return result.with_controller(self._controller, self)
         raise GovernanceDeniedError(result)
 
     async def aclose(self) -> None:
@@ -152,6 +174,9 @@ class GovernanceRuntime:
         支持两种注册表形态：
         - 有 ``tools`` 属性（dict[str, Callable]），如简单字典注册表；
         - 有 ``list_tools()`` 和 ``get(name)`` 方法，如面向对象注册表。
+
+        替换是原子的：所有 governed_fn 先构造完成，再一次性写入注册表；
+        若中途失败，已构造的替换会被回滚。
         """
         exclude = exclude or set()
         items: list[tuple[str, Callable[..., Any]]] = []
@@ -159,8 +184,9 @@ class GovernanceRuntime:
         # 支持 dict/Mapping 形态：直接取键 "tools"
         if isinstance(registry, Mapping) and "tools" in registry:
             tools = registry["tools"]
-            if isinstance(tools, dict):
-                items.extend(tools.items())
+            if not isinstance(tools, dict):
+                raise TypeError("registry['tools'] 必须是 dict[str, Callable]")
+            items.extend(tools.items())
         else:
             tools = getattr(registry, "tools", None)
             if isinstance(tools, dict):
@@ -176,14 +202,32 @@ class GovernanceRuntime:
                     items.append((name, get_fn(name)))
 
         register = getattr(registry, "register", None)
+        originals: dict[str, Callable[..., Any]] = {}
+        replacements: dict[str, Callable[..., Any]] = {}
+
         for name, fn in items:
             if name in exclude:
                 continue
-            governed_fn = governed(tool_name=name)(fn)
             if register is not None:
-                register(name, governed_fn)
+                originals[name] = get_fn(name)
             elif tools is not None and isinstance(tools, dict):
-                tools[name] = governed_fn
+                originals[name] = tools[name]
+            replacements[name] = governed(tool_name=name)(fn)
+
+        try:
+            for name, governed_fn in replacements.items():
+                if register is not None:
+                    register(name, governed_fn)
+                elif tools is not None and isinstance(tools, dict):
+                    tools[name] = governed_fn
+        except Exception:
+            # 回滚：把原始函数写回注册表
+            for name, original_fn in originals.items():
+                if register is not None:
+                    register(name, original_fn)
+                elif tools is not None and isinstance(tools, dict):
+                    tools[name] = original_fn
+            raise
 
 
 def _run_async[T](coro: Coroutine[Any, Any, T]) -> T:
@@ -211,30 +255,76 @@ def _pack_arguments(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> dict[s
     return dict(bound.arguments)
 
 
+_RESERVED_GOVERNANCE_KEYS = {
+    "_loop_controller_session_id",
+    "_loop_controller_task_id",
+    "_loop_controller_task_context",
+}
+
+
+def _extract_reserved_governance_kwargs(
+    kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """把以 ``_loop_controller_`` 为前缀的保留参数从用户参数中分离出来。
+
+    返回 (reserved, user_kwargs)，reserved 中的 key 会去掉前缀后传给 ``rt.call()``。
+    """
+    reserved: dict[str, Any] = {}
+    user_kwargs: dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if key in _RESERVED_GOVERNANCE_KEYS:
+            reserved[key[len("_loop_controller_"):]] = value
+        else:
+            user_kwargs[key] = value
+    return reserved, user_kwargs
+
+
 def _make_governed_wrapper(
     fn: Callable[..., Any],
     *,
     tool_name: str,
+    wait_for_approval: bool,
 ) -> Callable[..., Any]:
     """根据原函数是否 async，返回保持签名的治理包装函数。"""
     name = tool_name or fn.__name__
 
     async def _call(*args: Any, **kwargs: Any) -> Any:
         rt = GovernanceRuntime.current()
-        arguments = _pack_arguments(fn, *args, **kwargs)
-        return await rt.call(name, arguments)
+        reserved, user_kwargs = _extract_reserved_governance_kwargs(dict(kwargs))
+        arguments = _pack_arguments(fn, *args, **user_kwargs)
+        return await rt.call(
+            name,
+            arguments,
+            session_id=reserved.get("session_id"),
+            task_id=reserved.get("task_id"),
+            task_context=reserved.get("task_context"),
+        )
 
     if inspect.iscoroutinefunction(fn):
 
         @functools.wraps(fn)
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-            return await _call(*args, **kwargs)
+            result = await _call(*args, **kwargs)
+            if (
+                isinstance(result, GovernanceResult)
+                and result.status == "require_approval"
+                and wait_for_approval
+            ):
+                return await result.retry_after_approval()
+            return result
 
         return async_wrapper
 
     @functools.wraps(fn)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-        return _run_async(_call(*args, **kwargs))
+        result = _run_async(_call(*args, **kwargs))
+        if (
+            isinstance(result, GovernanceResult)
+            and result.status == "require_approval"
+            and wait_for_approval
+        ):
+            return _run_async(result.retry_after_approval())
+        return result
 
     return sync_wrapper
 
@@ -243,6 +333,7 @@ def governed[T](
     fn: Callable[..., T] | None = None,
     *,
     tool_name: str | None = None,
+    wait_for_approval: bool = False,
 ) -> Callable[..., Any] | Callable[[Callable[..., T]], Callable[..., Any]]:
     """标记一个工具函数需要经过 Loop Controller 治理。
 
@@ -250,15 +341,18 @@ def governed[T](
 
     Args:
         tool_name: 在 Loop Controller 中注册的 canonical_name；默认使用函数名。
+        wait_for_approval: 为 True 时，若调用触发审批则自动轮询等待审批并返回执行结果。
 
     Raises:
-        GovernanceDeniedError: 当 Loop Controller 返回 deny / blocked / error / require_approval。
+        GovernanceDeniedError: 当 Loop Controller 返回 deny / blocked / error，
+            或 wait_for_approval=True 时审批被拒绝/超时。
     """
 
     def decorator(func: Callable[..., T]) -> Callable[..., Any]:
         return _make_governed_wrapper(
             func,
             tool_name=tool_name or func.__name__,
+            wait_for_approval=wait_for_approval,
         )
 
     if fn is not None:

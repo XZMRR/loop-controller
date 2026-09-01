@@ -15,6 +15,11 @@ from typing import Protocol, runtime_checkable
 from loop_controller.infra.durable_io import DurableJsonlFile
 from loop_controller.models import RiskProfile
 
+
+class RiskStateStoreError(Exception):
+    """RiskStateStore 持久化异常。"""
+
+
 # 风险证据标签集合：只有这些事件进入 recent_tags
 _RISK_EVIDENCE_TAGS = {"deny", "critical", "require_approval", "approval_denied", "approval_granted"}
 

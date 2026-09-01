@@ -1,7 +1,9 @@
-"""Isolated Subprocess Harness backend（v0.32.0）。
+"""Isolated Subprocess Harness backend（v0.34.0）。
 
 通过启动一个受限 Python 子进程执行工具，用于开发、CI 和低敏感生产场景。
 不保证完整容器级隔离；只提供进程级隔离与受限 builtins。
+
+v0.34.0 增加资源限制（Linux/macOS）与输出大小截断（全平台）。
 """
 
 from __future__ import annotations
@@ -11,7 +13,11 @@ import logging
 import os
 import sys
 import tempfile
+from functools import partial
 from typing import Any
+
+if sys.platform != "win32":
+    import resource
 
 from loop_controller.executors.harness_models import IsolatedSubprocessBackendConfig
 from loop_controller.executors.harness_protocol import (
@@ -116,6 +122,29 @@ if __name__ == "__main__":
 '''
 
 
+def _set_resource_limits(max_memory_bytes: int | None, cpu_seconds: float | None) -> None:
+    """在子进程启动前设置 RLIMIT_AS / RLIMIT_CPU（Linux / macOS）。"""
+    if sys.platform == "win32":
+        return
+    try:
+        if max_memory_bytes is not None:
+            resource.setrlimit(resource.RLIMIT_AS, (max_memory_bytes, max_memory_bytes))
+        if cpu_seconds is not None:
+            sec = max(1, int(cpu_seconds))
+            resource.setrlimit(resource.RLIMIT_CPU, (sec, sec))
+    except (OSError, ValueError) as exc:
+        logger.warning("无法设置子进程资源限制: %s", exc)
+
+
+def _truncate_output(data: bytes, max_bytes: int) -> tuple[str, bool]:
+    """将字节输出截断到指定长度并返回文本与是否截断。"""
+    truncated = len(data) > max_bytes
+    text = data[:max_bytes].decode("utf-8", errors="replace")
+    if truncated:
+        text += "\n...[truncated by harness]"
+    return text, truncated
+
+
 class IsolatedSubprocessHarnessBackend:
     """受限子进程 Harness backend。"""
 
@@ -174,12 +203,24 @@ class IsolatedSubprocessHarnessBackend:
             safe_env = {"PATH": os.environ.get("PATH", "")}
             if self.config.env:
                 safe_env.update(self.config.env)
+            max_output = sandbox.max_output_bytes if sandbox else 64 * 1024
+            max_memory = None
+            cpu_seconds = None
+            if sandbox is not None and sandbox.resource_limits is not None:
+                max_memory = sandbox.resource_limits.max_memory_bytes
+                cpu_seconds = sandbox.resource_limits.cpu_seconds
+
+            preexec_fn = None
+            if sys.platform != "win32":
+                preexec_fn = partial(_set_resource_limits, max_memory, cpu_seconds)
+
             proc = await asyncio.create_subprocess_exec(
                 self._python, runner_path,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=safe_env,
+                preexec_fn=preexec_fn,
             )
             input_bytes = request.model_dump_json().encode("utf-8")
             try:
@@ -190,8 +231,16 @@ class IsolatedSubprocessHarnessBackend:
                 return _HTTPHarnessClient._error_result(
                     context, tool_name, "子进程执行超时", "harness_timeout",
                 )
+
+            stdout_text, stdout_truncated = _truncate_output(stdout, max_output)
+            if stdout_truncated:
+                logger.warning(
+                    "harness %s stdout 超过 max_output_bytes=%d，已截断",
+                    tool_name, max_output,
+                )
+
             try:
-                response = HarnessExecuteResponse.model_validate_json(stdout.decode("utf-8", errors="replace"))
+                response = HarnessExecuteResponse.model_validate_json(stdout_text)
             except Exception as exc:
                 logger.warning("isolated_subprocess 返回非法 JSON: %s", exc)
                 return _HTTPHarnessClient._error_result(

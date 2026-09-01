@@ -73,6 +73,10 @@ $RECYCLE.BIN/
 dmypy.json
 .ruff_cache/
 
+# Go
+/bin/
+go/bin/
+
 # Project specific: large embedded dependencies
 mcp_servers_official/
 *.zip

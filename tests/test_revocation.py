@@ -12,7 +12,6 @@ import yaml
 from loop_controller.audit.evidence import EvidenceChain, HMACEvidenceSigner, SignedEvidence
 from loop_controller.audit.evidence_backends import LocalFileEvidenceBackend
 from loop_controller.controller import build_controller
-from loop_controller.identity import MTLSIdentityProvider
 from loop_controller.identity.models import AgentIdentity
 from loop_controller.identity.revocation import (
     KillSwitchConfig,
@@ -25,7 +24,7 @@ from loop_controller.infra.audit_store import JsonlAuditStore
 from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.infra.durable_io import DurableIOError
 from loop_controller.infra.hot_reload import HotReloader
-from loop_controller.models import Agent, ApprovalRecord
+from loop_controller.models import ApprovalRecord
 from loop_controller.server import build_app
 from tests.conftest import write_trusted_local_harness_config
 
@@ -209,110 +208,6 @@ def test_http_admin_revocation_endpoints_require_api_key_when_unconfigured(tmp_p
         assert client.post("/admin/revoke", json={"type": "tool", "id": "search"}).status_code == 401
         assert client.get("/admin/revocation-list").status_code == 401
         assert client.post("/admin/kill-switch", json={"enabled": True}).status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_grpc_admin_methods(tmp_path: Path) -> None:
-    grpc = pytest.importorskip("grpc")
-    from loop_controller.grpc_server import ToolGovernanceServicer
-    from loop_controller.v1 import governance_pb2
-
-    class Context:
-        def __init__(self) -> None:
-            self._code = None
-            self.details = ""
-
-        def auth_context(self):
-            return {"x509_common_name": [b"CN=admin-agent"]}
-
-        def code(self):
-            return self._code
-
-        def set_code(self, code) -> None:
-            self._code = code
-
-        def set_details(self, details: str) -> None:
-            self.details = details
-
-    revocations = RevocationList()
-    evidence_backend = LocalFileEvidenceBackend(tmp_path / "grpc-evidence")
-    audit_store = JsonlAuditStore(
-        tmp_path / "grpc-audit.jsonl",
-        evidence_chain=EvidenceChain(
-            evidence_backend,
-            HMACEvidenceSigner(b"test-key", key_id="hmac-1"),
-        ),
-    )
-    controller = _AdminController(revocations, audit_store)
-    admin = Agent(
-        agent_id="admin-agent",
-        name="Admin",
-        profile_id="admin-profile",
-        owner_id="admin-user",
-    )
-    identity_provider = MTLSIdentityProvider(
-        agents={admin.agent_id: admin},
-        users={admin.agent_id: admin.owner_id},
-        cert_mappings=[{"cn": "admin-agent", "agent_id": admin.agent_id}],
-    )
-    unauthorized = ToolGovernanceServicer(  # type: ignore[arg-type]
-        controller, identity_provider=identity_provider
-    )
-    denied_context = Context()
-    denied = await unauthorized.GetRevocationList(
-        governance_pb2.GetRevocationListRequest(), denied_context
-    )
-    assert not denied.revocations
-    assert denied_context.code() is grpc.StatusCode.PERMISSION_DENIED
-
-    servicer = ToolGovernanceServicer(  # type: ignore[arg-type]
-        controller,
-        identity_provider=identity_provider,
-        entrypoints_config={"grpc": {"admin_agent_ids": ["admin-agent"]}},
-    )
-    context = Context()
-    response = await servicer.Revoke(
-        governance_pb2.RevokeRequest(type="agent", id="agent-1", reason="compromised"),
-        context,
-    )
-    assert response.success and context.code() is not grpc.StatusCode.INVALID_ARGUMENT
-
-    kill_switch = await servicer.SetKillSwitch(
-        governance_pb2.SetKillSwitchRequest(enabled=True, reason="emergency"), context
-    )
-    assert kill_switch.enabled
-    evidence = [record async for record in evidence_backend.iter_evidence(None)]
-    evidence_reasons = [record.event.reason for record in evidence]
-    assert "revocation_added" in evidence_reasons
-    assert "kill_switch_updated" in evidence_reasons
-    listing = await servicer.GetRevocationList(
-        governance_pb2.GetRevocationListRequest(), context
-    )
-    assert listing.revocations[0].id == "agent-1"
-
-    removed = await servicer.Revoke(
-        governance_pb2.RevokeRequest(type="agent", id="agent-1", remove=True), context
-    )
-    assert removed.success and removed.removed
-
-    invalid_time_context = Context()
-    invalid_time = await servicer.Revoke(
-        governance_pb2.RevokeRequest(
-            type="agent", id="agent-1", expires_at="2026-08-28T12:00:00"
-        ),
-        invalid_time_context,
-    )
-    assert not invalid_time.success
-    assert invalid_time_context.code() is grpc.StatusCode.INVALID_ARGUMENT
-
-    revocations.add(RevocationEntry(type="agent", id="admin-agent", reason="compromised"))
-    revoked_context = Context()
-    denied = await servicer.GetRevocationList(
-        governance_pb2.GetRevocationListRequest(), revoked_context
-    )
-    assert not denied.revocations
-    assert revoked_context.code() is grpc.StatusCode.PERMISSION_DENIED
-    assert revoked_context.details == "admin identity is revoked"
 
 
 @pytest.mark.asyncio

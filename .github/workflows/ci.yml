@@ -27,7 +27,7 @@ jobs:
       - name: Mypy type check
         run: uv run mypy src
 
-  test:
+  unit:
     runs-on: ubuntu-latest
     needs: lint
     steps:
@@ -42,6 +42,33 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --dev
 
+      - name: Install server extras
+        run: uv pip install -e ".[server]"
+
+      - name: Run unit tests
+        run: uv run pytest tests/ -q -m "not integration"
+        env:
+          LOOP_CONTROLLER_AUDIT_HMAC_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: unit
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.6.x"
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --dev
+
+      - name: Install server extras
+        run: uv pip install -e ".[server]"
+
       - name: Download OPA
         run: |
           mkdir -p tools
@@ -53,8 +80,8 @@ jobs:
           test -x tools/opa
           ./tools/opa version
 
-      - name: Run tests
-        run: uv run pytest tests/ -q
+      - name: Run integration tests
+        run: uv run pytest tests/integration -q -m integration
         env:
           OPA_PATH: tools/opa
           LOOP_CONTROLLER_AUDIT_HMAC_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

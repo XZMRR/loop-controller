@@ -19,9 +19,8 @@ server = [
     "uvicorn>=0.30",
     "prometheus-client>=0.20",
 ]
-grpc = [
-    "grpcio>=1.68",
-    "grpcio-tools>=1.68",
+langchain = [
+    "langchain_core>=0.1.0",
 ]
 
 [project.scripts]
@@ -31,12 +30,11 @@ lc = "loop_controller.cli:main"
 dev = [
     "mypy>=2.3.0",
     "pre-commit>=4.6.1",
+    "psutil>=7.2.2",
     "pytest>=9.1.1",
     "pytest-asyncio>=0.23",
     "ruff>=0.16.1",
     "types-pyyaml>=6.0.12.20260815",
-    "grpcio-tools>=1.68",
-    "mypy-protobuf>=5.1.0",
 ]
 
 [[tool.uv.index]]
@@ -54,9 +52,7 @@ select = ["E", "F", "W", "I", "N", "UP"]
 ignore = ["E501", "ANN", "D", "BLE"]
 exclude = ["src/loop_controller/v1/*"]
 [tool.ruff.lint.per-file-ignores]
-"src/loop_controller/grpc_server.py" = ["N802"]
 "src/loop_controller/checkpoint.py" = ["N818"]
-"tests/test_grpc_server.py" = ["N802"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -66,15 +62,14 @@ disallow_untyped_defs = false
 exclude = ["src/loop_controller/v1/", "examples/contrib/adapters/"]
 
 [[tool.mypy.overrides]]
-module = ["langchain_core.*", "grpc.*", "google.protobuf.*"]
+module = ["langchain_core.*"]
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["loop_controller.grpc_server", "loop_controller.grpc_client"]
-ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 asyncio_mode = "auto"
 norecursedirs = ["legacy", "data", "venv", "__pycache__"]
+markers = [
+    "integration: 集成测试，需要 OPA/真实子进程/MCP server",
+]

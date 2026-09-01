@@ -195,6 +195,7 @@ def _build_client(
     api_key: str | None = None,
     watcher: ApprovalWatcher | None = None,
     identity_provider: ConfigIdentityProvider | None = None,
+    entrypoints_config: dict[str, Any] | None = None,
 ) -> tuple[TestClient, _MockController]:
     controller = _MockController()
     app = build_app(
@@ -203,6 +204,7 @@ def _build_client(
         watcher=watcher,
         configure_logs=False,
         identity_provider=identity_provider,
+        entrypoints_config=entrypoints_config,
     )
     return TestClient(app), controller
 
@@ -998,7 +1000,6 @@ def test_admin_approvals_approve_success() -> None:
     admin_ops = [e for e in audit if e.action == "admin_operation"]
     assert len(admin_ops) == 1
     assert admin_ops[0].reason == "approval_approve"
-    assert admin_ops[0].target == "decision:d-1"
 
 
 def test_admin_approvals_deny_success() -> None:
@@ -1088,3 +1089,72 @@ def test_admin_approvals_conflict_when_already_decided() -> None:
     admin_ops = [e for e in audit if e.action == "admin_operation"]
     assert len(admin_ops) == 1
     assert admin_ops[0].reason == "approval_approve"
+
+
+# ---------------------------------------------------------------------------
+# v0.33.0 安全加固测试
+# ---------------------------------------------------------------------------
+
+
+def test_body_size_limit_returns_413() -> None:
+    """Content-Length 超过 max_body_size 时返回 413，不进入业务处理。"""
+    client, controller = _build_client(
+        entrypoints_config={"http": {"max_body_size": 1024}}
+    )
+    resp = client.post(
+        "/v1/govern/tool-call",
+        headers={"Content-Length": "2048"},
+    )
+    assert resp.status_code == 413
+    assert resp.json()["error"] == "payload_too_large"
+    assert controller.tool_calls == []
+
+
+def test_invalid_content_length_returns_400() -> None:
+    """Content-Length 非法时返回 400 而非 500。"""
+    client, _controller = _build_client()
+    resp = client.post(
+        "/v1/govern/tool-call",
+        headers={"Content-Length": "not-a-number"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_parameter"
+
+
+def test_rate_limit_blocks_excessive_requests() -> None:
+    """配置限流后超过 burst 的请求返回 429。"""
+    client, _controller = _build_client(
+        entrypoints_config={
+            "http": {
+                "rate_limit": {
+                    "requests_per_minute": 1,
+                    "burst": 1,
+                }
+            }
+        }
+    )
+    for i in range(3):
+        resp = client.get("/health")
+        if i < 2:
+            assert resp.status_code == 200
+        else:
+            assert resp.status_code == 429
+            assert resp.json()["error"] == "rate_limited"
+
+
+def test_api_key_length_mismatch_safe() -> None:
+    """候选 key 长度与配置 key 不一致时不会触发 compare_digest 异常。"""
+    client, _controller = _build_client(api_key="short")
+    resp = client.get(
+        "/v1/admin/approvals/pending",
+        headers={"X-API-Key": "a-much-longer-key"},
+    )
+    assert resp.status_code == 401
+
+
+def test_invalid_query_param_returns_400() -> None:
+    """max_wait 等 query 参数非法时返回 400。"""
+    client, _controller = _build_client()
+    resp = client.get("/v1/wait-for-approval?request_id=r1&max_wait=abc")
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_parameter"

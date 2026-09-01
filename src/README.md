@@ -1,6 +1,10 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.29.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环；v0.28.0 为审计/证据链引入外部可信锚点，v0.29.0 修复人工审批跨进程闭环失效与预算/决策状态泄漏，让"审批 → 恢复执行"在任何部署形态下都可靠闭环。
+企业级 AI Agent 治理层（v0.33.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环。
+
+**v0.33.0 战略方向**：在 v0.32.0 接入方式收敛的基础上，本版本聚焦**Python 工具治理层的健壮性加固**：堵住 Agent SDK、MCP Proxy、HTTP REST API 与配置校验中当前最危险的安全、稳定与正确性漏洞，使 `@governed` 主路线和网络接入面达到可生产部署基线。HTTP REST API 与 MCP Proxy 继续作为**网关/强制约束层**保留，用于外部不可控 Agent 或跨语言接入；FastAPI 与 gRPC 接入已从核心包移除，LangChain 集成降级为 `examples/integrations/` 可选示例。
+
+v0.28.0 为审计/证据链引入外部可信锚点；v0.29.0 修复人工审批跨进程闭环失效与预算/决策状态泄漏；v0.32.0 重点完善 Agent 主动接入体验，并通过 22 个集成测试覆盖 `@governed`、hook 注册表、审批流、审批后自动重试、多步骤工作流、MCP Proxy、LangChain 等真实场景；v0.33.0 进一步补齐 SDK 并发安全、API 入口防御、错误响应脱敏、admin 权限隔离与 CI 分层验证。
 
 **核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为工具调用治理控制平面，是所有经治理工具调用的**唯一授权出口**。
 
@@ -23,7 +27,13 @@
 - **本地签名证据链**（v0.26.1）：审计事件可写入 HMAC-SHA256 或 Ed25519 签名的链式 JSONL 证据；异步写入保持单进程有序，并通过审计—证据交叉校验和签名本地 checkpoint 检测单边丢失与相对回退；
 - **外部可信锚点**（v0.28.0）：checkpoint 成功后向远程锚点服务发布当前链状态，获取 Ed25519 签名的 receipt；启动时交叉验证远程最新锚点与本地证据/审计；冲突/回滚时进入写阻断并告警；提供 Admin 端点用于 verify / publish / bootstrap；
 - **审批与状态恢复闭环**（v0.29.0）：审批结果通过增量 `refresh()` 对运行中的 Runtime 可见，CLI 与 Admin 端点复用统一校验；审批记录不可覆盖；`portalocker` 跨进程锁保护追加写；启动期清扫过期预算预留；Decision 状态机与 `finalized` 持久化防止重复消费。
-- **网络级治理入口**（v0.20.0）：HTTP、gRPC、MCP Proxy 作为生产入口，Agent 不直接持有工具凭证。
+- **Agent 主动接入体验**（v0.32.0）：`@governed` 装饰器支持同步/异步函数、`hook_tool_registry` 批量治理注册表、保留参数 `_loop_controller_session_id/task_id/task_context` 透传治理上下文；`require_approval` 支持阻塞等待审批后自动重试并返回执行结果。
+- **网络级治理入口**：HTTP REST API、MCP Proxy 作为网关/强制约束层保留；gRPC 与 FastAPI 集成已移除核心包。
+- **API 入口防御性中间件**（v0.33.0）：HTTP 服务增加请求体大小限制、可配置限流、CORS 来源校验与全局异常处理器；MCP Proxy 增加 SSE 并发上限、请求体限制、限流与错误响应脱敏，避免内部信息泄露与 DoS。
+- **SDK 并发安全与 fail-closed**（v0.33.0）：`GovernanceRuntime` 改用 `ContextVar` 隔离运行时上下文；`GovernanceResult` 内部引用改为 `PrivateAttr`，避免深拷贝与序列化泄露；`hook_tool_registry` 两阶段原子替换，失败回滚；`wait_for_approval` 超时后清理审批请求。
+- **admin 工具权限隔离**（v0.33.0）：kill_switch、revoke 等 admin 工具仅在调用 agent 的 `profile_id` 属于 `entrypoints.admin.agent_profiles` 白名单时才允许执行，默认关闭。
+- **配置校验 fail-closed**（v0.33.0）：`_check_dirs_writable` 覆盖所有持久化路径；配置加载的 `ValidationError` 统一包装为 `ConfigValidationError`；OPA fixture 通过子进程端口探测消除端口抢占 TOCTOU。
+- **CI 分层**（v0.33.0）：单元测试与集成测试拆分为独立 job，integration job 限定 `pytest tests/integration -m integration` 并加 30 分钟超时。
 
 ## 架构
 
@@ -47,15 +57,23 @@ R3 AuditStore：异步全量记录 + 哈希链 + 可选本地签名证据链 + �
 R0 AsyncApprovalManager：异步审批请求持久化，审批人通过 `lc` CLI 写入结果
 ```
 
-## 接入形态（v0.20.0）
+## 接入形态（v0.33.0）
 
-| 形态 | 定位 | 生产可用性 | 说明 |
-|---|---|---|---|
-| **HTTP 服务** | 生产主推入口 | 是 | Agent 通过 REST API 调用，支持 JWT 认证 |
-| **gRPC 服务** | 生产主推入口（内部服务间） | 是 | 强类型、高性能，支持 mTLS |
-| **MCP Proxy** | 兼容入口（外部标准 MCP Client） | 是 | 对 Agent 透明，生产推荐 SSE + mTLS |
-| **Python SDK / ToolGovernor** | 内部开发/可信 Agent | 协作式 | 同进程，不承诺实时阻断 |
-| **Framework Adapters** | 迁移示例 | 否 | 已移出核心包，见 `examples/contrib/adapters/` |
+| 形态 | 定位 | 方向 | 成熟度 | 说明 |
+|---|---|---|---|---|
+| **Python SDK `@governed`** | **主路线 / 推荐** | 主动接入 | 高 | 装饰同步/异步函数，调用自动提交 Loop Controller；支持 `hook_tool_registry` 批量治理；`require_approval` 可阻塞等待审批后自动重试 |
+| **HTTP REST API** | 生产入口 / 管理面 | 网关/强制约束 | 高 | Agent 通过 REST 调用，支持 JWT/API Key；含完整 admin 审批/审计接口 |
+| **MCP Proxy** | 兼容入口 | 网关/强制约束 | 高 | 对标准 MCP Client 透明，支持 stdio/SSE、mTLS、审批恢复 |
+| **LangChain 集成** | 可选示例 | 主动接入示例 | 中 | 已移出核心包，见 `examples/integrations/langchain_example.py`；依赖可选 `langchain_core` |
+
+**已移除**：
+
+- **FastAPI 集成**：`GovernedFastAPI` / `governed_route` 已移除，HTTP REST API 覆盖同样场景。
+- **gRPC 服务**：`grpc_server` / `grpc_client` / `lc grpc-server` 已移除，HTTP REST API 覆盖同样场景。
+
+**方向说明**：
+- **主动接入**：Agent 主动调用 SDK 或装饰器，把每次工具调用提交给 Loop Controller。这是我们认定的主路线，控制权在 Agent 侧，错误语义最清晰。
+- **网关/强制约束**：Loop Controller 作为网络代理或网关，对不感知治理的外部 Agent 做强制拦截。用于不可控 Agent、跨语言、遗留系统接入。
 
 ## 快速开始
 
@@ -82,7 +100,7 @@ export LOOP_CONTROLLER_EVIDENCE_PRIVATE_KEY=$(openssl rand -base64 32)
 opa run --server --addr localhost:8181 policies/
 
 # 5. 跑端到端示例（研究助手：搜索 → 读知识库 → 写摘要 → 暂停待审批）
-python examples/research_agent_example.py
+python examples/research_agent.py
 
 # 示例会在 send_email 前暂停并返回 needs_approval；另开终端审批后继续：
 # lc approvals list --config-dir config
@@ -124,7 +142,7 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 | `masking_rules.yaml` | 审计/审批的分级掩码规则 |
 | `approval.yaml` | 审批人默认与规则（用于确定 escalation_target） |
 | `identity.yaml` | 身份 Provider 配置（static / jwt / mtls） |
-| `entrypoints.yaml` | HTTP/gRPC/MCP Proxy 入口认证方式与开关 |
+| `entrypoints.yaml` | HTTP/MCP Proxy 入口认证方式与开关 |
 | `harness_tools.yaml` | Harness 后端与工具配置（v0.27.0，默认注释；生产模板为 HTTPS + HMAC + 健康检查） |
 | `revocation.yaml` | 全局吊销列表与 Kill Switch（v0.26.0，支持热更新） |
 | `evidence.yaml` | 本地签名证据链后端与锚点配置（v0.28.0） |
@@ -132,7 +150,16 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 
 ## 已知局限
 
-**本项目当前为 v0.28.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：Harness 默认不启用；生产仅推荐独立 HTTPS HTTP Harness，参考服务和 subprocess 都不是生产沙箱；并发门控、防重放 nonce store、吊销状态与本地 JSONL 写入均是单进程/单实例语义。远程调用超时后的执行结果可能未知且不会自动重试；远程取消、跨实例长期幂等和分布式配额尚未实现；Harness 只读 Admin 状态端点复用现有 API key 鉴权，专用调用/排队/过载/in-flight/健康指标已接入 Prometheus。签名本地 checkpoint 可通过外部可信锚点获得 Ed25519 receipt，但锚点服务本身是外部独立可信系统；KMS/HSM、远程证据存储、多签 receipt 和完整多租户隔离也尚未实现。
+**本项目当前为 v0.33.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：
+
+- **接入方式已收敛**：v0.32.0 已移除 FastAPI 集成与 gRPC 服务，LangChain 集成降级为 `examples/integrations/langchain_example.py` 可选示例；核心包只保留 `@governed`（主路线）、HTTP REST API、MCP Proxy 三种工具接入方式。v0.33.0 对三条接入线都做了健壮性加固，但网关层的限流、请求体限制仍为单进程内存实现，未提供分布式限流。
+- **Harness 默认不启用**：生产仅推荐独立 HTTPS HTTP Harness，参考服务和 subprocess 都不是生产沙箱。
+- **单进程/单实例语义**：并发门控、防重放 nonce store、吊销状态与本地 JSONL 写入均未实现分布式。
+- **主动接入**：`@governed` 已支持 `wait_for_approval=True` 阻塞等待审批后自动重试；默认行为保持返回 `GovernanceResult`，由调用方自行处理。
+- **远程调用**：超时后的执行结果可能未知且不会自动重试；远程取消、跨实例长期幂等和分布式配额尚未实现。
+- **Admin 鉴权**：HTTP Admin API 已升级为 API Key + `hmac.compare_digest` 安全比较；admin 工具（kill_switch、revoke 等）在 MCP Proxy 中已按 agent profile 白名单隔离。Harness 只读 Admin 状态端点仍复用现有 API key，未实现基于角色的细粒度授权。
+- **审计与证据链**：签名本地 checkpoint 可通过外部可信锚点获得 Ed25519 receipt，但锚点服务本身是外部独立可信系统；KMS/HSM、远程证据存储、多签 receipt 和完整多租户隔离也尚未实现。
+- **mTLS fallback 加固**：v0.33.0 已禁止在服务端要求客户端证书但未成功提取身份时 fallback 到默认身份；生产部署仍需正确配置 TLS termination 与 `client_ca_cert`。
 
 ## 文档
 
@@ -147,7 +174,10 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `loop_controller_v0.26.1_development.md`——v0.26.1 吊销、Kill Switch 与证据链可靠性修复
 - `loop_controller_v0.27.0_development.md`——v0.27.0 Harness 生产闭环
 - `loop_controller_v0.28.0_development.md`——v0.28.0 可信锚点与审计链外部闭环
-- `loop_controller_v0.29.0_development.md`——v0.29.0 审批与状态恢复闭环（当前版本依据）
+- `loop_controller_v0.29.0_development.md`——v0.29.0 审批与状态恢复闭环
+- `loop_controller_v0.31.0_development.md`——v0.31.0 外部工具执行沙箱（Harness）
+- `loop_controller_v0.32.0_development.md`——v0.32.0 Agent 接入体验优化与接入方式收敛
+- `loop_controller_v0.33.0_development.md`——v0.33.0 工具治理层健壮性加固：SDK 与 API 入口安全（当前版本依据）
 - `development_log.md`——开发记录与决策追溯
 - `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
 - `answer.md`——MVP 审查分析与修复状态追踪

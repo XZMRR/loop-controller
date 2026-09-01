@@ -1,138 +1,124 @@
-# v0.32.0 Agent 接入体验优化与 Harness 后端完善
+# v0.32.0 接入方式收敛与审批后自动重试
 
-> 一句话目标：**让愿意接入 Loop Controller 的 Agent 以最低成本获得完整治理，补齐 MCP Proxy 的运维与审计能力，并完成 v0.31.0 声明但未实现的 Docker / Isolated Subprocess Harness backend。**
+> 一句话目标：**把 Loop Controller 的接入面收敛到三种工具接入方式，确认 `@governed` 主动接入为主路线；补齐 `@governed` 审批后自动重试能力，使 Agent 在 `require_approval` 后能够阻塞等待审批结果并继续执行。**
 >
-> 范围限定：本版本只服务“主动接入”的 Agent；不配合 Agent 的进程外约束、运行时沙箱、SaaS 控制台均不在本版本范围内。
+> 范围限定：本版本只完善"主动接入"与"网关接入"两条线；Agent 交互治理（A2A/Go 内核）不在本版本范围内。
 
 - 状态：**已完成**
 - 前置版本：v0.31.0 外部工具执行沙箱（Harness）
-- 版本性质：接入层体验与后端完善
-- 核心范围：ToolGovernor SDK 友好化、MCP Proxy 运维工具、Harness backend 完善、接入示例
-- 验证目标：pytest 全绿 / ruff 通过 / mypy 通过 / 提供至少 3 个 Agent 接入示例
+- 版本性质：接入层收敛与主路线体验收尾
+- 核心范围：接入方式收敛、`@governed` 审批后自动重试、集成测试补强
+- 验证目标：`pytest tests/integration -m integration -v` 全绿、`pytest tests -m "not integration" -q` 无新增失败、ruff 通过
+
+**v0.32.0 验证结果：**
+
+- `pytest tests/integration -m integration -q`：**22 passed**（当前环境已安装 `langchain_core`；未安装时为 21 passed, 1 skipped）。
+  - `@governed` 端到端、hook 注册表、审批流、**审批后自动重试**、审计、多步骤工作流、session 隔离、本地函数异常/超时；
+  - MCP Proxy 工具发现/执行、require_approval、deny、参数错误、approval_status、admin status；
+  - LangChain 单 tool / 多步工作流 / require_approval（作为 `@governed` 的示例应用）。
+- `pytest tests -m "not integration" -q`：**738 passed, 4 skipped, 22 deselected**。
+- `python -m ruff check src tests`：**All checks passed**。
 
 ---
 
 ## 1. 背景
 
-v0.31.0 已经把 Harness 变成治理入口上的默认执行模式：任何经过 ToolGovernor / MCP Proxy / HTTP / gRPC 进入 Loop Controller 的敏感工具调用，默认走 Harness 沙箱。
+v0.31.0 已经把 Harness 变成治理入口上的默认执行模式。v0.32.0 前期完成了 `@governed` 装饰器、MCP Proxy、LangChain/FastAPI 示例、Harness backend 等能力。
 
-但 v0.31.0 留下几个明显问题：
+但随着接入方式增多，项目出现两个必须解决的问题：
 
-1. **接入成本高**：ToolGovernor SDK 要求 Agent 在每个调用点改成 `tool_governor.call(...)`，对复杂 Agent（如 Trae、LangChain Agent、FastAPI 服务）改造量大；
-2. **MCP Proxy 接入隐性成本高**：需要把内置工具、Skill 工具、子 Agent 工具都包装成 MCP server，工程量大；
-3. **MCP Proxy 缺少运维能力**：没有 admin/审计类 MCP tool，运维人员无法通过 MCP 入口查看后端状态、审批记录、证据链；
-4. **Harness backend 不完整**：配置模型已声明 Docker / Isolated Subprocess backend，但运行时只支持 `http` / `subprocess`；
-5. **缺少接入示例**：没有针对常见 Agent 框架（LangChain、FastAPI、函数式 Agent）的示例，新用户不知道从何开始。
+1. **接入面过于发散**：当前存在 `@governed`、MCP Proxy、HTTP、gRPC、FastAPI、LangChain 六种接入形态，导致用户选择困难、文档边界不清、维护成本高。
+2. **`@governed` 主路线未收尾**：`require_approval` 时只返回 `GovernanceResult`，Agent 需要手动处理审批恢复，没有内置的阻塞等待/自动重试机制，真实 Agent 难以使用。
 
-v0.32.0 不新增治理规则，而是**把“接入 Loop Controller”这件事从工程挑战变成基础设施配置**。
+v0.32.0 后半段的目标是：
+
+- **收敛接入方式**：只保留 `@governed`（主路线）、MCP Proxy（网关）、HTTP REST API（跨语言）。
+- **移除冗余**：删除 FastAPI 集成、删除 gRPC 服务、将 LangChain 集成降级为可选示例。
+- **补齐主路线体验**：实现 `@governed` 审批后阻塞等待/自动重试，让 Agent 代码在 `require_approval` 后像普通函数一样继续执行。
 
 ---
 
 ## 2. 当前问题清单
 
-### P0-1：ToolGovernor SDK 要求改造每个调用点
+### P0-1：接入方式过多，边界不清
 
-当前使用方式：
+当前接入方式：
+
+- `@governed`：Python 主动接入
+- MCP Proxy：标准 MCP Client 网关
+- HTTP REST API：跨语言接入
+- gRPC：可选跨语言接入
+- FastAPI 集成：HTTP 路由装饰器
+- LangChain 集成：框架适配
+
+问题：
+
+- 用户不知道选哪个；
+- 文档需要维护六种方式；
+- FastAPI/gRPC 与 HTTP/MCP 功能重叠；
+- 与后续 Agent 交互治理（A2A/Go 内核）的边界不清。
+
+### P0-2：`@governed` 审批恢复不完整
+
+当前行为：
 
 ```python
-# Agent 原来
-result = write_file(path, content)
+@governed(tool_name="send_email")
+async def send_email(...):
+    ...
 
-# 改造后
-result = await tool_governor.call("write_file", {"path": path, "content": content})
+result = await send_email(...)
+if result.status == "require_approval":
+    # Agent 需要手动轮询 approval_status，然后在某处重新调用
 ```
 
 问题：
 
-- 调用点分散，复杂 Agent 可能有几十个；
-- Trae 这类 IDE-Agent 改造风险高，容易改坏；
-- Agent 开发者需要手动处理参数打包/解包、async/sync 边界。
+- Agent 代码需要分叉处理 `allow` 和 `require_approval`；
+- 审批通过后 Agent 需要主动重试；
+- 没有统一的等待/恢复抽象。
 
-### P0-2：MCP Proxy 缺少运维与审计工具
+### P1-1：FastAPI 集成价值低
 
-当前 MCP Proxy 只提供正向工具转发能力，缺少：
+`GovernedFastAPI` 当前基本是空壳，`governed_route` 把 HTTP body 整体当工具参数，与真实 FastAPI 用法冲突。
 
-- 查询 Harness backend 健康状态；
-- 对 backend drain/reset；
-- 查询最近审批、decision 状态；
-- 查询 evidence / audit 摘要；
-- kill switch / revocation 管理。
+### P1-2：gRPC 服务维护成本高
 
-这导致一旦 Agent 通过 MCP Proxy 接入，运维人员必须同时维护 HTTP / gRPC admin 入口，增加了运营复杂度。
+gRPC 是可选依赖，管理接口未与 HTTP REST 对齐，HTTP 已覆盖同样场景。
 
-### P0-3：Docker / Isolated Subprocess backend 未实现
+### P1-3：LangChain 集成不应作为独立模块
 
-v0.31.0 配置模型 `HarnessBackendConfig` 已声明：
-
-- `docker` backend；
-- `isolated_subprocess` backend。
-
-但 `HarnessExecutor._build_backend()` 只实现了 `http` 和 `subprocess`。
-
-风险：
-
-- `subprocess` backend 隔离性弱，只能用于开发测试；
-- 没有 Docker backend，生产环境必须依赖外部 HTTP Harness 服务；
-- 配置模型与实际能力不一致，用户会被误导。
-
-### P0-4：没有面向常见 Agent 框架的接入示例
-
-常见 Agent 框架：
-
-- LangChain / LangGraph；
-- FastAPI 服务；
-- 函数式工具 Agent；
-- 已有统一 `tool_registry` 的自定义 Agent。
-
-缺少示例导致：
-
-- 用户不知道选哪种接入方式；
-- 不清楚如何最小化改造；
-- 不知道生产环境推荐配置。
-
-### P1-1：接入方式选择没有指导
-
-Agent 开发者面对 ToolGovernor SDK、MCP Proxy、HTTP、gRPC 四种入口，不知道：
-
-- 哪种适合自己的 Agent；
-- 每种方式的改造成本；
-- 生产环境推荐组合。
+LangChain 集成只是 `@governed` 在 LangChain 工具上的一种应用，不应与 `@governed` 并列。
 
 ---
 
 ## 3. 设计原则
 
-### 3.1 接入成本最低优先
+### 3.1 接入方式收敛为三种
 
-- 优先让 Agent 在**工具定义处**完成治理接入，而不是改造每个调用点；
-- 优先支持“一行代码 hook 整个工具注册表”的方式；
-- 只有当工具调用已经自然经过某个入口时，才推荐该入口（如 MCP tool 用 MCP Proxy，HTTP API 用 HTTP 入口）。
+| 接入方式 | 面向 Agent | 定位 |
+|---|---|---|
+| `@governed` | Python 自研 Agent | **主路线：主动接入** |
+| MCP Proxy | 标准 MCP Client（Cursor、Claude Desktop） | 网关/强制约束 |
+| HTTP REST API | 跨语言 Agent / 遗留系统 | 通用协议接入 |
 
-### 3.2 不新增接入方式，强化现有方式
+其他方式：
 
-v0.32.0 不引入新的接入协议，而是让现有接入方式更易用：
+- FastAPI 集成：移除；HTTP REST API 已覆盖服务端接入。
+- gRPC 服务：移除；HTTP 已覆盖跨语言接入。
+- LangChain 集成：降级为 `examples/` 或 `tests/integration/` 中的可选示例，不作为核心包维护。
 
-- ToolGovernor SDK：通过装饰器和注册表 Hook 降低改造量；
-- MCP Proxy：补齐 admin/审计工具；
-- HTTP / gRPC：保持现状，作为多语言和已有 HTTP 链路的选项。
+### 3.2 `@governed` 是主路线，必须能跑通完整审批流
 
-### 3.3 MCP Proxy 是可选补充，不是默认推荐
+Agent 调用被治理函数时，应该像调用普通函数一样简单：
 
-- 只有当 Agent 的工具栈已经是 MCP 形态时，才推荐 MCP Proxy；
-- 不要把复杂 Agent 的内置工具、Skill 工具、子 Agent 工具强制包装成 MCP server；
-- 文档中明确说明各种接入方式的适用场景。
+```python
+result = await send_email(...)  # require_approval 时自动等待审批并返回执行结果
+```
 
-### 3.4 后端完善是生产前提
+### 3.3 不破坏现有稳定能力
 
-- 必须实现 Docker backend，让 Harness 能在生产环境单机部署；
-- 必须实现 Isolated Subprocess backend，作为跨平台开发和 CI 兜底；
-- `subprocess` backend 明确标注为“仅开发测试”。
-
-### 3.5 示例即文档
-
-- 每个接入方式至少有一个可运行的最小示例；
-- 示例覆盖函数式 Agent、LangChain、FastAPI；
-- 示例同时展示开发和生产配置差异。
+MCP Proxy、HTTP REST API、Harness backend 保持可用；清理工作通过删除模块和依赖完成，不改动核心治理逻辑。
 
 ---
 
@@ -141,24 +127,24 @@ v0.32.0 不引入新的接入协议，而是让现有接入方式更易用：
 ```text
 Agent 代码
     │
-    ├─ 工具函数定义处：@governed 装饰器
+    ├─ Python 自研 Agent：@governed 装饰器 / hook_tool_registry
     │
-    ├─ Agent 启动时：GovernanceRuntime.hook_tool_registry(agent.tool_registry)
+    ├─ 标准 MCP Client Agent：MCP Proxy
     │
-    └─ 自然走 MCP 的工具：MCP Proxy
+    └─ 跨语言 Agent：HTTP REST API
                 │
                 ▼
     ┌─────────────────────────────┐
     │     Loop Controller Runtime    │
     │  ┌─────────────────────────┐  │
     │  │   ToolGovernor / MCP    │  │
-    │  │   Proxy / HTTP / gRPC   │  │
+    │  │   Proxy / HTTP          │  │
     │  └─────────────────────────┘  │
     │              │               │
     │              ▼               │
     │  ┌─────────────────────────┐  │
-    │  │   ExecutionModeResolver │  │
-    │  │   (harness_required)    │  │
+    │  │   Checkpoint / R2       │  │
+    │  │   OPA / Rego 策略判定    │  │
     │  └─────────────────────────┘  │
     │              │               │
     │              ▼               │
@@ -179,286 +165,169 @@ Agent 代码
 
 ## 5. 详细设计
 
-### 5.1 `@governed` 装饰器
+### 5.1 接入方式收敛
 
-新增装饰器 `loop_controller.governed`：
+#### 5.1.1 移除 FastAPI 集成
 
-```python
-from loop_controller import governed
+- 删除 `src/loop_controller/integrations/fastapi.py`
+- 删除 `tests/integrations/test_fastapi.py`（如有）
+- 从 `pyproject.toml` 移除 `fastapi` 相关可选依赖
+- 从 `src/loop_controller/integrations/__init__.py` 移除导出
+- 从 README/开发文档/KNOWN_LIMITATIONS 移除 FastAPI 接入说明
 
-@governed(tool_name="write_file")  # 可选，默认使用函数名
-def write_file(path: str, content: str) -> dict:
-    ...
-```
+#### 5.1.2 移除 gRPC 服务
 
-行为：
+- 删除 `src/loop_controller/grpc_server.py`
+- 删除 `src/loop_controller/grpc_client.py`
+- 从 `cli.py` 移除 `grpc-server` 子命令
+- 从 `pyproject.toml` 移除 `grpcio`、`grpcio-tools` 等依赖
+- 删除 gRPC 相关测试
+- 更新 README/开发文档
 
-- 保持原函数签名不变；
-- 调用时自动把调用路由到 Loop Controller；
-- 等待 Loop Controller 审批通过后执行；
-- 返回原始返回值。
+#### 5.1.3 LangChain 集成降级为可选示例
 
-> 注意：v0.32.0 的装饰器只暴露 `tool_name` 参数。`mode` 和 `budget_unit` 等策略覆盖能力将随 v0.34.0 策略引擎统一支持，避免在 SDK 公共签名中留下未生效的字段。
+- 将 `src/loop_controller/integrations/langchain.py` 移动到 `examples/integrations/langchain_example.py`
+- 保留 `tests/integration/test_langchain_agent.py` 作为集成测试，但标记为可选依赖
+- 从 `src/loop_controller/integrations/__init__.py` 移除导出
+- 文档中说明：LangChain 用户可参考示例，但推荐方式仍然是把 LangChain tool 用 `@governed` 包装
 
-支持同步和异步函数：
+#### 5.1.4 接入方式选择指南（收敛后）
 
-```python
-@governed(tool_name="fetch_url")
-async def fetch_url(url: str) -> str:
-    ...
-```
-
-实现要点：
-
-- 装饰器内部使用 `GovernanceRuntime.current()` 获取当前运行时；
-- 通过反射获取函数签名和参数名，自动打包参数；
-- 返回结果自动解包为原始返回类型；
-- 如果 Loop Controller 拒绝，抛出 `GovernanceDeniedError`。
-
-### 5.2 工具注册表 Hook
-
-新增 `GovernanceRuntime.hook_tool_registry(registry)`：
-
-```python
-from loop_controller import GovernanceRuntime
-
-rt = GovernanceRuntime.from_config("loop-controller.yaml")
-rt.hook_tool_registry(agent.tool_registry)
-```
-
-假设 Agent 已有统一工具注册表：
-
-```python
-class ToolRegistry:
-    def register(self, name: str, fn: Callable): ...
-    def get(self, name: str) -> Callable: ...
-```
-
-`hook_tool_registry` 行为：
-
-- 遍历注册表中所有工具；
-- 为每个工具自动应用 `@governed`；
-- 替换原 callable 为治理后的 callable；
-- 支持可选的排除列表和策略覆盖。
-
-适用场景：
-
-- Trae 类已有统一工具注册表的 Agent；
-- LangChain `BaseToolkit` / `Tool` 注册表；
-- 自定义 Agent 框架。
-
-### 5.3 Agent 启动器
-
-新增 `loop_controller.launch_agent`：
-
-```python
-from loop_controller import launch_agent
-
-launch_agent(
-    agent_module="my_agent.main:run",
-    config="loop-controller.yaml",
-    workspace="/tmp/agent-001",
-)
-```
-
-行为：
-
-- 读取 Loop Controller 配置；
-- 启动 Agent 进程/线程；
-- 注入治理上下文；
-- 可选：限制 Agent 工作目录（不强制）。
-
-这不是运行时沙箱，只是方便 Agent 在治理上下文中启动。
-
-### 5.4 LangChain / LangGraph 集成
-
-提供 `loop_controller.integrations.langchain`：
-
-```python
-from loop_controller.integrations.langchain import govern_langchain_tools
-
-govern_langchain_tools(
-    tools=tools,
-    runtime=rt,
-)
-```
-
-行为：
-
-- 把 LangChain `BaseTool` 列表中的每个 tool 包装成治理版本；
-- 保持 LangChain 的调用约定（`_run` / `_arun`）；
-- 支持 `StructuredTool`、`AgentTool` 等常见类型。
-
-### 5.5 FastAPI 集成
-
-提供 `loop_controller.integrations.fastapi`：
-
-```python
-from fastapi import FastAPI
-from loop_controller.integrations.fastapi import GovernedFastAPI
-
-app = FastAPI()
-governed_app = GovernedFastAPI(app, runtime=rt)
-```
-
-或在路由层面：
-
-```python
-from loop_controller.integrations.fastapi import governed_route
-
-@app.post("/run-tool")
-@governed_route(tool_name="run_tool")
-async def run_tool(req: ToolRequest):
-    ...
-```
-
-### 5.6 MCP Proxy admin / 审计工具
-
-为 MCP Proxy 增加以下 MCP tool：
-
-| MCP Tool | 功能 |
+| Agent 形态 | 推荐接入方式 |
 |---|---|
-| `harness_backend_status` | 查询所有 backend 状态 |
-| `harness_backend_drain` | drain 指定 backend |
-| `harness_backend_reset` | reset 指定 backend |
-| `list_recent_decisions` | 查询最近 decision |
-| `get_decision_status` | 查询某个 decision 的状态 |
-| `list_recent_audit_events` | 查询最近审计事件（元数据，不含敏感参数） |
-| `get_evidence_summary` | 查询 evidence 摘要 |
-| `trigger_kill_switch` | 触发 kill switch |
-| `revoke_decision` | 吊销某个 decision |
+| Python 函数式 Agent / 自研 Agent | `@governed` 装饰器 |
+| 已有统一工具注册表 | `hook_tool_registry` |
+| 标准 MCP Client（Cursor、Claude Desktop、Windsurf） | MCP Proxy |
+| 跨语言 Agent / 遗留系统 | HTTP REST API |
+| LangChain Agent | 参考 `examples/integrations/langchain_example.py` |
 
-这些工具本身也要走 Loop Controller 治理，需要 admin 权限审批。
+### 5.2 `@governed` 审批后自动重试
 
-实现要点：
+#### 5.2.1 设计目标
 
-- 在 `mcp_gateway.py` 中增加 `AdminToolRegistry`；
-- 复用现有 `server.py` admin 端点的内部方法；
-- 返回数据做脱敏，不暴露敏感参数和完整结果。
+Agent 调用 `@governed` 函数时：
 
-### 5.7 Docker backend 实现
+- `allow`：立即返回执行结果（当前已实现）
+- `require_approval`：默认阻塞等待审批，审批通过后自动重试并返回执行结果
+- `deny` / `blocked` / `error`：抛出 `GovernanceDeniedError`（当前已实现）
 
-新增 `src/loop_controller/executors/docker_harness_backend.py`：
+#### 5.2.2 新增 API
+
+在 `GovernanceResult` 上增加等待方法：
 
 ```python
-class DockerHarnessBackend:
-    def __init__(self, config: DockerBackendConfig): ...
+class GovernanceResult:
+    ...
 
-    async def execute(self, request: HarnessExecuteRequest) -> HarnessExecuteResponse:
-        # 1. 创建一次性容器
-        # 2. 挂载 allowed_paths 为只读/读写
-        # 3. network_mode 默认 none
-        # 4. 运行 harness runner
-        # 5. 读取 stdout 作为 HarnessExecuteResponse
-        # 6. 清理容器
+    async def wait_for_approval(
+        self,
+        *,
+        timeout: float | None = 60.0,
+        poll_interval: float = 1.0,
+    ) -> "GovernanceResult":
+        """阻塞等待审批完成，返回最终执行结果或 raise GovernanceDeniedError。"""
+
+    async def retry_after_approval(
+        self,
+        *,
+        timeout: float | None = 60.0,
+        poll_interval: float = 1.0,
+    ) -> Any:
+        """等待审批通过后，使用原 Decision 重试执行并返回执行结果。"""
 ```
 
-配置示例：
-
-```yaml
-backends:
-  docker_harness:
-    type: docker
-    image: loop-controller/harness-runner:latest
-    network_mode: none
-    mounts:
-      - source: /data/output
-        target: /data/output
-        read_only: false
-    max_concurrent_calls: 5
-    acquire_timeout_seconds: 2
-```
-
-### 5.8 Isolated Subprocess backend 实现
-
-新增 `src/loop_controller/executors/isolated_subprocess_harness.py`：
+在 `@governed` 装饰器上增加参数：
 
 ```python
-class IsolatedSubprocessHarnessBackend:
-    def __init__(self, config: IsolatedSubprocessBackendConfig): ...
-
-    async def execute(self, request: HarnessExecuteRequest) -> HarnessExecuteResponse:
-        # 1. 启动一个受限 Python 子进程
-        # 2. 子进程只加载白名单 builtins
-        # 3. 通过 IPC 传递请求
-        # 4. 子进程在受限环境中执行工具代码
-        # 5. 返回 HarnessExecuteResponse
+@governed(tool_name="send_email", wait_for_approval=True)
+async def send_email(...):
+    ...
 ```
 
-限制：
+- `wait_for_approval=True`：遇到 `require_approval` 时自动阻塞等待，审批通过后自动重试，最终返回执行结果
+- `wait_for_approval=False`（默认或保持当前行为）：返回 `GovernanceResult`，由 Agent 自己处理
 
-- 优先支持 Linux / Windows / macOS 通用子进程隔离；
-- 不保证完整容器级隔离；
-- 用于开发、CI 和低敏感生产场景。
+#### 5.2.3 实现要点
 
-### 5.9 接入方式选择指南
+1. `GovernanceResult` 保存原始 `ActionProposal`、`Decision`、`tool_name`、`arguments` 等重试所需信息
+2. `wait_for_approval` 轮询 `approval_service` 或 `ApprovalStore` 获取 `ApprovalRecord`
+3. 审批通过后，使用原 Decision 的 `decision_id` 调用 `controller.execute_with_decision(decision_id, ...)` 或等效接口
+4. 审批被拒或超时：抛出 `GovernanceDeniedError`
+5. 在 `@governed` 装饰器中，根据 `wait_for_approval` 参数自动调用 `retry_after_approval`
 
-在文档中明确：
+#### 5.2.4 示例
 
-| Agent 形态 | 推荐接入方式 | 原因 |
-|---|---|---|
-| Python 函数式 Agent | `@governed` 装饰器 | 改动最小 |
-| 已有统一工具注册表 | `hook_tool_registry` | 一行代码接入 |
-| LangChain / LangGraph | `govern_langchain_tools` | 框架原生集成 |
-| FastAPI 服务 | `governed_route` 或 `GovernedFastAPI` | HTTP 调用链自然经过入口 |
-| 工具栈已是 MCP | MCP Proxy | 无需改工具形态 |
-| 多语言 Agent | HTTP / gRPC | 跨语言 |
+```python
+@governed(tool_name="send_email", wait_for_approval=True)
+async def send_email(to: str, subject: str, body: str) -> dict[str, str]:
+    return {"status": "sent"}
+
+# 调用方像普通函数一样使用
+result = await send_email("bob@company.com", "hi", "body")
+# 如果触发审批，会自动等待审批通过并返回执行结果
+```
+
+### 5.3 `@governed` 保留治理参数
+
+调用 `@governed` 函数时，可以通过以 `_loop_controller_` 为前缀的关键字参数传入治理上下文，这些参数**不会**被打包为工具参数，而是直接传给 `GovernanceRuntime.call()`：
+
+| 参数 | 说明 |
+|---|---|
+| `_loop_controller_session_id` | 显式指定 session_id；需预先存在，否则 `create_task` 会报错 |
+| `_loop_controller_task_id` | 显式指定 task_id；需预先存在 |
+| `_loop_controller_task_context` | 覆盖本次调用的任务上下文 |
 
 ---
 
 ## 6. 配置变更
 
-### 6.1 新增 `config/agent_sdk.yaml`（可选）
+### 6.1 移除 FastAPI / gRPC 可选依赖
 
-```yaml
-agent_sdk:
-  auto_hook_registries: true
-  default_mode: harness_required
-  decorator_enabled: true
+从 `pyproject.toml` 移除或标记为 deprecated：
 
-integrations:
-  langchain:
-    enabled: true
-  fastapi:
-    enabled: true
+```toml
+# 移除
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.100.0"]
+grpc = ["grpcio>=1.60.0", "grpcio-tools>=1.60.0"]
 ```
 
-### 6.2 `config/harness_tools.yaml` 补充 backend 示例
+保留：
 
-```yaml
-backends:
-  docker_harness:
-    type: docker
-    image: loop-controller/harness-runner:latest
-    network_mode: none
-
-  isolated_subprocess:
-    type: isolated_subprocess
-    python_path: .venv/bin/python
-    max_concurrent_calls: 3
+```toml
+[project.optional-dependencies]
+langchain = ["langchain_core>=0.1.0"]  # 可选示例依赖
 ```
+
+### 6.2 无需新增配置
+
+审批后自动重试通过 API 参数控制，不引入新配置文件。
 
 ---
 
 ## 7. 接口变更
 
-### 7.1 新增
+### 7.1 移除
 
-- `loop_controller.governed` 装饰器
-- `GovernanceRuntime.hook_tool_registry()`
-- `loop_controller.launch_agent()`
-- `loop_controller.integrations.langchain.govern_langchain_tools()`
 - `loop_controller.integrations.fastapi.GovernedFastAPI`
-- `loop_controller.integrations.fastapi.governed_route()`
-- `DockerHarnessBackend`
-- `IsolatedSubprocessHarnessBackend`
-- MCP Proxy admin tools：`harness_backend_status`、`harness_backend_drain`、`harness_backend_reset`、`list_recent_decisions`、`get_decision_status`、`list_recent_audit_events`、`get_evidence_summary`、`trigger_kill_switch`、`revoke_decision`
+- `loop_controller.integrations.fastapi.governed_route`
+- `loop_controller.grpc_server`
+- `loop_controller.grpc_client`
+- CLI `grpc-server` 子命令
 
 ### 7.2 修改
 
-- `HarnessExecutor._build_backend()` 支持 `docker` 和 `isolated_subprocess`
-- `mcp_gateway.py` 增加 `AdminToolRegistry`
-- `Runtime._build_executor_registry()` 默认启用 Docker / Isolated Subprocess backend
+- `loop_controller.integrations.langchain.govern_langchain_tools` 移动到 `examples/integrations/langchain_example.py`
+- `GovernanceResult` 新增 `wait_for_approval()`、`retry_after_approval()` 方法
+- `@governed` 装饰器新增 `wait_for_approval` 参数
+
+### 7.3 保留
+
+- `loop_controller.governed`
+- `GovernanceRuntime.hook_tool_registry()`
+- `loop_controller.launch_agent()`
+- MCP Proxy admin tools
+- HTTP REST API
 
 ---
 
@@ -466,76 +335,59 @@ backends:
 
 ### 8.1 单元测试
 
-- `tests/test_governed_decorator.py`
-  - 同步函数装饰后调用走 Loop Controller；
-  - 异步函数装饰后调用走 Loop Controller；
-  - 参数自动打包/解包正确；
-  - Loop Controller 拒绝时抛出正确异常。
-
-- `tests/test_hook_tool_registry.py`
-  - 注册表中所有工具被自动治理；
-  - 排除列表生效；
-  - 原始调用点无需修改。
-
-- `tests/test_docker_harness_backend.py`（本地有 Docker 时运行）
-  - 成功启动一次性容器；
-  - `network_mode=none` 生效；
-  - 只读挂载生效；
-  - 返回 `HarnessExecuteResponse`。
-
-- `tests/test_isolated_subprocess_harness.py`
-  - 成功执行 `echo`；
-  - 访问 `allowed_paths` 外文件被拒绝；
-  - 超时返回 `harness_timeout`。
+- `tests/test_agent_sdk.py`
+  - `GovernanceResult.wait_for_approval()` 超时抛出 `GovernanceDeniedError`；
+  - `GovernanceResult.retry_after_approval()` 审批通过后返回执行结果；
+  - `@governed(wait_for_approval=True)` 自动等待审批并返回结果；
+  - `@governed(wait_for_approval=False)` 保持当前行为，返回 `GovernanceResult`。
 
 ### 8.2 集成测试
 
-- `tests/test_langchain_integration.py`
-  - LangChain tool 被治理后，Agent 调用走 Harness；
-  - 返回结果格式正确。
+- `tests/integration/test_functional_agent.py`
+  - `@governed` 端到端调用真实 Loop Controller；
+  - `allow` 时返回实际执行结果；
+  - `wait_for_approval=True` 时触发审批、审批通过后自动返回执行结果；
+  - 审计记录正确写入。
 
-- `tests/test_fastapi_integration.py`
-  - FastAPI 路由被治理后，HTTP 调用走 Harness；
-  - 审批拒绝返回 403/合适状态码。
+- `tests/integration/test_mcp_proxy.py`
+  - MCP Proxy 端到端路径保持通过；
+  - require_approval、deny、参数错误路径保持通过。
 
-- `tests/test_mcp_proxy_admin_tools.py`
-  - MCP Proxy admin tools 可查询 backend 状态；
-  - drain/reset 生效；
-  - audit 查询返回脱敏数据。
+- `tests/integration/test_langchain_agent.py`
+  - 作为可选依赖测试保留；
+  - 未安装 `langchain_core` 时自动 skip。
 
-### 8.3 端到端测试
+### 8.3 清理验证
 
-- 函数式 Agent 接入示例可完整跑通；
-- LangChain Agent 接入示例可完整跑通；
-- FastAPI 服务接入示例可完整跑通；
-- Docker backend 在生产配置下可运行。
+- 确认 `src/loop_controller/integrations/fastapi.py` 已删除；
+- 确认 `src/loop_controller/grpc_server.py`、`grpc_client.py` 已删除；
+- 确认 `pyproject.toml` 中 `fastapi`、`grpcio` 相关可选依赖已移除；
+- 确认 `python -m loop_controller.cli grpc-server --help` 不再存在。
 
 ---
 
 ## 9. 验收标准
 
-1. `python -m pytest -q` 全部通过；
-2. `python -m ruff check src tests` 通过；
-3. `python -m mypy src/loop_controller` 通过；
-4. `@governed` 装饰器支持 sync/async 函数；
-5. `hook_tool_registry` 能治理注册表中所有工具，调用点无需修改；
-6. LangChain 和 FastAPI 集成测试通过；
-7. Docker backend 在有 Docker 环境下可运行；
-8. Isolated Subprocess backend 跨平台可运行；
-9. MCP Proxy admin tools 至少实现 `harness_backend_status`、`harness_backend_drain`、`list_recent_audit_events`；
-10. 提供 3 个可运行的 Agent 接入示例；
-11. 接入方式选择文档清晰，明确各种方式的适用场景。
+1. `pytest tests/integration -m integration -v` 通过（保留 21 passed；`langchain_core` 未安装时 20 passed, 1 skipped）；
+2. `pytest tests -m "not integration" -q` 无新增失败；
+3. `python -m ruff check src tests` 通过；
+4. FastAPI 集成已从代码库和文档中移除；
+5. gRPC 服务已从代码库和文档中移除；
+6. LangChain 集成已移动到 `examples/integrations/`，不作为核心包导出；
+7. `@governed(wait_for_approval=True)` 能够在触发审批后阻塞等待并返回执行结果；
+8. `@governed` 对 `allow` / `deny` / `blocked` / `error` 的语义保持不变；
+9. README 和开发文档中的接入形态表格已更新为三种接入方式；
+10. KNOWN_LIMITATIONS 已更新，说明 FastAPI/gRPC 已移除、LangChain 为可选示例。
 
 ---
 
 ## 10. 非目标
 
-- **不配合 Agent 的进程外约束**：Agent 必须主动接入，本版本不解决 Agent 进程内部绕过治理入口的问题；
-- **运行时沙箱 / 应用级沙箱启动器**：`launch_agent` 只是方便启动，不提供强隔离；真正的运行时沙箱放到 v0.36.0 或企业版；
+- **新增接入方式**：本版本不新增 A2A、GraphQL、WebSocket 等接入方式；
+- **Agent 交互治理（Go 内核）**：这是 v0.34+ 的方向，本版本只收敛工具接入面；
+- **运行时沙箱 / 应用级沙箱启动器**：`launch_agent` 只是方便启动，不提供强隔离；
 - **SaaS 控制台 / 多租户**：控制平面仍部署在客户本地；
-- **新增接入协议**：不新增第四种接入方式；
-- **强制把所有工具改成 MCP**：MCP Proxy 只是可选项；
-- **内核级 / 系统调用级拦截**：不属于开源核心范围。
+- **审批 UI 完整实现**：`wait_for_approval` 通过轮询 `approval_service` / `ApprovalStore` 实现，不依赖前端。
 
 ---
 
@@ -543,17 +395,16 @@ backends:
 
 | 风险 | 缓解 |
 |---|---|
-| `@governed` 装饰器改变原函数签名或类型提示 | 充分单元测试 + mypy 测试；保留原函数 `__signature__` |
-| `hook_tool_registry` 与 Agent 自己的装饰器冲突 | 支持排除列表；提供详细调试日志 |
-| Docker backend 在 Windows/macOS 上体验不一致 | 用 Isolated Subprocess backend 作为跨平台兜底；文档明确说明 |
-| MCP Proxy admin tools 泄露敏感信息 | 返回数据脱敏；admin tools 自身也要审批 |
-| LangChain / FastAPI 版本兼容性问题 | 集成测试覆盖主流版本；文档说明支持版本 |
+| 移除 FastAPI/gRPC 影响已有用户 | 本版本先标记 deprecated 并在文档中说明；v0.33.0 正式移除 |
+| `wait_for_approval` 默认行为改变破坏现有测试 | 默认保持 `wait_for_approval=False`，显式开启才阻塞 |
+| 审批通过后重试时参数状态不一致 | 使用原始 `ActionProposal` 和 `Decision` 重试，不重新构造参数 |
+| 轮询审批增加服务负载 | 支持可配置 `poll_interval`；长期可替换为事件驱动 |
+| LangChain 示例移出核心包导致测试 skip | 在 CI 中保留可选依赖安装步骤 |
 
 ---
 
 ## 12. 备注
 
-- 本版本重点是“接入体验”，不是“治理能力增强”。v0.31.0 已经把治理能力（Harness 默认化、沙箱校验、证据回传、健康熔断）做扎实了，v0.32.0 让这些能力更容易被 Agent 使用；
-- MCP Proxy 在本版本补齐 admin tools 后，可以作为 MCP-native Agent 的完整接入方案；
-- 接入示例要同时展示“最小改造”和“生产配置”，帮助用户快速判断 ROI；
-- v0.32.0 完成后，应该能够回答潜在客户的核心问题：“我的 Agent 要改多少代码才能用 Loop Controller？”
+- 本版本后半段重点是"接入收敛"和"主路线收尾"；
+- `@governed` 跑稳后，v0.33.0 可以专注扩展 `hook_tool_registry` 对真实框架工具注册表的支持；
+- v0.34.0 及以后将进入 Agent 交互治理层（Go 内核 + A2A），与 Python 工具治理层分层协作。

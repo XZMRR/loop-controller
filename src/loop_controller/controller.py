@@ -15,6 +15,7 @@ import uuid
 from typing import Any
 
 from loop_controller.checkpoint import CheckpointError, DecisionAlreadyConsumed
+from loop_controller.go_kernel_bridge import A2AMessage, DelegationRequest
 from loop_controller.identity import AgentIdentity
 from loop_controller.infra.config_loader import AppConfig
 from loop_controller.masker import Masker
@@ -123,6 +124,73 @@ class LoopController:
     async def aclose(self) -> None:
         """关闭 MCP gateway 等异步资源。"""
         await self._runtime.aclose()
+
+    async def _try_delegate_to_agent(
+        self,
+        task: Task,
+        proposal: ActionProposal,
+        decision: Decision,
+    ) -> GovernanceResult | None:
+        """v0.36.0：若参数包含 __target_agent_id，向 Go 内核请求跨 Agent 委托。
+
+        返回 None 表示不委托，继续本地执行；返回 GovernanceResult 表示已委托或被拒绝。
+        """
+        bridge = self._runtime.go_kernel_bridge
+        if bridge is None:
+            return None
+        target_agent_id = proposal.arguments.get("__target_agent_id")
+        if not isinstance(target_agent_id, str):
+            return None
+
+        resp = await bridge.request_delegation(
+            DelegationRequest(
+                request_id=proposal.call_id,
+                initiator_agent_id=proposal.agent_id,
+                target_agent_id=target_agent_id,
+                tool_name=proposal.tool_name,
+                arguments={k: v for k, v in proposal.arguments.items() if k != "__target_agent_id"},
+                session_id=task.session_id,
+                task_id="",
+                risk_level=proposal.risk_level,
+            )
+        )
+        if not resp.allowed:
+            return GovernanceResult(
+                status="blocked",
+                call_id=proposal.call_id,
+                tool_name=proposal.tool_name,
+                arguments=proposal.arguments,
+                reason=f"delegation rejected: {resp.reason}",
+                error_code="delegation_denied",
+            )
+
+        await bridge.route_message(
+            A2AMessage(
+                message_id=proposal.call_id,
+                task_id=resp.task_id or task.task_id,
+                from_agent_id=proposal.agent_id,
+                to_agent_id=target_agent_id,
+                parts=[{"type": "text", "text": proposal.tool_name}]
+                + [{"type": "data", "data": {k: v for k, v in proposal.arguments.items() if k != "__target_agent_id"}}],
+            )
+        )
+
+        return GovernanceResult(
+            status="allow",
+            call_id=proposal.call_id,
+            tool_name=proposal.tool_name,
+            arguments=proposal.arguments,
+            decision=decision,
+            content={
+                "delegated": True,
+                "target_agent_id": target_agent_id,
+                "target_entrypoint": (
+                    resp.target_entrypoint.url if resp.target_entrypoint else None
+                ),
+                "delegation_token": resp.delegation_token,
+                "task_id": resp.task_id,
+            },
+        )
 
     async def evaluate(
         self,
@@ -383,6 +451,12 @@ class LoopController:
         # allow / modify
         decision = eval_result.decision
         assert decision is not None
+
+        # v0.36.0：可选的跨 Agent 委托门控
+        delegated = await self._try_delegate_to_agent(task, proposal, decision)
+        if delegated is not None:
+            return delegated
+
         try:
             result = await self._execute_proposal(task, proposal, decision)
         except CheckpointError as exc:
@@ -575,6 +649,10 @@ class LoopController:
             content=result.content,
             error_code=result.error_code,
         )
+
+    async def cancel_approval(self, request_id: str) -> None:
+        """取消指定审批请求；主要用于 wait_for_approval 超时清理。"""
+        await self._runtime.approval_manager.cancel_request(request_id)
 
     # -----------------------------------------------------------------------
     # 内部辅助

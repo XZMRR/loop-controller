@@ -11,19 +11,15 @@ from __future__ import annotations
 import copy
 import dataclasses
 import shutil
-import socket
-import subprocess
-import time
 from pathlib import Path
 
-import httpx
 import pytest
 import yaml
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from loop_controller.infra.config_loader import ConfigLoader, ConfigValidationError
-from tests.conftest import resolve_opa_bin
+from tests.conftest import _start_opa, _terminate_proc, resolve_opa_bin
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OPA_BIN = resolve_opa_bin(REPO_ROOT)
@@ -120,33 +116,12 @@ def opa_server(tmp_path_factory) -> str:
     policy_dir = tmp_path_factory.mktemp("opa_policies")
     (policy_dir / "default.rego").write_text(MINIMAL_REGO, encoding="utf-8")
 
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    proc = subprocess.Popen(
-        [str(OPA_BIN), "run", "--server", "--bundle", str(policy_dir), "--addr", f"127.0.0.1:{port}"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    base_url = f"http://127.0.0.1:{port}"
-    deadline = time.time() + 20
-    ready = False
-    while time.time() < deadline:
-        try:
-            if httpx.get(f"{base_url}/health", timeout=1, trust_env=False).status_code == 200:
-                ready = True
-                break
-        except Exception:
-            time.sleep(0.3)
-    if not ready:
-        proc.terminate()
-        pytest.skip("OPA 无法启动，跳过依赖 OPA 的用例")
+    if not OPA_BIN.exists():
+        pytest.skip("OPA 未安装，跳过依赖 OPA 的用例")
+
+    proc, base_url = _start_opa(OPA_BIN, policy_dir=policy_dir)
     yield base_url
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    _terminate_proc(proc)
 
 
 def _valid_anchor_config(config_dir: Path) -> dict:

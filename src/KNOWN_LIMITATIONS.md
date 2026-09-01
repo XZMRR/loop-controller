@@ -1,24 +1,30 @@
 # 已知局限（Known Limitations）
 
-> 本文件列出 Loop Controller v0.32.0 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
+> 本文件列出 Loop Controller v0.33.0 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
 
 ---
 
 ## v0.20.0 边界声明
 
-### V20-1. 接入形态收敛为三种官方形态
+### V20-1. 接入形态收敛为三种官方形态（v0.32.0 刷新）
 
-v0.20.0 核心包仅维护三种官方接入形态：
+v0.32.0 核心包仅维护三种官方接入形态，所有其他方式已移除或降级为示例；v0.33.0 对这三条接入线做了健壮性加固：
 
-| 形态 | 定位 |
-|---|---|
-| HTTP 服务 | 生产主推入口 |
-| gRPC 服务 | 生产主推入口（内部服务间） |
-| MCP Proxy | 兼容入口（外部标准 MCP Client） |
+| 形态 | 定位 | 说明 |
+|---|---|---|
+| `@governed` + `GovernanceRuntime` | **主路线**：Python Agent 主动接入 | 单 Agent 工具调用、审批、审计、错误恢复的首选路径；支持同步/异步函数与统一工具注册表 Hook。v0.33.0 将 `GovernanceRuntime` 上下文改为 `ContextVar`，内部引用改为 `PrivateAttr`，注册表替换改为两阶段原子操作。 |
+| MCP Proxy | 强制约束/网关入口 | 外部不可控 Agent（Cursor、Claude Desktop 等）通过标准 MCP Client 接入，必须走网关。v0.33.0 增加 SSE 并发上限、请求体/限流、admin profile 白名单、错误脱敏与 mTLS fallback 加固。 |
+| HTTP REST API | 跨语言调用入口 | 为 Go / Node / Java 等外部 Agent 或管理系统提供稳定 REST 调用面。v0.33.0 增加请求体大小限制、可配置限流、CORS 来源校验、全局异常处理、API Key 安全比较与 Query 参数校验。 |
 
-`Python SDK / ToolGovernor` 保留在核心包，但仅作为**内部开发/可信 Agent** 使用；
-`Framework Adapters`（LangChain / OpenAI Agents / AutoGen）已移出核心包，仅保留在
-`examples/contrib/adapters/` 作为迁移示例。
+已移除的接入方式：
+
+- **FastAPI 集成**：`src/loop_controller/integrations/fastapi.py` 已删除；Loop Controller 的 HTTP 面由自有 Starlette/HTTP REST 服务提供，不再依赖框架级适配。
+- **gRPC 服务**：`src/loop_controller/grpc_server.py`、`grpc_client.py` 已删除；CLI `grpc-server` 子命令已移除。后续 Agent 间横向交互治理由独立 Go 内核通过 A2A 协议负责，不再在 Python 工具治理层暴露 gRPC。
+- **LangChain 集成模块**：`src/loop_controller/integrations/langchain.py` 已删除，降级为 `examples/integrations/langchain_example.py` 示例应用，展示如何用 `@governed` 包装 LangChain 工具。
+
+`Python SDK / ToolGovernor` 是主路线，不再只是“内部开发/可信 Agent”用途；
+`Framework Adapters`（LangChain / OpenAI Agents / AutoGen）全部移出核心包，仅保留在
+`examples/integrations/` 作为接入示例。
 
 ### V20-2. 仅 MCP / HTTP 协议型工具由 Loop Controller 内部代理执行
 
@@ -39,11 +45,15 @@ v0.27.0 将远程 HTTP Harness 收敛为生产主路径，支持认证、防重�
 `LocalFunctionExecutor`（v0.23.0）保留，但仅定位为“不方便包装成 MCP 时的可选辅助”，
 不是核心架构方向。
 
-### V20-3. 同进程 SDK/Adapter 不提供工具级实时阻断
+### V20-3. 同进程 SDK/Adapter 的阻断是合作式而非强制式
 
-`Python SDK` 和 `Framework Adapter` 与 Agent 同进程运行，Agent 代码理论上可以
-绕过治理、直接调用底层库或访问本地资源。因此这些形态**不承诺工具级实时阻断**。
-企业级强治理必须使用 HTTP / gRPC / MCP Proxy 等网络边界，并配合凭证/网络隔离。
+`@governed` 与 `Framework Adapter` 与 Agent 同进程运行，Agent 代码理论上可以
+绕过装饰器直接调用底层库或访问本地资源。因此这些形态提供的是**合作式治理**——
+只要 Agent 调用被装饰的工具，Loop Controller 就能完整执行 R1/R2/R3 链路、审批等待与错误恢复；
+但它不承诺对恶意/错误代码的进程级强制隔离。
+
+企业级强治理必须对不可控 Agent 使用 **MCP Proxy** 或 **HTTP REST API** 等网络边界，
+并配合凭证/网络隔离。
 
 ### V20-4. 身份认证处于基础实现阶段
 
@@ -366,3 +376,31 @@ v0.29.0 修复了跨进程审批结果不可见的问题：Runtime 在每次查�
 ### V29-4. `DecisionAlreadyConsumed` 仅在同一 Loop Controller 实例内生效
 
 `DecisionAlreadyConsumed` 由内存 `_finalized_decisions` 集合与 `JsonlDecisionStore` 的 `finalized` 记录共同保护。进程重启后 `finalized` 记录会被重放恢复，因此跨重启仍然有效；但在多 worker 场景下，单个实例的 finalized 集合同步仍依赖底层持久化存储，不额外提供分布式协调。
+
+## v0.33.0 边界声明
+
+### V33-1. 网关层安全加固为单进程内存实现
+
+v0.33.0 为 HTTP REST API 与 MCP Proxy 增加了请求体大小限制、可配置限流、全局异常处理、错误响应脱敏、API Key 安全比较、admin 工具 profile 白名单、SSE 并发上限、mTLS fallback 加固与 CORS 来源校验。但这些机制当前均为单进程、内存实现：
+
+- 限流计数器按进程独立，多副本部署时没有分布式共享配额；
+- 请求体大小限制在应用层读取前生效，但仍依赖底层 HTTP server 的连接管理；
+- SSE 并发上限为单进程 `asyncio.Semaphore`。
+
+生产多副本部署需在负载均衡或 API Gateway 层补充全局限流与连接控制。
+
+### V33-2. mTLS 身份提取依赖部署层 TLS termination
+
+v0.33.0 的 `_resolve_sse_identity` 已禁止在 `client_ca_cert` 已配置但未成功提取 mTLS 身份时 fallback 到默认身份，从而触发 401。但该机制能获取的对端证书信息受 ASGI server 与部署层 TLS termination 实现限制；如果反向代理未正确转发客户端证书（且未配置 `trust_proxy_headers`），身份提取将失败。生产部署需确保 TLS termination 发生在 Loop Controller 进程内，或仅信任已验证的代理转发。
+
+### V33-3. admin 工具白名单默认关闭
+
+`entrypoints.admin.agent_profiles` 默认为空列表，MCP Proxy 中的 kill_switch、revoke 等 admin 工具默认全部拒绝。启用后，仅当调用 agent 的 `profile_id` 在白名单中时才允许执行。HTTP Admin API 仍使用 API Key 鉴权，两套 admin 权限模型尚未统一为单一 RBAC 体系。
+
+### V33-4. 错误响应脱敏不覆盖 DEBUG 模式
+
+v0.33.0 的所有网络入口错误响应统一返回固定错误码与文案，不携带原始异常信息。该行为在生产配置下生效；若显式开启调试模式或降低日志级别，内部堆栈仍可能进入日志文件。生产环境应确保日志与审计文件 ACL 严格受限。
+
+### V33-5. OPA fixture 端口探测依赖 psutil
+
+v0.33.0 通过 OPA 绑定 `127.0.0.1:0` 并由子进程网络连接表读取实际端口，消除了端口抢占 TOCTOU。该机制依赖 `psutil`；CI 与 dev 依赖已加入 `psutil>=7.0`。若运行集成测试的环境未安装 psutil，fixture 会回退到重试逻辑，但仍可能受端口抢占影响。

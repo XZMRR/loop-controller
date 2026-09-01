@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 # ---------------------------------------------------------------------------
 # 枚举类型（照抄方案，不自行发明取值）
@@ -483,6 +483,14 @@ class EvaluationResult(BaseModel):
     risk_signal: RiskSignal | None = None
 
 
+class GovernanceDeniedError(Exception):
+    """Loop Controller 拒绝、阻断、执行出错或审批被拒绝/超时抛出。"""
+
+    def __init__(self, result: GovernanceResult) -> None:
+        self.result = result
+        super().__init__(f"{result.status}: {result.reason}")
+
+
 class GovernanceResult(BaseModel):
     """Agent 驱动模式下，Loop Controller 对单次工具调用的完整响应。"""
 
@@ -497,6 +505,77 @@ class GovernanceResult(BaseModel):
     reason: str = ""
     content: Any = None  # allow 后执行的结果内容
     error_code: str | None = None
+
+    # 内部保留：用于审批后自动重试；不参与序列化/深拷贝
+    _controller: Any = PrivateAttr(default=None)
+    _runtime: Any = PrivateAttr(default=None)
+
+    def with_controller(self, controller: Any, runtime: Any | None = None) -> GovernanceResult:
+        """返回携带内部 controller 引用的副本，用于 wait_for_approval。"""
+        copied = self.model_copy(deep=True)
+        copied._controller = controller
+        copied._runtime = runtime or getattr(controller, "_runtime", None)
+        return copied
+
+    async def wait_for_approval(
+        self,
+        *,
+        timeout: float | None = 60.0,
+        poll_interval: float = 1.0,
+    ) -> GovernanceResult:
+        """阻塞等待审批完成，返回最终 GovernanceResult。
+
+        - 审批通过：返回 allow 的 GovernanceResult，content 为执行结果；
+        - 审批拒绝/超时：抛出 GovernanceDeniedError。
+        """
+        import asyncio
+
+        if self.status != "require_approval":
+            return self
+        if self.request_id is None:
+            raise RuntimeError("require_approval GovernanceResult 缺少 request_id")
+        controller = self._controller
+        if controller is None:
+            raise RuntimeError(
+                "GovernanceResult 未绑定 controller；"
+                "请通过 GovernanceRuntime.call() 或 @governed 调用获得"
+            )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout if timeout is not None else None
+
+        while True:
+            result = await controller.resume_after_approval(self.request_id)
+            if result.status != "require_approval":
+                return result
+            if deadline is not None:
+                now = loop.time()
+                if now >= deadline:
+                    if hasattr(controller, "cancel_approval"):
+                        await controller.cancel_approval(self.request_id)
+                    raise GovernanceDeniedError(
+                        self.model_copy(
+                            update={"status": "error", "reason": "等待审批超时", "error_code": "approval_timeout"}
+                        )
+                    )
+                await asyncio.sleep(min(poll_interval, deadline - now))
+            else:
+                await asyncio.sleep(poll_interval)
+
+    async def retry_after_approval(
+        self,
+        *,
+        timeout: float | None = 60.0,
+        poll_interval: float = 1.0,
+    ) -> Any:
+        """等待审批通过后，返回最终执行结果（allow 的 content）。
+
+        审批拒绝、超时或其他状态抛出 GovernanceDeniedError。
+        """
+        result = await self.wait_for_approval(timeout=timeout, poll_interval=poll_interval)
+        if result.status == "allow":
+            return result.content
+        raise GovernanceDeniedError(result)
 
 
 # ---------------------------------------------------------------------------
