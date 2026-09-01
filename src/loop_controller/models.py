@@ -10,9 +10,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+
+if TYPE_CHECKING:
+    from loop_controller.controller import LoopController
 
 # ---------------------------------------------------------------------------
 # 枚举类型（照抄方案，不自行发明取值）
@@ -30,7 +33,12 @@ AuditAction = Literal[
     "evaluate",
     "approve",
     "deny",
-    "execute",
+    "execute",  # v0.36.1 起保留为兼容性别名，推荐用 execution_*
+    "execution_authorized",  # v0.36.1：Decision 已消费、执行器调用前
+    "execution_completed",  # v0.36.1：执行器明确成功
+    "execution_failed",  # v0.36.1：执行器明确失败
+    "execution_outcome_unknown",  # v0.36.1：执行器调用后无法确认结果（如超时）
+    "execution_blocked",  # v0.36.1：执行前被策略/吊销/配置阻断
     "task_end",
     "seal",
     "planner_error",
@@ -200,6 +208,9 @@ class Decision(BaseModel):
 
     ``expires_at`` 的分档逻辑（allow/modify 5min、require_approval 15min、deny 立即过期）
     由 Checkpoint 的工厂方法集中处理，不在此模型内。
+
+    v0.36.1：新增 original_args / policy_modified_args / effective_args 以明确 modify
+    语义。为向后兼容，``modified_args`` 保留作为 ``policy_modified_args`` 的别名。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -209,7 +220,10 @@ class Decision(BaseModel):
     task_id: str
     verdict: Verdict
     reason: str  # 不允许为空字符串（审批可读性与审计可解释性底线）
-    modified_args: dict[str, Any] | None = None  # verdict == "modify" 时回写
+    modified_args: dict[str, Any] | None = None  # 向后兼容：等价于 policy_modified_args
+    original_args: dict[str, Any] | None = None  # v0.36.1：modify 前的原始参数
+    policy_modified_args: dict[str, Any] | None = None  # v0.36.1：策略返回的改写后参数
+    effective_args: dict[str, Any] | None = None  # v0.36.1：复核后最终执行的参数
     escalation_target: str | None = None  # verdict == "require_approval" 时指向审批人
     policy_hits: list[str] = Field(default_factory=list)  # 由 OPA 返回，Checkpoint 透传
     policy_version: str = ""  # 判定时生效的策略版本
@@ -534,7 +548,7 @@ class GovernanceResult(BaseModel):
             return self
         if self.request_id is None:
             raise RuntimeError("require_approval GovernanceResult 缺少 request_id")
-        controller = self._controller
+        controller = cast("LoopController", self._controller)
         if controller is None:
             raise RuntimeError(
                 "GovernanceResult 未绑定 controller；"

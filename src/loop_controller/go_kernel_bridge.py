@@ -1,4 +1,4 @@
-"""Python bridge to the Go interaction governance kernel (v0.35.0)."""
+"""Python bridge to the Go interaction governance kernel (v0.36.1)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,30 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Current A2A HTTP/JSON protocol version. Patch differences are tolerated;
+# major/minor differences are fail-closed.
+CURRENT_PROTOCOL_VERSION = "0.36.1"
+
+
+def check_protocol_version(version: str) -> None:
+    """Validate that *version* is compatible with ``CURRENT_PROTOCOL_VERSION``.
+
+    Empty versions are allowed during the transition period. Raises
+    ``ValueError`` if the major or minor component differs.
+    """
+    if not version:
+        return
+    if version == CURRENT_PROTOCOL_VERSION:
+        return
+    parts = version.split(".")
+    current = CURRENT_PROTOCOL_VERSION.split(".")
+    if len(parts) < 2 or len(current) < 2:
+        raise ValueError(f"invalid protocol version {version!r}")
+    if parts[0] != current[0] or parts[1] != current[1]:
+        raise ValueError(
+            f"incompatible protocol version {version!r}, expected {CURRENT_PROTOCOL_VERSION}"
+        )
 
 
 class AgentEntrypoint:
@@ -36,7 +60,7 @@ class AgentCard:
         entrypoint: AgentEntrypoint | None = None,
         capabilities: list[str] | None = None,
         trust_domain: str = "",
-        version: str = "0.35.0",
+        version: str = CURRENT_PROTOCOL_VERSION,
     ) -> None:
         self.agent_id = agent_id
         self.name = name
@@ -45,6 +69,19 @@ class AgentCard:
         self.capabilities = capabilities or []
         self.trust_domain = trust_domain
         self.version = version
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AgentCard:
+        ep = data.get("entrypoint")
+        return cls(
+            agent_id=data.get("agent_id", ""),
+            name=data.get("name", ""),
+            description=data.get("description", ""),
+            entrypoint=AgentEntrypoint.from_dict(ep) if isinstance(ep, dict) else None,
+            capabilities=data.get("capabilities") or [],
+            trust_domain=data.get("trust_domain", ""),
+            version=data.get("version", CURRENT_PROTOCOL_VERSION),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +107,8 @@ class A2AMessage:
         to_agent_id: str,
         role: str = "user",
         parts: list[dict[str, Any]] | None = None,
+        timestamp: str = "",
+        protocol_version: str = CURRENT_PROTOCOL_VERSION,
     ) -> None:
         self.message_id = message_id
         self.task_id = task_id
@@ -77,16 +116,22 @@ class A2AMessage:
         self.to_agent_id = to_agent_id
         self.role = role
         self.parts = parts or []
+        self.timestamp = timestamp
+        self.protocol_version = protocol_version
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "message_id": self.message_id,
             "task_id": self.task_id,
             "from_agent_id": self.from_agent_id,
             "to_agent_id": self.to_agent_id,
             "role": self.role,
             "parts": self.parts,
+            "protocol_version": self.protocol_version,
         }
+        if self.timestamp:
+            data["timestamp"] = self.timestamp
+        return data
 
 
 class DelegationRequest:
@@ -103,6 +148,7 @@ class DelegationRequest:
         session_id: str = "",
         task_id: str = "",
         risk_level: str = "critical",
+        protocol_version: str = CURRENT_PROTOCOL_VERSION,
     ) -> None:
         self.request_id = request_id
         self.initiator_agent_id = initiator_agent_id
@@ -112,6 +158,7 @@ class DelegationRequest:
         self.session_id = session_id
         self.task_id = task_id
         self.risk_level = risk_level
+        self.protocol_version = protocol_version
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +170,7 @@ class DelegationRequest:
             "session_id": self.session_id,
             "task_id": self.task_id,
             "risk_level": self.risk_level,
+            "protocol_version": self.protocol_version,
         }
 
 
@@ -137,12 +185,14 @@ class DelegationResponse:
         target_entrypoint: AgentEntrypoint | None = None,
         delegation_token: str = "",
         reason: str = "",
+        protocol_version: str = CURRENT_PROTOCOL_VERSION,
     ) -> None:
         self.allowed = allowed
         self.task_id = task_id
         self.target_entrypoint = target_entrypoint
         self.delegation_token = delegation_token
         self.reason = reason
+        self.protocol_version = protocol_version
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DelegationResponse:
@@ -153,7 +203,24 @@ class DelegationResponse:
             target_entrypoint=AgentEntrypoint.from_dict(ep) if ep else None,
             delegation_token=data.get("delegation_token", ""),
             reason=data.get("reason", ""),
+            protocol_version=data.get("protocol_version", CURRENT_PROTOCOL_VERSION),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "allowed": self.allowed,
+            "task_id": self.task_id,
+            "reason": self.reason,
+            "protocol_version": self.protocol_version,
+        }
+        if self.target_entrypoint is not None:
+            data["target_entrypoint"] = {
+                "type": self.target_entrypoint.type,
+                "url": self.target_entrypoint.url,
+            }
+        if self.delegation_token:
+            data["delegation_token"] = self.delegation_token
+        return data
 
 
 class GoKernelBridge:
@@ -222,7 +289,7 @@ class GoKernelBridge:
             if response.status_code != 200:
                 return False
             data = response.json()
-            return data.get("accepted", False)
+            return bool(isinstance(data, dict) and data.get("accepted", False))
         except httpx.RequestError as exc:
             logger.warning("Go kernel route_message unreachable: %s", exc)
             return False
@@ -236,7 +303,11 @@ class GoKernelBridge:
             if response.status_code == 404:
                 return None
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            if isinstance(result, dict):
+                return result
+            logger.warning("Go kernel query_task returned non-object: %s", type(result))
+            return None
         except httpx.RequestError as exc:
             logger.warning("Go kernel query_task unreachable: %s", exc)
             return None

@@ -23,10 +23,13 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlparse
+
+T = TypeVar("T")
 
 import httpx
 import yaml
@@ -407,7 +410,7 @@ class ConfigLoader:
         agents: dict[str, Agent] = {}
         for item in data.get("agents", []):
             agent = self._construct(
-                path, "Agent", lambda item=item: Agent(**item)
+                path, "Agent", partial(Agent, **item)
             )
             agents[agent.agent_id] = agent
         users: dict[str, str] = {}
@@ -426,16 +429,12 @@ class ConfigLoader:
                 tools[tool_name] = self._construct(
                     path,
                     f"Profile tool {tool_name}",
-                    lambda perm=perm, tool_name=tool_name: ToolPermission(
-                        tool_name=tool_name, **perm
-                    ),
+                    partial(ToolPermission, tool_name=tool_name, **perm),
                 )
             profile = self._construct(
                 path,
                 f"Profile {item.get('profile_id', '<unknown>')}",
-                lambda item=item, tools=tools, version=version: CapabilityProfile(
-                    version=version, tools=tools, **item
-                ),
+                partial(CapabilityProfile, version=version, tools=tools, **item),
             )
             profiles[profile.profile_id] = profile
         return profiles
@@ -449,7 +448,7 @@ class ConfigLoader:
             servers[name] = self._construct(
                 path,
                 f"MCP server {name}",
-                lambda conf=conf, name=name: MCPServerConfig(name=name, **conf),
+                partial(MCPServerConfig, name=name, **conf),
             )
         mapping: dict[str, ToolMappingEntry] = {}
         http_specs: dict[str, HTTPToolSpec] = {}
@@ -461,15 +460,13 @@ class ConfigLoader:
                 http_specs[canonical] = self._construct(
                     path,
                     f"HTTP tool {canonical}",
-                    lambda canonical=canonical, resolved=resolved: HTTPToolSpec(
-                        tool_name=canonical, **resolved
-                    ),
+                    partial(HTTPToolSpec, tool_name=canonical, **resolved),
                 )
             else:
                 mapping[canonical] = self._construct(
                     path,
                     f"Tool mapping {canonical}",
-                    lambda entry=entry: ToolMappingEntry(**entry),
+                    partial(ToolMappingEntry, **entry),
                 )
         return servers, mapping, http_specs
 
@@ -487,9 +484,7 @@ class ConfigLoader:
             specs[canonical] = self._construct(
                 path,
                 f"HTTP tool {canonical}",
-                lambda canonical=canonical, resolved=resolved: HTTPToolSpec(
-                    tool_name=canonical, **resolved
-                ),
+                partial(HTTPToolSpec, tool_name=canonical, **resolved),
             )
         return specs
 
@@ -529,9 +524,7 @@ class ConfigLoader:
             specs[canonical] = self._construct(
                 path,
                 f"Local function {canonical}",
-                lambda canonical=canonical, entry=entry: LocalFunctionSpec(
-                    tool_name=canonical, **entry
-                ),
+                partial(LocalFunctionSpec, tool_name=canonical, **entry),
             )
         return specs
 
@@ -657,7 +650,7 @@ class ConfigLoader:
                 self._construct(
                     path,
                     "Permission rule condition",
-                    lambda c=c: PermissionCondition(**c),
+                    partial(PermissionCondition, **c),
                 )
                 for c in item.get("when_all", [])
             ]
@@ -665,7 +658,8 @@ class ConfigLoader:
                 self._construct(
                     path,
                     f"Permission rule {item.get('id', '<unknown>')}",
-                    lambda item=item, conditions=conditions: PermissionRule(
+                    partial(
+                        PermissionRule,
                         id=item["id"],
                         description=item.get("description", ""),
                         when_all=conditions,
@@ -689,7 +683,8 @@ class ConfigLoader:
                 self._construct(
                     path,
                     f"Capability producer for {name}",
-                    lambda p=p: CapabilityProducer(
+                    partial(
+                        CapabilityProducer,
                         tool=p["tool"],
                         arg_match=p.get("arg_match"),
                         arg_not_match=p.get("arg_not_match"),
@@ -700,9 +695,7 @@ class ConfigLoader:
             capabilities[name] = self._construct(
                 path,
                 f"Capability {name}",
-                lambda name=name, producers=producers: CapabilityDef(
-                    name=name, produced_by=producers
-                ),
+                partial(CapabilityDef, name=name, produced_by=producers),
             )
         combination_rules: list[CapabilityCombinationRule] = []
         for item in data.get("combination_rules", []):
@@ -710,7 +703,8 @@ class ConfigLoader:
                 self._construct(
                     path,
                     f"Capability combination rule {item.get('id', '<unknown>')}",
-                    lambda item=item: CapabilityCombinationRule(
+                    partial(
+                        CapabilityCombinationRule,
                         id=item["id"],
                         description=item.get("description", ""),
                         requires_any=list(item.get("requires_any", [])),
@@ -725,8 +719,10 @@ class ConfigLoader:
         return self._construct(
             path,
             "Capability rules",
-            lambda: CapabilityRules(
-                capabilities=capabilities, combination_rules=combination_rules
+            partial(
+                CapabilityRules,
+                capabilities=capabilities,
+                combination_rules=combination_rules,
             ),
         )
 
@@ -738,40 +734,45 @@ class ConfigLoader:
         grants: dict[str, AuthorityGrantRule] = {}
         for capability, item in (data.get("authority_grants") or {}).items():
             cond = item.get("conditions", {})
+            conditions = self._construct(
+                path,
+                f"Authority conditions for {capability}",
+                partial(
+                    AuthorityConditions,
+                    user_confirmation=cond.get("user_confirmation", False),
+                    budget_remaining=cond.get("budget_remaining"),
+                    no_recent_denials_within_steps=cond.get(
+                        "no_recent_denials_within_steps"
+                    ),
+                    require_task_context_regex=cond.get(
+                        "require_task_context_regex"
+                    ),
+                ),
+            )
+            budget_limit = self._construct(
+                path,
+                f"Authority budget limit for {capability}",
+                partial(
+                    BudgetCost,
+                    **item.get("budget_limit", {"token_count": 0}),
+                ),
+            )
             grants[capability] = self._construct(
                 path,
                 f"Authority grant {capability}",
-                lambda capability=capability, item=item, cond=cond: AuthorityGrantRule(
+                partial(
+                    AuthorityGrantRule,
                     capability=capability,
                     description=item.get("description", ""),
-                    conditions=self._construct(
-                        path,
-                        f"Authority conditions for {capability}",
-                        lambda cond=cond: AuthorityConditions(
-                            user_confirmation=cond.get("user_confirmation", False),
-                            budget_remaining=cond.get("budget_remaining"),
-                            no_recent_denials_within_steps=cond.get(
-                                "no_recent_denials_within_steps"
-                            ),
-                            require_task_context_regex=cond.get(
-                                "require_task_context_regex"
-                            ),
-                        ),
-                    ),
+                    conditions=conditions,
                     max_duration_seconds=item.get("max_duration_seconds", 300),
-                    budget_limit=self._construct(
-                        path,
-                        f"Authority budget limit for {capability}",
-                        lambda: BudgetCost(
-                            **item.get("budget_limit", {"token_count": 0})
-                        ),
-                    ),
+                    budget_limit=budget_limit,
                 ),
             )
         return self._construct(
             path,
             "Authority rules",
-            lambda: AuthorityRules(enabled=data.get("enabled", True), grants=grants),
+            partial(AuthorityRules, enabled=data.get("enabled", True), grants=grants),
         )
 
     def _load_audit_rules(self, path: Path) -> AuditRules:
@@ -782,38 +783,39 @@ class ConfigLoader:
         rules: list[AuditRule] = []
         for item in data.get("rules", []):
             cond = item.get("conditions", {})
+            conditions = self._construct(
+                path,
+                f"Audit conditions for {item.get('id', '<unknown>')}",
+                partial(
+                    AuditRuleConditions,
+                    min_denies_count=cond.get("min_denies_count"),
+                    min_denies_within_seconds=cond.get("min_denies_within_seconds"),
+                    consecutive_denies=cond.get("consecutive_denies"),
+                    action_sequence=cond.get("action_sequence"),
+                    has_any_action=cond.get("has_any_action"),
+                    has_all_actions=cond.get("has_all_actions"),
+                    authority_token_exhausted=cond.get(
+                        "authority_token_exhausted", False
+                    ),
+                ),
+            )
             rules.append(
                 self._construct(
                     path,
                     f"Audit rule {item.get('id', '<unknown>')}",
-                    lambda item=item, cond=cond: AuditRule(
+                    partial(
+                        AuditRule,
                         rule_id=item["id"],
                         description=item.get("description", ""),
                         severity=item.get("severity", "medium"),
-                        conditions=self._construct(
-                            path,
-                            f"Audit conditions for {item.get('id', '<unknown>')}",
-                            lambda cond=cond: AuditRuleConditions(
-                                min_denies_count=cond.get("min_denies_count"),
-                                min_denies_within_seconds=cond.get(
-                                    "min_denies_within_seconds"
-                                ),
-                                consecutive_denies=cond.get("consecutive_denies"),
-                                action_sequence=cond.get("action_sequence"),
-                                has_any_action=cond.get("has_any_action"),
-                                has_all_actions=cond.get("has_all_actions"),
-                                authority_token_exhausted=cond.get(
-                                    "authority_token_exhausted", False
-                                ),
-                            ),
-                        ),
+                        conditions=conditions,
                     ),
                 )
             )
         return self._construct(
             path,
             "Audit rules",
-            lambda: AuditRules(enabled=data.get("enabled", True), rules=rules),
+            partial(AuditRules, enabled=data.get("enabled", True), rules=rules),
         )
 
     def _load_masking_rules(self, path: Path) -> MaskingRules:
@@ -822,7 +824,7 @@ class ConfigLoader:
             self._construct(
                 path,
                 f"Masking value pattern {p.get('name', '<unknown>')}",
-                lambda p=p: ValuePattern(**p),
+                partial(ValuePattern, **p),
             )
             for p in data.get("value_patterns", [])
         ]
@@ -842,15 +844,17 @@ class ConfigLoader:
             self._construct(
                 path,
                 f"Approval rule {r.get('tool_name', '<unknown>')}",
-                lambda r=r: ApprovalRule(**r),
+                partial(ApprovalRule, **r),
             )
             for r in data.get("rules", [])
         ]
         return self._construct(
             path,
             "Approval config",
-            lambda: ApprovalConfig(
-                default=data.get("approvers", {}).get("default", ""), rules=rules
+            partial(
+                ApprovalConfig,
+                default=data.get("approvers", {}).get("default", ""),
+                rules=rules,
             ),
         )
 
@@ -860,7 +864,7 @@ class ConfigLoader:
             return None
         data = self._read_yaml(path)
         return self._construct(
-            path, "LLM planner", lambda: LLMPlannerConfig(**data)
+            path, "LLM planner", partial(LLMPlannerConfig, **data)
         )
 
     def _load_identity_config(self, path: Path) -> dict[str, Any]:
@@ -1375,16 +1379,6 @@ class ConfigLoader:
                 raise ConfigValidationError(
                     f"entrypoints.{name}.require_auth 必须是布尔值"
                 )
-            admin_agent_ids = cfg.get("admin_agent_ids")
-            if admin_agent_ids is not None and (
-                name != "grpc"
-                or not isinstance(admin_agent_ids, list)
-                or any(not isinstance(agent_id, str) or not agent_id for agent_id in admin_agent_ids)
-            ):
-                raise ConfigValidationError(
-                    "entrypoints.grpc.admin_agent_ids 必须是非空字符串列表"
-                )
-
         # v0.33.0 admin profile 白名单
         admin = entrypoints.get("admin")
         if admin is None:
@@ -1401,7 +1395,7 @@ class ConfigLoader:
     # -- 工具 ---------------------------------------------------------------
 
     @staticmethod
-    def _construct(path: Path, context: str, build: Callable[[], Any]) -> Any:
+    def _construct(path: Path, context: str, build: Callable[[], T]) -> T:
         """统一包装模型/数据类构造异常，确保启动期给出 ConfigValidationError。"""
         try:
             return build()

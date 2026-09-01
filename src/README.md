@@ -1,6 +1,6 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.33.0）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环。
+企业级 AI Agent 治理层（v0.36.1）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环。
 
 **v0.33.0 战略方向**：在 v0.32.0 接入方式收敛的基础上，本版本聚焦**Python 工具治理层的健壮性加固**：堵住 Agent SDK、MCP Proxy、HTTP REST API 与配置校验中当前最危险的安全、稳定与正确性漏洞，使 `@governed` 主路线和网络接入面达到可生产部署基线。HTTP REST API 与 MCP Proxy 继续作为**网关/强制约束层**保留，用于外部不可控 Agent 或跨语言接入；FastAPI 与 gRPC 接入已从核心包移除，LangChain 集成降级为 `examples/integrations/` 可选示例。
 

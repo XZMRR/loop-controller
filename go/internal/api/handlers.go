@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/loop-controller/go/internal/delegation"
@@ -26,6 +28,50 @@ type Server struct {
 	delegation *delegation.Delegator
 	publisher  stream.TaskEventPublisher
 	discovery  *discovery.Manager
+}
+
+// currentProtocolVersion is the A2A HTTP/JSON protocol version implemented by
+// this kernel. Patch differences are allowed; major/minor differences are
+// fail-closed.
+const currentProtocolVersion = "0.36.1"
+
+// checkProtocolVersion returns an error if the client-supplied protocol version
+// is incompatible with the current kernel. Empty/missing versions are allowed
+// during the transition period but logged.
+func checkProtocolVersion(v string) error {
+	if v == "" {
+		return nil
+	}
+	if v == currentProtocolVersion {
+		return nil
+	}
+	parts := strings.Split(v, ".")
+	current := strings.Split(currentProtocolVersion, ".")
+	if len(parts) < 2 || len(current) < 2 {
+		return fmt.Errorf("invalid protocol version %q", v)
+	}
+	if parts[0] != current[0] || parts[1] != current[1] {
+		return fmt.Errorf("incompatible protocol version %q, expected %s", v, currentProtocolVersion)
+	}
+	// patch-level drift is tolerated
+	return nil
+}
+
+// validateMessageParts rejects unknown Part types and empty data payloads.
+func validateMessageParts(msg *models.Message) error {
+	for i, p := range msg.Parts {
+		switch p.Type {
+		case "text":
+			// text parts may carry arbitrary text; no further validation
+		case "data":
+			if len(p.Data) == 0 {
+				return fmt.Errorf("part %d: data part has empty payload", i)
+			}
+		default:
+			return fmt.Errorf("part %d: unknown part type %q", i, p.Type)
+		}
+	}
+	return nil
 }
 
 // NewServer creates a new Server.
@@ -136,11 +182,20 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
+	if err := checkProtocolVersion(msg.ProtocolVersion); err != nil {
+		writeError(w, http.StatusBadRequest, "incompatible_protocol_version", err.Error())
+		return
+	}
+	if err := validateMessageParts(&msg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_message_parts", err.Error())
+		return
+	}
 	resp, err := s.router.Route(msg)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "route_failed", err.Error())
 		return
 	}
+	resp.ProtocolVersion = currentProtocolVersion
 	status := http.StatusOK
 	if !resp.Accepted {
 		status = http.StatusBadRequest
@@ -154,11 +209,16 @@ func (s *Server) handleDelegation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
+	if err := checkProtocolVersion(req.ProtocolVersion); err != nil {
+		writeError(w, http.StatusBadRequest, "incompatible_protocol_version", err.Error())
+		return
+	}
 	resp, err := s.delegation.Request(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "delegation_failed", err.Error())
 		return
 	}
+	resp.ProtocolVersion = currentProtocolVersion
 	status := http.StatusOK
 	if !resp.Allowed {
 		status = http.StatusForbidden
@@ -167,7 +227,10 @@ func (s *Server) handleDelegation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":            "ok",
+		"protocol_version":  currentProtocolVersion,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -164,7 +164,18 @@ class LoopController:
                 error_code="delegation_denied",
             )
 
-        await bridge.route_message(
+        # v0.36.1：委托响应必须携带 task_id，否则无法确认 Task 已创建。
+        if not resp.task_id:
+            return GovernanceResult(
+                status="blocked",
+                call_id=proposal.call_id,
+                tool_name=proposal.tool_name,
+                arguments=proposal.arguments,
+                reason="delegation response missing task_id",
+                error_code="delegation_failed",
+            )
+
+        message_recorded = await bridge.route_message(
             A2AMessage(
                 message_id=proposal.call_id,
                 task_id=resp.task_id or task.task_id,
@@ -174,6 +185,15 @@ class LoopController:
                 + [{"type": "data", "data": {k: v for k, v in proposal.arguments.items() if k != "__target_agent_id"}}],
             )
         )
+        if not message_recorded:
+            return GovernanceResult(
+                status="blocked",
+                call_id=proposal.call_id,
+                tool_name=proposal.tool_name,
+                arguments=proposal.arguments,
+                reason="delegation message routing failed",
+                error_code="delegation_route_failed",
+            )
 
         return GovernanceResult(
             status="allow",
@@ -183,6 +203,9 @@ class LoopController:
             decision=decision,
             content={
                 "delegated": True,
+                "authorized": True,
+                "task_created": True,
+                "message_recorded": True,
                 "target_agent_id": target_agent_id,
                 "target_entrypoint": (
                     resp.target_entrypoint.url if resp.target_entrypoint else None
@@ -776,7 +799,7 @@ class LoopController:
         proposal: ActionProposal,
         decision: Decision,
     ) -> ToolResult:
-        """调用 Checkpoint.forward 执行 Decision，并写审计事件。"""
+        """调用 Checkpoint.forward 执行 Decision；执行阶段审计由 Checkpoint 统一写入。"""
         try:
             self._runtime.require_execution_ready()
         except RuntimeError as exc:
@@ -786,6 +809,18 @@ class LoopController:
             raise CheckpointError(f"unknown agent_id: {proposal.agent_id}")
         blocked = await self._handle_revocation(task, agent, proposal, "pre_execute")
         if blocked is not None:
+            # v0.36.1：在 Controller 侧被吊销阻断的执行请求显式记录。
+            await self._runtime.audit_store.append_async(
+                _audit_event(
+                    task,
+                    action="execution_blocked",
+                    proposal=proposal,
+                    decision=decision,
+                    result=blocked,
+                    reason="execution blocked by revocation pre-check",
+                    masker=self._runtime.masker,
+                )
+            )
             return blocked
         session = self._runtime.session_manager.get_session(task.session_id)
         session_id = session.session_id if session is not None else task.session_id
@@ -795,16 +830,6 @@ class LoopController:
             session_id=session_id,
             user_id=task.user_id,
             tenant_id=task.tenant_id,
-        )
-        await self._runtime.audit_store.append_async(
-            _audit_event(
-                task,
-                action="execute",
-                proposal=proposal,
-                decision=decision,
-                result=result,
-                masker=self._runtime.masker,
-            )
         )
         return result
 

@@ -198,6 +198,8 @@ class GovernanceRuntime:
                     raise TypeError(
                         "registry 必须提供 tools 字典，或 list_tools()/get(name) 方法"
                     )
+                assert list_fn is not None
+                assert get_fn is not None
                 for name in list_fn():
                     items.append((name, get_fn(name)))
 
@@ -209,6 +211,7 @@ class GovernanceRuntime:
             if name in exclude:
                 continue
             if register is not None:
+                assert get_fn is not None, "registry 提供 register 时必须提供 get"
                 originals[name] = get_fn(name)
             elif tools is not None and isinstance(tools, dict):
                 originals[name] = tools[name]
@@ -230,7 +233,7 @@ class GovernanceRuntime:
             raise
 
 
-def _run_async[T](coro: Coroutine[Any, Any, T]) -> T:
+def _run_async(coro: Coroutine[Any, Any, T]) -> T:
     """在当前线程运行一个协程；兼容无事件循环的情况。
 
     如果调用处已经在一个运行中的事件循环里，同步等待协程会导致事件循环死锁或
@@ -329,7 +332,7 @@ def _make_governed_wrapper(
     return sync_wrapper
 
 
-def governed[T](
+def governed(
     fn: Callable[..., T] | None = None,
     *,
     tool_name: str | None = None,

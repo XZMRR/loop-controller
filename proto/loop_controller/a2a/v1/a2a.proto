@@ -4,9 +4,10 @@ package loop_controller.a2a.v1;
 
 option go_package = "github.com/loop-controller/go/internal/a2a";
 
-// A2A 最小协议（v0.35.0）。
-// 本文件作为规范存在；v0.35.0 的 Go 实现使用等价 JSON 模型，
-// 未来版本可生成 *_pb2.go 与 *_grpc.pb.go。
+// A2A 最小协议（v0.36.1）。
+// 本文件自 v0.36.1 起仅作为历史/概念规范保留；当前线协议是 HTTP/JSON/SSE，
+// 其权威来源为 OpenAPI/JSON Schema 与 src/loop_controller/go_kernel_bridge.py。
+// 本文件不再生成 *_pb2.go 与 *_grpc.pb.go，也不得作为当前可生成的 gRPC 服务承诺。
 
 service A2AKernel {
   // 注册 / 更新 Agent Card
@@ -37,7 +38,7 @@ message AgentCard {
 }
 
 message AgentEntrypoint {
-  string type = 1;  // "http" | "grpc" | "mcp"
+  string type = 1;  // "http" | "mcp"
   string url = 2;
 }
 
@@ -94,7 +95,7 @@ message Message {
 message Part {
   string type = 1;  // "text" | "data"
   string text = 2;
-  string data_json = 3;
+  string data_json = 3;  // 历史字段；当前 HTTP/JSON 线协议使用结构化 data 对象
 }
 
 message SendMessageRequest {
@@ -120,8 +121,7 @@ message DelegationRequest {
 
 message DelegationResponse {
   bool allowed = 1;
-  string task_id = 2;
-  AgentEntrypoint target_entrypoint = 3;
-  string delegation_token = 4;
-  string reason = 5;
+  AgentEntrypoint target_entrypoint = 2;
+  string delegation_token = 3;
+  string reason = 4;
 }

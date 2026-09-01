@@ -1110,7 +1110,12 @@ def build_app(
         ],
     )
 
-    async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    async def _http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        if not isinstance(exc, HTTPException):
+            return JSONResponse(
+                {"error": "internal_error"},
+                status_code=500,
+            )
         return JSONResponse(
             {"error": "http_error", "message": str(exc.detail)},
             status_code=exc.status_code,

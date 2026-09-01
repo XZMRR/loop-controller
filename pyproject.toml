@@ -1,6 +1,10 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "loop-controller"
-version = "0.36.0"
+version = "0.36.1"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.0",
@@ -64,6 +68,22 @@ exclude = ["go/", "examples/contrib/adapters/"]
 [[tool.mypy.overrides]]
 module = ["langchain_core.*"]
 ignore_missing_imports = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loop_controller"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/config",
+    "/policies",
+    "/go",
+    "/proto",
+    "/LICENSE",
+    "/README.md",
+    "/src/README.md",
+    "/src/KNOWN_LIMITATIONS.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

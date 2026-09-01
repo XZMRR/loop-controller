@@ -838,6 +838,8 @@ async def test_forward_modify_recheck_failed_on_value(
         verdict="modify",
         reason="modified",
         modified_args={"path": "/etc/passwd"},  # 越出 /data/kb/** 白名单
+        original_args=proposal.arguments,
+        policy_modified_args={"path": "/etc/passwd"},
         policy_hits=["modify_rule"],
         policy_version="v",
         profile_version="v",
@@ -894,6 +896,8 @@ async def test_forward_modify_allowed_value_passes(
         verdict="modify",
         reason="modified",
         modified_args={"path": "/data/kb/other.md"},  # 仍在白名单内 → 复核通过
+        original_args=proposal.arguments,
+        policy_modified_args={"path": "/data/kb/other.md"},
         policy_version="v",
         profile_version="v",
         expires_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -909,6 +913,42 @@ async def test_forward_modify_allowed_value_passes(
     history = cp._history[task.task_id]
     assert len(history) == 1
     assert history[0].arguments == {"path": "/data/kb/other.md"}
+
+
+async def test_forward_modify_recheck_opa_non_allow(
+    task: Task, agent: Agent, profile: CapabilityProfile, identity: ConfigIdentityProvider
+) -> None:
+    """v0.36.1：用 policy_modified_args 重新跑 OPA 复核，非 allow 时 block。"""
+    cp, _, gw = make_checkpoint(
+        profile,
+        identity,
+        engine_by_tool={
+            "read_file": {"verdict": "deny", "reason": "modified args denied by policy"}
+        },
+    )
+    proposal = make_proposal(
+        task, agent, tool_name="read_file", arguments={"path": "/data/kb/doc.md"}
+    )
+    decision = Decision(
+        decision_id=uuid.uuid4().hex,
+        call_id=proposal.call_id,
+        task_id=task.task_id,
+        verdict="modify",
+        reason="modified",
+        modified_args={"path": "/data/kb/doc.md"},
+        original_args=proposal.arguments,
+        policy_modified_args={"path": "/data/kb/doc.md"},
+        policy_version="v",
+        profile_version="v",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+
+    cp._decision_store.record_decision(decision)
+    result = await cp.forward(proposal, decision)
+
+    assert result.status == "blocked"
+    assert result.error_code == "modify_recheck_failed"
+    assert gw.calls == []
 
 
 # ---------------------------------------------------------------------------

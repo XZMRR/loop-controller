@@ -1,0 +1,56 @@
+{
+  "protocol_version": "0.36.1",
+  "agent_card": {
+    "agent_id": "agent-a",
+    "name": "Agent A",
+    "description": "contract fixture agent",
+    "entrypoint": {
+      "type": "http",
+      "url": "http://127.0.0.1:9001"
+    },
+    "capabilities": ["delegate_execution"],
+    "trust_domain": "test.loop-controller.local",
+    "version": "0.36.1"
+  },
+  "message": {
+    "message_id": "msg-001",
+    "task_id": "task-001",
+    "from_agent_id": "agent-a",
+    "to_agent_id": "agent-b",
+    "role": "user",
+    "parts": [
+      {
+        "type": "text",
+        "text": "invoke-tool"
+      },
+      {
+        "type": "data",
+        "data": {"path": "/data/kb/doc.md", "mode": "read"}
+      }
+    ],
+    "timestamp": "2026-09-01T12:00:00Z",
+    "protocol_version": "0.36.1"
+  },
+  "delegation_request": {
+    "request_id": "req-001",
+    "initiator_agent_id": "agent-a",
+    "target_agent_id": "agent-b",
+    "tool_name": "read_file",
+    "arguments_json": "{\"path\":\"/data/kb/doc.md\"}",
+    "session_id": "sess-001",
+    "task_id": "task-001",
+    "risk_level": "high",
+    "protocol_version": "0.36.1"
+  },
+  "delegation_response": {
+    "allowed": true,
+    "task_id": "task-001",
+    "target_entrypoint": {
+      "type": "http",
+      "url": "http://127.0.0.1:9002"
+    },
+    "delegation_token": "token-001",
+    "reason": "authorized",
+    "protocol_version": "0.36.1"
+  }
+}

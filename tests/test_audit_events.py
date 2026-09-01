@@ -140,6 +140,7 @@ def _build_controller(audit_path: Path) -> LoopController:
         risk_manager=risk_manager,
         conversation_store=conversation_store,
     )
+    checkpoint._audit_store = audit_store
     return LoopController(runtime)
 
 
@@ -192,20 +193,20 @@ async def test_audit_event_sequence_and_fields(tmp_path) -> None:
         ]
         actions = [e.action for e in events]
         assert actions == [
-            "propose", "evaluate", "execute",  # web_search
+            "propose", "evaluate", "execution_authorized", "execution_completed",  # web_search
             "propose", "evaluate",             # send_email 被 require_approval 拦截
-            "approve", "approval_consumed", "execute",  # send_email 审批后执行
+            "approve", "approval_consumed", "execution_authorized", "execution_completed",  # send_email 审批后执行
         ]
 
         # approve 事件由审批人触发（actor_type 使用 r0_delegate）
-        approve_event = events[-3]
+        approve_event = events[-4]
         assert approve_event.action == "approve"
         assert approve_event.actor_type == "r0_delegate"
         assert approve_event.actor_id == "zhang_manager"
         assert approve_event.decision == "allow"
 
         # approval_consumed 事件由 checkpoint 触发
-        consumed_event = events[-2]
+        consumed_event = events[-3]
         assert consumed_event.action == "approval_consumed"
         assert consumed_event.actor_type == "checkpoint"
 

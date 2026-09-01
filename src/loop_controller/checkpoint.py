@@ -33,6 +33,7 @@ from loop_controller.models import (
     ActionProposal,
     Agent,
     ApprovalRequest,
+    AuditAction,
     AuditEvent,
     BudgetCost,
     BudgetReservation,
@@ -318,26 +319,30 @@ class Checkpoint:
                 )
             )
 
-    async def _audit_execution(
+    async def _audit_execution_event(
         self,
+        action: AuditAction,
         proposal: ActionProposal,
-        result: ToolResult,
+        result: ToolResult | None,
         *,
         session_id: str | None,
         user_id: str,
         tenant_id: str | None,
+        reason: str,
     ) -> None:
-        """v0.31.0：工具执行成功后把 Harness evidence 摘要写入审计链。"""
+        """v0.36.1：写入 execution_* 阶段审计事件，避免同名 execute 重复。"""
         if self._audit_store is None:
             return
         metadata: dict[str, Any] = {
             "user_id": user_id,
-            "result_status": result.status,
-            "error_code": result.error_code,
         }
-        harness_evidence = result.metadata.get("harness_evidence")
-        if harness_evidence is not None:
-            metadata["harness_evidence"] = harness_evidence
+        if result is not None:
+            metadata["result_status"] = result.status
+            if result.error_code:
+                metadata["error_code"] = result.error_code
+            harness_evidence = result.metadata.get("harness_evidence")
+            if harness_evidence is not None:
+                metadata["harness_evidence"] = harness_evidence
         await self._audit_store.append_async(
             AuditEvent(
                 event_id=uuid.uuid4().hex,
@@ -346,10 +351,10 @@ class Checkpoint:
                 call_id=proposal.call_id,
                 actor_type="agent",
                 actor_id=proposal.agent_id,
-                action="execute",
+                action=action,
                 target=proposal.tool_name,
-                decision="allow",
-                reason="tool executed",
+                decision="allow" if action == "execution_authorized" else None,
+                reason=reason,
                 metadata=metadata,
             )
         )
@@ -695,13 +700,17 @@ class Checkpoint:
 
         if proposal.risk_level == "critical":
             self._risk_manager.update(task.session_id, "critical")
+        modified_args = rego_decision.get("modified_args") if verdict == "modify" else None
         decision = Decision(
             decision_id=uuid.uuid4().hex,
             call_id=proposal.call_id,
             task_id=proposal.task_id,
             verdict=verdict,  # allow / modify
             reason=rego_decision.get("reason", "allowed by policy"),
-            modified_args=rego_decision.get("modified_args") if verdict == "modify" else None,
+            modified_args=modified_args,  # 向后兼容
+            original_args=proposal.arguments if verdict == "modify" else None,
+            policy_modified_args=modified_args,
+            effective_args=None,  # forward 复核后回填
             escalation_target=rego_decision.get("escalation_target"),
             policy_hits=hits,
             policy_version=policy_version,
@@ -963,16 +972,82 @@ class Checkpoint:
             # 校验 6：modify 复核（PEP 职责，不抛异常，返回 blocked）
             effective_args = proposal.arguments
             if decision.verdict == "modify":
-                if decision.modified_args is None or canonical_json(
-                    decision.modified_args
+                # v0.36.1：明确 original / policy_modified / effective 三阶段参数语义。
+                if decision.original_args is None or canonical_json(
+                    decision.original_args
                 ) != canonical_json(proposal.arguments):
                     self._refund_reservation(reservation)
-                    return self._blocked(proposal, "modified_args 缺失或改动超出参数值范围")
-                perm = self._tool_permission_for(proposal)
-                if perm is None or not self._args_allowed(perm, decision.modified_args):
+                    await self._audit_execution_event(
+                        "execution_blocked",
+                        proposal,
+                        None,
+                        session_id=session_id,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        reason="Decision 记录的 original_args 与当前 proposal 不一致",
+                    )
+                    return self._blocked(proposal, "Decision 记录的 original_args 与当前 proposal 不一致")
+                candidate = decision.policy_modified_args
+                if candidate is None:
                     self._refund_reservation(reservation)
+                    await self._audit_execution_event(
+                        "execution_blocked",
+                        proposal,
+                        None,
+                        session_id=session_id,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        reason="policy_modified_args 缺失",
+                    )
+                    return self._blocked(proposal, "policy_modified_args 缺失")
+                # 用改写后参数重新请求 OPA，期望 allow；不允许再次 modify。
+                agent_for_modify = self._identity.get_agent(proposal.agent_id)
+                if agent_for_modify is None:
+                    self._refund_reservation(reservation)
+                    raise CheckpointError(f"unknown agent_id: {proposal.agent_id}")
+                profile_for_modify = self._profiles.get(agent_for_modify.profile_id)
+                if profile_for_modify is None:
+                    self._refund_reservation(reservation)
+                    raise CheckpointError(f"unknown profile: {agent_for_modify.profile_id}")
+                modified_proposal = proposal.model_copy(update={"arguments": candidate})
+                session_risk_for_modify = self._risk_manager.get_profile(
+                    session_id or proposal.task_id
+                )
+                recheck = await self._policy_engine.evaluate(
+                    _PACKAGE,
+                    build_policy_input(
+                        modified_proposal,
+                        agent_for_modify,
+                        profile_for_modify,
+                        session_risk_for_modify,
+                    ),
+                )
+                if recheck.get("verdict") != "allow":
+                    self._refund_reservation(reservation)
+                    await self._audit_execution_event(
+                        "execution_blocked",
+                        proposal,
+                        None,
+                        session_id=session_id,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        reason="改写后参数未通过策略复核",
+                    )
+                    return self._blocked(proposal, "改写后参数未通过策略复核")
+                perm = self._tool_permission_for(proposal)
+                if perm is None or not self._args_allowed(perm, candidate):
+                    self._refund_reservation(reservation)
+                    await self._audit_execution_event(
+                        "execution_blocked",
+                        proposal,
+                        None,
+                        session_id=session_id,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        reason="modify 后参数未通过 Profile 白/黑名单复核",
+                    )
                     return self._blocked(proposal, "modify 后参数未通过 Profile 白/黑名单复核")
-                effective_args = decision.modified_args
+                effective_args = candidate
 
             # 校验 7-8：最终吊销检查后转发执行；成功才记入 per-task 历史。
             if self._revocation_list is not None:
@@ -1015,6 +1090,15 @@ class Checkpoint:
             if executor is None:
                 # v0.31.0：执行策略拒绝该工具（deny）。
                 self._refund_reservation(reservation)
+                await self._audit_execution_event(
+                    "execution_blocked",
+                    proposal,
+                    None,
+                    session_id=session_id,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    reason="execution mode denied by policy",
+                )
                 return ToolResult(
                     call_id=proposal.call_id,
                     task_id=proposal.task_id,
@@ -1037,6 +1121,17 @@ class Checkpoint:
             if consumed_authority is None:
                 raise CheckpointError("Authority token 无效、已过期或预算不足")
 
+            # v0.36.1：Decision 已消费、Authority 已确认，记录执行授权。
+            await self._audit_execution_event(
+                "execution_authorized",
+                proposal,
+                None,
+                session_id=session_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                reason="decision and authority validated before execution",
+            )
+
             try:
                 result = await executor.execute(
                     tool_name=proposal.tool_name,
@@ -1058,6 +1153,15 @@ class Checkpoint:
                     outcome="uncertain",
                     refunded=False,
                 )
+                await self._audit_execution_event(
+                    "execution_outcome_unknown",
+                    proposal,
+                    None,
+                    session_id=session_id,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    reason="executor raised before returning a result",
+                )
                 self._refund_reservation(reservation)
                 raise
             await self._audit_authority_consumption(
@@ -1068,13 +1172,26 @@ class Checkpoint:
                 refunded=False,
             )
             self._commit_reservation(reservation)
-            await self._audit_execution(
-                proposal,
-                result,
-                session_id=session_id,
-                user_id=user_id,
-                tenant_id=tenant_id,
-            )
+            if result.status == "success":
+                await self._audit_execution_event(
+                    "execution_completed",
+                    proposal,
+                    result,
+                    session_id=session_id,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    reason="tool executed",
+                )
+            else:
+                await self._audit_execution_event(
+                    "execution_failed",
+                    proposal,
+                    result,
+                    session_id=session_id,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    reason="tool execution returned failure",
+                )
         except CheckpointError:
             if reservation is not None:
                 self._refund_reservation(reservation)
@@ -1082,8 +1199,8 @@ class Checkpoint:
         if result.status == "success":
             # v0.23.2：modify 后历史应记录实际生效参数，而非原始参数
             history_proposal = proposal
-            if decision.verdict == "modify" and decision.modified_args is not None:
-                history_proposal = proposal.model_copy(update={"arguments": decision.modified_args})
+            if decision.verdict == "modify" and effective_args is not None:
+                history_proposal = proposal.model_copy(update={"arguments": effective_args})
             self._history.setdefault(proposal.task_id, []).append(history_proposal)
             # v1.2：allow 且风险低时按低风险成功衰减会话风险分
             if (

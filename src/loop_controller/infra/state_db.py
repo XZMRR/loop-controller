@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS decisions (
     verdict TEXT NOT NULL,
     reason TEXT NOT NULL,
     modified_args TEXT,
+    original_args TEXT,
+    policy_modified_args TEXT,
+    effective_args TEXT,
     escalation_target TEXT,
     policy_hits TEXT,
     policy_version TEXT,
@@ -44,6 +47,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     used_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
+
 CREATE INDEX IF NOT EXISTS idx_decisions_call_id ON decisions(call_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_task_id ON decisions(task_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_expires_at ON decisions(expires_at);
@@ -96,6 +100,9 @@ class DecisionRecord:
     verdict: str
     reason: str
     modified_args: dict[str, Any] | None
+    original_args: dict[str, Any] | None
+    policy_modified_args: dict[str, Any] | None
+    effective_args: dict[str, Any] | None
     escalation_target: str | None
     policy_hits: list[str]
     policy_version: str
@@ -108,7 +115,10 @@ class DecisionRecord:
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> DecisionRecord:
-        modified_args = row["modified_args"]
+        def _load(col: str) -> dict[str, Any] | None:
+            value = row[col]
+            return json.loads(value) if value else None
+
         policy_hits = row["policy_hits"]
         return cls(
             decision_id=row["decision_id"],
@@ -116,7 +126,10 @@ class DecisionRecord:
             task_id=row["task_id"],
             verdict=row["verdict"],
             reason=row["reason"],
-            modified_args=json.loads(modified_args) if modified_args else None,
+            modified_args=_load("modified_args"),
+            original_args=_load("original_args"),
+            policy_modified_args=_load("policy_modified_args"),
+            effective_args=_load("effective_args"),
             escalation_target=row["escalation_target"],
             policy_hits=json.loads(policy_hits) if policy_hits else [],
             policy_version=row["policy_version"] or "",
@@ -154,17 +167,32 @@ class StateDatabase:
                 isolation_level=None,
             )
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 5000;")
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA foreign_keys=ON;")
             return conn
         except sqlite3.Error as exc:
             raise StateDatabaseError(f"无法连接状态数据库 {self._db_path}: {exc}") from exc
 
+    def _migrate_decisions_columns(self) -> None:
+        """v0.36.1：增量为 decisions 表添加 modify 参数字段。"""
+        try:
+            with self._connect() as conn:
+                with conn:
+                    cur = conn.execute("PRAGMA table_info(decisions)")
+                    existing = {row["name"] for row in cur.fetchall()}
+                    for col in ("original_args", "policy_modified_args", "effective_args"):
+                        if col not in existing:
+                            conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} TEXT")
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"无法升级 decisions 表 Schema: {exc}") from exc
+
     def init_schema(self) -> None:
         """初始化/校验 Schema；幂等。"""
         try:
             with self._connect() as conn:
                 conn.executescript(SCHEMA)
+            self._migrate_decisions_columns()
         except sqlite3.Error as exc:
             raise StateDatabaseError(f"无法初始化状态数据库 Schema: {exc}") from exc
 
@@ -216,10 +244,11 @@ class StateDatabase:
                         """
                         INSERT INTO decisions (
                             decision_id, call_id, task_id, verdict, reason,
-                            modified_args, escalation_target, policy_hits,
+                            modified_args, original_args, policy_modified_args, effective_args,
+                            escalation_target, policy_hits,
                             policy_version, profile_version, expires_at,
                             max_uses, finalized, used_count, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             record.decision_id,
@@ -229,6 +258,15 @@ class StateDatabase:
                             record.reason,
                             json.dumps(record.modified_args, ensure_ascii=False)
                             if record.modified_args is not None
+                            else None,
+                            json.dumps(record.original_args, ensure_ascii=False)
+                            if record.original_args is not None
+                            else None,
+                            json.dumps(record.policy_modified_args, ensure_ascii=False)
+                            if record.policy_modified_args is not None
+                            else None,
+                            json.dumps(record.effective_args, ensure_ascii=False)
+                            if record.effective_args is not None
                             else None,
                             record.escalation_target,
                             json.dumps(record.policy_hits, ensure_ascii=False)

@@ -128,10 +128,10 @@ def _set_resource_limits(max_memory_bytes: int | None, cpu_seconds: float | None
         return
     try:
         if max_memory_bytes is not None:
-            resource.setrlimit(resource.RLIMIT_AS, (max_memory_bytes, max_memory_bytes))
+            resource.setrlimit(resource.RLIMIT_AS, (max_memory_bytes, max_memory_bytes))  # type: ignore[name-defined]
         if cpu_seconds is not None:
             sec = max(1, int(cpu_seconds))
-            resource.setrlimit(resource.RLIMIT_CPU, (sec, sec))
+            resource.setrlimit(resource.RLIMIT_CPU, (sec, sec))  # type: ignore[name-defined]
     except (OSError, ValueError) as exc:
         logger.warning("无法设置子进程资源限制: %s", exc)
 

@@ -1,16 +1,18 @@
-"""审批请求与结果持久化。"""
+"""审批请求与结果持久化（v0.36.1 起支持敏感载荷 AES-256-GCM 加密）。"""
 
 from __future__ import annotations
 
 import json
 import logging
 import os  # noqa: F401  # 保留兼容故障注入：测试通过本模块替换 os.fsync
+import shutil
 import threading
 import uuid
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from loop_controller.infra.alert_store import AlertStore
+from loop_controller.infra.approval_crypto import ApprovalCrypto, ApprovalCryptoError
 from loop_controller.infra.durable_io import DurableIOError, DurableJsonlFile
 from loop_controller.models import ApprovalRecord, ApprovalRequest, AuditAlert
 
@@ -21,17 +23,82 @@ class ApprovalStoreError(Exception):
     """ApprovalStore 损坏或操作冲突时抛出（fail-closed）。"""
 
 
-def _serialize_request(request: ApprovalRequest) -> dict:
-    return {**request.model_dump(mode="json"), "type": "request"}
+class ApprovalStoreCorruptedError(ApprovalStoreError):
+    """审批存储存在损坏或非法记录。"""
+
+
+_ENCRYPTED_SCHEMA_VERSION = "1"
+_SENSITIVE_FIELDS = ("tool_arguments", "original_decision")
+
+
+def _aad_context(request_id: str, call_id: str, agent_id: str, tool_name: str) -> dict[str, str]:
+    return {
+        "request_id": request_id,
+        "call_id": call_id,
+        "agent_id": agent_id,
+        "tool_name": tool_name,
+        "schema_version": _ENCRYPTED_SCHEMA_VERSION,
+    }
+
+
+def _serialize_request(request: ApprovalRequest, crypto: ApprovalCrypto | None = None) -> dict:
+    data = request.model_dump(mode="json")
+    if crypto is not None:
+        payload: dict[str, object] = {}
+        has_sensitive = False
+        for field in _SENSITIVE_FIELDS:
+            value = data.pop(field, None)
+            if value is not None:
+                payload[field] = value
+                has_sensitive = True
+        if has_sensitive:
+            aad = _aad_context(
+                request_id=data["request_id"],
+                call_id=data["call_id"],
+                agent_id=data["agent_id"],
+                tool_name=data["tool_name"],
+            )
+            data["encrypted_payload"] = {
+                "ciphertext": crypto.encrypt(payload, aad),
+                "schema_version": _ENCRYPTED_SCHEMA_VERSION,
+            }
+    data["type"] = "request"
+    return data
 
 
 def _serialize_record(record: ApprovalRecord) -> dict:
     return {**record.model_dump(mode="json"), "type": "response"}
 
 
-def _deserialize_request(record: dict) -> ApprovalRequest:
+def _deserialize_request(record: dict, crypto: ApprovalCrypto | None = None) -> ApprovalRequest:
     data = dict(record)
     data.pop("type", None)
+    encrypted_payload = data.pop("encrypted_payload", None)
+    if encrypted_payload is not None:
+        if crypto is None:
+            raise ApprovalStoreCorruptedError(
+                "发现加密审批记录但缺少解密密钥，无法恢复原始参数"
+            )
+        if not isinstance(encrypted_payload, dict):
+            raise ApprovalStoreCorruptedError("encrypted_payload 必须是对象")
+        ciphertext = encrypted_payload.get("ciphertext")
+        if not ciphertext or not isinstance(ciphertext, str):
+            raise ApprovalStoreCorruptedError("encrypted_payload.ciphertext 缺失或类型错误")
+        schema_version = str(encrypted_payload.get("schema_version", _ENCRYPTED_SCHEMA_VERSION))
+        aad = _aad_context(
+            request_id=data.get("request_id", ""),
+            call_id=data.get("call_id", ""),
+            agent_id=data.get("agent_id", ""),
+            tool_name=data.get("tool_name", ""),
+        )
+        aad["schema_version"] = schema_version
+        try:
+            plaintext = crypto.decrypt(ciphertext, aad)
+        except ApprovalCryptoError as exc:
+            raise ApprovalStoreCorruptedError(f"审批敏感载荷解密失败：{exc}") from exc
+        for field in _SENSITIVE_FIELDS:
+            if field in plaintext:
+                data[field] = plaintext[field]
     return ApprovalRequest.model_validate(data)
 
 
@@ -39,6 +106,54 @@ def _deserialize_record(record: dict) -> ApprovalRecord:
     data = dict(record)
     data.pop("type", None)
     return ApprovalRecord.model_validate(data)
+
+
+def migrate_approval_store(
+    path: str | Path,
+    crypto: ApprovalCrypto,
+    *,
+    backup_suffix: str = ".plaintext-backup",
+) -> None:
+    """离线、幂等地把明文 Approval JSONL 迁移为加密格式。
+
+    步骤：
+    1. 若目标文件不存在，直接返回；
+    2. 创建 ``path + backup_suffix`` 只读备份；
+    3. 逐行读取旧文件，把 ``request`` 类型记录中的敏感字段加密后写入临时文件；
+    4. ``response`` 类型记录原样复制；
+    5. fsync 临时文件并原子替换原文件；
+    6. 迁移失败不删除备份。
+
+    幂等性：已加密记录会被重新解密再加密（ciphertext 会改变，语义等价）。
+    """
+    src = Path(path)
+    if not src.exists():
+        return
+    backup_path = src.with_suffix(src.suffix + backup_suffix)
+    shutil.copy2(src, backup_path)
+    tmp_path = src.with_suffix(src.suffix + ".migrate-tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8", newline="") as f:
+            with src.open("r", encoding="utf-8") as f_src:
+                for line in f_src:
+                    line = line.rstrip("\r\n")
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if record.get("type") == "request":
+                        request = _deserialize_request(record, crypto=crypto)
+                        record = _serialize_request(request, crypto=crypto)
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_path.replace(src)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
 
 
 @runtime_checkable
@@ -53,10 +168,16 @@ class ApprovalStore(Protocol):
 
 
 class JsonlApprovalStore:
-    def __init__(self, path: str | Path, alert_store: AlertStore | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        alert_store: AlertStore | None = None,
+        crypto: ApprovalCrypto | None = None,
+    ) -> None:
         self._path = Path(path)
         self._durable = DurableJsonlFile(self._path)
         self._alert_store = alert_store
+        self._crypto = crypto
         self._requests: dict[str, ApprovalRequest] = {}
         self._responses: dict[str, ApprovalRecord] = {}
         self._lock = threading.RLock()
@@ -89,14 +210,16 @@ class JsonlApprovalStore:
             try:
                 record = json.loads(raw)
                 if record.get("type") == "request":
-                    request = _deserialize_request(record)
+                    request = _deserialize_request(record, crypto=self._crypto)
                     requests[request.decision_id] = request
                 elif record.get("type") == "response":
                     response = _deserialize_record(record)
                     responses.setdefault(response.decision_id, response)
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 self._alert_for_bad_line(raw.decode("utf-8", errors="replace"), "invalid_json")
-                raise ApprovalStoreError(f"审批存储 {self._path} 存在损坏的完整记录") from exc
+                raise ApprovalStoreCorruptedError(
+                    f"审批存储 {self._path} 存在损坏的完整记录"
+                ) from exc
         self._requests, self._responses = requests, responses
 
     def refresh(self) -> None:
@@ -116,7 +239,7 @@ class JsonlApprovalStore:
                     existing = self._requests.get(request.decision_id)
                     if existing == request:
                         return
-                    transaction.append_json(_serialize_request(request))
+                    transaction.append_json(_serialize_request(request, crypto=self._crypto))
                     self._requests[request.decision_id] = request
             except DurableIOError as exc:
                 raise ApprovalStoreError(f"无法写入审批存储 {self._path}: {exc}") from exc

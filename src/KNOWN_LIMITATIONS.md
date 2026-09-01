@@ -288,13 +288,13 @@ v0.26.1 支持 HMAC-SHA256 与 Ed25519，并通过审计—证据交叉校验和
 
 `append_async()` 避免阻塞事件循环，并在单个 `JsonlAuditStore` 实例内保证序号和哈希链有序；它不提供多进程、多 worker 或多节点对同一 JSONL 文件的安全并发。违反该部署前提不在完整性承诺范围内。
 
-### V261-2. gRPC 管理授权是简单 allowlist，不是完整 RBAC
+### V261-2. gRPC 管理接口已移除
 
-`entrypoints.grpc.admin_agent_ids` 只按已认证身份的精确 `agent_id` 授权 Admin RPC；省略或空列表时默认全部拒绝。本版本不提供角色继承、细粒度管理权限或多租户管理员域。HTTP Admin API 继续使用现有 API key，两套认证体系尚未统一。
+v0.32.0 已移除 Python gRPC 服务与 `entrypoints.grpc` 配置；v0.36.1 继续清理相关文档与校验。管理操作统一通过 HTTP Admin API 与现有 API key 认证，不提供角色继承、细粒度管理权限或多租户管理员域。
 
 ### V261-3. 吊销时间必须显式携带时区
 
-`revoked_at` 与 `expires_at` 的 HTTP、gRPC、YAML 输入必须是带时区的 ISO 8601 时间；合法值会转为 UTC，无时区值会被拒绝。吊销热更新校验失败时保留旧内存快照，不会用无效配置覆盖现有保护。
+`revoked_at` 与 `expires_at` 的 HTTP、YAML 输入必须是带时区的 ISO 8601 时间；合法值会转为 UTC，无时区值会被拒绝。吊销热更新校验失败时保留旧内存快照，不会用无效配置覆盖现有保护。
 
 ### V261-4. 证据验证失败采用降级而非拒绝启动
 

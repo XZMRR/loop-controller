@@ -36,6 +36,7 @@ from loop_controller.go_kernel_bridge import AgentCard, AgentEntrypoint, GoKerne
 from loop_controller.identity import ConfigIdentityProvider, IdentityProvider
 from loop_controller.identity.revocation import RevocationList
 from loop_controller.infra.alert_store import JsonlAlertStore
+from loop_controller.infra.approval_crypto import ApprovalCrypto
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import AuditStore, JsonlAuditStore
 from loop_controller.infra.authority_store import JsonlAuthorityStore
@@ -218,6 +219,8 @@ class Runtime:
 
     async def _register_local_agent_card(self) -> None:
         """向 Go 内核注册本地 Agent Card（v0.36.0）。"""
+        if self.go_kernel_bridge is None:
+            return
         try:
             local = self.local_agent_config
             entrypoint = local.get("entrypoint", "http://127.0.0.1:8000")
@@ -597,8 +600,13 @@ def build_runtime(
         index_path=audit_index_path,
     )
     checkpoint._audit_store = audit_store
+    approval_crypto = ApprovalCrypto.from_env_or_none()
     approval_manager = AsyncApprovalManager(
-        JsonlApprovalStore(config.approval_store_path, alert_store=alert_store)
+        JsonlApprovalStore(
+            config.approval_store_path,
+            alert_store=alert_store,
+            crypto=approval_crypto,
+        )
     )
     audit_analyzer = RuleBasedAuditAnalyzer(
         rules=config.audit_rules,

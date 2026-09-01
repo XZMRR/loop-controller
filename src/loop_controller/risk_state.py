@@ -119,11 +119,16 @@ class JsonlRiskStateStore:
 
     def _ensure_writable(self) -> None:
         """检查并确保父目录可写（启动校验）。"""
+        import os
+        import uuid
+
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        probe = self._path.parent / ".write_probe_risk_state"
+        probe = self._path.parent / f".write_probe_risk_state_{os.getpid()}_{uuid.uuid4().hex}"
         try:
-            probe.write_text("", encoding="utf-8")
-            probe.unlink()
+            try:
+                probe.write_text("", encoding="utf-8")
+            finally:
+                probe.unlink(missing_ok=True)
         except OSError as exc:
             raise PermissionError(f"risk_state 父目录 {self._path.parent} 不可写：{exc}") from exc
         # 若文件已存在则确认可追加

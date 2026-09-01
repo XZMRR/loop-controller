@@ -1,6 +1,6 @@
 """审批事件通知器（v0.19.0）。
 
-为 SSE 与 gRPC server-streaming 提供统一的等待/通知抽象。
+为 SSE 与 HTTP 长轮询提供统一的等待/通知抽象。
 审批权威状态仍在 ApprovalStore；本模块只负责在状态可能变化时唤醒 waiter。
 """
 

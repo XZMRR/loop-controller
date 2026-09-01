@@ -40,7 +40,12 @@ from typing import Any
 from loop_controller.approval_service import ApprovalServiceError, build_approval_record
 from loop_controller.audit_analyzer import RuleBasedAuditAnalyzer
 from loop_controller.infra.alert_store import JsonlAlertStore
-from loop_controller.infra.approval_store import ApprovalStoreError, JsonlApprovalStore
+from loop_controller.infra.approval_crypto import ApprovalCrypto
+from loop_controller.infra.approval_store import (
+    ApprovalStoreError,
+    JsonlApprovalStore,
+    migrate_approval_store,
+)
 from loop_controller.infra.audit_store import JsonlAuditStore
 from loop_controller.infra.config_loader import AppConfig, ConfigLoader
 from loop_controller.proxy_server import LoopControllerProxyServer, ProxyIdentity
@@ -82,6 +87,15 @@ def _build_parser() -> argparse.ArgumentParser:
     deny_cmd.add_argument("decision_id", help="需要审批的 decision_id")
     deny_cmd.add_argument("--approver", required=True, help="审批人 ID")
     deny_cmd.add_argument("--comment", default="", help="审批意见")
+
+    migrate_cmd = app_sub.add_parser(
+        "migrate", help="离线迁移审批存储：明文 → AES-256-GCM 加密（v0.36.1）"
+    )
+    migrate_cmd.add_argument(
+        "--backup-suffix",
+        default=".plaintext-backup",
+        help="备份文件后缀（默认 .plaintext-backup）",
+    )
 
     audit = subparsers.add_parser("audit", help="审计分析（v0.12.0）")
     audit_sub = audit.add_subparsers(dest="audit_cmd", required=True)
@@ -390,7 +404,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
-    store = JsonlApprovalStore(config.approval_store_path)
+    store = JsonlApprovalStore(
+        config.approval_store_path,
+        crypto=ApprovalCrypto.from_env_or_none(),
+    )
 
     if args.approval_cmd == "list":
         return _cmd_list(store, args)
@@ -398,6 +415,15 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_approve_or_deny(store, config, args, "approve")
     if args.approval_cmd == "deny":
         return _cmd_approve_or_deny(store, config, args, "deny")
+    if args.approval_cmd == "migrate":
+        crypto = ApprovalCrypto.from_env()
+        migrate_approval_store(
+            config.approval_store_path,
+            crypto,
+            backup_suffix=args.backup_suffix,
+        )
+        print(f"已迁移 {config.approval_store_path}，备份位于 {args.backup_suffix}")
+        return 0
 
     parser.print_help()
     return 1

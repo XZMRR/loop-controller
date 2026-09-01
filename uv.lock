@@ -716,8 +716,8 @@ wheels = [
 
 [[package]]
 name = "loop-controller"
-version = "0.36.0"
-source = { virtual = "." }
+version = "0.36.1"
+source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
     { name = "httpx" },

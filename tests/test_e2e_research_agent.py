@@ -130,6 +130,7 @@ def _build_controller(workdir: Path, opa_url: str) -> LoopController:
         risk_manager=risk_manager,
         conversation_store=conversation_store,
     )
+    checkpoint._audit_store = audit_store
     return LoopController(runtime)
 
 
@@ -268,11 +269,11 @@ async def test_e2e_approve_path_event_sequence(opa_server, workdir) -> None:
 
     actions = [e.action for e in _events(workdir)]
     assert actions == [
-        "propose", "evaluate", "execute",  # web_search
-        "propose", "evaluate", "execute",  # read_file
-        "propose", "evaluate", "execute",  # write_file
+        "propose", "evaluate", "execution_authorized", "execution_completed",  # web_search
+        "propose", "evaluate", "execution_authorized", "execution_completed",  # read_file
+        "propose", "evaluate", "execution_authorized", "execution_completed",  # write_file
         "propose", "evaluate",             # send_email 被 require_approval 拦截
-        "approve", "approval_consumed", "execute",  # send_email 审批后执行
+        "approve", "approval_consumed", "execution_authorized", "execution_completed",  # send_email 审批后执行
     ]
     assert controller._runtime.audit_store.verify_chain()
 

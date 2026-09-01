@@ -195,10 +195,11 @@ async def test_agent_multi_step_workflow(simple_controller: Any) -> None:
         assert "add" in targets
         assert "echo" in targets
 
-        # 验证至少包含 propose 与 execute 两类事件
+        # 验证至少包含 propose 与执行阶段事件
         add_events = [e for e in events if e.target == "add"]
         assert any(e.action == "propose" for e in add_events)
-        assert any(e.action == "execute" for e in add_events)
+        assert any(e.action == "execution_authorized" for e in add_events)
+        assert any(e.action == "execution_completed" for e in add_events)
     finally:
         await rt.aclose()
 
