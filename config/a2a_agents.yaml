@@ -1,0 +1,22 @@
+# A2A Agent Card 静态发现样例（v0.36.0）
+# 本文件为 Go A2A 内核的静态发现 Provider 提供示例 Agent Card。
+# 生产部署时应替换为真实 Agent 的 endpoint、capabilities 与 token。
+
+- agent_id: loop-controller-local
+  name: Loop Controller Python Runtime
+  entrypoint:
+    type: http
+    url: http://127.0.0.1:8000
+  capabilities:
+    - delegate_execution
+  version: 0.36.0
+
+- agent_id: research-agent
+  name: Research Agent
+  entrypoint:
+    type: http
+    url: http://127.0.0.1:8001
+  capabilities:
+    - delegate_execution
+    - stream_task
+  version: 0.36.0

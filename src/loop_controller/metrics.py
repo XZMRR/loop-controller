@@ -111,6 +111,43 @@ ANCHOR_CONFLICTS_TOTAL = Counter(
     "Total trusted anchor conflicts",
 )
 
+PERSISTENCE_FSYNC_ENABLED = Gauge(
+    "loop_controller_persistence_fsync_enabled",
+    "Whether durable fsync is enabled (1) or disabled (0)",
+)
+
+PERSISTENCE_DURABILITY_SAFE = Gauge(
+    "loop_controller_persistence_durability_safe",
+    "Whether persistence durability is considered safe (1) or unsafe (0)",
+)
+
+PERSISTENCE_TAIL_REPAIRS_TOTAL = Counter(
+    "loop_controller_persistence_tail_repairs_total",
+    "Total durable JSONL tail repairs",
+)
+
+PERSISTENCE_CORRUPTED_TOTAL = Counter(
+    "loop_controller_persistence_corrupted_total",
+    "Total durable store corruption events",
+    ["store"],
+)
+
+PERSISTENCE_LOCK_FAILURES_TOTAL = Counter(
+    "loop_controller_persistence_lock_failures_total",
+    "Total durable I/O lock acquisition failures",
+)
+
+PERSISTENCE_FSYNC_DURATION = Histogram(
+    "loop_controller_persistence_fsync_duration_seconds",
+    "Durable fsync call duration",
+)
+
+PERSISTENCE_LOCK_WAIT_DURATION = Histogram(
+    "loop_controller_persistence_lock_wait_seconds",
+    "Durable I/O lock acquisition wait duration",
+)
+
+
 _ANCHOR_ERROR_CODES = {
     "none",
     "anchor_authentication_failed",
@@ -220,6 +257,37 @@ def observe_anchor_conflict() -> None:
 def render_metrics() -> bytes:
     """返回 Prometheus 指标文本。"""
     return generate_latest()
+
+
+def set_persistence_durability(safe: bool, fsync_enabled: bool) -> None:
+    """更新持久化 durability 与 fsync 状态指标。"""
+    PERSISTENCE_DURABILITY_SAFE.set(1 if safe else 0)
+    PERSISTENCE_FSYNC_ENABLED.set(1 if fsync_enabled else 0)
+
+
+def observe_persistence_fsync(duration: float) -> None:
+    """记录一次 fsync 耗时。"""
+    PERSISTENCE_FSYNC_DURATION.observe(max(0.0, duration))
+
+
+def observe_persistence_lock_wait(duration: float) -> None:
+    """记录一次 durable I/O 锁等待耗时。"""
+    PERSISTENCE_LOCK_WAIT_DURATION.observe(max(0.0, duration))
+
+
+def observe_persistence_tail_repair() -> None:
+    """记录一次尾部修复。"""
+    PERSISTENCE_TAIL_REPAIRS_TOTAL.inc()
+
+
+def observe_persistence_corruption(store: str) -> None:
+    """记录一次持久化存储损坏事件。"""
+    PERSISTENCE_CORRUPTED_TOTAL.labels(store=store).inc()
+
+
+def observe_persistence_lock_failure() -> None:
+    """记录一次锁获取失败。"""
+    PERSISTENCE_LOCK_FAILURES_TOTAL.inc()
 
 
 def _status_label(status_code: int) -> str:

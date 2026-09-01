@@ -72,7 +72,7 @@ jobs:
       - name: Download OPA
         run: |
           mkdir -p tools
-          curl -L -o tools/opa https://openpolicyagent.org/downloads/v1.0.1/opa_linux_amd64_static
+          curl -L -o tools/opa https://openpolicyagent.org/downloads/v1.19.0/opa_linux_amd64_static
           chmod +x tools/opa
 
       - name: Verify OPA is available
@@ -85,3 +85,18 @@ jobs:
         env:
           OPA_PATH: tools/opa
           LOOP_CONTROLLER_AUDIT_HMAC_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+  go:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Run Go tests
+        run: cd go && go test ./...

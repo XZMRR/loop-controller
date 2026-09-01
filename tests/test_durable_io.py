@@ -13,6 +13,7 @@ from loop_controller.infra.durable_io import (
     DurableIOError,
     DurableJsonlFile,
     durable_atomic_replace,
+    durable_locked_read,
 )
 
 
@@ -74,6 +75,42 @@ def test_lock_timeout_has_stable_error_and_cause(tmp_path: Path, monkeypatch) ->
             pass
 
     assert captured.value.__cause__ is error
+
+
+@pytest.mark.parametrize("operation", ["transaction", "locked_read", "atomic_replace"])
+def test_all_lock_paths_observe_wait_on_timeout(
+    tmp_path: Path, monkeypatch, operation: str
+) -> None:
+    error = portalocker.LockException("busy")
+    lock = Mock()
+    lock.__enter__ = Mock(side_effect=error)
+    lock.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(portalocker, "Lock", Mock(return_value=lock))
+    observe = Mock()
+    monkeypatch.setattr("loop_controller.infra.durable_io.observe_persistence_lock_wait", observe)
+
+    with pytest.raises(DurableIOError, match="timed out acquiring durable I/O lock"):
+        if operation == "transaction":
+            with DurableJsonlFile(tmp_path / "events.jsonl").transaction():
+                pass
+        elif operation == "locked_read":
+            durable_locked_read(tmp_path / "events.jsonl")
+        else:
+            durable_atomic_replace(tmp_path / "checkpoint.json", b"content")
+
+    observe.assert_called_once()
+    assert observe.call_args.args[0] >= 0
+
+
+def test_locked_read_observes_successful_lock_wait(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b"content")
+    observe = Mock()
+    monkeypatch.setattr("loop_controller.infra.durable_io.observe_persistence_lock_wait", observe)
+
+    assert durable_locked_read(path) == b"content"
+
+    observe.assert_called_once()
 
 
 def test_read_complete_lines_accepts_crlf_without_text_offsets(tmp_path: Path) -> None:
@@ -175,6 +212,17 @@ def test_atomic_replace_fsyncs_temp_before_replace_and_parent_after(
     assert events[0:2] == ["fsync", "replace"]
     if os.name != "nt":
         assert events == ["fsync", "replace", "fsync"]
+
+
+def test_atomic_replace_observes_each_fsync(tmp_path: Path, monkeypatch) -> None:
+    observe = Mock()
+    monkeypatch.setattr("loop_controller.infra.durable_io.observe_persistence_fsync", observe)
+
+    durable_atomic_replace(tmp_path / "checkpoint.json", b"content")
+
+    expected = 1 if os.name == "nt" else 2
+    assert observe.call_count == expected
+    assert all(call.args[0] >= 0 for call in observe.call_args_list)
 
 
 def test_atomic_replace_failure_cleans_only_own_temp(tmp_path: Path, monkeypatch) -> None:

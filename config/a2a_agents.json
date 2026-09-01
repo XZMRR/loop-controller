@@ -1,0 +1,22 @@
+[
+  {
+    "agent_id": "loop-controller-local",
+    "name": "Loop Controller Python Runtime",
+    "entrypoint": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000"
+    },
+    "capabilities": ["delegate_execution"],
+    "version": "0.36.0"
+  },
+  {
+    "agent_id": "research-agent",
+    "name": "Research Agent",
+    "entrypoint": {
+      "type": "http",
+      "url": "http://127.0.0.1:8001"
+    },
+    "capabilities": ["delegate_execution", "stream_task"],
+    "version": "0.36.0"
+  }
+]

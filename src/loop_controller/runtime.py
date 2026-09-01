@@ -114,6 +114,7 @@ class Runtime:
     evidence_anchor: HTTPAnchorBackend | None = None  # v0.28.0
     persistence_status: PersistenceStatus = field(default_factory=PersistenceStatus)
     go_kernel_bridge: GoKernelBridge | None = None  # v0.36.0 A2A 交互治理桥接
+    local_agent_config: dict[str, Any] = field(default_factory=dict)
 
     def require_execution_ready(self) -> None:
         if self.persistence_status.status not in {"healthy", "tail_repaired"}:
@@ -218,14 +219,16 @@ class Runtime:
     async def _register_local_agent_card(self) -> None:
         """向 Go 内核注册本地 Agent Card（v0.36.0）。"""
         try:
-            # 使用当前运行时的入口信息；实际部署时应从 entrypoints_config 读取。
+            local = self.local_agent_config
+            entrypoint = local.get("entrypoint", "http://127.0.0.1:8000")
+            capabilities = local.get("capabilities", ["delegate_execution"])
             await self.go_kernel_bridge.register_agent(
                 AgentCard(
-                    agent_id="loop-controller-local",
-                    name="Loop Controller Python Runtime",
-                    entrypoint=AgentEntrypoint("http", "http://127.0.0.1:8000"),
-                    capabilities=["delegate_execution"],
-                    version="0.36.0",
+                    agent_id=local.get("agent_id", "loop-controller-local"),
+                    name=local.get("name", "Loop Controller Python Runtime"),
+                    entrypoint=AgentEntrypoint("http", entrypoint),
+                    capabilities=capabilities if isinstance(capabilities, list) else ["delegate_execution"],
+                    version=local.get("version", "0.36.0"),
                 )
             )
         except Exception as exc:
@@ -649,4 +652,7 @@ def build_runtime(
         evidence_anchor=evidence_anchor,
         persistence_status=persistence_status,
         go_kernel_bridge=go_kernel_bridge,
+        local_agent_config=dict(
+            config.go_kernel_config.get("go_kernel", {}).get("local_agent", {})
+        ),
     )

@@ -1,18 +1,25 @@
-# Harness 后端、工具与执行策略配置（v0.32.0）
+# Harness 后端、工具与执行策略配置（v0.36.0）
 # Loop Controller 默认不信任 Agent：非 trusted_local_tools 中的敏感工具必须
 # 通过外部 Harness 在受限沙箱中执行，网络/文件/命令出口默认全部 deny。
 #
 # 生产主路径是 HTTPS 远程 HTTP Harness；subprocess 仅用于开发/集成测试。
 # Loop Controller 不直接编排 Docker。启用前还需将工具名加入 profiles.yaml，
 # 并通过环境变量注入认证密钥。
+#
+# 执行策略也可独立维护在 config/execution_policy.yaml 中作为样例；
+# 当前 `ConfigLoader` 从本文件的 `execution:` 节点读取策略。
 
 # execution:
-#   # 默认策略：trusted_local（允许本地 MCP 执行）或 harness_required（默认不信任）。
+#   # 默认策略：trusted_local / harness_required / harness_preferred。
 #   default_mode: harness_required
-#   # deny 模式下返回的自定义错误信息。
-#   denied_message: "该工具在 deny 策略下被禁止执行"
+#   # 后端不健康时是否 fail-closed。
+#   fail_closed_when_unhealthy: true
+#   # 是否允许在所有 Harness 后端不可用时回退到本地执行。
+#   allow_fallback_to_local: false
 #   # 显式允许在本地通过 MCP/HTTP/Executor 执行的工具白名单。
 #   trusted_local_tools: []
+#   # 单个工具的执行策略覆盖（工具名 -> {mode, sandbox}）。
+#   tools: {}
 
 # backends:
 #   production_harness:

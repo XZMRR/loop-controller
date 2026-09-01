@@ -9,10 +9,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/loop-controller/go/internal/models"
+	"gopkg.in/yaml.v3"
 )
 
 // DiscoveryEventType indicates the kind of discovery change.
@@ -131,9 +134,17 @@ func (p *StaticProvider) Discover(ctx context.Context) ([]models.AgentCard, erro
 		}
 		return nil, err
 	}
+
+	ext := strings.ToLower(filepath.Ext(p.path))
 	var cards []models.AgentCard
+	if ext == ".yaml" || ext == ".yml" {
+		if err := yaml.Unmarshal(data, &cards); err != nil {
+			return nil, fmt.Errorf("parse yaml %s: %w", p.path, err)
+		}
+		return cards, nil
+	}
 	if err := json.Unmarshal(data, &cards); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", p.path, err)
+		return nil, fmt.Errorf("parse json %s: %w", p.path, err)
 	}
 	return cards, nil
 }

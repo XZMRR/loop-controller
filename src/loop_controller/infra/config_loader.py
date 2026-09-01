@@ -290,7 +290,8 @@ class ConfigLoader:
         http_tool_specs.update(legacy_http_specs)
         local_function_specs = self._load_local_functions(config_dir / "local_functions.yaml")
         harness_tool_specs, harness_backends, harness_execution_policy = self._load_harness_tools(
-            config_dir / "harness_tools.yaml"
+            config_dir / "harness_tools.yaml",
+            config_dir / "execution_policy.yaml",
         )
         secrets_config = self._load_secrets_config(config_dir / "secrets.yaml", root)
         revocation_config = self._load_optional_config(config_dir / "revocation.yaml")
@@ -535,7 +536,9 @@ class ConfigLoader:
         return specs
 
     def _load_harness_tools(
-        self, path: Path
+        self,
+        path: Path,
+        execution_policy_path: Path | None = None,
     ) -> tuple[
         dict[str, HarnessToolSpec],
         dict[
@@ -544,19 +547,20 @@ class ConfigLoader:
         ],
         HarnessExecutionPolicy,
     ]:
-        """加载 Harness 后端、工具规格与执行策略（v0.31.0）。
-
-        文件缺失时使用默认 harness_required 策略（向后兼容但会告警）。
-        """
+        """加载 Harness 后端、工具规格与独立执行策略。"""
         tool_specs: dict[str, HarnessToolSpec] = {}
         backends: dict[
             str,
             SubprocessBackendConfig | DockerBackendConfig | IsolatedSubprocessBackendConfig | HTTPBackendConfig,
         ] = {}
-        if not path.exists():
-            return tool_specs, backends, HarnessExecutionPolicy()
-        data = self._read_yaml(path)
-        execution_raw = data.get("execution") or {}
+        data = self._read_yaml(path) if path.exists() else {}
+        if "execution" in data:
+            execution_raw = data.get("execution") or {}
+        elif execution_policy_path is not None and execution_policy_path.exists():
+            policy_data = self._read_yaml(execution_policy_path)
+            execution_raw = policy_data.get("execution") or {}
+        else:
+            execution_raw = {}
         try:
             policy = HarnessExecutionPolicy(**execution_raw)
         except ValidationError as exc:
@@ -606,7 +610,11 @@ class ConfigLoader:
         HarnessExecutionPolicy,
     ]:
         """热更新：重新加载 Harness 工具、后端与执行策略。"""
-        return self._load_harness_tools(Path(config_dir) / "harness_tools.yaml")
+        config_dir = Path(config_dir)
+        return self._load_harness_tools(
+            config_dir / "harness_tools.yaml",
+            config_dir / "execution_policy.yaml",
+        )
 
     def reload_secrets_config(
         self, config_dir: str | Path
@@ -1101,6 +1109,7 @@ class ConfigLoader:
                 ) from exc
 
         # v0.31.0：默认需要 Harness 时，非 trusted_local 工具必须存在 Harness spec。
+        harness_required_tools: set[str] = set()
         if policy.default_mode == "harness_required":
             for tool_name in all_known_tools:
                 if tool_name in policy.trusted_local_tools:
@@ -1108,13 +1117,14 @@ class ConfigLoader:
                 override: ToolExecutionPolicy | None = policy.tools.get(tool_name)
                 if override is not None and override.mode == "trusted_local":
                     continue
+                harness_required_tools.add(tool_name)
                 if tool_name not in config.harness_tool_specs:
                     raise ConfigValidationError(
                         f"默认执行策略为 harness_required，工具 {tool_name} 未配置 Harness 规格且不在 trusted_local 白名单"
                     )
 
-        # v0.31.0：harness_required 模式下必须至少配置一个后端。
-        if policy.default_mode == "harness_required" and not config.harness_backends:
+        # 仅当确有工具需要 Harness 时才要求 backend；全量显式 trusted_local 的开发配置可加载。
+        if harness_required_tools and not config.harness_backends:
             raise ConfigValidationError(
                 "默认执行策略为 harness_required，但 harness_tools.yaml 未配置任何 backend"
             )

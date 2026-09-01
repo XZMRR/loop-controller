@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -184,10 +185,12 @@ class JsonlSessionBackend:
     def _ensure_writable(self) -> None:
         """检查并确保父目录可写（启动校验）。"""
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        probe = self._path.parent / ".write_probe_session"
+        probe = self._path.parent / f".write_probe_session_{os.getpid()}_{uuid.uuid4().hex}"
         try:
-            probe.write_text("", encoding="utf-8")
-            probe.unlink(missing_ok=True)
+            try:
+                probe.write_text("", encoding="utf-8")
+            finally:
+                probe.unlink(missing_ok=True)
         except OSError as exc:
             raise PermissionError(f"session 父目录 {self._path.parent} 不可写：{exc}") from exc
         if self._path.exists():

@@ -229,6 +229,30 @@ async def test_checkpoint_session_consecutive_deny_block() -> None:
     assert "session_consecutive_deny_block" in decision.policy_hits
 
 
+def test_build_runtime_injects_local_agent_config(tmp_path: Path) -> None:
+    from loop_controller.runtime import build_runtime
+
+    _make_minimal_config(tmp_path)
+    (tmp_path / "config" / "go_kernel.yaml").write_text(
+        """go_kernel:
+  enabled: false
+  local_agent:
+    agent_id: configured-local
+    name: Configured Runtime
+    entrypoint: http://127.0.0.1:9000
+    capabilities: [delegate_execution, message_receive]
+    version: 9.9.9
+""",
+        encoding="utf-8",
+    )
+    config = ConfigLoader().load(tmp_path / "config", opa_base_url=None)
+
+    runtime = build_runtime(config)
+
+    assert runtime.local_agent_config == config.go_kernel_config["go_kernel"]["local_agent"]
+    assert runtime.local_agent_config is not config.go_kernel_config["go_kernel"]["local_agent"]
+
+
 def test_runtime_create_task_reuses_session(tmp_path: Path) -> None:
     """S2：Runtime.create_task 可通过 session_id 复用 Session。"""
     from loop_controller.runtime import build_runtime

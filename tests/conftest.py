@@ -47,8 +47,8 @@ def write_trusted_local_harness_config(
         "  default_mode: trusted_local",
     ]
     if tools:
-        lines.append("trusted_local_tools:")
-        lines.extend(f"  - {tool}" for tool in tools)
+        lines.append("  trusted_local_tools:")
+        lines.extend(f"    - {tool}" for tool in tools)
     (config_path / "harness_tools.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 # P0 HMAC：为全部测试自动注入一个 32 字节测试 key，避免默认 hmac-sha256 模式启动失败。

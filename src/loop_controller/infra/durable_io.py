@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -12,6 +13,22 @@ from typing import BinaryIO
 import portalocker
 
 logger = logging.getLogger(__name__)
+
+try:
+    from loop_controller.metrics import (
+        observe_persistence_fsync,
+        observe_persistence_lock_wait,
+        observe_persistence_tail_repair,
+    )
+except ImportError:
+    def observe_persistence_fsync(_duration: float) -> None:  # type: ignore[misc]
+        pass
+
+    def observe_persistence_lock_wait(_duration: float) -> None:  # type: ignore[misc]
+        pass
+
+    def observe_persistence_tail_repair() -> None:  # type: ignore[misc]
+        pass
 
 
 class DurableIOError(RuntimeError):
@@ -39,6 +56,7 @@ class DurableJsonlFile:
 
     @contextmanager
     def transaction(self) -> Iterator[DurableJsonlTransaction]:
+        lock_wait_start = time.perf_counter()
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             lock_existed = self.lock_path.exists()
@@ -47,6 +65,7 @@ class DurableJsonlFile:
                 mode="a+b",
                 timeout=self.lock_timeout_seconds,
             ):
+                observe_persistence_lock_wait(time.perf_counter() - lock_wait_start)
                 if not lock_existed and os.name != "nt":
                     os.chmod(self.lock_path, 0o600)
                 file_existed = self.path.exists()
@@ -60,6 +79,7 @@ class DurableJsonlFile:
         except DurableIOError:
             raise
         except portalocker.LockException as exc:
+            observe_persistence_lock_wait(time.perf_counter() - lock_wait_start)
             raise DurableIOError(f"timed out acquiring durable I/O lock: {self.lock_path}") from exc
         except (OSError, ValueError) as exc:
             raise DurableIOError(f"durable JSONL transaction failed: {self.path}") from exc
@@ -75,6 +95,7 @@ def durable_locked_read(
 
     path = Path(path)
     lock_path = Path(f"{path}.lock")
+    lock_wait_start = time.perf_counter()
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with portalocker.Lock(
@@ -82,8 +103,10 @@ def durable_locked_read(
             mode="a+b",
             timeout=lock_timeout_seconds,
         ):
+            observe_persistence_lock_wait(time.perf_counter() - lock_wait_start)
             return path.read_bytes() if path.exists() else None
     except portalocker.LockException as exc:
+        observe_persistence_lock_wait(time.perf_counter() - lock_wait_start)
         raise DurableIOError(f"timed out acquiring durable I/O lock: {lock_path}") from exc
     except OSError as exc:
         raise DurableIOError(f"durable locked read failed: {path}") from exc
@@ -136,10 +159,12 @@ class DurableJsonlTransaction:
                 self._stream.seek(tail_start)
                 self._stream.truncate()
                 self._sync()
+                observe_persistence_tail_repair()
                 return True
             self._stream.seek(0, os.SEEK_END)
             self._stream.write(b"\n")
             self._sync()
+            observe_persistence_tail_repair()
             return True
         except OSError as exc:
             raise DurableIOError("failed to repair incomplete JSONL tail") from exc
@@ -170,7 +195,9 @@ class DurableJsonlTransaction:
     def _sync(self) -> None:
         self._stream.flush()
         if self._fsync_enabled:
+            fsync_start = time.perf_counter()
             os.fsync(self._stream.fileno())
+            observe_persistence_fsync(time.perf_counter() - fsync_start)
 
 
 def durable_atomic_replace(
@@ -187,6 +214,7 @@ def durable_atomic_replace(
     path = Path(path)
     lock_path = Path(f"{path}.lock")
     temp_path: Path | None = None
+    lock_wait_start = time.perf_counter()
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock_existed = lock_path.exists()
@@ -195,6 +223,7 @@ def durable_atomic_replace(
             mode="a+b",
             timeout=lock_timeout_seconds,
         ):
+            observe_persistence_lock_wait(time.perf_counter() - lock_wait_start)
             if not lock_existed and os.name != "nt":
                 os.chmod(lock_path, 0o600)
             replacement = content(path.read_bytes() if path.exists() else None) if callable(content) else content
@@ -210,7 +239,9 @@ def durable_atomic_replace(
                         raise OSError("short write while writing atomic replacement")
                     written += count
                 if fsync_enabled:
+                    fsync_start = time.perf_counter()
                     os.fsync(fd)
+                    observe_persistence_fsync(time.perf_counter() - fsync_start)
             finally:
                 os.close(fd)
             os.replace(temp_path, path)
@@ -218,12 +249,15 @@ def durable_atomic_replace(
             if fsync_enabled and os.name != "nt":
                 directory_fd = os.open(path.parent, os.O_RDONLY)
                 try:
+                    fsync_start = time.perf_counter()
                     os.fsync(directory_fd)
+                    observe_persistence_fsync(time.perf_counter() - fsync_start)
                 finally:
                     os.close(directory_fd)
     except DurableIOError:
         raise
     except portalocker.LockException as exc:
+        observe_persistence_lock_wait(time.perf_counter() - lock_wait_start)
         raise DurableIOError(f"timed out acquiring durable I/O lock: {lock_path}") from exc
     except (OSError, TypeError, ValueError) as exc:
         raise DurableIOError(f"durable atomic replace failed: {path}") from exc

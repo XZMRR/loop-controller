@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,26 @@ from loop_controller.infra.durable_io import (
     DurableJsonlFile,
     durable_atomic_replace,
 )
+
+try:
+    from loop_controller.metrics import (
+        observe_persistence_corruption,
+        observe_persistence_lock_failure,
+        observe_persistence_lock_wait,
+        set_persistence_durability,
+    )
+except ImportError:
+    def observe_persistence_corruption(_store: str) -> None:  # type: ignore[misc]
+        pass
+
+    def observe_persistence_lock_failure() -> None:  # type: ignore[misc]
+        pass
+
+    def observe_persistence_lock_wait(_duration: float) -> None:  # type: ignore[misc]
+        pass
+
+    def set_persistence_durability(_safe: bool, _fsync_enabled: bool) -> None:  # type: ignore[misc]
+        pass
 
 
 @dataclass(frozen=True)
@@ -70,16 +91,21 @@ class PersistenceProbe:
                 if "timed out acquiring" in str(exc):
                     result.lock_failures += 1
                     result.status = "lock_unavailable"
+                    observe_persistence_lock_failure()
                 else:
                     result.corrupted_stores.append(target.name)
                     result.status = "write_blocked" if target.critical else "degraded"
+                    observe_persistence_corruption(target.name)
             except (OSError, ValueError, PermissionError):
                 result.corrupted_stores.append(target.name)
                 result.status = "write_blocked" if target.critical else "degraded"
+                observe_persistence_corruption(target.name)
         if result.unsafe_permissions and self._fail_on_unsafe_permissions:
             result.status = "write_blocked"
         elif result.tail_repairs and result.status == "healthy":
             result.status = "tail_repaired"
+        safe = self._fsync_enabled and result.status in {"healthy", "tail_repaired"}
+        set_persistence_durability(safe, self._fsync_enabled)
         return result
 
     def _probe_target(self, target: PersistenceTarget, result: PersistenceStatus) -> None:
@@ -89,10 +115,12 @@ class PersistenceProbe:
         if target.replace:
             target_lock = Path(f"{path}.lock")
             lock_existed = target_lock.exists()
+            lock_wait_start = time.perf_counter()
             try:
                 with portalocker.Lock(
                     str(target_lock), mode="a+b", timeout=self._lock_timeout_seconds
                 ):
+                    observe_persistence_lock_wait(time.perf_counter() - lock_wait_start)
                     if not lock_existed and os.name != "nt":
                         os.chmod(target_lock, 0o600)
                     if path.exists():
@@ -106,6 +134,7 @@ class PersistenceProbe:
                     probe.unlink(missing_ok=True)
                     Path(f"{probe}.lock").unlink(missing_ok=True)
             except portalocker.LockException as exc:
+                observe_persistence_lock_wait(time.perf_counter() - lock_wait_start)
                 raise DurableIOError(
                     f"timed out acquiring durable I/O lock: {target_lock}"
                 ) from exc

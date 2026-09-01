@@ -1,6 +1,6 @@
 [project]
 name = "loop-controller"
-version = "0.32.0"
+version = "0.36.0"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.0",
@@ -50,7 +50,7 @@ line-length = 100
 # but exclude bandit (`BLE`) rules for early-stage development
 select = ["E", "F", "W", "I", "N", "UP"]
 ignore = ["E501", "ANN", "D", "BLE"]
-exclude = ["src/loop_controller/v1/*"]
+exclude = ["go/*"]
 [tool.ruff.lint.per-file-ignores]
 "src/loop_controller/checkpoint.py" = ["N818"]
 
@@ -59,7 +59,7 @@ python_version = "3.13"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
-exclude = ["src/loop_controller/v1/", "examples/contrib/adapters/"]
+exclude = ["go/", "examples/contrib/adapters/"]
 
 [[tool.mypy.overrides]]
 module = ["langchain_core.*"]

@@ -1,6 +1,6 @@
 # 已知局限（Known Limitations）
 
-> 本文件列出 Loop Controller v0.33.0 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
+> 本文件列出 Loop Controller v0.36.0 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
 
 ---
 
@@ -195,7 +195,7 @@ Rego 策略文件为明文，仅依赖文件系统权限保护。恶意 Agent �
 | # | 边界 | 说明 |
 |---|---|---|
 | F1 | ~~审批为配置打桩~~ 已实现异步审批 CLI | v0.3.0 Iteration 5 用 `AsyncApprovalManager` + `JsonlApprovalStore` + `lc approvals list/approve/deny` 替换 `ConfigR0Delegate`；审批人通过 CLI 写入结果，任务 `resume_task` 后继续 |
-| F2 | 无 Agent 间交互治理 | 只治理 `tool_call`；多 Agent 委托、inter_agent 均未实现 |
+| F2 | Agent 间交互治理由独立 Go A2A 内核负责 | Python 工具治理层仍只治理单 Agent 的 `tool_call`；v0.35.0-v0.36.0 引入的 Go A2A 内核（发现、委托、路由、流式任务）运行在独立进程中，通过 HTTP/JSON 与 Python Runtime 桥接，不在 Python R2 主流程内 |
 | F3 | 无 Earned Authority | 权限固定，无任务后临时提权；`fixed_ceiling` 保留为空 |
 | F4 | ~~LLMPlanner 未实现~~ 已实现（T3.5） | 默认仍关闭（`config/llm_planner.yaml`），开启后由 LLM 动态规划；密钥仅来自环境变量，失败不重试 |
 | F5 | 权限组合规则为静态 YAML | 无图分析/能力代数；规则需人工维护 |
@@ -252,7 +252,7 @@ v0.25.0 实现 `HarnessExecutor`，通过 `config/harness_tools.yaml` 将工具�
 
 ### V25-3. Loop Controller 不提供 Docker/Kubernetes 编排
 
-`DockerBackendConfig` 类型和 `examples/contrib/harness/docker_backend.py` 示例仍在代码库中，但 v0.27.0 配置加载器会在启动期拒绝 `type: docker`，不会把它注册到 `HarnessExecutor`。生产容器或 Kubernetes 工作负载必须由部署层启动为独立 HTTP Harness Service。
+`DockerBackendConfig` 类型和 `examples/contrib/harness/docker_backend.py` 示例仍在代码库中，`config/harness_tools.yaml` 中 `type: docker` 会被 `ConfigLoader` 正常解析并注册到 `HarnessExecutor`。但 `DockerHarnessBackend` 仅负责构造本地 runner 命令，**不管理镜像构建、容器生命周期、网络、卷或重启策略**。生产容器或 Kubernetes 工作负载必须由部署层启动为独立 HTTP Harness Service，Loop Controller 只把它当作普通 HTTP 后端进行治理。
 
 ### V25-4. Harness 工具风险等级由配置提供下限
 
@@ -351,6 +351,22 @@ PUT 超时、连接中断等不确定结果会通过 `GET /v1/anchors/{stream_id
 ### V28-6. 仅支持 Ed25519 receipt 验证
 
 当前 receipt 签名算法固定为 Ed25519，不支持多签、threshold 签名或密钥轮换后的历史 receipt 兼容。服务公钥在启动时通过配置文件加载，运行期不支持轮换。
+
+## v0.36.0 边界声明
+
+### V36-1. A2A 发现、流式与委托为 Go 内核骨架，Python 层仅桥接
+
+v0.35.0-v0.36.0 已实现 Go A2A 内核的最小协议（Agent Card、Task、Message/Part、Delegation）、静态/HTTP 发现、Task SSE 流式更新、JWT HMAC Token 与 Python `GoKernelBridge`。但以下能力尚未落地：
+
+- 持续 watch：`StaticProvider` 与 `HTTPProvider` 的 `Watch` 方法当前直接返回错误，远端 Agent Card 变更需要手动触发 `DiscoveryManager.Sync()` 或重启进程；
+- 发现失败 fail-soft：`DiscoveryManager.Sync()` 任一 provider 失败即整体报错，未按风险缓解项降级为部分结果；
+- SSE fallback：Task 流式更新失败时不会自动回退到轮询；
+- 远程取消/幂等状态查询：超时后仅返回 `harness_request_timeout`，不会自动发起取消或幂等状态查询；
+- 配置样例：`config/go_kernel.yaml` 与 `config/agents.yaml` 为静态示例，生产部署需替换为真实 Agent Card。
+
+### V36-2. Go 内核与 Python Runtime 的版本必须一致
+
+`GoKernelBridge` 通过 HTTP/JSON 与 Go 内核通信，双方 Agent Card、Task 消息与错误码的序列化契约随版本变化。`config/go_kernel.yaml` 中的 `local_agent.version` 与 `pyproject.toml` 版本应当保持一致；不匹配不会导致启动失败，但可能在跨版本升级时出现字段解析降级或错误码误解。
 
 ## 环境备注
 

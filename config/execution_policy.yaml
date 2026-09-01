@@ -1,0 +1,25 @@
+# Harness 执行策略配置（v0.36.0）
+# Harness 未配置时，仓库内置示例工具逐项进入 trusted_local_tools；
+# 新增工具不会自动获得本地执行权限。
+
+execution:
+  # 默认策略：trusted_local / harness_required / harness_preferred
+  default_mode: harness_required
+  # 后端不健康时是否 fail-closed（不返回本地执行）
+  fail_closed_when_unhealthy: true
+  # 是否允许在所有 Harness 后端不可用时回退到本地执行
+  allow_fallback_to_local: false
+  # 显式允许在本地通过 MCP/HTTP/Executor 执行的工具白名单
+  trusted_local_tools:
+    - read_file
+    - write_file
+    - list_directory
+    - fetch_url
+    - query_database
+    - update_database
+    - web_search
+    - send_email
+    - calculate_checksum
+    - transform_data
+  # 单个工具的执行策略覆盖
+  tools: {}

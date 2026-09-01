@@ -6,19 +6,19 @@ import "time"
 
 // AgentCard describes an agent that can participate in governed interactions.
 type AgentCard struct {
-	AgentID     string         `json:"agent_id"`
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Entrypoint  AgentEntrypoint `json:"entrypoint"`
-	Capabilities []string      `json:"capabilities"`
-	TrustDomain string         `json:"trust_domain"`
-	Version     string         `json:"version"`
+	AgentID      string          `json:"agent_id" yaml:"agent_id"`
+	Name         string          `json:"name" yaml:"name"`
+	Description  string          `json:"description" yaml:"description"`
+	Entrypoint   AgentEntrypoint `json:"entrypoint" yaml:"entrypoint"`
+	Capabilities []string        `json:"capabilities" yaml:"capabilities"`
+	TrustDomain  string          `json:"trust_domain" yaml:"trust_domain"`
+	Version      string          `json:"version" yaml:"version"`
 }
 
 // AgentEntrypoint describes how to reach an agent.
 type AgentEntrypoint struct {
-	Type string `json:"type"`
-	URL  string `json:"url"`
+	Type string `json:"type" yaml:"type"`
+	URL  string `json:"url" yaml:"url"`
 }
 
 // Task represents an interaction context between two agents.

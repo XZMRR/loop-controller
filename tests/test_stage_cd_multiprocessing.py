@@ -127,6 +127,16 @@ def _risk_worker(path: str, start) -> None:
     manager.update("session", "deny")
 
 
+def _session_init_worker(path: str, start, results) -> None:
+    start.wait()
+    try:
+        for _ in range(20):
+            JsonlSessionBackend(path)
+        results.put(None)
+    except Exception as exc:
+        results.put(repr(exc))
+
+
 def _session_worker(path: str, session_id: str, operation: str, start, results) -> None:
     manager = SessionManager(backend=JsonlSessionBackend(path))
     start.wait()
@@ -285,6 +295,25 @@ def test_risk_state_multiprocess_updates_refresh_before_append(tmp_path: Path) -
     profile = RiskStateManager(JsonlRiskStateStore(path)).get_profile("session")
     assert profile.denied_count == 2
     assert profile.cumulative_risk_score == 0.38
+
+
+def test_session_backend_multiprocess_init_uses_unique_cleaned_probes(tmp_path: Path) -> None:
+    path = tmp_path / "sessions.jsonl"
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(target=_session_init_worker, args=(str(path), start, results))
+        for _ in range(4)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(10)
+        assert process.exitcode == 0
+    assert [results.get(timeout=1) for _ in processes] == [None] * len(processes)
+    assert list(tmp_path.glob(".write_probe_session*")) == []
 
 
 def test_session_close_is_terminal_against_multiprocess_touch(tmp_path: Path) -> None:

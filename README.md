@@ -1,7 +1,7 @@
 # Loop Controller — 企业内部 Agent 工具调用治理基础设施
 
-> **当前版本**：v0.33.0（Python 工具治理层健壮性加固：SDK 与 API 入口安全）
-> **项目阶段**：MVP 已完成；当前提供 HTTP REST API、MCP Proxy 治理入口，以及可信身份、全局吊销、可插拔执行器、本地签名证据链和受治理的远程 HTTP Harness 出口。v0.33.0 重点加固 `@governed` 主路线与网络接入面的安全、稳定与正确性，使核心路径达到可生产部署基线。
+> **当前版本**：v0.36.0（A2A 交互治理层：自动发现、流式任务与 Runtime 委托集成）
+> **项目阶段**：MVP 已完成；当前提供 HTTP REST API、MCP Proxy 治理入口，以及可信身份、全局吊销、可插拔执行器、本地签名证据链、受治理的远程 HTTP Harness 出口与 Go 交互治理内核。v0.36.0 在 v0.33.0 工具治理层健壮性基础上，新增 Agent Card 自动发现、Task SSE 流式更新与跨 Agent 委托门控。
 > **首选语言**：Python（Agent 生态最丰富，社区传播友好）
 > **文档语言**：中文为主，代码与核心 API 文档以英文为主，便于国际化开源
 
@@ -124,7 +124,7 @@ pip install -e ".[dev]"
 ```powershell
 # Windows
 mkdir tools
-Invoke-WebRequest -Uri "https://openpolicyagent.org/downloads/v1.0.1/opa_windows_amd64.exe" -OutFile "tools\opa.exe"
+Invoke-WebRequest -Uri "https://openpolicyagent.org/downloads/v1.19.0/opa_windows_amd64.exe" -OutFile "tools\opa.exe"
 
 # Linux/macOS 参见 .github/workflows/ci.yml
 ```
@@ -136,7 +136,7 @@ $env:PYTHONPATH="src"
 .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
-当前已通过 **702 个单元测试**（集成测试 22 个，需有效 OPA 二进制），覆盖：
+当前已通过 **800+ 个单元与集成测试**（集成测试需有效 OPA 二进制），覆盖：
 - 配置加载与 8 条启动校验
 - R1 `RuleBasedClassifier` 风险分类
 - R2 `Checkpoint` 判定流水线、审批、权限组合、预算、调用次数上限
@@ -151,7 +151,7 @@ $env:PYTHONPATH="src"
 
 ```powershell
 $env:PYTHONPATH="src"
-.venv\Scripts\python.exe examples/research_agent_example.py
+.venv\Scripts\python.exe examples/research_agent.py
 ```
 
 示例会模拟一个完整的研究助手任务：
@@ -285,6 +285,10 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 ### Phase 3：迭代完善与开源规范
 
 - [x] v0.33.0：Python 工具治理层健壮性加固（SDK 并发安全、API 入口防御、错误脱敏、admin 权限隔离、配置校验 fail-closed、CI 分层）
+- [x] v0.34.0：状态持久化 SQLite 化与 Harness 生产化（热更新、远程取消、幂等、资源隔离）
+- [x] v0.35.0：A2A 交互治理层骨架（Go kernel、Agent Registry、Task Manager、Delegation Manager）
+- [x] v0.36.0：A2A 自动发现、流式任务与 Runtime 委托集成
+- [ ] v0.37.0+：Go 交互治理层完整状态机、跨 Agent 审批委托、分布式发现
 - [ ] T3.5（可选）：LLMPlanner JSON Schema 契约实现
 - [ ] 补充更多示例与文档
 - [ ] 建立完整 CI/CD、代码规范、贡献指南

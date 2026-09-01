@@ -50,6 +50,7 @@ from loop_controller.metrics import (
     observe_tool_call,
     render_metrics,
     set_pending_approvals,
+    set_persistence_durability,
 )
 from loop_controller.metrics import (
     set_trace_id as metrics_set_trace_id,
@@ -339,6 +340,14 @@ class ToolGovernServer:
         uptime = time.time() - self._start_time
         persistence = getattr(self._controller._runtime, "persistence_status", None)
         persistence_summary = persistence.as_dict() if persistence is not None else {}
+        fsync_enabled = persistence_summary.get("fsync_enabled", True)
+        persistence_status = persistence_summary.get("status", "healthy")
+        durability = (
+            "safe"
+            if fsync_enabled and persistence_status in {"healthy", "tail_repaired"}
+            else "unsafe"
+        )
+        set_persistence_durability(durability == "safe", bool(fsync_enabled))
         executor = getattr(self._controller._runtime, "harness_executor", None)
         if executor is not None:
             harness_backends = [status.model_dump(mode="json") for status in executor.backend_statuses()]
@@ -351,7 +360,7 @@ class ToolGovernServer:
         degraded = (
             evidence_status == "degraded"
             or anchor_summary["anchor_status"] not in {"disabled", "healthy"}
-            or persistence_summary.get("status", "healthy") != "healthy"
+            or persistence_status != "healthy"
             or harness_degraded
         )
         return JSONResponse(
@@ -361,6 +370,7 @@ class ToolGovernServer:
                 gateway_ready=gateway_ready,
                 evidence_status=evidence_status,
                 persistence=persistence_summary,
+                durability=durability,
                 uptime_seconds=round(uptime, 2),
                 harness_backends=harness_backends,
                 **anchor_summary,

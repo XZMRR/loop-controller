@@ -179,6 +179,42 @@ def test_load_valid_config(config_dir):
     assert config.persistence.repair_incomplete_tail is True
 
 
+def test_repository_default_config_loads_execution_policy(monkeypatch):
+    repo_root = Path(__file__).resolve().parent.parent
+    monkeypatch.setenv("LOOP_CONTROLLER_AUDIT_HASH_ALGO", "sha256")
+
+    config = ConfigLoader().load(repo_root / "config")
+
+    assert config.harness_execution_policy.default_mode == "harness_required"
+    assert "read_file" in config.harness_execution_policy.trusted_local_tools
+
+
+def test_harness_execution_overrides_execution_policy_file(config_dir):
+    _write_yaml(
+        config_dir / "execution_policy.yaml",
+        {
+            "execution": {
+                "default_mode": "harness_required",
+                "trusted_local_tools": ["read_file"],
+            }
+        },
+    )
+    _write_yaml(
+        config_dir / "harness_tools.yaml",
+        {
+            "execution": {
+                "default_mode": "trusted_local",
+                "trusted_local_tools": ["web_search"],
+            }
+        },
+    )
+
+    config = ConfigLoader().load(config_dir)
+
+    assert config.harness_execution_policy.default_mode == "trusted_local"
+    assert config.harness_execution_policy.trusted_local_tools == {"web_search"}
+
+
 def test_persistence_config_loads(config_dir):
     _write_yaml(config_dir / "persistence.yaml", {
         "persistence": {
