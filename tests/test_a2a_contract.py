@@ -5,13 +5,13 @@ import pytest
 
 from loop_controller.go_kernel_bridge import (
     CURRENT_PROTOCOL_VERSION,
-    AgentCard,
-    AgentEntrypoint,
     A2AMessage,
+    AgentCard,
     DelegationRequest,
     DelegationResponse,
     check_protocol_version,
 )
+from loop_controller.utils.canonical import canonical_json
 
 FIXTURE = Path(__file__).resolve().parents[1] / "contract" / "a2a_v0.36.1.json"
 
@@ -94,3 +94,58 @@ def test_delegation_response_roundtrip(contract: dict) -> None:
 def test_delegation_response_default_protocol_version() -> None:
     resp = DelegationResponse(allowed=True)
     assert resp.protocol_version == "0.36.1"
+
+
+def test_task_fixture_is_canonical_and_has_stable_timestamps(contract: dict) -> None:
+    fixture = contract["task"]
+    assert fixture["task_id"] == "task-001"
+    assert fixture["status"] == "pending"
+    assert fixture["created_at"].endswith("Z")
+    assert canonical_json(json.loads(canonical_json(fixture))) == canonical_json(fixture)
+
+
+def test_all_roundtrip_fixtures_have_stable_canonical_json(contract: dict) -> None:
+    for name in (
+        "agent_card",
+        "task",
+        "message",
+        "delegation_request",
+        "delegation_response",
+        "error_response",
+        "sse_event",
+    ):
+        fixture = contract[name]
+        assert canonical_json(json.loads(json.dumps(fixture))) == canonical_json(fixture)
+
+
+def test_error_response_fixture(contract: dict) -> None:
+    fixture = contract["error_response"]
+    assert fixture == {
+        "error": "protocol version 0.35.0 is incompatible",
+        "code": "incompatible_protocol_version",
+    }
+
+
+def test_sse_event_fixture(contract: dict) -> None:
+    fixture = contract["sse_event"]
+    assert fixture["data"]["task_id"] == contract["task"]["task_id"]
+    assert fixture["data"]["status"] == "active"
+
+
+def classify_message_error(message: dict) -> str | None:
+    required = {"message_id", "task_id", "from_agent_id", "to_agent_id", "parts"}
+    if not required.issubset(message):
+        return "invalid_request"
+    try:
+        check_protocol_version(message.get("protocol_version", ""))
+    except ValueError:
+        return "incompatible_protocol_version"
+    if any(part.get("type") not in {"text", "data"} for part in message["parts"]):
+        return "invalid_message_parts"
+    return None
+
+
+@pytest.mark.parametrize("case_index", range(3))
+def test_error_cases_have_expected_category(contract: dict, case_index: int) -> None:
+    case = contract["error_cases"][case_index]
+    assert classify_message_error(case["message"]) == case["category"]

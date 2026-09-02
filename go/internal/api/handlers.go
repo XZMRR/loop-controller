@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -33,23 +35,24 @@ type Server struct {
 // currentProtocolVersion is the A2A HTTP/JSON protocol version implemented by
 // this kernel. Patch differences are allowed; major/minor differences are
 // fail-closed.
-const currentProtocolVersion = "0.36.1"
+const (
+	currentProtocolVersion = "0.36.1"
+	maxJSONBodyBytes       = 1 << 20
+)
+
+var strictSemverPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 
 // checkProtocolVersion returns an error if the client-supplied protocol version
-// is incompatible with the current kernel. Empty/missing versions are allowed
-// during the transition period but logged.
+// is missing, malformed, or incompatible with the current kernel.
 func checkProtocolVersion(v string) error {
-	if v == "" {
-		return nil
+	if !strictSemverPattern.MatchString(v) {
+		return fmt.Errorf("invalid protocol version %q: expected major.minor.patch", v)
 	}
 	if v == currentProtocolVersion {
 		return nil
 	}
 	parts := strings.Split(v, ".")
 	current := strings.Split(currentProtocolVersion, ".")
-	if len(parts) < 2 || len(current) < 2 {
-		return fmt.Errorf("invalid protocol version %q", v)
-	}
 	if parts[0] != current[0] || parts[1] != current[1] {
 		return fmt.Errorf("incompatible protocol version %q, expected %s", v, currentProtocolVersion)
 	}
@@ -123,10 +126,33 @@ func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
 	_ = stream.ServeTaskStream(s.publisher, w, r, taskID)
 }
 
+func decodeJSONPost(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		var partErr *models.PartValidationError
+		switch {
+		case errors.As(err, &maxBytesErr):
+			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds limit")
+		case errors.As(err, &partErr):
+			writeError(w, http.StatusBadRequest, "invalid_message_parts", partErr.Error())
+		default:
+			writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		}
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid_json", "request body must contain a single JSON value")
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	var card models.AgentCard
-	if err := json.NewDecoder(r.Body).Decode(&card); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSONPost(w, r, &card) {
 		return
 	}
 	if err := s.registry.Register(card); err != nil {
@@ -158,8 +184,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		InitiatorAgentID string `json:"initiator_agent_id"`
 		TargetAgentID    string `json:"target_agent_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSONPost(w, r, &req) {
 		return
 	}
 	t := s.tasks.Create(req.SessionID, req.InitiatorAgentID, req.TargetAgentID)
@@ -178,8 +203,7 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	var msg models.Message
-	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSONPost(w, r, &msg) {
 		return
 	}
 	if err := checkProtocolVersion(msg.ProtocolVersion); err != nil {
@@ -205,8 +229,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDelegation(w http.ResponseWriter, r *http.Request) {
 	var req models.DelegationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSONPost(w, r, &req) {
 		return
 	}
 	if err := checkProtocolVersion(req.ProtocolVersion); err != nil {
@@ -228,8 +251,8 @@ func (s *Server) handleDelegation(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
-		"status":            "ok",
-		"protocol_version":  currentProtocolVersion,
+		"status":           "ok",
+		"protocol_version": currentProtocolVersion,
 	})
 }
 

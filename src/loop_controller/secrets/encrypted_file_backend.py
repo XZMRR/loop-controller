@@ -21,7 +21,6 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 

@@ -114,12 +114,13 @@ func TestSendMessage(t *testing.T) {
 	http.Post(server.URL+"/a2a/v1/agents", "application/json", bytes.NewReader(body))
 
 	msg := models.Message{
-		MessageID:   "msg-1",
-		FromAgentID: "agent-a",
-		ToAgentID:   "agent-b",
-		Role:        "user",
-		Parts:       []models.Part{{Type: "text", Text: "hello"}},
-		Timestamp:   time.Now().UTC(),
+		MessageID:       "msg-1",
+		FromAgentID:     "agent-a",
+		ToAgentID:       "agent-b",
+		Role:            "user",
+		Parts:           []models.Part{{Type: "text", Text: "hello"}},
+		Timestamp:       time.Now().UTC(),
+		ProtocolVersion: currentProtocolVersion,
 	}
 	body, _ = json.Marshal(msg)
 	resp, err := http.Post(server.URL+"/a2a/v1/messages", "application/json", bytes.NewReader(body))
@@ -150,6 +151,7 @@ func TestDelegationAllowed(t *testing.T) {
 		InitiatorAgentID: "planner",
 		TargetAgentID:    "executor",
 		ToolName:         "query_sales",
+		ProtocolVersion:  currentProtocolVersion,
 	}
 	body, _ = json.Marshal(req)
 	resp, err := http.Post(server.URL+"/a2a/v1/delegations", "application/json", bytes.NewReader(body))
@@ -163,6 +165,72 @@ func TestDelegationAllowed(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&got)
 	if !got.Allowed {
 		t.Fatalf("expected allowed, got %v", got)
+	}
+}
+
+func TestJSONPostValidation(t *testing.T) {
+	srv := NewServer(testSecret)
+	server := httptest.NewServer(muxFor(srv))
+	defer server.Close()
+
+	tests := []struct {
+		name   string
+		path   string
+		body   string
+		status int
+	}{
+		{"unknown field", "/a2a/v1/tasks", `{"session_id":"s","initiator_agent_id":"a","target_agent_id":"b","extra":true}`, http.StatusBadRequest},
+		{"multiple values", "/a2a/v1/tasks", `{"session_id":"s"} {"session_id":"s2"}`, http.StatusBadRequest},
+		{"oversized", "/a2a/v1/tasks", `{"session_id":"` + strings.Repeat("x", maxJSONBodyBytes) + `"}`, http.StatusRequestEntityTooLarge},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Post(server.URL+tc.path, "application/json", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatalf("post failed: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.status {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.status)
+			}
+		})
+	}
+}
+
+func TestMessagePartFieldPolicy(t *testing.T) {
+	srv := NewServer(testSecret)
+	server := httptest.NewServer(muxFor(srv))
+	defer server.Close()
+
+	bodies := []string{
+		`{"from_agent_id":"a","to_agent_id":"b","protocol_version":"0.36.1","parts":[{"type":"text","text":"x","data":{}}]}`,
+		`{"from_agent_id":"a","to_agent_id":"b","protocol_version":"0.36.1","parts":[{"type":"text","text":null}]}`,
+		`{"from_agent_id":"a","to_agent_id":"b","protocol_version":"0.36.1","parts":[{"type":"data","data":null}]}`,
+		`{"from_agent_id":"a","to_agent_id":"b","protocol_version":"0.36.1","parts":[{"type":"data"}]}`,
+	}
+	for _, body := range bodies {
+		resp, err := http.Post(server.URL+"/a2a/v1/messages", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post failed: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400", body, resp.StatusCode)
+		}
+	}
+}
+
+func TestMissingProtocolVersionRejected(t *testing.T) {
+	srv := NewServer(testSecret)
+	server := httptest.NewServer(muxFor(srv))
+	defer server.Close()
+	resp, err := http.Post(server.URL+"/a2a/v1/messages", "application/json", strings.NewReader(`{"from_agent_id":"a","to_agent_id":"b","parts":[{"type":"text","text":"x"}]}`))
+	if err != nil {
+		t.Fatalf("post failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 }
 
@@ -220,6 +288,7 @@ func TestTaskStreamSSE(t *testing.T) {
 		TargetAgentID:    "agent-b",
 		ToolName:         "echo",
 		TaskID:           task.TaskID,
+		ProtocolVersion:  currentProtocolVersion,
 	}
 	body, _ = json.Marshal(dr)
 	http.Post(server.URL+"/a2a/v1/delegations", "application/json", bytes.NewReader(body))

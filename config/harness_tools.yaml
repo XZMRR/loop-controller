@@ -1,4 +1,4 @@
-# Harness 后端、工具与执行策略配置（v0.36.0）
+# Harness 后端、工具与执行策略配置（v0.36.1）
 # Loop Controller 默认不信任 Agent：非 trusted_local_tools 中的敏感工具必须
 # 通过外部 Harness 在受限沙箱中执行，网络/文件/命令出口默认全部 deny。
 #

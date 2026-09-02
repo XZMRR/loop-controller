@@ -4,6 +4,7 @@ package models
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -54,6 +55,58 @@ type Part struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
+// PartValidationError identifies an invalid message Part wire representation.
+type PartValidationError struct {
+	Message string
+}
+
+func (e *PartValidationError) Error() string { return e.Message }
+
+func partErrorf(format string, args ...any) error {
+	return &PartValidationError{Message: fmt.Sprintf(format, args...)}
+}
+
+// UnmarshalJSON enforces the wire-level field contract for message parts.
+func (p *Part) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for name := range fields {
+		if name != "type" && name != "text" && name != "data" {
+			return partErrorf("unknown part field %q", name)
+		}
+	}
+	if err := json.Unmarshal(fields["type"], &p.Type); err != nil {
+		return partErrorf("part type: %v", err)
+	}
+	text, hasText := fields["text"]
+	dataField, hasData := fields["data"]
+	switch p.Type {
+	case "text":
+		if !hasText || hasData || string(text) == "null" {
+			return partErrorf("text part requires non-null text and forbids data")
+		}
+		if err := json.Unmarshal(text, &p.Text); err != nil {
+			return partErrorf("text part text: %v", err)
+		}
+		p.Data = nil
+	case "data":
+		if !hasData || hasText || string(dataField) == "null" {
+			return partErrorf("data part requires non-null data and forbids text")
+		}
+		var value any
+		if err := json.Unmarshal(dataField, &value); err != nil {
+			return partErrorf("data part data: %v", err)
+		}
+		p.Text = ""
+		p.Data = append(p.Data[:0], dataField...)
+	default:
+		return partErrorf("unknown part type %q", p.Type)
+	}
+	return nil
+}
+
 // DelegationRequest is sent by the Python tool-governance layer when it wants
 // to forward a tool execution to another agent.
 type DelegationRequest struct {
@@ -70,12 +123,12 @@ type DelegationRequest struct {
 
 // DelegationResponse is returned by the Go kernel.
 type DelegationResponse struct {
-	Allowed           bool            `json:"allowed"`
-	TaskID            string          `json:"task_id"`
-	TargetEntrypoint  AgentEntrypoint `json:"target_entrypoint,omitempty"`
-	DelegationToken   string          `json:"delegation_token,omitempty"`
-	Reason            string          `json:"reason"`
-	ProtocolVersion   string          `json:"protocol_version,omitempty"`
+	Allowed          bool            `json:"allowed"`
+	TaskID           string          `json:"task_id"`
+	TargetEntrypoint AgentEntrypoint `json:"target_entrypoint,omitempty"`
+	DelegationToken  string          `json:"delegation_token,omitempty"`
+	Reason           string          `json:"reason"`
+	ProtocolVersion  string          `json:"protocol_version,omitempty"`
 }
 
 // SendMessageResponse indicates whether a message was accepted for routing.
@@ -92,6 +145,6 @@ type AgentList struct {
 
 // ErrorResponse is the standard error envelope.
 type ErrorResponse struct {
-	Error   string `json:"error"`
-	Code    string `json:"code"`
+	Error string `json:"error"`
+	Code  string `json:"code"`
 }

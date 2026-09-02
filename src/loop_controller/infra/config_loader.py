@@ -29,8 +29,6 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlparse
 
-T = TypeVar("T")
-
 import httpx
 import yaml
 from cryptography.hazmat.primitives import serialization
@@ -62,6 +60,8 @@ from loop_controller.models import (
     ToolPermission,
 )
 from loop_controller.utils.globmatch import compile_glob
+
+T = TypeVar("T")
 
 POLICY_PACKAGE = "loop_controller.tool_permission"
 

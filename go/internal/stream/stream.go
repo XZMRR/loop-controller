@@ -58,9 +58,8 @@ func (p *InMemoryPublisher) Subscribe(ctx context.Context, taskID string) (<-cha
 // Publish sends a task update to all subscribers.
 func (p *InMemoryPublisher) Publish(ctx context.Context, task models.Task) error {
 	p.mu.RLock()
-	subs := p.subscribers[task.TaskID]
-	p.mu.RUnlock()
-	for _, ch := range subs {
+	defer p.mu.RUnlock()
+	for _, ch := range p.subscribers[task.TaskID] {
 		select {
 		case ch <- task:
 		default:

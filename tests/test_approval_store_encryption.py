@@ -17,7 +17,10 @@ from loop_controller.infra.approval_store import (
     JsonlApprovalStore,
     migrate_approval_store,
 )
-from loop_controller.models import ActionProposal, Agent, ApprovalRecord, ApprovalRequest, Decision, Task
+from loop_controller.models import (
+    ApprovalRequest,
+    Decision,
+)
 
 
 @pytest.fixture
@@ -175,10 +178,7 @@ def test_migrate_idempotent(
     plain_store.submit_request(request_obj)
 
     migrate_approval_store(path, crypto)
-    first = path.read_text(encoding="utf-8")
-
     migrate_approval_store(path, crypto)
-    second = path.read_text(encoding="utf-8")
 
     # 每次加密 nonce 不同，ciphertext 会变，但语义保持一致即可
     encrypted_store = JsonlApprovalStore(path, crypto=crypto)

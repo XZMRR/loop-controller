@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class SecretScope(str, Enum):
+class SecretScope(StrEnum):
     """Secret 作用域。"""
 
     GLOBAL = "global"

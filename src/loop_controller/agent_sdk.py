@@ -233,7 +233,7 @@ class GovernanceRuntime:
             raise
 
 
-def _run_async(coro: Coroutine[Any, Any, T]) -> T:
+def _run_async(coro: Coroutine[Any, Any, T]) -> T:  # noqa: UP047
     """在当前线程运行一个协程；兼容无事件循环的情况。
 
     如果调用处已经在一个运行中的事件循环里，同步等待协程会导致事件循环死锁或
@@ -332,7 +332,7 @@ def _make_governed_wrapper(
     return sync_wrapper
 
 
-def governed(
+def governed(  # noqa: UP047
     fn: Callable[..., T] | None = None,
     *,
     tool_name: str | None = None,

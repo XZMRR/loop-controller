@@ -30,14 +30,14 @@ class ApprovalCrypto:
         self._key = key if key is not None else self._resolve_key(key_env)
 
     @classmethod
-    def from_env(cls, key_env: str = "LC_APPROVAL_ENCRYPTION_KEY") -> "ApprovalCrypto":
+    def from_env(cls, key_env: str = "LC_APPROVAL_ENCRYPTION_KEY") -> ApprovalCrypto:
         """从环境变量构造，缺失或非法时抛出 ``ApprovalCryptoError``（fail-closed）。"""
         return cls(key_env=key_env)
 
     @classmethod
     def from_env_or_none(
         cls, key_env: str = "LC_APPROVAL_ENCRYPTION_KEY"
-    ) -> "ApprovalCrypto | None":
+    ) -> ApprovalCrypto | None:
         """环境变量存在且合法时构造加密器，否则返回 ``None``（明文兼容模式）。"""
         if os.environ.get(key_env):
             return cls(key_env=key_env)

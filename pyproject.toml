@@ -65,10 +65,6 @@ warn_unused_configs = true
 disallow_untyped_defs = false
 exclude = ["go/", "examples/contrib/adapters/"]
 
-[[tool.mypy.overrides]]
-module = ["langchain_core.*"]
-ignore_missing_imports = true
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/loop_controller"]
 

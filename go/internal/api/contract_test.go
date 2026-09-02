@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -36,7 +37,10 @@ func TestCheckProtocolVersion(t *testing.T) {
 		{"0.36.1", false},
 		{"0.36.0", false},
 		{"0.36.99", false},
-		{"", false},
+		{"", true},
+		{"0.36", true},
+		{"0.36.1.0", true},
+		{"v0.36.1", true},
 		{"0.35.0", true},
 		{"0.37.0", true},
 		{"not-a-version", true},
@@ -86,6 +90,111 @@ func TestContractFixture_DecodeMessage(t *testing.T) {
 	}
 	if err := validateMessageParts(&msg); err != nil {
 		t.Errorf("validateMessageParts: %v", err)
+	}
+}
+
+func canonicalJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal canonical JSON: %v", err)
+	}
+	var normalized any
+	if err := json.Unmarshal(data, &normalized); err != nil {
+		t.Fatalf("normalize canonical JSON: %v", err)
+	}
+	data, err = json.Marshal(normalized)
+	if err != nil {
+		t.Fatalf("marshal normalized JSON: %v", err)
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, data); err != nil {
+		t.Fatalf("compact canonical JSON: %v", err)
+	}
+	return compact.Bytes()
+}
+
+func assertCanonicalRoundTrip(t *testing.T, raw json.RawMessage, value any) {
+	t.Helper()
+	var fixture any
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("decode fixture for canonical comparison: %v", err)
+	}
+	if !bytes.Equal(canonicalJSON(t, fixture), canonicalJSON(t, value)) {
+		t.Errorf("canonical roundtrip mismatch\nfixture: %s\nvalue:   %s", canonicalJSON(t, fixture), canonicalJSON(t, value))
+	}
+}
+
+func TestContractFixture_DecodeTaskErrorAndSSE(t *testing.T) {
+	fixture := loadFixture(t)
+
+	var task models.Task
+	if err := json.Unmarshal(fixture["task"], &task); err != nil {
+		t.Fatalf("unmarshal task: %v", err)
+	}
+	if task.TaskID != "task-001" || task.Status != "pending" {
+		t.Errorf("task mismatch: %+v", task)
+	}
+	assertCanonicalRoundTrip(t, fixture["task"], task)
+
+	var apiError models.ErrorResponse
+	if err := json.Unmarshal(fixture["error_response"], &apiError); err != nil {
+		t.Fatalf("unmarshal error_response: %v", err)
+	}
+	if apiError.Code != "incompatible_protocol_version" {
+		t.Errorf("error code = %q", apiError.Code)
+	}
+	assertCanonicalRoundTrip(t, fixture["error_response"], apiError)
+
+	var event struct {
+		Data models.Task `json:"data"`
+	}
+	if err := json.Unmarshal(fixture["sse_event"], &event); err != nil {
+		t.Fatalf("unmarshal sse_event: %v", err)
+	}
+	if event.Data.TaskID != task.TaskID || event.Data.Status != "active" {
+		t.Errorf("SSE event mismatch: %+v", event)
+	}
+	assertCanonicalRoundTrip(t, fixture["sse_event"], event)
+}
+
+func TestContractFixture_ErrorCategories(t *testing.T) {
+	fixture := loadFixture(t)
+	var cases []struct {
+		Name     string          `json:"name"`
+		Category string          `json:"category"`
+		Message  json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(fixture["error_cases"], &cases); err != nil {
+		t.Fatalf("unmarshal error_cases: %v", err)
+	}
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(tc.Message, &raw); err != nil {
+				t.Fatalf("unmarshal message fields: %v", err)
+			}
+			category := ""
+			for _, required := range []string{"message_id", "task_id", "from_agent_id", "to_agent_id", "parts"} {
+				if _, ok := raw[required]; !ok {
+					category = "invalid_request"
+					break
+				}
+			}
+			if category == "" {
+				var msg models.Message
+				if err := json.Unmarshal(tc.Message, &msg); err != nil {
+					category = "invalid_message_parts"
+				} else if err := checkProtocolVersion(msg.ProtocolVersion); err != nil {
+					category = "incompatible_protocol_version"
+				} else if err := validateMessageParts(&msg); err != nil {
+					category = "invalid_message_parts"
+				}
+			}
+			if category != tc.Category {
+				t.Errorf("category = %q, want %q", category, tc.Category)
+			}
+		})
 	}
 }
 

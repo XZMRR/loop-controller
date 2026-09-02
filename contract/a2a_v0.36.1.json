@@ -12,6 +12,15 @@
     "trust_domain": "test.loop-controller.local",
     "version": "0.36.1"
   },
+  "task": {
+    "task_id": "task-001",
+    "session_id": "sess-001",
+    "initiator_agent_id": "agent-a",
+    "target_agent_id": "agent-b",
+    "status": "pending",
+    "created_at": "2026-09-01T12:00:00Z",
+    "updated_at": "2026-09-01T12:00:01Z"
+  },
   "message": {
     "message_id": "msg-001",
     "task_id": "task-001",
@@ -52,5 +61,55 @@
     "delegation_token": "token-001",
     "reason": "authorized",
     "protocol_version": "0.36.1"
-  }
+  },
+  "error_response": {
+    "error": "protocol version 0.35.0 is incompatible",
+    "code": "incompatible_protocol_version"
+  },
+  "sse_event": {
+    "data": {
+      "task_id": "task-001",
+      "session_id": "sess-001",
+      "initiator_agent_id": "agent-a",
+      "target_agent_id": "agent-b",
+      "status": "active",
+      "created_at": "2026-09-01T12:00:00Z",
+      "updated_at": "2026-09-01T12:00:02Z"
+    }
+  },
+  "error_cases": [
+    {
+      "name": "missing_required_field",
+      "category": "invalid_request",
+      "message": {"task_id": "task-001", "parts": []}
+    },
+    {
+      "name": "unknown_part_type",
+      "category": "invalid_message_parts",
+      "message": {
+        "message_id": "msg-invalid-part",
+        "task_id": "task-001",
+        "from_agent_id": "agent-a",
+        "to_agent_id": "agent-b",
+        "role": "user",
+        "parts": [{"type": "binary", "data": "AA=="}],
+        "timestamp": "2026-09-01T12:00:00Z",
+        "protocol_version": "0.36.1"
+      }
+    },
+    {
+      "name": "incompatible_version",
+      "category": "incompatible_protocol_version",
+      "message": {
+        "message_id": "msg-old-version",
+        "task_id": "task-001",
+        "from_agent_id": "agent-a",
+        "to_agent_id": "agent-b",
+        "role": "user",
+        "parts": [{"type": "text", "text": "invoke-tool"}],
+        "timestamp": "2026-09-01T12:00:00Z",
+        "protocol_version": "0.35.0"
+      }
+    }
+  ]
 }

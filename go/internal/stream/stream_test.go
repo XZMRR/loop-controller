@@ -53,6 +53,28 @@ func TestInMemoryPublisherCleansUpOnCancel(t *testing.T) {
 	}
 }
 
+func TestConcurrentCancelAndPublish(t *testing.T) {
+	pub := NewInMemoryPublisher()
+	for i := 0; i < 100; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := pub.Subscribe(ctx, "task-1"); err != nil {
+			t.Fatalf("subscribe failed: %v", err)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for j := 0; j < 100; j++ {
+				if err := pub.Publish(context.Background(), models.Task{TaskID: "task-1"}); err != nil {
+					t.Errorf("publish failed: %v", err)
+					return
+				}
+			}
+		}()
+		cancel()
+		<-done
+	}
+}
+
 func TestSubscribeEmptyTaskID(t *testing.T) {
 	pub := NewInMemoryPublisher()
 	ctx := context.Background()

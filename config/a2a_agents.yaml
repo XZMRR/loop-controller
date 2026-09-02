@@ -1,4 +1,4 @@
-# A2A Agent Card 静态发现样例（v0.36.0）
+# A2A Agent Card 静态发现样例（v0.36.1）
 # 本文件为 Go A2A 内核的静态发现 Provider 提供示例 Agent Card。
 # 生产部署时应替换为真实 Agent 的 endpoint、capabilities 与 token。
 

@@ -2,6 +2,7 @@ package delegation
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -46,6 +47,34 @@ func TestRequestAllowed(t *testing.T) {
 	}
 	if resp.DelegationToken == "" {
 		t.Error("expected non-empty delegation token")
+	}
+}
+
+type failingIssuer struct{}
+
+func (failingIssuer) Issue(token.DelegationClaims, time.Duration) (string, error) {
+	return "", errors.New("signing unavailable")
+}
+
+func TestRequestTokenIssuanceFailureIsDenied(t *testing.T) {
+	reg := registry.New()
+	reg.Register(models.AgentCard{
+		AgentID:      "executor",
+		Capabilities: []string{"delegate_execution"},
+	})
+	d := New(reg, task.New(), failingIssuer{}, nil, time.Hour)
+
+	resp, err := d.Request(context.Background(), models.DelegationRequest{
+		RequestID:        "req-1",
+		InitiatorAgentID: "planner",
+		TargetAgentID:    "executor",
+		ToolName:         "query_sales",
+	})
+	if err == nil {
+		t.Fatal("expected token issuance error")
+	}
+	if resp.Allowed || resp.DelegationToken != "" {
+		t.Fatalf("token failure must fail closed, got %+v", resp)
 	}
 }
 

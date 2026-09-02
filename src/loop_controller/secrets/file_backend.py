@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import stat
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -150,7 +150,7 @@ class FileSecretBackend:
         if isinstance(value, datetime):
             # YAML 可能解析为 datetime；确保带 tz
             if value.tzinfo is None:
-                return value.replace(tzinfo=timezone.utc)
+                return value.replace(tzinfo=UTC)
             return value
         if isinstance(value, str):
             # 兼容 ISO-8601，含或不含 Z
@@ -158,7 +158,7 @@ class FileSecretBackend:
             try:
                 parsed = datetime.fromisoformat(text)
                 if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
+                    parsed = parsed.replace(tzinfo=UTC)
                 return parsed
             except ValueError as exc:
                 raise SecretError(f"expires_at 格式非法：{exc}") from exc

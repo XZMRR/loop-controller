@@ -4,6 +4,7 @@ package delegation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/loop-controller/go/internal/models"
@@ -100,22 +101,31 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 		}
 	}
 
-	if d.publisher != nil {
-		_ = d.publisher.Publish(ctx, task)
+	if d.issuer == nil {
+		return models.DelegationResponse{
+			Allowed: false,
+			TaskID:  taskID,
+			Reason:  "delegation token issuer unavailable",
+		}, errors.New("delegation token issuer unavailable")
+	}
+	claims := token.DelegationClaims{
+		RequestID:        req.RequestID,
+		InitiatorAgentID: req.InitiatorAgentID,
+		TargetAgentID:    req.TargetAgentID,
+		ToolName:         req.ToolName,
+		TaskID:           taskID,
+	}
+	tokenStr, err := d.issuer.Issue(claims, d.tokenTTL)
+	if err != nil || tokenStr == "" {
+		return models.DelegationResponse{
+			Allowed: false,
+			TaskID:  taskID,
+			Reason:  "delegation token issuance failed",
+		}, fmt.Errorf("delegation token issuance failed: %w", err)
 	}
 
-	tokenStr := ""
-	if d.issuer != nil {
-		claims := token.DelegationClaims{
-			RequestID:        req.RequestID,
-			InitiatorAgentID: req.InitiatorAgentID,
-			TargetAgentID:    req.TargetAgentID,
-			ToolName:         req.ToolName,
-			TaskID:           taskID,
-		}
-		if tok, err := d.issuer.Issue(claims, d.tokenTTL); err == nil {
-			tokenStr = tok
-		}
+	if d.publisher != nil {
+		_ = d.publisher.Publish(ctx, task)
 	}
 
 	return models.DelegationResponse{
