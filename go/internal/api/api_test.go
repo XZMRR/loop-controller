@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,10 +17,22 @@ import (
 
 var testSecret = []byte("test-secret")
 
-func TestRegisterAgentAndGet(t *testing.T) {
-	srv := NewServer(testSecret)
+func newTestServer(t *testing.T) (*Server, *httptest.Server) {
+	t.Helper()
+	srv, err := NewServer(testSecret, filepath.Join(t.TempDir(), "a2a.db"))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
 	server := httptest.NewServer(muxFor(srv))
-	defer server.Close()
+	t.Cleanup(func() {
+		server.Close()
+		_ = srv.Close()
+	})
+	return srv, server
+}
+
+func TestRegisterAgentAndGet(t *testing.T) {
+	_, server := newTestServer(t)
 
 	card := models.AgentCard{
 		AgentID:      "agent-1",
@@ -51,9 +64,7 @@ func TestRegisterAgentAndGet(t *testing.T) {
 }
 
 func TestListAgents(t *testing.T) {
-	srv := NewServer(testSecret)
-	server := httptest.NewServer(muxFor(srv))
-	defer server.Close()
+	_, server := newTestServer(t)
 
 	card := models.AgentCard{AgentID: "agent-1", Name: "Test"}
 	body, _ := json.Marshal(card)
@@ -71,9 +82,7 @@ func TestListAgents(t *testing.T) {
 }
 
 func TestCreateTaskAndGet(t *testing.T) {
-	srv := NewServer(testSecret)
-	server := httptest.NewServer(muxFor(srv))
-	defer server.Close()
+	_, server := newTestServer(t)
 
 	req := map[string]string{
 		"session_id":         "session-1",
@@ -104,9 +113,7 @@ func TestCreateTaskAndGet(t *testing.T) {
 }
 
 func TestSendMessage(t *testing.T) {
-	srv := NewServer(testSecret)
-	server := httptest.NewServer(muxFor(srv))
-	defer server.Close()
+	_, server := newTestServer(t)
 
 	// Register target first.
 	card := models.AgentCard{AgentID: "agent-b", Name: "B"}
@@ -133,9 +140,7 @@ func TestSendMessage(t *testing.T) {
 }
 
 func TestDelegationAllowed(t *testing.T) {
-	srv := NewServer(testSecret)
-	server := httptest.NewServer(muxFor(srv))
-	defer server.Close()
+	_, server := newTestServer(t)
 
 	card := models.AgentCard{
 		AgentID:      "executor",
@@ -169,9 +174,7 @@ func TestDelegationAllowed(t *testing.T) {
 }
 
 func TestJSONPostValidation(t *testing.T) {
-	srv := NewServer(testSecret)
-	server := httptest.NewServer(muxFor(srv))
-	defer server.Close()
+	_, server := newTestServer(t)
 
 	tests := []struct {
 		name   string
@@ -198,9 +201,7 @@ func TestJSONPostValidation(t *testing.T) {
 }
 
 func TestMessagePartFieldPolicy(t *testing.T) {
-	srv := NewServer(testSecret)
-	server := httptest.NewServer(muxFor(srv))
-	defer server.Close()
+	_, server := newTestServer(t)
 
 	bodies := []string{
 		`{"from_agent_id":"a","to_agent_id":"b","protocol_version":"0.36.1","parts":[{"type":"text","text":"x","data":{}}]}`,
@@ -221,9 +222,7 @@ func TestMessagePartFieldPolicy(t *testing.T) {
 }
 
 func TestMissingProtocolVersionRejected(t *testing.T) {
-	srv := NewServer(testSecret)
-	server := httptest.NewServer(muxFor(srv))
-	defer server.Close()
+	_, server := newTestServer(t)
 	resp, err := http.Post(server.URL+"/a2a/v1/messages", "application/json", strings.NewReader(`{"from_agent_id":"a","to_agent_id":"b","parts":[{"type":"text","text":"x"}]}`))
 	if err != nil {
 		t.Fatalf("post failed: %v", err)
@@ -235,9 +234,7 @@ func TestMissingProtocolVersionRejected(t *testing.T) {
 }
 
 func TestTaskStreamSSE(t *testing.T) {
-	srv := NewServer(testSecret)
-	server := httptest.NewServer(muxFor(srv))
-	defer server.Close()
+	srv, server := newTestServer(t)
 
 	// Create task first.
 	req := map[string]string{

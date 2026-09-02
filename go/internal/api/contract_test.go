@@ -17,7 +17,7 @@ func loadFixture(t *testing.T) map[string]json.RawMessage {
 		t.Fatalf("getwd: %v", err)
 	}
 	// go/internal/api -> project root -> contract
-	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.36.1.json")
+	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.37.0.json")
 	data, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
@@ -34,15 +34,15 @@ func TestCheckProtocolVersion(t *testing.T) {
 		version string
 		wantErr bool
 	}{
-		{"0.36.1", false},
-		{"0.36.0", false},
-		{"0.36.99", false},
+		{"0.37.0", false},
+		{"0.37.1", false},
+		{"0.37.99", false},
 		{"", true},
-		{"0.36", true},
-		{"0.36.1.0", true},
-		{"v0.36.1", true},
-		{"0.35.0", true},
-		{"0.37.0", true},
+		{"0.37", true},
+		{"0.37.0.0", true},
+		{"v0.37.0", true},
+		{"0.36.1", true},
+		{"0.38.0", true},
 		{"not-a-version", true},
 	}
 	for _, c := range cases {
@@ -62,8 +62,8 @@ func TestContractFixture_DecodeAgentCard(t *testing.T) {
 	if err := json.Unmarshal(fixture["agent_card"], &card); err != nil {
 		t.Fatalf("unmarshal agent_card: %v", err)
 	}
-	if card.AgentID != "agent-a" {
-		t.Errorf("agent_id = %q, want agent-a", card.AgentID)
+	if card.AgentID != "agent-b" {
+		t.Errorf("agent_id = %q, want agent-b", card.AgentID)
 	}
 	if card.Entrypoint.Type != "http" {
 		t.Errorf("entrypoint.type = %q, want http", card.Entrypoint.Type)
@@ -76,8 +76,8 @@ func TestContractFixture_DecodeMessage(t *testing.T) {
 	if err := json.Unmarshal(fixture["message"], &msg); err != nil {
 		t.Fatalf("unmarshal message: %v", err)
 	}
-	if msg.ProtocolVersion != "0.36.1" {
-		t.Errorf("protocol_version = %q, want 0.36.1", msg.ProtocolVersion)
+	if msg.ProtocolVersion != "0.37.0" {
+		t.Errorf("protocol_version = %q, want 0.37.0", msg.ProtocolVersion)
 	}
 	if len(msg.Parts) != 2 {
 		t.Fatalf("parts length = %d, want 2", len(msg.Parts))
@@ -207,8 +207,8 @@ func TestContractFixture_DecodeDelegation(t *testing.T) {
 	if req.RequestID != "req-001" {
 		t.Errorf("request_id = %q, want req-001", req.RequestID)
 	}
-	if req.ProtocolVersion != "0.36.1" {
-		t.Errorf("protocol_version = %q, want 0.36.1", req.ProtocolVersion)
+	if req.ProtocolVersion != "0.37.0" {
+		t.Errorf("protocol_version = %q, want 0.37.0", req.ProtocolVersion)
 	}
 
 	var resp models.DelegationResponse

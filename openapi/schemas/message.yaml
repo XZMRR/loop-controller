@@ -1,0 +1,39 @@
+title: Message
+type: object
+required:
+  - protocol_version
+  - message_id
+  - task_id
+  - from_agent_id
+  - to_agent_id
+  - role
+  - parts
+properties:
+  protocol_version:
+    $ref: './protocol-version.yaml'
+  message_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  task_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  from_agent_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  to_agent_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  role:
+    type: string
+    enum:
+      - user
+      - assistant
+      - system
+  parts:
+    type: array
+    items:
+      $ref: './part.yaml'
+  timestamp:
+    type: string
+    format: date-time
+description: A unit of communication between agents; all parts must be text or data.

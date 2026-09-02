@@ -13,7 +13,7 @@ from loop_controller.go_kernel_bridge import (
 )
 from loop_controller.utils.canonical import canonical_json
 
-FIXTURE = Path(__file__).resolve().parents[1] / "contract" / "a2a_v0.36.1.json"
+FIXTURE = Path(__file__).resolve().parents[1] / "contract" / "a2a_v0.37.0.json"
 
 
 @pytest.fixture
@@ -29,12 +29,12 @@ def test_current_protocol_version_matches_fixture(contract: dict) -> None:
 @pytest.mark.parametrize(
     ("version", "should_raise"),
     [
-        ("0.36.1", False),
-        ("0.36.0", False),
-        ("0.36.99", False),
+        ("0.37.0", False),
+        ("0.37.1", False),
+        ("0.37.99", False),
         ("", False),
-        ("0.35.0", True),
-        ("0.37.0", True),
+        ("0.36.1", True),
+        ("0.38.0", True),
         ("not-a-version", True),
     ],
 )
@@ -93,7 +93,7 @@ def test_delegation_response_roundtrip(contract: dict) -> None:
 
 def test_delegation_response_default_protocol_version() -> None:
     resp = DelegationResponse(allowed=True)
-    assert resp.protocol_version == "0.36.1"
+    assert resp.protocol_version == "0.37.0"
 
 
 def test_task_fixture_is_canonical_and_has_stable_timestamps(contract: dict) -> None:
@@ -113,6 +113,7 @@ def test_all_roundtrip_fixtures_have_stable_canonical_json(contract: dict) -> No
         "delegation_response",
         "error_response",
         "sse_event",
+        "task_event",
     ):
         fixture = contract[name]
         assert canonical_json(json.loads(json.dumps(fixture))) == canonical_json(fixture)
@@ -121,7 +122,7 @@ def test_all_roundtrip_fixtures_have_stable_canonical_json(contract: dict) -> No
 def test_error_response_fixture(contract: dict) -> None:
     fixture = contract["error_response"]
     assert fixture == {
-        "error": "protocol version 0.35.0 is incompatible",
+        "error": "protocol version 0.36.1 is incompatible",
         "code": "incompatible_protocol_version",
     }
 

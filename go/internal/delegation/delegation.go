@@ -34,11 +34,12 @@ type TaskEventPublisher interface {
 
 // Delegator performs delegation decisions.
 type Delegator struct {
-	registry  AgentQuerier
-	tasks     TaskStore
-	issuer    TokenIssuer
-	publisher TaskEventPublisher
-	tokenTTL  time.Duration
+	registry   AgentQuerier
+	tasks      TaskStore
+	issuer     TokenIssuer
+	authorizer R2Authorizer
+	publisher  TaskEventPublisher
+	tokenTTL   time.Duration
 }
 
 // New creates a Delegator backed by the given dependencies.
@@ -59,6 +60,13 @@ func New(
 		publisher: publisher,
 		tokenTTL:  tokenTTL,
 	}
+}
+
+// WithR2Authorizer attaches an R2 authorizer. When set, Request calls R2
+// after the local capability check.
+func (d *Delegator) WithR2Authorizer(a R2Authorizer) *Delegator {
+	d.authorizer = a
+	return d
 }
 
 // Request evaluates a delegation request.
@@ -83,6 +91,22 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 			Allowed: false,
 			Reason:  "target agent does not support delegate_execution",
 		}, nil
+	}
+
+	if d.authorizer != nil {
+		r2Resp, err := d.authorizer.Authorize(ctx, req)
+		if err != nil {
+			if !r2Resp.Allowed && r2Resp.Reason == "" {
+				r2Resp.Reason = "R2 authorization failed"
+			}
+			return r2Resp, err
+		}
+		if !r2Resp.Allowed {
+			if r2Resp.Reason == "" {
+				r2Resp.Reason = "R2 denied delegation"
+			}
+			return r2Resp, nil
+		}
 	}
 
 	taskID := req.TaskID

@@ -1,0 +1,356 @@
+/a2a/v1/tasks:
+  post:
+    operationId: createTask
+    summary: Create a new Task
+    tags:
+      - Tasks
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '../schemas/task.yaml'
+    responses:
+      '201':
+        description: Task created
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/task.yaml'
+      '400':
+        description: Invalid request
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+      '409':
+        description: Task already exists or invalid state transition
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+
+/a2a/v1/tasks/{id}:
+  get:
+    operationId: getTask
+    summary: Get a Task by ID
+    tags:
+      - Tasks
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    responses:
+      '200':
+        description: Task found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/task.yaml'
+      '404':
+        description: Task not found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+
+/a2a/v1/tasks/{id}/stream:
+  get:
+    operationId: streamTaskEvents
+    summary: Subscribe to Task events via SSE
+    tags:
+      - Tasks
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    responses:
+      '200':
+        description: Server-sent event stream
+        content:
+          text/event-stream:
+            schema:
+              type: string
+            example: |
+              data: {"protocol_version":"0.37.0","event_id":"ev-001","task_id":"task-001","event_type":"task_created","payload":{},"published_at":"2026-09-01T12:00:00Z"}
+
+/a2a/v1/tasks/{id}/cancel:
+  post:
+    operationId: cancelTask
+    summary: Request cancellation of a Task
+    tags:
+      - Tasks
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - protocol_version
+            properties:
+              protocol_version:
+                $ref: '../schemas/protocol-version.yaml'
+              reason:
+                type: string
+    responses:
+      '200':
+        description: Cancellation result
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/task.yaml'
+      '404':
+        description: Task not found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+      '409':
+        description: Task already in a terminal state
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+
+/a2a/v1/entrypoint/tasks:
+  post:
+    operationId: entrypointReceiveTask
+    summary: Target agent entrypoint receives a delegated Task
+    tags:
+      - Entrypoint
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - protocol_version
+              - task_id
+              - session_id
+              - initiator_agent_id
+              - target_agent_id
+              - tool_name
+              - arguments
+              - delegation_token
+            properties:
+              protocol_version:
+                $ref: '../schemas/protocol-version.yaml'
+              task_id:
+                type: string
+                pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+              session_id:
+                type: string
+                pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+              initiator_agent_id:
+                type: string
+                pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+              target_agent_id:
+                type: string
+                pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+              tool_name:
+                type: string
+              arguments:
+                type: object
+                additionalProperties: true
+              delegation_token:
+                type: string
+    responses:
+      '201':
+        description: Task received
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/task.yaml'
+      '400':
+        description: Invalid request
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+      '403':
+        description: Delegation token rejected
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+
+/a2a/v1/entrypoint/tasks/{id}/accept:
+  post:
+    operationId: entrypointAcceptTask
+    summary: Target agent explicitly accepts a Task
+    tags:
+      - Entrypoint
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - protocol_version
+            properties:
+              protocol_version:
+                $ref: '../schemas/protocol-version.yaml'
+    responses:
+      '200':
+        description: Task accepted
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/task.yaml'
+      '404':
+        description: Task not found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+      '409':
+        description: Invalid state transition
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+
+/a2a/v1/entrypoint/tasks/{id}/cancel:
+  post:
+    operationId: entrypointCancelTask
+    summary: Target agent receives a cancellation request
+    tags:
+      - Entrypoint
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - protocol_version
+            properties:
+              protocol_version:
+                $ref: '../schemas/protocol-version.yaml'
+              reason:
+                type: string
+    responses:
+      '200':
+        description: Cancellation result
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/task.yaml'
+      '404':
+        description: Task not found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+
+/a2a/v1/entrypoint/tasks/{id}:
+  get:
+    operationId: entrypointGetTask
+    summary: Target agent queries a Task
+    tags:
+      - Entrypoint
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    responses:
+      '200':
+        description: Task found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/task.yaml'
+      '404':
+        description: Task not found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+
+/a2a/v1/entrypoint/tasks/{id}/results:
+  post:
+    operationId: entrypointSubmitResults
+    summary: Target agent submits Task execution results
+    tags:
+      - Entrypoint
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - protocol_version
+              - status
+            properties:
+              protocol_version:
+                $ref: '../schemas/protocol-version.yaml'
+              status:
+                type: string
+                enum:
+                  - completed
+                  - failed
+                  - outcome_unknown
+              outcome:
+                description: Execution result or failure summary as a JSON value.
+              error_code:
+                type: string
+    responses:
+      '200':
+        description: Result recorded
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/task.yaml'
+      '404':
+        description: Task not found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+      '409':
+        description: Invalid state transition
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'

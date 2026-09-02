@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Current A2A HTTP/JSON protocol version. Patch differences are tolerated;
 # major/minor differences are fail-closed.
-CURRENT_PROTOCOL_VERSION = "0.36.1"
+CURRENT_PROTOCOL_VERSION = "0.37.0"
 
 
 def check_protocol_version(version: str) -> None:
@@ -181,6 +181,7 @@ class DelegationResponse:
         self,
         *,
         allowed: bool,
+        decision_id: str = "",
         task_id: str = "",
         target_entrypoint: AgentEntrypoint | None = None,
         delegation_token: str = "",
@@ -188,6 +189,7 @@ class DelegationResponse:
         protocol_version: str = CURRENT_PROTOCOL_VERSION,
     ) -> None:
         self.allowed = allowed
+        self.decision_id = decision_id
         self.task_id = task_id
         self.target_entrypoint = target_entrypoint
         self.delegation_token = delegation_token
@@ -199,6 +201,7 @@ class DelegationResponse:
         ep = data.get("target_entrypoint")
         return cls(
             allowed=data.get("allowed", False),
+            decision_id=data.get("decision_id", ""),
             task_id=data.get("task_id", ""),
             target_entrypoint=AgentEntrypoint.from_dict(ep) if ep else None,
             delegation_token=data.get("delegation_token", ""),
@@ -213,6 +216,8 @@ class DelegationResponse:
             "reason": self.reason,
             "protocol_version": self.protocol_version,
         }
+        if self.decision_id:
+            data["decision_id"] = self.decision_id
         if self.target_entrypoint is not None:
             data["target_entrypoint"] = {
                 "type": self.target_entrypoint.type,
@@ -293,6 +298,24 @@ class GoKernelBridge:
         except httpx.RequestError as exc:
             logger.warning("Go kernel route_message unreachable: %s", exc)
             return False
+
+    async def get_agent(self, agent_id: str) -> AgentCard | dict[str, Any] | None:
+        """查询已注册 Agent Card；不可达时返回 None。"""
+        url = f"{self._base_url}/a2a/v1/agents/{agent_id}"
+        try:
+            client = await self._client_context()
+            response = await client.get(url)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            result = response.json()
+            if isinstance(result, dict):
+                return AgentCard.from_dict(result)
+            logger.warning("Go kernel get_agent returned non-object: %s", type(result))
+            return None
+        except httpx.RequestError as exc:
+            logger.warning("Go kernel get_agent unreachable: %s", exc)
+            return None
 
     async def query_task(self, task_id: str) -> dict[str, Any] | None:
         """查询任务状态。"""

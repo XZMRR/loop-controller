@@ -1,0 +1,80 @@
+/a2a/v1/agents:
+  post:
+    operationId: registerAgent
+    summary: Register or update an Agent Card
+    tags:
+      - Agents
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '../schemas/agent-card.yaml'
+    responses:
+      '200':
+        description: Agent registered
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/agent-card.yaml'
+      '400':
+        description: Invalid request
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+  get:
+    operationId: listAgents
+    summary: List registered Agent Cards
+    tags:
+      - Agents
+    responses:
+      '200':
+        description: Agent list
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - protocol_version
+                - agents
+              properties:
+                protocol_version:
+                  $ref: '../schemas/protocol-version.yaml'
+                agents:
+                  type: array
+                  items:
+                    $ref: '../schemas/agent-card.yaml'
+      '500':
+        description: Internal error
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+
+/a2a/v1/agents/{id}:
+  get:
+    operationId: getAgent
+    summary: Get a registered Agent Card
+    tags:
+      - Agents
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    responses:
+      '200':
+        description: Agent found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/agent-card.yaml'
+      '404':
+        description: Agent not found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'

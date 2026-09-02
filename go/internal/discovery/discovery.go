@@ -156,12 +156,12 @@ func (p *StaticProvider) Watch(ctx context.Context) (<-chan DiscoveryEvent, erro
 
 // HTTPProvider fetches Agent Cards from a remote URL with caching.
 type HTTPProvider struct {
-	client     *http.Client
-	url        string
-	cacheFor   time.Duration
-	mu         sync.RWMutex
-	cachedAt   time.Time
-	cached     []models.AgentCard
+	client   *http.Client
+	url      string
+	cacheFor time.Duration
+	mu       sync.RWMutex
+	cachedAt time.Time
+	cached   []models.AgentCard
 }
 
 // NewHTTPProvider creates a provider that fetches from url.

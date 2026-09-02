@@ -36,6 +36,7 @@ import httpx
 from loop_controller.approval_service import ApprovalServiceError, build_approval_record
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
+from loop_controller.delegation import DelegationAuthorizeEndpoint, DelegationAuthorizer
 from loop_controller.identity import (
     AgentIdentity,
     IdentityCredential,
@@ -396,6 +397,22 @@ class ToolGovernServer:
                 "harness_id": identity.harness_id,
             }
         )
+
+    async def _handle_delegation_authorize(self, request: Request) -> JSONResponse:
+        """v0.37.0：Go 内核在创建委托 Task 前调用 R2 完成授权判定。"""
+        authorized, _identity = await self._check_agent_auth(request)
+        if not authorized:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            logger.warning("invalid delegation authorize request: %s", exc)
+            return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+
+        authorizer = DelegationAuthorizer(self._controller)
+        endpoint = DelegationAuthorizeEndpoint(authorizer)
+        return JSONResponse(await endpoint.handle(payload))
 
     async def _handle_metrics(self, request: Request) -> PlainTextResponse:
         if self._api_key is not None and not self._check_api_key(request):
@@ -1048,6 +1065,11 @@ def build_app(
             Route("/v1/health", server._handle_health, methods=["GET"]),
             Route("/metrics", server._handle_metrics, methods=["GET"]),
             Route("/v1/govern/tool-call", server._handle_govern_tool_call, methods=["POST"]),
+            Route(
+                "/r2/v1/delegations/authorize",
+                server._handle_delegation_authorize,
+                methods=["POST"],
+            ),
             Route(
                 "/v1/govern/resume-after-approval",
                 server._handle_resume_after_approval,

@@ -27,13 +27,35 @@ type AgentEntrypoint struct {
 
 // Task represents an interaction context between two agents.
 type Task struct {
-	TaskID           string    `json:"task_id"`
-	SessionID        string    `json:"session_id"`
-	InitiatorAgentID string    `json:"initiator_agent_id"`
-	TargetAgentID    string    `json:"target_agent_id"`
-	Status           string    `json:"status"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	TaskID           string          `json:"task_id"`
+	SessionID        string          `json:"session_id"`
+	InitiatorAgentID string          `json:"initiator_agent_id"`
+	TargetAgentID    string          `json:"target_agent_id"`
+	Status           string          `json:"status"`
+	CreatedAt        time.Time       `json:"created_at"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
+	Outcome          json.RawMessage `json:"outcome,omitempty"`
+	ErrorCode        string          `json:"error_code,omitempty"`
+}
+
+// IsTerminal reports whether the task has reached a final state.
+func (t Task) IsTerminal() bool {
+	switch t.Status {
+	case "completed", "failed", "cancelled", "outcome_unknown":
+		return true
+	}
+	return false
+}
+
+// TaskEvent is a persisted SSE event for a task.
+type TaskEvent struct {
+	EventID     string          `json:"event_id"`
+	TaskID      string          `json:"task_id"`
+	EventType   string          `json:"event_type"`
+	Payload     json.RawMessage `json:"payload"`
+	PublishedAt time.Time       `json:"published_at"`
+	Published   bool            `json:"published"`
 }
 
 // Message is a unit of communication between agents.
@@ -107,6 +129,28 @@ func (p *Part) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// EntrypointTaskRequest is received by the target agent entrypoint to start a
+// delegated task.
+type EntrypointTaskRequest struct {
+	ProtocolVersion  string          `json:"protocol_version"`
+	TaskID           string          `json:"task_id"`
+	SessionID        string          `json:"session_id"`
+	InitiatorAgentID string          `json:"initiator_agent_id"`
+	TargetAgentID    string          `json:"target_agent_id"`
+	ToolName         string          `json:"tool_name"`
+	Arguments        json.RawMessage `json:"arguments"`
+	DelegationToken  string          `json:"delegation_token"`
+}
+
+// EntrypointResultRequest is received by the target agent entrypoint to report
+// the final outcome of a delegated task.
+type EntrypointResultRequest struct {
+	ProtocolVersion string          `json:"protocol_version"`
+	Status          string          `json:"status"`
+	Outcome         json.RawMessage `json:"outcome,omitempty"`
+	ErrorCode       string          `json:"error_code,omitempty"`
+}
+
 // DelegationRequest is sent by the Python tool-governance layer when it wants
 // to forward a tool execution to another agent.
 type DelegationRequest struct {
@@ -124,6 +168,7 @@ type DelegationRequest struct {
 // DelegationResponse is returned by the Go kernel.
 type DelegationResponse struct {
 	Allowed          bool            `json:"allowed"`
+	DecisionID       string          `json:"decision_id,omitempty"`
 	TaskID           string          `json:"task_id"`
 	TargetEntrypoint AgentEntrypoint `json:"target_entrypoint,omitempty"`
 	DelegationToken  string          `json:"delegation_token,omitempty"`

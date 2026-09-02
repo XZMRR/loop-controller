@@ -76,6 +76,7 @@ dmypy.json
 # Go
 /bin/
 go/bin/
+go/data/
 
 # Project specific: large embedded dependencies
 mcp_servers_official/

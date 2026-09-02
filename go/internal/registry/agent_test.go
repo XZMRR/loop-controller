@@ -9,9 +9,9 @@ import (
 func TestRegisterAndGet(t *testing.T) {
 	r := New()
 	card := models.AgentCard{
-		AgentID:     "agent-1",
-		Name:        "Test Agent",
-		Entrypoint:  models.AgentEntrypoint{Type: "http", URL: "http://localhost:8080"},
+		AgentID:      "agent-1",
+		Name:         "Test Agent",
+		Entrypoint:   models.AgentEntrypoint{Type: "http", URL: "http://localhost:8080"},
 		Capabilities: []string{"delegate_execution"},
 	}
 	if err := r.Register(card); err != nil {

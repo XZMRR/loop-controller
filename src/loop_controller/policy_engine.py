@@ -96,6 +96,9 @@ def build_policy_input(
         "risk_level": proposal.risk_level,
         "risk_tags": proposal.risk_tags,
         "task_context": proposal.task_context,
+        "action_kind": proposal.action_kind,  # v0.37.0
+        "target_agent_id": proposal.target_agent_id,  # v0.37.0
+        "delegation_context": proposal.delegation_context,  # v0.37.0
         "action": {
             "combination_risk_tags": proposal.combination_risk_tags,
             "combination_risk_score": proposal.combination_risk_score,

@@ -1,4 +1,4 @@
-# Harness 执行策略配置（v0.36.1）
+# Harness 执行策略配置（v0.37.0）
 # Harness 未配置时，仓库内置示例工具逐项进入 trusted_local_tools；
 # 新增工具不会自动获得本地执行权限。
 

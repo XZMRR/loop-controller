@@ -3,15 +3,27 @@ package delegation
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/loop-controller/go/internal/models"
 	"github.com/loop-controller/go/internal/registry"
+	"github.com/loop-controller/go/internal/store"
 	"github.com/loop-controller/go/internal/stream"
 	"github.com/loop-controller/go/internal/task"
 	"github.com/loop-controller/go/internal/token"
 )
+
+func openTestDB(t *testing.T) *store.DB {
+	t.Helper()
+	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "a2a.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
 
 func TestRequestAllowed(t *testing.T) {
 	reg := registry.New()
@@ -21,9 +33,10 @@ func TestRequestAllowed(t *testing.T) {
 		Entrypoint:   models.AgentEntrypoint{Type: "http", URL: "http://executor:8080"},
 		Capabilities: []string{"delegate_execution"},
 	})
-	tasks := task.New()
+	db := openTestDB(t)
+	tasks := task.New(db.TaskStore())
 	issuer := token.NewHMACIssuer([]byte("secret"))
-	pub := stream.NewInMemoryPublisher()
+	pub := stream.NewPublisher(db.EventStore())
 	d := New(reg, tasks, issuer, pub, time.Hour)
 
 	resp, err := d.Request(context.Background(), models.DelegationRequest{
@@ -62,7 +75,8 @@ func TestRequestTokenIssuanceFailureIsDenied(t *testing.T) {
 		AgentID:      "executor",
 		Capabilities: []string{"delegate_execution"},
 	})
-	d := New(reg, task.New(), failingIssuer{}, nil, time.Hour)
+	db := openTestDB(t)
+	d := New(reg, task.New(db.TaskStore()), failingIssuer{}, nil, time.Hour)
 
 	resp, err := d.Request(context.Background(), models.DelegationRequest{
 		RequestID:        "req-1",
@@ -80,7 +94,8 @@ func TestRequestTokenIssuanceFailureIsDenied(t *testing.T) {
 
 func TestRequestMissingTarget(t *testing.T) {
 	reg := registry.New()
-	tasks := task.New()
+	db := openTestDB(t)
+	tasks := task.New(db.TaskStore())
 	d := New(reg, tasks, nil, nil, time.Hour)
 
 	resp, err := d.Request(context.Background(), models.DelegationRequest{
@@ -99,7 +114,8 @@ func TestRequestMissingTarget(t *testing.T) {
 
 func TestRequestMissingFields(t *testing.T) {
 	reg := registry.New()
-	tasks := task.New()
+	db := openTestDB(t)
+	tasks := task.New(db.TaskStore())
 	d := New(reg, tasks, nil, nil, time.Hour)
 
 	_, err := d.Request(context.Background(), models.DelegationRequest{})
@@ -116,7 +132,8 @@ func TestRequestNoCapability(t *testing.T) {
 		Entrypoint:   models.AgentEntrypoint{Type: "http", URL: "http://executor:8080"},
 		Capabilities: []string{"chat"},
 	})
-	tasks := task.New()
+	db := openTestDB(t)
+	tasks := task.New(db.TaskStore())
 	d := New(reg, tasks, nil, nil, time.Hour)
 
 	resp, err := d.Request(context.Background(), models.DelegationRequest{
@@ -139,7 +156,8 @@ func TestRequestExistingTask(t *testing.T) {
 		AgentID:      "executor",
 		Capabilities: []string{"delegate_execution"},
 	})
-	tasks := task.New()
+	db := openTestDB(t)
+	tasks := task.New(db.TaskStore())
 	tsk := tasks.Create("session-1", "planner", "executor")
 	issuer := token.NewHMACIssuer([]byte("secret"))
 	d := New(reg, tasks, issuer, nil, time.Hour)

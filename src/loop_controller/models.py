@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 RiskLevel = Literal["low", "medium", "high", "critical"]
 Verdict = Literal["allow", "deny", "modify", "require_approval"]
+ActionKind = Literal["tool_call", "delegation"]
 AuditDecision = Literal["allow", "deny", "modify", "require_approval", "blocked"]
 ToolResultStatus = Literal["success", "error", "blocked"]
 ActorType = Literal["agent", "user", "r0_delegate", "system", "checkpoint"]
@@ -171,6 +172,9 @@ class ActionProposal(BaseModel):
     tool_name: str  # 规范化工具名
     arguments: dict[str, Any]
     task_context: str  # 由 Task.description 纯截断（前 200 字符）生成
+    action_kind: ActionKind = "tool_call"  # v0.37.0: tool_call 或 delegation
+    target_agent_id: str | None = None  # v0.37.0: delegation 目标 Agent
+    delegation_context: dict[str, Any] | None = None  # v0.37.0: 委托附加元数据
     risk_level: RiskLevel = "low"
     risk_tags: list[str] = Field(default_factory=list)
     combination_risk_tags: list[str] = Field(default_factory=list)  # v0.10.0：能力组合风险标签
@@ -218,6 +222,10 @@ class Decision(BaseModel):
     decision_id: str  # R2 生成的 UUID
     call_id: str
     task_id: str
+    action_kind: ActionKind = "tool_call"  # v0.37.0
+    target_agent_id: str | None = None  # v0.37.0
+    delegation_token: str | None = None  # v0.37.0: 成功授权后由 Go 内核签发
+    target_entrypoint: dict[str, Any] | None = None  # v0.37.0
     verdict: Verdict
     reason: str  # 不允许为空字符串（审批可读性与审计可解释性底线）
     modified_args: dict[str, Any] | None = None  # 向后兼容：等价于 policy_modified_args
@@ -510,7 +518,7 @@ class GovernanceResult(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    status: Literal["allow", "deny", "require_approval", "blocked", "error"]
+    status: Literal["allow", "deny", "require_approval", "blocked", "error", "delegated"]
     call_id: str
     tool_name: str
     arguments: dict[str, Any]

@@ -1,0 +1,37 @@
+title: TaskEvent
+type: object
+required:
+  - protocol_version
+  - event_id
+  - task_id
+  - event_type
+  - payload
+  - published_at
+properties:
+  protocol_version:
+    $ref: './protocol-version.yaml'
+  event_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  task_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  event_type:
+    type: string
+    enum:
+      - task_created
+      - task_accepted
+      - task_running
+      - task_completed
+      - task_failed
+      - task_cancelled
+      - task_outcome_unknown
+      - message_received
+      - delegation_authorized
+      - delegation_denied
+  payload:
+    description: Event-specific payload as a JSON value.
+  published_at:
+    type: string
+    format: date-time
+description: Event published over the task SSE stream or persisted to the event log.
