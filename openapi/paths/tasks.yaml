@@ -9,7 +9,24 @@
       content:
         application/json:
           schema:
-            $ref: '../schemas/task.yaml'
+            type: object
+            required:
+              - protocol_version
+              - session_id
+              - initiator_agent_id
+              - target_agent_id
+            properties:
+              protocol_version:
+                $ref: '../schemas/protocol-version.yaml'
+              session_id:
+                type: string
+                pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+              initiator_agent_id:
+                type: string
+                pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+              target_agent_id:
+                type: string
+                pattern: '^[a-zA-Z0-9_.-]{1,128}$'
     responses:
       '201':
         description: Task created
@@ -78,7 +95,9 @@
             schema:
               type: string
             example: |
-              data: {"protocol_version":"0.39.0","event_id":"ev-001","task_id":"task-001","event_type":"task_created","payload":{},"published_at":"2026-09-01T12:00:00Z"}
+              id: ev-001
+              event: task_created
+              data: {"protocol_version":"0.40.0","event_id":"ev-001","task_id":"task-001","event_type":"task_created","payload":{},"published_at":"2026-09-01T12:00:00Z"}
 
 /a2a/v1/tasks/{id}/cancel:
   post:
@@ -132,6 +151,8 @@
     summary: Target agent entrypoint receives a delegated Task
     tags:
       - Entrypoint
+    security:
+      - TaskDelegationToken: []
     requestBody:
       required: true
       content:
@@ -195,6 +216,8 @@
     summary: Target agent explicitly accepts a Task
     tags:
       - Entrypoint
+    security:
+      - TaskDelegationToken: []
     parameters:
       - name: id
         in: path
@@ -233,12 +256,60 @@
             schema:
               $ref: '../schemas/error-response.yaml'
 
+/a2a/v1/entrypoint/tasks/{id}/start:
+  post:
+    operationId: entrypointStartTask
+    summary: Target agent starts an accepted Task
+    tags:
+      - Entrypoint
+    security:
+      - TaskDelegationToken: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - protocol_version
+            properties:
+              protocol_version:
+                $ref: '../schemas/protocol-version.yaml'
+    responses:
+      '200':
+        description: Task running
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/task.yaml'
+      '404':
+        description: Task not found
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+      '409':
+        description: Invalid state transition
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+
 /a2a/v1/entrypoint/tasks/{id}/cancel:
   post:
     operationId: entrypointCancelTask
     summary: Target agent receives a cancellation request
     tags:
       - Entrypoint
+    security:
+      - TaskDelegationToken: []
     parameters:
       - name: id
         in: path
@@ -279,6 +350,8 @@
     summary: Target agent queries a Task
     tags:
       - Entrypoint
+    security:
+      - TaskDelegationToken: []
     parameters:
       - name: id
         in: path
@@ -306,6 +379,8 @@
     summary: Target agent submits Task execution results
     tags:
       - Entrypoint
+    security:
+      - TaskDelegationToken: []
     parameters:
       - name: id
         in: path
@@ -330,7 +405,6 @@
                 enum:
                   - completed
                   - failed
-                  - outcome_unknown
               outcome:
                 description: Execution result or failure summary as a JSON value.
               error_code:

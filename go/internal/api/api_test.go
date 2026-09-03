@@ -89,6 +89,7 @@ func TestCreateTaskAndGet(t *testing.T) {
 	_, server := newTestServer(t)
 
 	req := map[string]string{
+		"protocol_version":   currentProtocolVersion,
 		"session_id":         "session-1",
 		"initiator_agent_id": "agent-a",
 		"target_agent_id":    "agent-b",
@@ -242,6 +243,7 @@ func TestTaskStreamSSE(t *testing.T) {
 
 	// Create task first.
 	req := map[string]string{
+		"protocol_version":   currentProtocolVersion,
 		"session_id":         "session-1",
 		"initiator_agent_id": "agent-a",
 		"target_agent_id":    "agent-b",
@@ -301,6 +303,48 @@ func TestTaskStreamSSE(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for SSE event")
+	}
+}
+
+func TestTaskStreamLastEventIDReplaysOnlyNewerEvents(t *testing.T) {
+	srv, server := newTestServer(t)
+	task, err := srv.tasks.CreateReliable("session-replay", "agent-a", "agent-b")
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	for _, status := range []string{"accepted", "running"} {
+		if err := srv.publisher.Publish(context.Background(), models.Task{TaskID: task.TaskID, Status: status}); err != nil {
+			t.Fatalf("publish %s: %v", status, err)
+		}
+	}
+	history, err := srv.db.EventStore().ListAfter(context.Background(), task.TaskID, "")
+	if err != nil || len(history) != 3 {
+		t.Fatalf("history: len=%d err=%v", len(history), err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/a2a/v1/tasks/"+task.TaskID+"/stream", nil)
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Last-Event-ID", history[0].EventID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("stream request: %v", err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	var eventTypes []string
+	for len(eventTypes) < 2 {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read stream: %v", err)
+		}
+		if strings.HasPrefix(line, "event: ") {
+			eventTypes = append(eventTypes, strings.TrimSpace(strings.TrimPrefix(line, "event: ")))
+		}
+	}
+	if eventTypes[0] != "task_accepted" || eventTypes[1] != "task_running" {
+		t.Fatalf("event types = %#v, want accepted then running", eventTypes)
 	}
 }
 

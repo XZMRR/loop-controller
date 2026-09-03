@@ -13,7 +13,11 @@ from loop_controller.go_kernel_bridge import (
 )
 from loop_controller.utils.canonical import canonical_json
 
-FIXTURE = Path(__file__).resolve().parents[1] / "contract" / "a2a_v0.39.0.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FIXTURE = PROJECT_ROOT / "contract" / "a2a_v0.40.0.json"
+OPENAPI = PROJECT_ROOT / "openapi" / "a2a_v0.40.0.yaml"
+TASK_PATHS = PROJECT_ROOT / "openapi" / "paths" / "tasks.yaml"
+TASK_SCHEMA = PROJECT_ROOT / "openapi" / "schemas" / "task.yaml"
 
 
 @pytest.fixture
@@ -29,12 +33,12 @@ def test_current_protocol_version_matches_fixture(contract: dict) -> None:
 @pytest.mark.parametrize(
     ("version", "should_raise"),
     [
-        ("0.39.0", False),
-        ("0.39.1", False),
-        ("0.39.99", False),
+        ("0.40.0", False),
+        ("0.40.1", False),
+        ("0.40.99", False),
         ("", True),
-        ("0.38.1", True),
-        ("0.40.0", True),
+        ("0.39.1", True),
+        ("0.41.0", True),
         ("not-a-version", True),
     ],
 )
@@ -92,7 +96,7 @@ def test_delegation_response_roundtrip(contract: dict) -> None:
 
 def test_delegation_response_default_protocol_version() -> None:
     resp = DelegationResponse(allowed=True)
-    assert resp.protocol_version == "0.39.0"
+    assert resp.protocol_version == "0.40.0"
 
 
 def test_task_fixture_is_canonical_and_has_stable_timestamps(contract: dict) -> None:
@@ -121,15 +125,63 @@ def test_all_roundtrip_fixtures_have_stable_canonical_json(contract: dict) -> No
 def test_error_response_fixture(contract: dict) -> None:
     fixture = contract["error_response"]
     assert fixture == {
-        "error": "protocol version 0.38.0 is incompatible",
+        "error": "protocol version 0.39.0 is incompatible",
         "code": "incompatible_protocol_version",
     }
 
 
 def test_sse_event_fixture(contract: dict) -> None:
     fixture = contract["sse_event"]
-    assert fixture["data"]["task_id"] == contract["task"]["task_id"]
-    assert fixture["data"]["status"] == "active"
+    event = fixture["data"]
+    assert fixture["id"] == event["event_id"]
+    assert fixture["event"] == event["event_type"]
+    assert event == contract["task_event"]
+    assert event["protocol_version"] == CURRENT_PROTOCOL_VERSION
+    assert event["task_id"] == contract["task"]["task_id"]
+
+
+def test_openapi_task_token_and_status_contract() -> None:
+    import yaml
+
+    with OPENAPI.open("r", encoding="utf-8") as f:
+        openapi = yaml.safe_load(f)
+    with TASK_PATHS.open("r", encoding="utf-8") as f:
+        task_paths = yaml.safe_load(f)
+    with TASK_SCHEMA.open("r", encoding="utf-8") as f:
+        task_schema = yaml.safe_load(f)
+
+    entrypoint_paths = (
+        "/a2a/v1/entrypoint/tasks",
+        "/a2a/v1/entrypoint/tasks/{id}/accept",
+        "/a2a/v1/entrypoint/tasks/{id}/start",
+        "/a2a/v1/entrypoint/tasks/{id}/cancel",
+        "/a2a/v1/entrypoint/tasks/{id}",
+        "/a2a/v1/entrypoint/tasks/{id}/results",
+    )
+    assert openapi["components"]["securitySchemes"]["TaskDelegationToken"] == {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Task-scoped delegation token issued by the A2A kernel.",
+    }
+    for path in entrypoint_paths:
+        assert path in openapi["paths"]
+        operation = task_paths[path]["get" if path.endswith("{id}") else "post"]
+        assert operation["security"] == [{"TaskDelegationToken": []}]
+
+    assert task_schema["properties"]["status"]["enum"] == [
+        "pending",
+        "accepted",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "outcome_unknown",
+    ]
+    result_status = task_paths["/a2a/v1/entrypoint/tasks/{id}/results"]["post"][
+        "requestBody"
+    ]["content"]["application/json"]["schema"]["properties"]["status"]["enum"]
+    assert result_status == ["completed", "failed"]
 
 
 def classify_message_error(message: dict) -> str | None:

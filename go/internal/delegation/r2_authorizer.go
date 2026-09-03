@@ -15,7 +15,7 @@ import (
 	"github.com/loop-controller/go/internal/models"
 )
 
-const interactionProtocolVersion = "0.39.0"
+const interactionProtocolVersion = models.CurrentProtocolVersion
 const maxAuthorizationResponseBytes = 1 << 20
 
 var strictProtocolVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
@@ -35,6 +35,7 @@ type HTTPR2Authorizer struct {
 
 type interactionAuthorizationRequest struct {
 	ProtocolVersion string          `json:"protocol_version"`
+	InteractionID   string          `json:"interaction_id"`
 	RequestID       string          `json:"request_id"`
 	SourceAgentID   string          `json:"source_agent_id"`
 	TargetAgentID   string          `json:"target_agent_id"`
@@ -77,6 +78,7 @@ func (a *HTTPR2Authorizer) Authorize(ctx context.Context, req models.DelegationR
 	}
 	payload, err := json.Marshal(interactionAuthorizationRequest{
 		ProtocolVersion: req.ProtocolVersion,
+		InteractionID:   req.RequestID,
 		RequestID:       req.RequestID,
 		SourceAgentID:   req.InitiatorAgentID,
 		TargetAgentID:   req.TargetAgentID,
@@ -153,6 +155,45 @@ func denied(reason string) models.DelegationResponse {
 		Reason:          reason,
 		ProtocolVersion: interactionProtocolVersion,
 	}
+}
+
+// RecordLifecycle appends a committed Task transition to the Python audit timeline.
+func (a *HTTPR2Authorizer) RecordLifecycle(ctx context.Context, task models.Task, event string) error {
+	payload, err := json.Marshal(map[string]any{
+		"interaction_id":        task.InteractionID,
+		"root_interaction_id":   task.RootInteractionID,
+		"parent_interaction_id": task.ParentInteractionID,
+		"decision_id":           task.DecisionID,
+		"task_id":               task.TaskID,
+		"session_id":            task.SessionID,
+		"source_agent_id":       task.InitiatorAgentID,
+		"target_agent_id":       task.TargetAgentID,
+		"event":                 event,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal interaction lifecycle: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.BaseURL+"/interaction/v1/delegations/lifecycle", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build interaction lifecycle request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if a.BearerToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+a.BearerToken)
+	}
+	client := a.Client
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("interaction lifecycle endpoint unreachable: %w", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return fmt.Errorf("interaction lifecycle endpoint returned status %d", httpResp.StatusCode)
+	}
+	return nil
 }
 
 // StaticR2Authorizer is a test/development authorizer that returns a fixed decision.

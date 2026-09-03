@@ -1,5 +1,5 @@
 title: ProtocolVersion
 type: string
 pattern: '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$'
-example: '0.39.0'
+example: '0.40.0'
 description: A2A protocol version in semantic-version format (major.minor.patch).

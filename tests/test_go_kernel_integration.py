@@ -107,7 +107,7 @@ class _AllowIIGEHandler(BaseHTTPRequestHandler):
                 "decision_id": "test-decision",
                 "task_id": payload.get("task_id", ""),
                 "reason": "test IIGE allow",
-                "protocol_version": "0.39.0",
+                "protocol_version": "0.40.0",
             }
         ).encode()
         self.send_response(200)
@@ -149,6 +149,7 @@ def kernel_url(tmp_path_factory: pytest.TempPathFactory) -> str:
             "test-secret",
             "-db",
             str(db_path),
+            "-development",
             "-interaction-url",
             f"http://127.0.0.1:{interaction_port}",
         ],

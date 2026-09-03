@@ -442,6 +442,33 @@ class ToolGovernServer:
             )
         return JSONResponse(response)
 
+    async def _handle_interaction_lifecycle(self, request: Request) -> JSONResponse:
+        """接收 Go Kernel 的 Interaction/Task 生命周期审计通知。"""
+        authorized, _identity = await self._check_agent_auth(request)
+        if not authorized:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be an object")
+            required = (
+                "interaction_id",
+                "decision_id",
+                "task_id",
+                "source_agent_id",
+                "target_agent_id",
+                "event",
+            )
+            missing = [field for field in required if not payload.get(field)]
+            if missing:
+                raise ValueError(f"missing lifecycle fields: {', '.join(missing)}")
+            engine = InteractionGovernanceEngine(self._controller)
+            event = engine.build_lifecycle_audit_event(payload)
+        except (KeyError, ValueError) as exc:
+            return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+        await self._controller._runtime.audit_store.append_async(event)
+        return JSONResponse({"accepted": True}, status_code=202)
+
     async def _handle_metrics(self, request: Request) -> PlainTextResponse:
         if self._api_key is not None and not self._check_api_key(request):
             return PlainTextResponse(content="unauthorized", status_code=401)
@@ -1118,6 +1145,11 @@ def build_app(
             Route(
                 "/interaction/v1/delegations/authorize",
                 server._handle_delegation_authorize,
+                methods=["POST"],
+            ),
+            Route(
+                "/interaction/v1/delegations/lifecycle",
+                server._handle_interaction_lifecycle,
                 methods=["POST"],
             ),
             Route(

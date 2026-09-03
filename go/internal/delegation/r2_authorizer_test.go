@@ -11,6 +11,36 @@ import (
 	"github.com/loop-controller/go/internal/models"
 )
 
+func TestHTTPR2Authorizer_RecordLifecycleCarriesCorrelationFields(t *testing.T) {
+	var payload map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode lifecycle: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer ts.Close()
+	auth := &HTTPR2Authorizer{BaseURL: ts.URL}
+	task := models.Task{
+		TaskID: "task-1", SessionID: "session-1", InteractionID: "int-1", DecisionID: "dec-1",
+		RootInteractionID: "root-1", ParentInteractionID: "parent-1", InitiatorAgentID: "agent-a", TargetAgentID: "agent-b",
+	}
+	if err := auth.RecordLifecycle(context.Background(), task, "running"); err != nil {
+		t.Fatalf("record lifecycle: %v", err)
+	}
+	for field, want := range map[string]string{
+		"interaction_id": "int-1", "decision_id": "dec-1", "root_interaction_id": "root-1",
+		"parent_interaction_id": "parent-1", "task_id": "task-1", "session_id": "session-1",
+	} {
+		if got := payload[field]; got != want {
+			t.Errorf("%s = %v, want %q", field, got, want)
+		}
+	}
+	if _, ok := payload["delegation_token"]; ok {
+		t.Fatal("lifecycle payload must not contain delegation token")
+	}
+}
+
 func TestHTTPR2Authorizer_Allowed(t *testing.T) {
 	want := models.DelegationResponse{
 		Allowed:         true,

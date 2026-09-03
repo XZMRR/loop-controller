@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -50,7 +51,139 @@ func TestTaskCreateAndGet(t *testing.T) {
 	}
 }
 
-func TestTaskStatusUpdate(t *testing.T) {
+func TestTaskCreateWithEventCommitsTogether(t *testing.T) {
+	db := openTestDB(t)
+	task := models.Task{
+		TaskID:           "task-created-event",
+		SessionID:        "session-1",
+		InitiatorAgentID: "agent-a",
+		TargetAgentID:    "agent-b",
+		Status:           "pending",
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
+	}
+	event, err := db.TaskStore().CreateWithEvent(context.Background(), task)
+	if err != nil {
+		t.Fatalf("create task with event: %v", err)
+	}
+	if event.EventType != "task_created" || event.TaskID != task.TaskID {
+		t.Fatalf("unexpected created event: %+v", event)
+	}
+	var payload models.Task
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("decode event payload: %v", err)
+	}
+	if payload.TaskID != task.TaskID || payload.Status != "pending" {
+		t.Fatalf("unexpected event payload: %+v", payload)
+	}
+	pending, err := db.EventStore().ListPending(context.Background(), task.TaskID)
+	if err != nil {
+		t.Fatalf("list pending events: %v", err)
+	}
+	if len(pending) != 1 || pending[0].EventID != event.EventID {
+		t.Fatalf("persisted events = %+v, want event %q", pending, event.EventID)
+	}
+}
+
+type retryingLifecycleAuditor struct {
+	calls int
+	tasks []models.Task
+}
+
+func (a *retryingLifecycleAuditor) RecordLifecycle(_ context.Context, task models.Task, _ string) error {
+	a.calls++
+	a.tasks = append(a.tasks, task)
+	if a.calls == 1 {
+		return errors.New("temporary audit failure")
+	}
+	return nil
+}
+
+func TestLifecycleOutboxIsTransactionalAndRetries(t *testing.T) {
+	db := openTestDB(t)
+	createdAt := time.Now().UTC()
+	task := models.Task{
+		TaskID: "task-lifecycle-outbox", SessionID: "session-1",
+		InteractionID: "int-1", DecisionID: "dec-1", RootInteractionID: "root-1", ParentInteractionID: "parent-1",
+		InitiatorAgentID: "agent-a", TargetAgentID: "agent-b", Status: "pending", CreatedAt: createdAt, UpdatedAt: createdAt,
+	}
+	if err := db.TaskStore().Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if _, _, err := db.TaskStore().UpdateStatus(context.Background(), task.TaskID, "pending", "accepted", nil, ""); err != nil {
+		t.Fatalf("accept task: %v", err)
+	}
+
+	now := time.Now().UTC()
+	outbox := db.LifecycleOutboxStore()
+	auditor := &retryingLifecycleAuditor{}
+	dispatcher := NewLifecycleOutboxDispatcher(outbox, auditor, time.Second)
+	if err := dispatcher.RunOnce(context.Background(), now); err != nil {
+		t.Fatalf("first dispatch: %v", err)
+	}
+	if due, err := outbox.ListDue(context.Background(), now, 10); err != nil || len(due) != 0 {
+		t.Fatalf("outbox should wait for retry: due=%+v err=%v", due, err)
+	}
+	if err := dispatcher.RunOnce(context.Background(), now.Add(time.Second)); err != nil {
+		t.Fatalf("retry dispatch: %v", err)
+	}
+	if due, err := outbox.ListDue(context.Background(), now.Add(time.Hour), 10); err != nil || len(due) != 0 {
+		t.Fatalf("outbox should be delivered: due=%+v err=%v", due, err)
+	}
+	if auditor.calls != 2 || len(auditor.tasks) != 2 {
+		t.Fatalf("audit calls = %d, tasks=%d", auditor.calls, len(auditor.tasks))
+	}
+	got := auditor.tasks[1]
+	if got.InteractionID != "int-1" || got.DecisionID != "dec-1" || got.RootInteractionID != "root-1" || got.ParentInteractionID != "parent-1" {
+		t.Fatalf("outbox lost linkage: %+v", got)
+	}
+}
+
+func TestLifecycleOutboxFailureRollsBackTaskTransition(t *testing.T) {
+	db := openTestDB(t)
+	now := time.Now().UTC()
+	task := models.Task{
+		TaskID: "task-outbox-rollback", SessionID: "session-1", InteractionID: "int-1", DecisionID: "dec-1",
+		InitiatorAgentID: "agent-a", TargetAgentID: "agent-b", Status: "pending", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.TaskStore().Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), "DROP TABLE lifecycle_outbox"); err != nil {
+		t.Fatalf("drop outbox: %v", err)
+	}
+	if _, _, err := db.TaskStore().UpdateStatus(context.Background(), task.TaskID, "pending", "accepted", nil, ""); err == nil {
+		t.Fatal("expected outbox persistence failure")
+	}
+	got, err := db.TaskStore().Get(context.Background(), task.TaskID)
+	if err != nil || got.Status != "pending" {
+		t.Fatalf("transition was not rolled back: task=%+v err=%v", got, err)
+	}
+}
+
+func TestTaskCreateAndEventRollbackTogether(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.ExecContext(context.Background(), "DROP TABLE events"); err != nil {
+		t.Fatalf("drop events table: %v", err)
+	}
+	task := models.Task{
+		TaskID:           "task-create-rollback",
+		SessionID:        "session-1",
+		InitiatorAgentID: "agent-a",
+		TargetAgentID:    "agent-b",
+		Status:           "pending",
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
+	}
+	if _, err := db.TaskStore().CreateWithEvent(context.Background(), task); err == nil {
+		t.Fatal("expected created event persistence failure")
+	}
+	if _, err := db.TaskStore().Get(context.Background(), task.TaskID); err == nil {
+		t.Fatal("task must be rolled back when created event persistence fails")
+	}
+}
+
+func TestTaskStatusUpdatePersistsTransitionEvent(t *testing.T) {
 	db := openTestDB(t)
 	ts := db.TaskStore()
 	task := models.Task{
@@ -66,10 +199,16 @@ func TestTaskStatusUpdate(t *testing.T) {
 		t.Fatalf("create task: %v", err)
 	}
 
+	if _, _, err := ts.UpdateStatus(context.Background(), task.TaskID, "pending", "accepted", nil, ""); err != nil {
+		t.Fatalf("accept task: %v", err)
+	}
+	if _, _, err := ts.UpdateStatus(context.Background(), task.TaskID, "accepted", "running", nil, ""); err != nil {
+		t.Fatalf("start task: %v", err)
+	}
 	outcome := json.RawMessage(`{"result":"ok"}`)
-	updated, err := ts.UpdateStatus(context.Background(), task.TaskID, "completed", outcome, "")
+	updated, event, err := ts.UpdateStatus(context.Background(), task.TaskID, "running", "completed", outcome, "")
 	if err != nil {
-		t.Fatalf("update status: %v", err)
+		t.Fatalf("complete task: %v", err)
 	}
 	if updated.Status != "completed" {
 		t.Errorf("status = %q, want completed", updated.Status)
@@ -79,6 +218,65 @@ func TestTaskStatusUpdate(t *testing.T) {
 	}
 	if updated.CompletedAt == nil {
 		t.Error("expected completed_at to be set")
+	}
+	if event.EventType != "task_completed" || event.TaskID != task.TaskID {
+		t.Fatalf("unexpected transition event: %+v", event)
+	}
+	events, err := db.EventStore().ListAfter(context.Background(), task.TaskID, "")
+	if err != nil {
+		t.Fatalf("list transition events: %v", err)
+	}
+	if len(events) != 3 || events[2].EventID != event.EventID {
+		t.Fatalf("persisted events = %+v, want final event %q", events, event.EventID)
+	}
+}
+
+func TestTaskStoreRejectsInvalidTransitions(t *testing.T) {
+	db := openTestDB(t)
+	ts := db.TaskStore()
+	task := models.Task{
+		TaskID: "task-invalid-transition", SessionID: "session-1",
+		InitiatorAgentID: "agent-a", TargetAgentID: "agent-b", Status: "pending",
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := ts.Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	for _, status := range []string{"running", "completed"} {
+		if _, _, err := ts.UpdateStatus(context.Background(), task.TaskID, "pending", status, nil, ""); err != ErrInvalidTransition {
+			t.Errorf("pending->%s error = %v, want ErrInvalidTransition", status, err)
+		}
+	}
+}
+
+func TestTaskStatusAndEventRollbackTogether(t *testing.T) {
+	db := openTestDB(t)
+	task := models.Task{
+		TaskID:           "task-rollback",
+		SessionID:        "session-1",
+		InitiatorAgentID: "agent-a",
+		TargetAgentID:    "agent-b",
+		Status:           "pending",
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
+	}
+	if err := db.TaskStore().Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), "DROP TABLE events"); err != nil {
+		t.Fatalf("drop events table: %v", err)
+	}
+
+	if _, _, err := db.TaskStore().UpdateStatus(context.Background(), task.TaskID, "pending", "accepted", nil, ""); err == nil {
+		t.Fatal("expected transition event persistence failure")
+	}
+	got, err := db.TaskStore().Get(context.Background(), task.TaskID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if got.Status != "pending" {
+		t.Fatalf("status = %q, want pending after rollback", got.Status)
 	}
 }
 

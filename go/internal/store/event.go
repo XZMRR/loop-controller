@@ -14,6 +14,7 @@ import (
 type EventStore interface {
 	Append(ctx context.Context, ev models.TaskEvent) error
 	ListPending(ctx context.Context, taskID string) ([]models.TaskEvent, error)
+	ListAfter(ctx context.Context, taskID, afterEventID string) ([]models.TaskEvent, error)
 	MarkPublished(ctx context.Context, eventIDs []string) error
 }
 
@@ -51,6 +52,26 @@ func (s *eventStore) ListPending(ctx context.Context, taskID string) ([]models.T
 	`, taskID)
 	if err != nil {
 		return nil, fmt.Errorf("list pending events: %w", err)
+	}
+	defer rows.Close()
+	return scanEvents(rows)
+}
+
+func (s *eventStore) ListAfter(ctx context.Context, taskID, afterEventID string) ([]models.TaskEvent, error) {
+	query := `
+		SELECT event_id, task_id, event_type, payload_json, published_at, published
+		FROM events
+		WHERE task_id = ?
+	`
+	args := []any{taskID}
+	if afterEventID != "" {
+		query += ` AND rowid > COALESCE((SELECT rowid FROM events WHERE event_id = ? AND task_id = ?), 0)`
+		args = append(args, afterEventID, taskID)
+	}
+	query += ` ORDER BY rowid ASC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list task events: %w", err)
 	}
 	defer rows.Close()
 	return scanEvents(rows)

@@ -7,7 +7,7 @@
       "url": "http://127.0.0.1:8000"
     },
     "capabilities": ["delegate_execution"],
-    "version": "0.39.0"
+    "version": "0.40.0"
   },
   {
     "agent_id": "research-agent",
@@ -17,6 +17,6 @@
       "url": "http://127.0.0.1:8001"
     },
     "capabilities": ["delegate_execution", "stream_task"],
-    "version": "0.39.0"
+    "version": "0.40.0"
   }
 ]

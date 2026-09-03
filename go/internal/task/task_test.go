@@ -21,7 +21,10 @@ func openTestStore(t *testing.T) store.TaskStore {
 
 func TestCreateAndGet(t *testing.T) {
 	m := New(openTestStore(t))
-	task := m.Create("session-1", "agent-a", "agent-b")
+	task, err := m.CreateReliable("session-1", "agent-a", "agent-b")
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
 	if task.Status != "pending" {
 		t.Errorf("expected status pending, got %q", task.Status)
 	}
@@ -71,20 +74,26 @@ func TestUpdateStatusTransition(t *testing.T) {
 	m := New(openTestStore(t))
 	task := m.Create("session-1", "agent-a", "agent-b")
 
-	if _, err := m.UpdateStatus(task.TaskID, "completed"); err != ErrInvalidStatus {
-		t.Fatalf("expected ErrInvalidStatus for pending->completed, got %v", err)
+	invalid := []string{"running", "completed"}
+	for _, status := range invalid {
+		if _, err := m.UpdateStatus(task.TaskID, status); err != ErrInvalidStatus {
+			t.Errorf("expected ErrInvalidStatus for pending->%s, got %v", status, err)
+		}
 	}
 
 	if _, err := m.UpdateStatus(task.TaskID, "accepted"); err != nil {
 		t.Fatalf("pending->accepted failed: %v", err)
 	}
+	if _, err := m.MarkOutcomeUnknown(task.TaskID); err != ErrInvalidStatus {
+		t.Fatalf("expected ErrInvalidStatus for accepted->outcome_unknown, got %v", err)
+	}
 	if _, err := m.UpdateStatus(task.TaskID, "running"); err != nil {
 		t.Fatalf("accepted->running failed: %v", err)
 	}
-	if _, err := m.UpdateStatus(task.TaskID, "completed"); err != nil {
+	if _, err := m.Complete(task.TaskID, "completed", nil, ""); err != nil {
 		t.Fatalf("running->completed failed: %v", err)
 	}
-	if _, err := m.UpdateStatus(task.TaskID, "failed"); err != ErrInvalidStatus {
+	if _, err := m.Complete(task.TaskID, "failed", nil, ""); err != ErrInvalidStatus {
 		t.Fatalf("expected ErrInvalidStatus for completed->failed, got %v", err)
 	}
 }
@@ -118,6 +127,41 @@ func TestCreateWithID(t *testing.T) {
 	}
 	if got.TaskID != "task-explicit" || got.Status != "pending" {
 		t.Errorf("unexpected task: %+v", got)
+	}
+}
+
+func TestConcurrentTransitionUsesCompareAndSet(t *testing.T) {
+	m := New(openTestStore(t))
+	created := m.Create("session-1", "agent-a", "agent-b")
+
+	firstDone := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		_, err := m.UpdateStatusFrom(created.TaskID, "pending", "accepted")
+		results <- err
+		close(firstDone)
+	}()
+	go func() {
+		<-firstDone
+		_, err := m.UpdateStatusFrom(created.TaskID, "pending", "cancelled")
+		results <- err
+	}()
+
+	successes := 0
+	conflicts := 0
+	for range 2 {
+		err := <-results
+		switch err {
+		case nil:
+			successes++
+		case ErrInvalidStatus:
+			conflicts++
+		default:
+			t.Fatalf("unexpected transition error: %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("expected one success and one conflict, got successes=%d conflicts=%d", successes, conflicts)
 	}
 }
 
@@ -184,8 +228,15 @@ func TestCompleteFromOutcomeUnknown(t *testing.T) {
 	if _, err := m.UpdateStatus(task.TaskID, "running"); err != nil {
 		t.Fatalf("running: %v", err)
 	}
-	if _, err := m.UpdateStatus(task.TaskID, "outcome_unknown"); err != nil {
+	unknown, err := m.MarkOutcomeUnknown(task.TaskID)
+	if err != nil {
 		t.Fatalf("outcome_unknown: %v", err)
+	}
+	if unknown.CompletedAt != nil {
+		t.Fatal("outcome_unknown must not set completed_at")
+	}
+	if unknown.IsTerminal() {
+		t.Fatal("outcome_unknown must remain recoverable")
 	}
 
 	completed, err := m.Complete(task.TaskID, "completed", json.RawMessage(`{"result":"ok"}`), "")

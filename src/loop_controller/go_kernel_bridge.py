@@ -1,4 +1,4 @@
-"""Python bridge to the Go interaction governance kernel (v0.39.0)."""
+"""Python bridge to the Go interaction governance kernel (v0.40.0)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Current A2A HTTP/JSON protocol version. Patch differences are tolerated;
 # major/minor differences are fail-closed.
-CURRENT_PROTOCOL_VERSION = "0.39.0"
+CURRENT_PROTOCOL_VERSION = "0.40.0"
 
 
 def check_protocol_version(version: str) -> None:
@@ -337,6 +337,32 @@ class GoKernelBridge:
             return None
         except httpx.RequestError as exc:
             logger.warning("Go kernel query_task unreachable: %s", exc)
+            return None
+
+    async def cancel_task(
+        self,
+        task_id: str,
+        reason: str = "",
+        delegation_token: str = "",
+    ) -> dict[str, Any] | None:
+        """请求取消委托任务；内核不可达或拒绝时返回 None。"""
+        url = f"{self._base_url}/a2a/v1/tasks/{task_id}/cancel"
+        headers = {"Authorization": f"Bearer {delegation_token}"} if delegation_token else None
+        try:
+            client = await self._client_context()
+            response = await client.post(
+                url,
+                json={
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "reason": reason,
+                },
+                headers=headers,
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result if isinstance(result, dict) else None
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            logger.warning("Go kernel cancel_task failed: %s", exc)
             return None
 
     async def stream_task(

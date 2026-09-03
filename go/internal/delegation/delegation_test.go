@@ -25,6 +25,58 @@ func openTestDB(t *testing.T) *store.DB {
 	return db
 }
 
+type recordingLifecycleAuditor struct {
+	events []string
+	tasks  []models.Task
+}
+
+func (a *recordingLifecycleAuditor) RecordLifecycle(_ context.Context, task models.Task, event string) error {
+	a.events = append(a.events, event)
+	a.tasks = append(a.tasks, task)
+	return nil
+}
+
+func TestInteractionLifecycleCarriesDecisionAndTaskLinkage(t *testing.T) {
+	reg := registry.New()
+	reg.Register(models.AgentCard{
+		AgentID: "executor", Entrypoint: models.AgentEntrypoint{Type: "http", URL: "http://executor"},
+		Capabilities: []string{"delegate_execution"},
+	})
+	db := openTestDB(t)
+	auditor := &recordingLifecycleAuditor{}
+	tasks := task.New(db.TaskStore()).WithLifecycleAuditor(auditor)
+	d := New(reg, tasks, token.NewHMACIssuer([]byte("secret")), nil, time.Hour).WithR2Authorizer(&StaticR2Authorizer{
+		Decision: models.DelegationResponse{Allowed: true, InteractionID: "int-1", DecisionID: "dec-1"},
+	}).WithEntrypointClient(succeedingDispatcher{})
+
+	resp, err := d.Request(context.Background(), models.DelegationRequest{
+		RequestID: "req-1", InitiatorAgentID: "planner", TargetAgentID: "executor", ToolName: "query_sales",
+	})
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	stored, err := tasks.Get(resp.TaskID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if stored.InteractionID != "int-1" || stored.DecisionID != "dec-1" {
+		t.Fatalf("missing audit linkage: %+v", stored)
+	}
+	if _, err := tasks.UpdateStatus(resp.TaskID, "accepted"); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	items, err := db.LifecycleOutboxStore().ListDue(context.Background(), time.Now().UTC().Add(time.Second), 10)
+	if err != nil {
+		t.Fatalf("list lifecycle outbox: %v", err)
+	}
+	if len(items) != 2 || items[0].Event != "dispatched" || items[1].Event != "accepted" {
+		t.Fatalf("unexpected lifecycle outbox: %+v", items)
+	}
+	if items[1].Task.InteractionID != "int-1" || items[1].Task.DecisionID != "dec-1" {
+		t.Fatalf("outbox lost linkage: %+v", items[1].Task)
+	}
+}
+
 func TestRequestAllowed(t *testing.T) {
 	reg := registry.New()
 	reg.Register(models.AgentCard{
@@ -63,12 +115,41 @@ func TestRequestAllowed(t *testing.T) {
 	if resp.DelegationToken == "" {
 		t.Error("expected non-empty delegation token")
 	}
+	events, err := db.EventStore().ListPending(context.Background(), resp.TaskID)
+	if err != nil {
+		t.Fatalf("list task events: %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != "task_created" {
+		t.Fatalf("expected one task_created event, got %+v", events)
+	}
 }
 
 type failingIssuer struct{}
 
 func (failingIssuer) Issue(token.DelegationClaims, time.Duration) (string, error) {
 	return "", errors.New("signing unavailable")
+}
+
+type failingDispatcher struct {
+	mayBeSent bool
+}
+
+func (d failingDispatcher) Dispatch(context.Context, models.AgentEntrypoint, models.EntrypointTaskRequest) error {
+	return &DispatchError{Err: errors.New("dispatch failed"), MayBeSent: d.mayBeSent}
+}
+
+func (failingDispatcher) Cancel(context.Context, models.AgentEntrypoint, string, string) (bool, error) {
+	return true, nil
+}
+
+type succeedingDispatcher struct{}
+
+func (succeedingDispatcher) Dispatch(context.Context, models.AgentEntrypoint, models.EntrypointTaskRequest) error {
+	return nil
+}
+
+func (succeedingDispatcher) Cancel(context.Context, models.AgentEntrypoint, string, string) (bool, error) {
+	return true, nil
 }
 
 func TestRequestWithoutInteractionAuthorizerIsDenied(t *testing.T) {
@@ -109,6 +190,47 @@ func TestRequestTokenIssuanceFailureIsDenied(t *testing.T) {
 	}
 	if resp.Allowed || resp.DelegationToken != "" {
 		t.Fatalf("token failure must fail closed, got %+v", resp)
+	}
+}
+
+func TestRequestDispatchFailureUpdatesTaskStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		mayBeSent  bool
+		wantStatus string
+	}{
+		{name: "definitely not sent", wantStatus: "failed"},
+		{name: "response uncertain", mayBeSent: true, wantStatus: "outcome_unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := registry.New()
+			reg.Register(models.AgentCard{
+				AgentID: "executor", Entrypoint: models.AgentEntrypoint{Type: "http", URL: "http://executor"},
+				Capabilities: []string{"delegate_execution"},
+			})
+			db := openTestDB(t)
+			tasks := task.New(db.TaskStore())
+			d := New(reg, tasks, token.NewHMACIssuer([]byte("secret")), nil, time.Hour).
+				WithR2Authorizer(&StaticR2Authorizer{Decision: models.DelegationResponse{Allowed: true}}).
+				WithEntrypointClient(failingDispatcher{mayBeSent: tc.mayBeSent})
+
+			resp, err := d.Request(context.Background(), models.DelegationRequest{
+				RequestID: "req-dispatch", InitiatorAgentID: "planner", TargetAgentID: "executor", ToolName: "echo",
+			})
+			if err == nil || resp.TaskID == "" {
+				t.Fatalf("expected dispatch error with task id, got %+v, %v", resp, err)
+			}
+			got, getErr := tasks.Get(resp.TaskID)
+			if getErr != nil {
+				t.Fatalf("get task: %v", getErr)
+			}
+			if got.Status != tc.wantStatus {
+				t.Fatalf("status = %q, want %q", got.Status, tc.wantStatus)
+			}
+			if got.DelegationToken == "" {
+				t.Fatal("delegation token was not persisted")
+			}
+		})
 	}
 }
 

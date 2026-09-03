@@ -391,13 +391,56 @@ class InteractionGovernanceEngine:
             profile_version=decision.profile_version,
             metadata={
                 "interaction_id": proposal.interaction_id,
+                "root_interaction_id": proposal.interaction_id,
+                "parent_interaction_id": None,
                 "request_id": proposal.request_id,
+                "task_id": proposal.task_id or None,
+                "decision_id": decision.decision_id,
                 "source_agent_id": proposal.source_agent_id,
                 "target_agent_id": proposal.target_agent_id,
                 "verdict": decision.verdict,
                 "delegation_depth": proposal.delegation_depth,
                 "policy_hits": decision.policy_hits,
                 "target_entrypoint": decision.target_entrypoint,
+            },
+        )
+
+    def build_lifecycle_audit_event(self, payload: dict[str, Any]) -> AuditEvent:
+        """将 Go Kernel 的 Task 生命周期通知关联到 Interaction 时间线。"""
+        interaction_id = str(payload["interaction_id"])
+        lifecycle_event = str(payload["event"])
+        actions: dict[str, AuditAction] = {
+            "dispatched": "interaction_dispatched",
+            "dispatch_outcome_unknown": "interaction_dispatch_outcome_unknown",
+            "accepted": "interaction_accepted",
+            "running": "interaction_running",
+            "completed": "interaction_completed",
+            "failed": "interaction_failed",
+            "cancelled": "interaction_cancelled",
+            "outcome_unknown": "interaction_outcome_unknown",
+        }
+        return AuditEvent(
+            schema_version="1.0",
+            event_id=str(uuid4()),
+            trace_id=str(payload["task_id"]),
+            session_id=str(payload.get("session_id") or ""),
+            actor_type="system",
+            actor_id=str(payload.get("actor_id") or "go-kernel"),
+            action=actions[lifecycle_event],
+            target=str(payload["task_id"]),
+            decision="allow" if lifecycle_event not in ("failed", "outcome_unknown") else None,
+            reason=str(payload.get("reason") or lifecycle_event),
+            metadata={
+                "interaction_id": interaction_id,
+                "root_interaction_id": str(payload.get("root_interaction_id") or interaction_id),
+                "parent_interaction_id": payload.get("parent_interaction_id"),
+                "request_id": payload.get("request_id"),
+                "task_id": str(payload["task_id"]),
+                "decision_id": str(payload["decision_id"]),
+                "source_agent_id": str(payload["source_agent_id"]),
+                "target_agent_id": str(payload["target_agent_id"]),
+                "verdict": str(payload.get("verdict") or "allow"),
+                "lifecycle_event": lifecycle_event,
             },
         )
 
@@ -533,6 +576,7 @@ class InteractionAuthorizeEndpoint:
         response: dict[str, Any] = {
             "allowed": decision.allowed,
             "verdict": decision.verdict,
+            "interaction_id": decision.interaction_id,
             "decision_id": decision.decision_id,
             "reason": decision.reason,
             "protocol_version": CURRENT_PROTOCOL_VERSION,

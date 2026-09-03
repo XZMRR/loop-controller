@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const CurrentProtocolVersion = "0.40.0"
+
 // AgentCard describes an agent that can participate in governed interactions.
 type AgentCard struct {
 	AgentID      string          `json:"agent_id" yaml:"agent_id"`
@@ -27,22 +29,28 @@ type AgentEntrypoint struct {
 
 // Task represents an interaction context between two agents.
 type Task struct {
-	TaskID           string          `json:"task_id"`
-	SessionID        string          `json:"session_id"`
-	InitiatorAgentID string          `json:"initiator_agent_id"`
-	TargetAgentID    string          `json:"target_agent_id"`
-	Status           string          `json:"status"`
-	CreatedAt        time.Time       `json:"created_at"`
-	UpdatedAt        time.Time       `json:"updated_at"`
-	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
-	Outcome          json.RawMessage `json:"outcome,omitempty"`
-	ErrorCode        string          `json:"error_code,omitempty"`
+	ProtocolVersion     string          `json:"protocol_version"`
+	TaskID              string          `json:"task_id"`
+	SessionID           string          `json:"session_id"`
+	InteractionID       string          `json:"interaction_id,omitempty"`
+	DecisionID          string          `json:"decision_id,omitempty"`
+	RootInteractionID   string          `json:"root_interaction_id,omitempty"`
+	ParentInteractionID string          `json:"parent_interaction_id,omitempty"`
+	InitiatorAgentID    string          `json:"initiator_agent_id"`
+	TargetAgentID       string          `json:"target_agent_id"`
+	Status              string          `json:"status"`
+	CreatedAt           time.Time       `json:"created_at"`
+	UpdatedAt           time.Time       `json:"updated_at"`
+	CompletedAt         *time.Time      `json:"completed_at,omitempty"`
+	Outcome             json.RawMessage `json:"outcome,omitempty"`
+	ErrorCode           string          `json:"error_code,omitempty"`
+	DelegationToken     string          `json:"-"`
 }
 
-// IsTerminal reports whether the task has reached a final state.
+// IsTerminal reports whether the task has reached an immutable final state.
 func (t Task) IsTerminal() bool {
 	switch t.Status {
-	case "completed", "failed", "cancelled", "outcome_unknown":
+	case "completed", "failed", "cancelled":
 		return true
 	}
 	return false
@@ -50,12 +58,13 @@ func (t Task) IsTerminal() bool {
 
 // TaskEvent is a persisted SSE event for a task.
 type TaskEvent struct {
-	EventID     string          `json:"event_id"`
-	TaskID      string          `json:"task_id"`
-	EventType   string          `json:"event_type"`
-	Payload     json.RawMessage `json:"payload"`
-	PublishedAt time.Time       `json:"published_at"`
-	Published   bool            `json:"published"`
+	ProtocolVersion string          `json:"protocol_version"`
+	EventID         string          `json:"event_id"`
+	TaskID          string          `json:"task_id"`
+	EventType       string          `json:"event_type"`
+	Payload         json.RawMessage `json:"payload"`
+	PublishedAt     time.Time       `json:"published_at"`
+	Published       bool            `json:"published,omitempty"`
 }
 
 // Message is a unit of communication between agents.
@@ -132,14 +141,24 @@ func (p *Part) UnmarshalJSON(data []byte) error {
 // EntrypointTaskRequest is received by the target agent entrypoint to start a
 // delegated task.
 type EntrypointTaskRequest struct {
-	ProtocolVersion  string          `json:"protocol_version"`
-	TaskID           string          `json:"task_id"`
-	SessionID        string          `json:"session_id"`
-	InitiatorAgentID string          `json:"initiator_agent_id"`
-	TargetAgentID    string          `json:"target_agent_id"`
-	ToolName         string          `json:"tool_name"`
-	Arguments        json.RawMessage `json:"arguments"`
-	DelegationToken  string          `json:"delegation_token"`
+	ProtocolVersion     string          `json:"protocol_version"`
+	InteractionID       string          `json:"interaction_id,omitempty"`
+	DecisionID          string          `json:"decision_id,omitempty"`
+	RootInteractionID   string          `json:"root_interaction_id,omitempty"`
+	ParentInteractionID string          `json:"parent_interaction_id,omitempty"`
+	TaskID              string          `json:"task_id"`
+	SessionID           string          `json:"session_id"`
+	InitiatorAgentID    string          `json:"initiator_agent_id"`
+	TargetAgentID       string          `json:"target_agent_id"`
+	ToolName            string          `json:"tool_name"`
+	Arguments           json.RawMessage `json:"arguments"`
+	DelegationToken     string          `json:"delegation_token"`
+}
+
+// CancelTaskRequest requests cancellation using the negotiated protocol version.
+type CancelTaskRequest struct {
+	ProtocolVersion string `json:"protocol_version"`
+	Reason          string `json:"reason,omitempty"`
 }
 
 // EntrypointResultRequest is received by the target agent entrypoint to report
@@ -154,20 +173,23 @@ type EntrypointResultRequest struct {
 // DelegationRequest asks the A2A kernel to forward a structured tool request
 // to another agent after interaction governance authorization.
 type DelegationRequest struct {
-	RequestID        string          `json:"request_id"`
-	InitiatorAgentID string          `json:"initiator_agent_id"`
-	TargetAgentID    string          `json:"target_agent_id"`
-	ToolName         string          `json:"tool_name"`
-	Arguments        json.RawMessage `json:"arguments"`
-	SessionID        string          `json:"session_id"`
-	TaskID           string          `json:"task_id"`
-	RiskLevel        string          `json:"risk_level"`
-	ProtocolVersion  string          `json:"protocol_version"`
+	RequestID           string          `json:"request_id"`
+	InitiatorAgentID    string          `json:"initiator_agent_id"`
+	TargetAgentID       string          `json:"target_agent_id"`
+	ToolName            string          `json:"tool_name"`
+	Arguments           json.RawMessage `json:"arguments"`
+	SessionID           string          `json:"session_id"`
+	TaskID              string          `json:"task_id"`
+	RootInteractionID   string          `json:"root_interaction_id,omitempty"`
+	ParentInteractionID string          `json:"parent_interaction_id,omitempty"`
+	RiskLevel           string          `json:"risk_level"`
+	ProtocolVersion     string          `json:"protocol_version"`
 }
 
 // DelegationResponse is returned by the Go kernel.
 type DelegationResponse struct {
 	Allowed          bool            `json:"allowed"`
+	InteractionID    string          `json:"interaction_id,omitempty"`
 	DecisionID       string          `json:"decision_id,omitempty"`
 	TaskID           string          `json:"task_id"`
 	TargetEntrypoint AgentEntrypoint `json:"target_entrypoint,omitempty"`

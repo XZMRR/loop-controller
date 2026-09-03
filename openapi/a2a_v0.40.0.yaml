@@ -1,10 +1,10 @@
 openapi: 3.1.0
 info:
   title: Loop Controller A2A Protocol
-  version: 0.39.0
+  version: 0.40.0
   description: |
     Authoritative OpenAPI description of the Loop Controller A2A HTTP/JSON
-    protocol v0.39.0. Delegation arguments are structured JSON objects and
+    protocol v0.40.0. Delegation arguments are structured JSON objects and
     protocol versions are required on all versioned request/response bodies.
 servers:
   - url: http://127.0.0.1:8080
@@ -26,6 +26,8 @@ paths:
     $ref: './paths/tasks.yaml#/a2a/v1/entrypoint/tasks'
   /a2a/v1/entrypoint/tasks/{id}/accept:
     $ref: './paths/tasks.yaml#/a2a/v1/entrypoint/tasks/{id}/accept'
+  /a2a/v1/entrypoint/tasks/{id}/start:
+    $ref: './paths/tasks.yaml#/a2a/v1/entrypoint/tasks/{id}/start'
   /a2a/v1/entrypoint/tasks/{id}/cancel:
     $ref: './paths/tasks.yaml#/a2a/v1/entrypoint/tasks/{id}/cancel'
   /a2a/v1/entrypoint/tasks/{id}:
@@ -39,6 +41,12 @@ paths:
   /health:
     $ref: './paths/health.yaml#/health'
 components:
+  securitySchemes:
+    TaskDelegationToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Task-scoped delegation token issued by the A2A kernel.
   schemas:
     ProtocolVersion:
       $ref: './schemas/protocol-version.yaml'
@@ -46,6 +54,8 @@ components:
       $ref: './schemas/agent-card.yaml'
     Task:
       $ref: './schemas/task.yaml'
+    TaskEvent:
+      $ref: './schemas/task-event.yaml'
     Message:
       $ref: './schemas/message.yaml'
     Part:

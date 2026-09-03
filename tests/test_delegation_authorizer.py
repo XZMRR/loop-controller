@@ -1,12 +1,13 @@
-"""旧 DelegationAuthorizer API 到 IIGE 的兼容测试（v0.39.0）。"""
+"""旧 DelegationAuthorizer API 到 IIGE 的兼容测试（v0.40.0）。"""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
 from loop_controller.delegation import DelegationAuthorizeEndpoint, DelegationAuthorizer
+from loop_controller.interaction.engine import InteractionGovernanceEngine
 from loop_controller.interaction.models import InteractionDecision
-from loop_controller.models import ActionProposal
+from loop_controller.models import ActionProposal, AuditEvent
 
 
 def _proposal(
@@ -86,12 +87,46 @@ async def test_iige_require_approval_is_preserved() -> None:
     assert result.request_id == "dec-001"
 
 
+def test_lifecycle_audit_keeps_interaction_decision_and_task_linkage() -> None:
+    engine = object.__new__(InteractionGovernanceEngine)
+    for lifecycle in (
+        "dispatched",
+        "accepted",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "outcome_unknown",
+    ):
+        event = engine.build_lifecycle_audit_event(
+            {
+                "interaction_id": "int-1",
+                "root_interaction_id": "root-1",
+                "parent_interaction_id": "parent-1",
+                "decision_id": "dec-1",
+                "task_id": "task-1",
+                "session_id": "session-1",
+                "source_agent_id": "agent-a",
+                "target_agent_id": "agent-b",
+                "event": lifecycle,
+            }
+        )
+        assert isinstance(event, AuditEvent)
+        assert event.action == f"interaction_{lifecycle}"
+        assert event.trace_id == "task-1"
+        assert event.metadata["interaction_id"] == "int-1"
+        assert event.metadata["root_interaction_id"] == "root-1"
+        assert event.metadata["parent_interaction_id"] == "parent-1"
+        assert event.metadata["decision_id"] == "dec-1"
+        assert "delegation_token" not in event.model_dump_json()
+
+
 async def test_legacy_endpoint_maps_initiator_to_source() -> None:
     authorizer, engine = _authorizer(_decision("allow", "allowed"))
     endpoint = DelegationAuthorizeEndpoint(authorizer)
     response = await endpoint.handle(
         {
-            "protocol_version": "0.39.0",
+            "protocol_version": "0.40.0",
             "request_id": "req-1",
             "initiator_agent_id": "agent-a",
             "target_agent_id": "agent-b",
@@ -116,7 +151,7 @@ async def test_legacy_endpoint_protocol_version_fail_closed() -> None:
 async def test_legacy_endpoint_missing_fields_is_denied() -> None:
     authorizer, engine = _authorizer(_decision("allow", "allowed"))
     endpoint = DelegationAuthorizeEndpoint(authorizer)
-    response = await endpoint.handle({"protocol_version": "0.39.0"})
+    response = await endpoint.handle({"protocol_version": "0.40.0"})
     assert response["allowed"] is False
     assert "missing required delegation fields" in response["reason"]
     engine.evaluate.assert_not_awaited()

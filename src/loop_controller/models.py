@@ -40,6 +40,14 @@ AuditAction = Literal[
     "execution_failed",  # v0.36.1：执行器明确失败
     "execution_outcome_unknown",  # v0.36.1：执行器调用后无法确认结果（如超时）
     "execution_blocked",  # v0.36.1：执行前被策略/吊销/配置阻断
+    "interaction_dispatched",
+    "interaction_dispatch_outcome_unknown",
+    "interaction_accepted",
+    "interaction_running",
+    "interaction_completed",
+    "interaction_failed",
+    "interaction_cancelled",
+    "interaction_outcome_unknown",
     "task_end",
     "seal",
     "planner_error",

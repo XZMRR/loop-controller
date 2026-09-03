@@ -1,6 +1,8 @@
 package token
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 	"time"
 )
@@ -28,6 +30,51 @@ func TestIssueAndValidate(t *testing.T) {
 	}
 	if got.ToolName != "query_sales" {
 		t.Errorf("unexpected tool_name: %q", got.ToolName)
+	}
+}
+
+func TestHashArgumentsCanonicalJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		left  string
+		right string
+	}{
+		{
+			name:  "object key order and whitespace",
+			left:  `{"region":"APAC","limit":10}`,
+			right: "{\n  \"limit\": 10,\n  \"region\": \"APAC\"\n}",
+		},
+		{
+			name:  "nested object key order",
+			left:  `{"filters":{"active":true,"tags":["a","b"]},"limit":10}`,
+			right: `{"limit":10,"filters":{"tags":["a","b"],"active":true}}`,
+		},
+		{
+			name:  "number lexeme",
+			left:  `{"value":1e3}`,
+			right: `{"value":1e3}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if HashArguments([]byte(tt.left)) != HashArguments([]byte(tt.right)) {
+				t.Fatal("equivalent JSON arguments produced different hashes")
+			}
+		})
+	}
+}
+
+func TestHashArgumentsNonJSONBytesAreHashedUnchanged(t *testing.T) {
+	arguments := []byte("  not json  \n")
+	sum := sha256.Sum256(arguments)
+	want := hex.EncodeToString(sum[:])
+
+	if got := HashArguments(arguments); got != want {
+		t.Fatalf("HashArguments() = %q, want raw bytes digest %q", got, want)
+	}
+	if HashArguments(arguments) == HashArguments([]byte("not json")) {
+		t.Fatal("non-JSON whitespace must remain significant")
 	}
 }
 

@@ -89,10 +89,11 @@ jobs:
           echo "${OPA_SHA256}  tools/opa" | sha256sum --check --strict
           chmod +x tools/opa
 
-      - name: Verify OPA is available
+      - name: Verify OPA policies
         run: |
           test -x tools/opa
           ./tools/opa version
+          ./tools/opa check --strict policies
 
       - name: Run integration tests
         run: uv run pytest tests/integration -q -m integration

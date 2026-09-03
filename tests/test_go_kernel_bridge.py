@@ -1,4 +1,4 @@
-"""Python bridge to the Go interaction governance kernel (v0.39.0)."""
+"""Python bridge to the Go interaction governance kernel (v0.40.0)."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from loop_controller.go_kernel_bridge import (
+    CURRENT_PROTOCOL_VERSION,
     A2AMessage,
     AgentCard,
     AgentEntrypoint,
@@ -49,7 +50,7 @@ class _AllowIIGEHandler(BaseHTTPRequestHandler):
                 "decision_id": "test-decision",
                 "task_id": payload.get("task_id", ""),
                 "reason": "test IIGE allow",
-                "protocol_version": "0.39.0",
+                "protocol_version": "0.40.0",
             }
         ).encode()
         self.send_response(200)
@@ -84,6 +85,7 @@ def kernel_url(tmp_path_factory: pytest.TempPathFactory) -> str:
             f":{port}",
             "-db",
             str(db_path),
+            "-development",
             "-interaction-url",
             f"http://127.0.0.1:{interaction_port}",
         ],
@@ -194,6 +196,37 @@ async def test_route_message(bridge: GoKernelBridge) -> None:
         parts=[{"type": "text", "text": "hello"}],
     )
     assert await bridge.route_message(msg)
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_posts_reason_and_returns_task() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/a2a/v1/tasks/task-cancel/cancel"
+        assert request.headers["Authorization"] == "Bearer delegation-token"
+        assert json.loads(request.content) == {
+            "protocol_version": CURRENT_PROTOCOL_VERSION,
+            "reason": "no longer needed",
+        }
+        return httpx.Response(200, json={"task_id": "task-cancel", "status": "cancelled"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bridge = GoKernelBridge(base_url="http://kernel", client=client)
+        result = await bridge.cancel_task(
+            "task-cancel", "no longer needed", delegation_token="delegation-token"
+        )
+
+    assert result == {"task_id": "task-cancel", "status": "cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_returns_none_when_kernel_rejects() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"code": "invalid_status_transition"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bridge = GoKernelBridge(base_url="http://kernel", client=client)
+        assert await bridge.cancel_task("task-running") is None
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ package delegation
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -18,8 +19,13 @@ type AgentQuerier interface {
 
 // TaskStore is the subset of task.Manager used by the delegator.
 type TaskStore interface {
-	Create(sessionID, initiatorAgentID, targetAgentID string) models.Task
+	CreateInteraction(sessionID, initiatorAgentID, targetAgentID, interactionID, decisionID, rootInteractionID, parentInteractionID string) (models.Task, error)
 	Get(taskID string) (models.Task, error)
+	RecordLifecycle(context.Context, models.Task, string) error
+	UpdateStatus(taskID, status string) (models.Task, error)
+	UpdateStatusFrom(taskID, expectedStatus, status string) (models.Task, error)
+	Complete(taskID, status string, outcome json.RawMessage, errorCode string) (models.Task, error)
+	SetDelegationToken(taskID, delegationToken string) error
 }
 
 // TokenIssuer issues delegation tokens.
@@ -39,6 +45,7 @@ type Delegator struct {
 	issuer     TokenIssuer
 	authorizer R2Authorizer
 	publisher  TaskEventPublisher
+	dispatcher EntrypointClient
 	tokenTTL   time.Duration
 }
 
@@ -67,6 +74,24 @@ func New(
 func (d *Delegator) WithR2Authorizer(a R2Authorizer) *Delegator {
 	d.authorizer = a
 	return d
+}
+
+// WithEntrypointClient enables delivery to the authorized target Agent.
+func (d *Delegator) WithEntrypointClient(client EntrypointClient) *Delegator {
+	d.dispatcher = client
+	return d
+}
+
+// Cancel asks the target Agent to cancel a delegated task.
+func (d *Delegator) Cancel(ctx context.Context, targetAgentID, taskID, delegationToken string) (bool, error) {
+	if d.dispatcher == nil {
+		return false, errors.New("entrypoint client is not configured")
+	}
+	target, err := d.registry.Get(targetAgentID)
+	if err != nil {
+		return false, fmt.Errorf("target agent not registered: %w", err)
+	}
+	return d.dispatcher.Cancel(ctx, target.Entrypoint, taskID, delegationToken)
 }
 
 // Request evaluates a delegation request.
@@ -115,8 +140,20 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 
 	taskID := req.TaskID
 	var task models.Task
+	interactionID := interactionResp.InteractionID
+	if interactionID == "" {
+		interactionID = req.RequestID
+	}
 	if taskID == "" {
-		task = d.tasks.Create(req.SessionID, req.InitiatorAgentID, req.TargetAgentID)
+		var createErr error
+		task, createErr = d.tasks.CreateInteraction(req.SessionID, req.InitiatorAgentID, req.TargetAgentID, interactionID, interactionResp.DecisionID, req.RootInteractionID, req.ParentInteractionID)
+		if createErr != nil {
+			return models.DelegationResponse{
+				Allowed:    false,
+				DecisionID: interactionResp.DecisionID,
+				Reason:     "delegation task persistence failed",
+			}, createErr
+		}
 		taskID = task.TaskID
 	} else {
 		var err error
@@ -142,22 +179,70 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 		TargetAgentID:    req.TargetAgentID,
 		ToolName:         req.ToolName,
 		TaskID:           taskID,
+		ArgumentsSHA256:  token.HashArguments(req.Arguments),
 	}
 	tokenStr, err := d.issuer.Issue(claims, d.tokenTTL)
 	if err != nil || tokenStr == "" {
+		_, _ = d.tasks.Complete(taskID, "failed", nil, "delegation_token_issuance_failed")
 		return models.DelegationResponse{
 			Allowed: false,
 			TaskID:  taskID,
 			Reason:  "delegation token issuance failed",
 		}, fmt.Errorf("delegation token issuance failed: %w", err)
 	}
+	if err := d.tasks.SetDelegationToken(taskID, tokenStr); err != nil {
+		_, _ = d.tasks.Complete(taskID, "failed", nil, "delegation_token_persistence_failed")
+		return models.DelegationResponse{
+			Allowed: false,
+			TaskID:  taskID,
+			Reason:  "delegation token persistence failed",
+		}, err
+	}
 
-	if d.publisher != nil {
-		_ = d.publisher.Publish(ctx, task)
+	if d.dispatcher != nil {
+		dispatchReq := models.EntrypointTaskRequest{
+			ProtocolVersion:     interactionProtocolVersion,
+			InteractionID:       interactionID,
+			DecisionID:          interactionResp.DecisionID,
+			RootInteractionID:   task.RootInteractionID,
+			ParentInteractionID: task.ParentInteractionID,
+			TaskID:              taskID,
+			SessionID:           req.SessionID,
+			InitiatorAgentID:    req.InitiatorAgentID,
+			TargetAgentID:       req.TargetAgentID,
+			ToolName:            req.ToolName,
+			Arguments:           req.Arguments,
+			DelegationToken:     tokenStr,
+		}
+		if err := d.dispatcher.Dispatch(ctx, target.Entrypoint, dispatchReq); err != nil {
+			var dispatchErr *DispatchError
+			newStatus := "failed"
+			if errors.As(err, &dispatchErr) && dispatchErr.MayBeSent {
+				newStatus = "outcome_unknown"
+			}
+			if _, updateErr := d.tasks.UpdateStatusFrom(taskID, task.Status, newStatus); updateErr != nil {
+				err = fmt.Errorf("%w (task status update: %v)", err, updateErr)
+			}
+			return models.DelegationResponse{
+				Allowed:          false,
+				DecisionID:       interactionResp.DecisionID,
+				TaskID:           taskID,
+				TargetEntrypoint: target.Entrypoint,
+				Reason:           "target Agent dispatch failed",
+			}, err
+		}
+		if err := d.tasks.RecordLifecycle(ctx, task, "dispatched"); err != nil {
+			return models.DelegationResponse{
+				Allowed: false, DecisionID: interactionResp.DecisionID, TaskID: taskID,
+				TargetEntrypoint: target.Entrypoint, Reason: "dispatch audit persistence failed",
+			}, err
+		}
 	}
 
 	return models.DelegationResponse{
 		Allowed:          true,
+		InteractionID:    interactionID,
+		DecisionID:       interactionResp.DecisionID,
 		TaskID:           taskID,
 		TargetEntrypoint: target.Entrypoint,
 		DelegationToken:  tokenStr,

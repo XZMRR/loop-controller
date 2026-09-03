@@ -17,7 +17,7 @@ func loadFixture(t *testing.T) map[string]json.RawMessage {
 		t.Fatalf("getwd: %v", err)
 	}
 	// go/internal/api -> project root -> contract
-	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.39.0.json")
+	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.40.0.json")
 	data, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
@@ -34,15 +34,15 @@ func TestCheckProtocolVersion(t *testing.T) {
 		version string
 		wantErr bool
 	}{
-		{"0.39.0", false},
-		{"0.39.1", false},
-		{"0.39.99", false},
+		{"0.40.0", false},
+		{"0.40.1", false},
+		{"0.40.99", false},
 		{"", true},
-		{"0.39", true},
-		{"0.39.0.0", true},
-		{"v0.39.0", true},
-		{"0.38.1", true},
-		{"0.40.0", true},
+		{"0.40", true},
+		{"0.40.0.0", true},
+		{"v0.40.0", true},
+		{"0.39.1", true},
+		{"0.41.0", true},
 		{"not-a-version", true},
 	}
 	for _, c := range cases {
@@ -76,8 +76,8 @@ func TestContractFixture_DecodeMessage(t *testing.T) {
 	if err := json.Unmarshal(fixture["message"], &msg); err != nil {
 		t.Fatalf("unmarshal message: %v", err)
 	}
-	if msg.ProtocolVersion != "0.39.0" {
-		t.Errorf("protocol_version = %q, want 0.39.0", msg.ProtocolVersion)
+	if msg.ProtocolVersion != "0.40.0" {
+		t.Errorf("protocol_version = %q, want 0.40.0", msg.ProtocolVersion)
 	}
 	if len(msg.Parts) != 2 {
 		t.Fatalf("parts length = %d, want 2", len(msg.Parts))
@@ -135,6 +135,9 @@ func TestContractFixture_DecodeTaskErrorAndSSE(t *testing.T) {
 	if task.TaskID != "task-001" || task.Status != "pending" {
 		t.Errorf("task mismatch: %+v", task)
 	}
+	if task.ProtocolVersion != currentProtocolVersion {
+		t.Errorf("task protocol_version = %q, want %q", task.ProtocolVersion, currentProtocolVersion)
+	}
 	assertCanonicalRoundTrip(t, fixture["task"], task)
 
 	var apiError models.ErrorResponse
@@ -147,15 +150,21 @@ func TestContractFixture_DecodeTaskErrorAndSSE(t *testing.T) {
 	assertCanonicalRoundTrip(t, fixture["error_response"], apiError)
 
 	var event struct {
-		Data models.Task `json:"data"`
+		ID    string           `json:"id"`
+		Event string           `json:"event"`
+		Data  models.TaskEvent `json:"data"`
 	}
 	if err := json.Unmarshal(fixture["sse_event"], &event); err != nil {
 		t.Fatalf("unmarshal sse_event: %v", err)
 	}
-	if event.Data.TaskID != task.TaskID || event.Data.Status != "active" {
+	if event.ID != event.Data.EventID || event.Event != event.Data.EventType || event.Data.TaskID != task.TaskID {
 		t.Errorf("SSE event mismatch: %+v", event)
 	}
+	if event.Data.ProtocolVersion != currentProtocolVersion {
+		t.Errorf("SSE protocol_version = %q, want %q", event.Data.ProtocolVersion, currentProtocolVersion)
+	}
 	assertCanonicalRoundTrip(t, fixture["sse_event"], event)
+	assertCanonicalRoundTrip(t, fixture["task_event"], event.Data)
 }
 
 func TestContractFixture_ErrorCategories(t *testing.T) {
@@ -207,8 +216,8 @@ func TestContractFixture_DecodeDelegation(t *testing.T) {
 	if req.RequestID != "req-001" {
 		t.Errorf("request_id = %q, want req-001", req.RequestID)
 	}
-	if req.ProtocolVersion != "0.39.0" {
-		t.Errorf("protocol_version = %q, want 0.39.0", req.ProtocolVersion)
+	if req.ProtocolVersion != "0.40.0" {
+		t.Errorf("protocol_version = %q, want 0.40.0", req.ProtocolVersion)
 	}
 	if !json.Valid(req.Arguments) {
 		t.Errorf("arguments is not valid JSON: %s", req.Arguments)

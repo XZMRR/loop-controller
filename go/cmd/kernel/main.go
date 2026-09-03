@@ -3,16 +3,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/loop-controller/go/internal/api"
 	"github.com/loop-controller/go/internal/delegation"
 	"github.com/loop-controller/go/internal/discovery"
+	"github.com/loop-controller/go/internal/execution"
 )
+
+const defaultTokenSecret = "change-me-in-production"
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
@@ -28,6 +33,16 @@ func main() {
 		"interaction-token",
 		"",
 		"IIGE Bearer token (falls back to LC_INTERACTION_TOKEN)",
+	)
+	executorURL := flag.String(
+		"executor-url",
+		"",
+		"target tool executor base URL (falls back to LC_EXECUTOR_URL, then interaction URL)",
+	)
+	development := flag.Bool(
+		"development",
+		false,
+		"enable insecure development defaults and disable HTTP entrypoint dispatch",
 	)
 	flag.Parse()
 
@@ -47,14 +62,20 @@ func main() {
 	if interactionBearerToken == "" {
 		interactionBearerToken = os.Getenv("LC_INTERACTION_TOKEN")
 	}
-
-	tokenSecret := *secret
-	if tokenSecret == "" {
-		tokenSecret = os.Getenv("GO_KERNEL_TOKEN_SECRET")
+	executorBaseURL := *executorURL
+	if executorBaseURL == "" {
+		executorBaseURL = os.Getenv("LC_EXECUTOR_URL")
 	}
-	if tokenSecret == "" {
-		tokenSecret = "change-me-in-production"
-		log.Println("warning: using default HMAC secret; set -secret or GO_KERNEL_TOKEN_SECRET in production")
+	if executorBaseURL == "" {
+		executorBaseURL = interactionBaseURL
+	}
+
+	tokenSecret, err := resolveTokenSecret(*secret, os.Getenv("GO_KERNEL_TOKEN_SECRET"), *development)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *development && tokenSecret == defaultTokenSecret {
+		log.Println("warning: development mode is using the insecure default HMAC secret")
 	}
 
 	var providers []discovery.AgentDiscoveryProvider
@@ -67,6 +88,17 @@ func main() {
 		log.Fatalf("failed to create server: %v", err)
 	}
 	defer srv.Close()
+	if dispatchEntrypointsEnabled(*development) {
+		srv.SetEntrypointClient(&delegation.HTTPEntrypointClient{
+			Client: &http.Client{Timeout: 10 * time.Second},
+		})
+	}
+	if executorBaseURL != "" {
+		srv.SetTargetExecutor(&execution.HTTPExecutor{
+			BaseURL: executorBaseURL,
+			Client:  &http.Client{Timeout: 30 * time.Second},
+		})
+	}
 
 	if interactionBaseURL != "" {
 		srv.SetR2Authorizer(&delegation.HTTPR2Authorizer{
@@ -91,4 +123,25 @@ func main() {
 	if err := http.ListenAndServe(*addr, mux); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
+}
+
+func dispatchEntrypointsEnabled(development bool) bool {
+	return !development
+}
+
+func resolveTokenSecret(flagSecret, envSecret string, development bool) (string, error) {
+	secret := strings.TrimSpace(flagSecret)
+	if secret == "" {
+		secret = strings.TrimSpace(envSecret)
+	}
+	if secret == "" {
+		if development {
+			return defaultTokenSecret, nil
+		}
+		return "", errors.New("HMAC token secret is required outside development mode; set -secret or GO_KERNEL_TOKEN_SECRET")
+	}
+	if !development && secret == defaultTokenSecret {
+		return "", errors.New("insecure default HMAC token secret is forbidden outside development mode")
+	}
+	return secret, nil
 }
