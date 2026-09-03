@@ -17,8 +17,8 @@ try:
 except ImportError:
     StructuredTool = None  # type: ignore[misc,assignment]
 
-from loop_controller import GovernanceRuntime
 from examples.integrations.langchain_example import govern_langchain_tools
+from loop_controller import GovernanceRuntime
 
 
 def _make_tools() -> list[Any]:

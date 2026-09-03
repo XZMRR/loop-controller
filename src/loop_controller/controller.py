@@ -20,6 +20,7 @@ from loop_controller.identity import AgentIdentity
 from loop_controller.infra.config_loader import AppConfig
 from loop_controller.masker import Masker
 from loop_controller.models import (
+    ActionKind,
     ActionProposal,
     ActorType,
     Agent,
@@ -129,18 +130,33 @@ class LoopController:
         self,
         task: Task,
         proposal: ActionProposal,
-        decision: Decision,
     ) -> GovernanceResult | None:
-        """v0.36.0：若参数包含 __target_agent_id，向 Go 内核请求跨 Agent 委托。
-
-        返回 None 表示不委托，继续本地执行；返回 GovernanceResult 表示已委托或被拒绝。
-        """
+        """在 R2 前识别兼容委托参数，并将委托仅路由到 Go Kernel/IIGE。"""
+        target_agent_id = proposal.target_agent_id
+        if proposal.action_kind != "delegation":
+            legacy_target = proposal.arguments.get("__target_agent_id")
+            if not isinstance(legacy_target, str):
+                return None
+            target_agent_id = legacy_target
+        if not target_agent_id:
+            return GovernanceResult(
+                status="blocked",
+                call_id=proposal.call_id,
+                tool_name=proposal.tool_name,
+                arguments=proposal.arguments,
+                reason="delegation requires target_agent_id",
+                error_code="invalid_delegation",
+            )
         bridge = self._runtime.go_kernel_bridge
         if bridge is None:
-            return None
-        target_agent_id = proposal.arguments.get("__target_agent_id")
-        if not isinstance(target_agent_id, str):
-            return None
+            return GovernanceResult(
+                status="blocked",
+                call_id=proposal.call_id,
+                tool_name=proposal.tool_name,
+                arguments=proposal.arguments,
+                reason="delegation requested but Go kernel bridge is unavailable",
+                error_code="delegation_unavailable",
+            )
 
         resp = await bridge.request_delegation(
             DelegationRequest(
@@ -200,7 +216,6 @@ class LoopController:
             call_id=proposal.call_id,
             tool_name=proposal.tool_name,
             arguments=proposal.arguments,
-            decision=decision,
             content={
                 "delegated": True,
                 "authorized": True,
@@ -420,6 +435,8 @@ class LoopController:
         session_id: str | None = None,
         task_id: str | None = None,
         task_context: str = "",
+        action_kind: ActionKind = "tool_call",
+        target_agent_id: str | None = None,
     ) -> GovernanceResult:
         """便捷方法：evaluate + execute 一键完成。
 
@@ -435,6 +452,8 @@ class LoopController:
             session_id=session_id,
             task_id=task_id,
             task_context=task_context,
+            action_kind=action_kind,
+            target_agent_id=target_agent_id,
         )
 
         blocked = await self._handle_revocation(task, agent, proposal, "initial")
@@ -448,6 +467,10 @@ class LoopController:
                 content=blocked.content,
                 error_code="revoked",
             )
+
+        delegated = await self._try_delegate_to_agent(task, proposal)
+        if delegated is not None:
+            return delegated
 
         eval_result = await self._evaluate_proposal(task, agent, proposal)
 
@@ -474,11 +497,6 @@ class LoopController:
         # allow / modify
         decision = eval_result.decision
         assert decision is not None
-
-        # v0.36.0：可选的跨 Agent 委托门控
-        delegated = await self._try_delegate_to_agent(task, proposal, decision)
-        if delegated is not None:
-            return delegated
 
         try:
             result = await self._execute_proposal(task, proposal, decision)
@@ -765,6 +783,8 @@ class LoopController:
         session_id: str | None,
         task_id: str | None,
         task_context: str,
+        action_kind: ActionKind = "tool_call",
+        target_agent_id: str | None = None,
     ) -> tuple[Task, Agent, ActionProposal]:
         """校验身份、创建/复用 Task 和 Session，构造 ActionProposal。"""
         agent = self._runtime.checkpoint._identity.get_agent(agent_id)
@@ -790,6 +810,8 @@ class LoopController:
             tool_name=tool_name,
             arguments=dict(arguments),
             task_context=task_context,
+            action_kind=action_kind,
+            target_agent_id=target_agent_id,
         )
         return task, agent, proposal
 

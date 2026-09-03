@@ -23,6 +23,16 @@ from tests.controller_helpers import env_extra
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def _disable_interaction_config(config_dir: Path) -> None:
+    (config_dir / "interaction_profiles.yaml").write_text(
+        "interaction_profiles: []\n", encoding="utf-8"
+    )
+    (config_dir / "agent_trust.yaml").write_text("agent_trust: []\n", encoding="utf-8")
+    (config_dir / "delegation_policies.yaml").write_text(
+        "delegation_policies: []\n", encoding="utf-8"
+    )
+
+
 @pytest.fixture
 def mcp_proxy_workdir(tmp_path: Path) -> Path:
     """准备 MCP Proxy 集成测试配置。"""
@@ -90,6 +100,7 @@ admin:
         encoding="utf-8",
     )
     write_trusted_local_harness_config(root / "config", ["web_search"])
+    _disable_interaction_config(root / "config")
     return root
 
 
@@ -168,6 +179,7 @@ admin:
         encoding="utf-8",
     )
     write_trusted_local_harness_config(root / "config", ["web_search", "send_email"])
+    _disable_interaction_config(root / "config")
     return root
 
 

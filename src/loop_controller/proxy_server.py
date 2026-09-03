@@ -43,6 +43,7 @@ from starlette.responses import Response  # type: ignore[import-untyped]
 from starlette.routing import Mount, Route  # type: ignore[import-untyped]
 
 from loop_controller.checkpoint import CheckpointError, DecisionAlreadyConsumed
+from loop_controller.controller import LoopController
 from loop_controller.identity import AgentIdentity, IdentityCredential, IdentityProvider
 from loop_controller.models import (
     ActionProposal,
@@ -717,6 +718,26 @@ class LoopControllerProxyServer:
                 )
             return await admin_handler(raw_arguments)
 
+        action_kind = raw_arguments.pop("_loop_controller_action_kind", "tool_call")
+        target_agent_id = raw_arguments.pop("_loop_controller_target_agent_id", None)
+        legacy_target = raw_arguments.pop("__target_agent_id", None)
+        if target_agent_id is None:
+            target_agent_id = legacy_target
+        if action_kind == "delegation" or target_agent_id is not None:
+            if action_kind not in ("tool_call", "delegation"):
+                return self._error_result("invalid action_kind", error_code="invalid_request")
+            if not isinstance(target_agent_id, str) or not target_agent_id:
+                return self._error_result(
+                    "delegation requires target_agent_id",
+                    error_code="invalid_delegation",
+                )
+            return await self._handle_delegation_call(
+                name,
+                raw_arguments,
+                identity,
+                target_agent_id,
+            )
+
         retry_decision_id = self._extract_retry_decision_id(raw_arguments)
 
         # v0.5.1：如果携带 decision_id，走重试恢复路径。
@@ -735,6 +756,42 @@ class LoopControllerProxyServer:
 
         # 正常路径：创建 Task、判定、执行或提交审批。
         return await self._handle_normal_call(name, raw_arguments, identity, agent)
+
+    async def _handle_delegation_call(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        identity: ProxyIdentity,
+        target_agent_id: str,
+    ) -> types.CallToolResult:
+        """将 MCP 委托显式路由至 Go Kernel/IIGE，不进入 Tool Checkpoint。"""
+        controller = LoopController(self._runtime)
+        try:
+            result = await controller.evaluate_and_execute(
+                agent_id=identity.agent_id,
+                user_id=identity.user_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                session_id=identity.session_id,
+                action_kind="delegation",
+                target_agent_id=target_agent_id,
+            )
+        except Exception:
+            logger.exception("Proxy delegation 失败")
+            return self._error_result("internal error", error_code="internal_error")
+        if result.status != "allow":
+            return self._error_result(
+                result.reason or "delegation denied",
+                error_code=result.error_code or "delegation_denied",
+            )
+        return types.CallToolResult(
+            content=[
+                types.TextContent(
+                    type="text",
+                    text=json.dumps(result.content, ensure_ascii=False),
+                )
+            ]
+        )
 
     async def _handle_retry(
         self,

@@ -151,18 +151,18 @@ type EntrypointResultRequest struct {
 	ErrorCode       string          `json:"error_code,omitempty"`
 }
 
-// DelegationRequest is sent by the Python tool-governance layer when it wants
-// to forward a tool execution to another agent.
+// DelegationRequest asks the A2A kernel to forward a structured tool request
+// to another agent after interaction governance authorization.
 type DelegationRequest struct {
-	RequestID        string `json:"request_id"`
-	InitiatorAgentID string `json:"initiator_agent_id"`
-	TargetAgentID    string `json:"target_agent_id"`
-	ToolName         string `json:"tool_name"`
-	ArgumentsJSON    string `json:"arguments_json"`
-	SessionID        string `json:"session_id"`
-	TaskID           string `json:"task_id"`
-	RiskLevel        string `json:"risk_level"`
-	ProtocolVersion  string `json:"protocol_version,omitempty"`
+	RequestID        string          `json:"request_id"`
+	InitiatorAgentID string          `json:"initiator_agent_id"`
+	TargetAgentID    string          `json:"target_agent_id"`
+	ToolName         string          `json:"tool_name"`
+	Arguments        json.RawMessage `json:"arguments"`
+	SessionID        string          `json:"session_id"`
+	TaskID           string          `json:"task_id"`
+	RiskLevel        string          `json:"risk_level"`
+	ProtocolVersion  string          `json:"protocol_version"`
 }
 
 // DelegationResponse is returned by the Go kernel.

@@ -1,0 +1,58 @@
+openapi: 3.1.0
+info:
+  title: Loop Controller A2A Protocol
+  version: 0.39.0
+  description: |
+    Authoritative OpenAPI description of the Loop Controller A2A HTTP/JSON
+    protocol v0.39.0. Delegation arguments are structured JSON objects and
+    protocol versions are required on all versioned request/response bodies.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local Go A2A kernel
+paths:
+  /a2a/v1/agents:
+    $ref: './paths/agents.yaml#/a2a/v1/agents'
+  /a2a/v1/agents/{id}:
+    $ref: './paths/agents.yaml#/a2a/v1/agents/{id}'
+  /a2a/v1/tasks:
+    $ref: './paths/tasks.yaml#/a2a/v1/tasks'
+  /a2a/v1/tasks/{id}:
+    $ref: './paths/tasks.yaml#/a2a/v1/tasks/{id}'
+  /a2a/v1/tasks/{id}/stream:
+    $ref: './paths/tasks.yaml#/a2a/v1/tasks/{id}/stream'
+  /a2a/v1/tasks/{id}/cancel:
+    $ref: './paths/tasks.yaml#/a2a/v1/tasks/{id}/cancel'
+  /a2a/v1/entrypoint/tasks:
+    $ref: './paths/tasks.yaml#/a2a/v1/entrypoint/tasks'
+  /a2a/v1/entrypoint/tasks/{id}/accept:
+    $ref: './paths/tasks.yaml#/a2a/v1/entrypoint/tasks/{id}/accept'
+  /a2a/v1/entrypoint/tasks/{id}/cancel:
+    $ref: './paths/tasks.yaml#/a2a/v1/entrypoint/tasks/{id}/cancel'
+  /a2a/v1/entrypoint/tasks/{id}:
+    $ref: './paths/tasks.yaml#/a2a/v1/entrypoint/tasks/{id}'
+  /a2a/v1/entrypoint/tasks/{id}/results:
+    $ref: './paths/tasks.yaml#/a2a/v1/entrypoint/tasks/{id}/results'
+  /a2a/v1/messages:
+    $ref: './paths/messages.yaml#/a2a/v1/messages'
+  /a2a/v1/delegations:
+    $ref: './paths/delegations.yaml#/a2a/v1/delegations'
+  /health:
+    $ref: './paths/health.yaml#/health'
+components:
+  schemas:
+    ProtocolVersion:
+      $ref: './schemas/protocol-version.yaml'
+    AgentCard:
+      $ref: './schemas/agent-card.yaml'
+    Task:
+      $ref: './schemas/task.yaml'
+    Message:
+      $ref: './schemas/message.yaml'
+    Part:
+      $ref: './schemas/part.yaml'
+    DelegationRequest:
+      $ref: './schemas/delegation-request.yaml'
+    DelegationResponse:
+      $ref: './schemas/delegation-response.yaml'
+    ErrorResponse:
+      $ref: './schemas/error-response.yaml'

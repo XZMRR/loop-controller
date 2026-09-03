@@ -47,6 +47,11 @@ from loop_controller.executors.harness_models import (
 )
 from loop_controller.executors.http_models import HTTPToolSpec, resolve_env_refs
 from loop_controller.executors.local_function_models import LocalFunctionSpec
+from loop_controller.interaction.config import (
+    InteractionConfig,
+    InteractionConfigError,
+    load_interaction_config,
+)
 from loop_controller.models import (
     Agent,
     AuditRule,
@@ -263,6 +268,7 @@ class AppConfig:
     revocation_config: dict[str, Any] = field(default_factory=dict)  # v0.26.0 吊销配置
     evidence_config: dict[str, Any] = field(default_factory=dict)  # v0.26.0 证据链配置
     go_kernel_config: dict[str, Any] = field(default_factory=dict)  # v0.36.0 Go 交互治理内核配置
+    interaction_config: InteractionConfig = field(default_factory=InteractionConfig)  # v0.38.0
 
 # ---------------------------------------------------------------------------
 # ConfigLoader
@@ -305,6 +311,12 @@ class ConfigLoader:
         identity_config = self._load_identity_config(config_dir / "identity.yaml")
         entrypoints_config = self._load_entrypoints_config(config_dir / "entrypoints.yaml")
         go_kernel_config = self._load_optional_config(config_dir / "go_kernel.yaml")
+        try:
+            interaction_profiles, interaction_trust, interaction_policies = load_interaction_config(
+                config_dir
+            )
+        except InteractionConfigError as exc:
+            raise ConfigValidationError(str(exc)) from exc
         permission_rules = self._load_permission_rules(config_dir / "permission_rules.yaml")
         capability_rules = self._load_capability_rules(config_dir / "capability_rules.yaml")
         authority_rules = self._load_authority_rules(config_dir / "authority_rules.yaml")
@@ -385,9 +397,17 @@ class ConfigLoader:
             revocation_config=revocation_config,
             evidence_config=evidence_config,
             go_kernel_config=go_kernel_config,
+            interaction_config=InteractionConfig(
+                profiles=interaction_profiles,
+                trust=interaction_trust,
+                policies=interaction_policies,
+                policy_dir=str(root / "policies"),
+            ),
         )
 
         self._check_profile_exists(app_config)
+        self._check_interaction_profile_exists(app_config)
+        self._check_interaction_agents_exist(app_config)
         self._check_tool_mapping(app_config)
         if opa_base_url is not None:
             self._check_policy_loadable(opa_base_url, app_config)
@@ -893,6 +913,26 @@ class ConfigLoader:
                     f"Agent {agent_id} 引用的 profile_id {agent.profile_id} 不存在"
                 )
 
+    def _check_interaction_profile_exists(self, config: AppConfig) -> None:
+        seen_agents: set[str] = set()
+        for profile_id, profile in config.interaction_config.profiles.items():
+            if profile.agent_id not in config.agents:
+                raise ConfigValidationError(
+                    f"InteractionProfile {profile_id} 引用的 agent_id {profile.agent_id} 不存在"
+                )
+            if profile.agent_id in seen_agents:
+                raise ConfigValidationError(
+                    f"Agent {profile.agent_id} 绑定了多个 InteractionProfile"
+                )
+            seen_agents.add(profile.agent_id)
+
+    def _check_interaction_agents_exist(self, config: AppConfig) -> None:
+        for trust in config.interaction_config.trust.values():
+            if trust.source_agent_id not in config.agents:
+                raise ConfigValidationError(
+                    f"agent_trust 引用的 source_agent_id {trust.source_agent_id} 不存在"
+                )
+
     def _check_tool_mapping(self, config: AppConfig) -> None:
         all_tools = (
             set(config.tool_mapping)
@@ -922,6 +962,36 @@ class ConfigLoader:
         if not isinstance(decision, dict) or decision.get("verdict") != "deny":
             raise ConfigValidationError(
                 "OPA 试查询未返回结构合法的 deny（空 input 必须命中 default deny）"
+            )
+        interaction_configured = any(
+            (
+                config.interaction_config.profiles,
+                config.interaction_config.trust,
+                config.interaction_config.policies,
+            )
+        )
+        interaction_rego = policy_dir / "interaction" / "default.rego"
+        if not interaction_rego.exists():
+            if interaction_configured:
+                raise ConfigValidationError(
+                    f"policy_dir {policy_dir} 下缺少 interaction/default.rego"
+                )
+            return
+        try:
+            interaction_result = self._query_opa(
+                opa_base_url, "loop_controller.interaction.delegation", {}
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-closed 启动拒绝
+            raise ConfigValidationError(
+                f"interaction OPA 试查询失败（{opa_base_url}）：{exc}"
+            ) from exc
+        interaction_decision = interaction_result.get("decision", {})
+        if (
+            not isinstance(interaction_decision, dict)
+            or interaction_decision.get("verdict") != "deny"
+        ):
+            raise ConfigValidationError(
+                "interaction OPA 试查询未返回结构合法的 deny"
             )
 
     @staticmethod

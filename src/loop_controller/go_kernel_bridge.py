@@ -1,4 +1,4 @@
-"""Python bridge to the Go interaction governance kernel (v0.36.1)."""
+"""Python bridge to the Go interaction governance kernel (v0.39.0)."""
 
 from __future__ import annotations
 
@@ -13,23 +13,20 @@ logger = logging.getLogger(__name__)
 
 # Current A2A HTTP/JSON protocol version. Patch differences are tolerated;
 # major/minor differences are fail-closed.
-CURRENT_PROTOCOL_VERSION = "0.37.0"
+CURRENT_PROTOCOL_VERSION = "0.39.0"
 
 
 def check_protocol_version(version: str) -> None:
     """Validate that *version* is compatible with ``CURRENT_PROTOCOL_VERSION``.
 
-    Empty versions are allowed during the transition period. Raises
-    ``ValueError`` if the major or minor component differs.
+    版本必须是严格的 ``major.minor.patch``；major/minor 不一致时拒绝。
     """
-    if not version:
-        return
-    if version == CURRENT_PROTOCOL_VERSION:
-        return
     parts = version.split(".")
     current = CURRENT_PROTOCOL_VERSION.split(".")
-    if len(parts) < 2 or len(current) < 2:
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
         raise ValueError(f"invalid protocol version {version!r}")
+    if version == CURRENT_PROTOCOL_VERSION:
+        return
     if parts[0] != current[0] or parts[1] != current[1]:
         raise ValueError(
             f"incompatible protocol version {version!r}, expected {CURRENT_PROTOCOL_VERSION}"
@@ -166,7 +163,7 @@ class DelegationRequest:
             "initiator_agent_id": self.initiator_agent_id,
             "target_agent_id": self.target_agent_id,
             "tool_name": self.tool_name,
-            "arguments_json": json.dumps(self.arguments, ensure_ascii=False),
+            "arguments": self.arguments,
             "session_id": self.session_id,
             "task_id": self.task_id,
             "risk_level": self.risk_level,
@@ -274,7 +271,14 @@ class GoKernelBridge:
             client = await self._client_context()
             response = await client.post(url, json=req.to_dict())
             response.raise_for_status()
-            return DelegationResponse.from_dict(response.json())
+            data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError("invalid Go kernel delegation response")
+            check_protocol_version(str(data.get("protocol_version", "")))
+            return DelegationResponse.from_dict(data)
+        except ValueError as exc:
+            logger.warning("Go kernel protocol rejected, fail-closed: %s", exc)
+            return DelegationResponse(allowed=False, reason="incompatible_protocol_version")
         except httpx.HTTPStatusError as exc:
             logger.warning("Go kernel delegation rejected: %s", exc)
             return DelegationResponse(allowed=False, reason="go_kernel_rejected")

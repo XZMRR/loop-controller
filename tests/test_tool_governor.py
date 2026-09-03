@@ -76,6 +76,26 @@ async def test_tool_governor_forwards_call_and_returns_content() -> None:
     assert call["kwargs"]["task_context"] == "default task"
     assert call["kwargs"]["session_id"] is None
     assert call["kwargs"]["task_id"] is None
+    assert call["kwargs"]["action_kind"] == "tool_call"
+    assert call["kwargs"]["target_agent_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_tool_governor_forwards_delegation_metadata() -> None:
+    controller = _MockController()
+    governor = ToolGovernor(controller, agent_id="researcher_001", user_id="alice")
+
+    await governor.call(
+        "analyze_sales",
+        {"region": "APAC"},
+        action_kind="delegation",
+        target_agent_id="research-agent",
+    )
+
+    call = controller.calls[0]
+    assert call["arguments"] == {"region": "APAC"}
+    assert call["kwargs"]["action_kind"] == "delegation"
+    assert call["kwargs"]["target_agent_id"] == "research-agent"
 
 
 @pytest.mark.asyncio

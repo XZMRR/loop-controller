@@ -98,6 +98,15 @@ users:
     display_name: 张经理
 """
     (config_dir / "agents.yaml").write_text(content, encoding="utf-8")
+    (config_dir / "interaction_profiles.yaml").write_text(
+        "interaction_profiles: []\n", encoding="utf-8"
+    )
+    (config_dir / "agent_trust.yaml").write_text(
+        "agent_trust: []\n", encoding="utf-8"
+    )
+    (config_dir / "delegation_policies.yaml").write_text(
+        "delegation_policies: []\n", encoding="utf-8"
+    )
 
 
 def _clear_mcp_servers(config_dir: Path) -> None:

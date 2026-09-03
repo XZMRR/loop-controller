@@ -1,0 +1,14 @@
+interaction_profiles:
+  - profile_id: researcher_interaction_v1
+    agent_id: researcher_001
+    version: "0.39.0"
+    description: Research Agent delegation profile
+    max_delegation_depth: 2
+    allow_external_delegation: true
+    require_approval_for_external: false
+    capabilities:
+      analyze_sales:
+        allowed: true
+        require_approval: false
+        allowed_target_agents:
+          - research-agent

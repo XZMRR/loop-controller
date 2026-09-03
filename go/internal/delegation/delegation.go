@@ -62,8 +62,8 @@ func New(
 	}
 }
 
-// WithR2Authorizer attaches an R2 authorizer. When set, Request calls R2
-// after the local capability check.
+// WithR2Authorizer attaches the interaction authorizer after the local
+// capability check. The legacy method name is retained for compatibility.
 func (d *Delegator) WithR2Authorizer(a R2Authorizer) *Delegator {
 	d.authorizer = a
 	return d
@@ -93,20 +93,24 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 		}, nil
 	}
 
-	if d.authorizer != nil {
-		r2Resp, err := d.authorizer.Authorize(ctx, req)
-		if err != nil {
-			if !r2Resp.Allowed && r2Resp.Reason == "" {
-				r2Resp.Reason = "R2 authorization failed"
-			}
-			return r2Resp, err
+	if d.authorizer == nil {
+		return models.DelegationResponse{
+			Allowed: false,
+			Reason:  "interaction authorizer is not configured",
+		}, errors.New("interaction authorizer is not configured")
+	}
+	interactionResp, err := d.authorizer.Authorize(ctx, req)
+	if err != nil {
+		if !interactionResp.Allowed && interactionResp.Reason == "" {
+			interactionResp.Reason = "interaction authorization failed"
 		}
-		if !r2Resp.Allowed {
-			if r2Resp.Reason == "" {
-				r2Resp.Reason = "R2 denied delegation"
-			}
-			return r2Resp, nil
+		return interactionResp, err
+	}
+	if !interactionResp.Allowed {
+		if interactionResp.Reason == "" {
+			interactionResp.Reason = "IIGE denied delegation"
 		}
+		return interactionResp, nil
 	}
 
 	taskID := req.TaskID
@@ -158,6 +162,7 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 		TargetEntrypoint: target.Entrypoint,
 		DelegationToken:  tokenStr,
 		Reason:           "target agent trusted and capable",
+		ProtocolVersion:  interactionProtocolVersion,
 	}, nil
 }
 

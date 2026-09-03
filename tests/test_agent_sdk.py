@@ -51,6 +51,33 @@ async def test_governed_async_returns_content() -> None:
     assert rt.controller.evaluate_and_execute.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_governed_delegation_passes_explicit_metadata() -> None:
+    rt = _make_runtime(
+        GovernanceResult(
+            status="allow",
+            call_id="c1",
+            tool_name="analyze_sales",
+            arguments={"region": "APAC"},
+            content={"delegated": True},
+        )
+    )
+
+    @governed(
+        tool_name="analyze_sales",
+        action_kind="delegation",
+        target_agent_id="research-agent",
+    )
+    async def analyze_sales(region: str) -> dict[str, Any]:
+        return {"region": region}
+
+    assert await analyze_sales("APAC") == {"delegated": True}
+    kwargs = rt.controller.evaluate_and_execute.await_args.kwargs
+    assert kwargs["action_kind"] == "delegation"
+    assert kwargs["target_agent_id"] == "research-agent"
+    assert kwargs["arguments"] == {"region": "APAC"}
+
+
 def test_governed_sync_returns_content() -> None:
     rt = _make_runtime(
         GovernanceResult(

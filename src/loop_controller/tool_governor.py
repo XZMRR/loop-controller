@@ -14,6 +14,7 @@ from typing import Any
 
 from loop_controller.controller import LoopController
 from loop_controller.formatting import format_governance_result
+from loop_controller.models import ActionKind
 
 
 class ToolGovernor:
@@ -51,6 +52,8 @@ class ToolGovernor:
         task_context: str | None = None,
         session_id: str | None = None,
         task_id: str | None = None,
+        action_kind: ActionKind = "tool_call",
+        target_agent_id: str | None = None,
     ) -> str:
         """提交一次工具调用给 Loop Controller 治理。
 
@@ -72,5 +75,7 @@ class ToolGovernor:
             task_context=task_context if task_context is not None else self._default_task_context,
             session_id=session_id,
             task_id=task_id,
+            action_kind=action_kind,
+            target_agent_id=target_agent_id,
         )
         return format_governance_result(result)

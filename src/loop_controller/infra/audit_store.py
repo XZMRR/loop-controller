@@ -53,6 +53,15 @@ class AuditStore(Protocol):
     def query_by_trace(self, trace_id: str) -> list[AuditEvent]: ...
     def query_by_session(self, session_id: str) -> list[AuditEvent]: ...  # v0.12.0
     def query_by_task(self, task_id: str) -> list[AuditEvent]: ...  # v0.12.0
+    def query_interactions(
+        self,
+        *,
+        interaction_id: str | None = None,
+        source_agent_id: str | None = None,
+        target_agent_id: str | None = None,
+        verdict: str | None = None,
+        limit: int = 100,
+    ) -> list[AuditEvent]: ...
     def iter_events(self) -> AsyncIterator[AuditEvent]: ...  # v0.18.0
     def list_recent(self, limit: int = 100) -> list[AuditEvent]: ...  # v0.32.0
 
@@ -902,6 +911,52 @@ class JsonlAuditStore:
     def query_by_task(self, task_id: str) -> list[AuditEvent]:
         """按 task_id 全文件扫描并返回 AuditEvent 列表（v0.12.0）。"""
         return self._query_by_field("task_id", task_id)
+
+    def query_interactions(
+        self,
+        *,
+        interaction_id: str | None = None,
+        source_agent_id: str | None = None,
+        target_agent_id: str | None = None,
+        verdict: str | None = None,
+        limit: int = 100,
+    ) -> list[AuditEvent]:
+        """按交互治理字段查询；索引不可用时回退 JSONL。"""
+        if self._audit_index is not None and not self._audit_index.degraded:
+            try:
+                return self._audit_index.query_interactions(
+                    interaction_id=interaction_id,
+                    source_agent_id=source_agent_id,
+                    target_agent_id=target_agent_id,
+                    verdict=verdict,
+                    limit=limit,
+                )
+            except AuditIndexError as exc:
+                logger.warning("交互审计索引查询失败，回退 JSONL 扫描: %s", exc)
+        results: list[AuditEvent] = []
+        if not self._path.exists():
+            return results
+        with self._path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                    event = AuditEvent(**(record.get("event") or record))
+                except (json.JSONDecodeError, ValidationError):
+                    continue
+                metadata = event.metadata or {}
+                if not metadata.get("interaction_id"):
+                    continue
+                if interaction_id is not None and metadata.get("interaction_id") != interaction_id:
+                    continue
+                if source_agent_id is not None and metadata.get("source_agent_id") != source_agent_id:
+                    continue
+                if target_agent_id is not None and metadata.get("target_agent_id") != target_agent_id:
+                    continue
+                event_verdict = metadata.get("verdict") or event.decision
+                if verdict is not None and event_verdict != verdict:
+                    continue
+                results.append(event)
+        return list(reversed(results[-limit:]))
 
     def list_recent(self, limit: int = 100) -> list[AuditEvent]:
         """返回最近的审计事件列表（v0.32.0）；v0.34.0 优先使用 SQLite 索引。"""

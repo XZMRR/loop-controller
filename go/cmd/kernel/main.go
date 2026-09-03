@@ -19,7 +19,16 @@ func main() {
 	secret := flag.String("secret", "", "HMAC token secret (falls back to GO_KERNEL_TOKEN_SECRET)")
 	dbPath := flag.String("db", "", "SQLite database path (falls back to LC_A2A_DB_PATH, default ./data/a2a.db)")
 	discoveryFile := flag.String("discovery-file", "", "optional JSON file with Agent Cards to auto-register")
-	r2URL := flag.String("r2-url", "", "Python R2 base URL (falls back to LC_R2_URL)")
+	interactionURL := flag.String(
+		"interaction-url",
+		"",
+		"Python IIGE base URL (falls back to LC_INTERACTION_URL, then LC_R2_URL)",
+	)
+	interactionToken := flag.String(
+		"interaction-token",
+		"",
+		"IIGE Bearer token (falls back to LC_INTERACTION_TOKEN)",
+	)
 	flag.Parse()
 
 	path := *dbPath
@@ -27,9 +36,16 @@ func main() {
 		path = os.Getenv("LC_A2A_DB_PATH")
 	}
 
-	r2BaseURL := *r2URL
-	if r2BaseURL == "" {
-		r2BaseURL = os.Getenv("LC_R2_URL")
+	interactionBaseURL := *interactionURL
+	if interactionBaseURL == "" {
+		interactionBaseURL = os.Getenv("LC_INTERACTION_URL")
+	}
+	if interactionBaseURL == "" {
+		interactionBaseURL = os.Getenv("LC_R2_URL")
+	}
+	interactionBearerToken := *interactionToken
+	if interactionBearerToken == "" {
+		interactionBearerToken = os.Getenv("LC_INTERACTION_TOKEN")
 	}
 
 	tokenSecret := *secret
@@ -52,10 +68,11 @@ func main() {
 	}
 	defer srv.Close()
 
-	if r2BaseURL != "" {
+	if interactionBaseURL != "" {
 		srv.SetR2Authorizer(&delegation.HTTPR2Authorizer{
-			BaseURL: r2BaseURL,
-			Client:  &http.Client{Timeout: 10 * time.Second},
+			BaseURL:     interactionBaseURL,
+			BearerToken: interactionBearerToken,
+			Client:      &http.Client{Timeout: 10 * time.Second},
 		})
 	}
 

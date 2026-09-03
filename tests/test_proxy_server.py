@@ -14,10 +14,13 @@ import json
 import shutil
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
+from loop_controller.controller import LoopController
 from loop_controller.infra.config_loader import ConfigLoader
+from loop_controller.models import GovernanceResult
 from loop_controller.proxy_server import LoopControllerProxyServer, ProxyIdentity
 from loop_controller.runtime import build_runtime
 from tests.conftest import write_trusted_local_harness_config
@@ -119,6 +122,44 @@ async def test_proxy_list_tools(proxy_ctx: LoopControllerProxyServer) -> None:
         "revoke_decision",
     ):
         assert name in names
+
+
+@pytest.mark.asyncio
+async def test_proxy_delegation_bypasses_checkpoint(
+    proxy_ctx: LoopControllerProxyServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = proxy_ctx._runtime.go_kernel_bridge
+    proxy_ctx._runtime.__dict__["go_kernel_bridge"] = object()
+    evaluate = AsyncMock(
+        return_value=GovernanceResult(
+            status="allow",
+            call_id="c1",
+            tool_name="web_search",
+            arguments={"query": "sales"},
+            content={"delegated": True, "target_agent_id": "research-agent"},
+        )
+    )
+    monkeypatch.setattr(LoopController, "evaluate_and_execute", evaluate)
+    checkpoint_evaluate = AsyncMock()
+    monkeypatch.setattr(proxy_ctx._runtime.checkpoint, "evaluate", checkpoint_evaluate)
+    try:
+        result = await proxy_ctx._handle_call_tool_impl(
+            name="web_search",
+            arguments={
+                "query": "sales",
+                "_loop_controller_action_kind": "delegation",
+                "_loop_controller_target_agent_id": "research-agent",
+            },
+        )
+    finally:
+        proxy_ctx._runtime.__dict__["go_kernel_bridge"] = bridge
+    assert not result.isError
+    kwargs = evaluate.await_args.kwargs
+    assert kwargs["action_kind"] == "delegation"
+    assert kwargs["target_agent_id"] == "research-agent"
+    assert kwargs["arguments"] == {"query": "sales"}
+    checkpoint_evaluate.assert_not_awaited()
 
 
 @pytest.mark.asyncio

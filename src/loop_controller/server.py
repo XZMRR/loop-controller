@@ -36,7 +36,6 @@ import httpx
 from loop_controller.approval_service import ApprovalServiceError, build_approval_record
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
-from loop_controller.delegation import DelegationAuthorizeEndpoint, DelegationAuthorizer
 from loop_controller.identity import (
     AgentIdentity,
     IdentityCredential,
@@ -45,6 +44,10 @@ from loop_controller.identity import (
     RevocationType,
 )
 from loop_controller.infra.approval_store import ApprovalStoreError
+from loop_controller.interaction.engine import (
+    InteractionAuthorizeEndpoint,
+    InteractionGovernanceEngine,
+)
 from loop_controller.logging_config import configure_logging, set_trace_id
 from loop_controller.metrics import (
     observe_request,
@@ -399,9 +402,9 @@ class ToolGovernServer:
         )
 
     async def _handle_delegation_authorize(self, request: Request) -> JSONResponse:
-        """v0.37.0：Go 内核在创建委托 Task 前调用 R2 完成授权判定。"""
-        authorized, _identity = await self._check_agent_auth(request)
-        if not authorized:
+        """由 IIGE 完成 Agent 委托授权；旧 R2 路由复用同一处理器。"""
+        authorized, identity = await self._check_agent_auth(request)
+        if not authorized or identity is None:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         try:
@@ -409,10 +412,35 @@ class ToolGovernServer:
         except Exception as exc:
             logger.warning("invalid delegation authorize request: %s", exc)
             return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "request body must be an object"}, status_code=422)
 
-        authorizer = DelegationAuthorizer(self._controller)
-        endpoint = DelegationAuthorizeEndpoint(authorizer)
-        return JSONResponse(await endpoint.handle(payload))
+        source_agent_id = payload.get("source_agent_id") or payload.get("initiator_agent_id")
+        if source_agent_id != identity.agent_id:
+            return JSONResponse({"error": "source agent identity mismatch"}, status_code=403)
+        payload["source_agent_id"] = source_agent_id
+        if "arguments" not in payload and "arguments_json" in payload:
+            return JSONResponse(
+                {"error": "arguments_json is no longer supported; use arguments object"},
+                status_code=422,
+            )
+
+        engine = InteractionGovernanceEngine(self._controller)
+        endpoint = InteractionAuthorizeEndpoint(engine)
+        try:
+            response = await endpoint.handle(payload)
+        except Exception as exc:
+            logger.warning("invalid interaction proposal: %s", exc)
+            return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+
+        if endpoint.last_proposal is not None and endpoint.last_decision is not None:
+            event = engine.build_audit_event(endpoint.last_proposal, endpoint.last_decision)
+            await self._controller._runtime.audit_store.append_async(event)
+        elif endpoint.last_rejection_event is not None:
+            await self._controller._runtime.audit_store.append_async(
+                endpoint.last_rejection_event
+            )
+        return JSONResponse(response)
 
     async def _handle_metrics(self, request: Request) -> PlainTextResponse:
         if self._api_key is not None and not self._check_api_key(request):
@@ -943,6 +971,16 @@ class ToolGovernServer:
 
         session_id = request.query_params.get("session_id")
         task_id = request.query_params.get("task_id")
+        interaction_id = request.query_params.get("interaction_id")
+        source_agent_id = request.query_params.get("source_agent_id")
+        target_agent_id = request.query_params.get("target_agent_id")
+        verdict = request.query_params.get("verdict")
+        valid_verdicts = {"allow", "deny", "modify", "require_approval"}
+        if verdict is not None and verdict not in valid_verdicts:
+            return JSONResponse(
+                {"error": "invalid_parameter", "message": "invalid interaction verdict"},
+                status_code=400,
+            )
         try:
             limit = int(request.query_params.get("limit", "100"))
         except ValueError:
@@ -953,19 +991,31 @@ class ToolGovernServer:
         limit = max(1, min(limit, 1000))
 
         audit_store = self._controller._runtime.audit_store
-        events = []
-        async for event in audit_store.iter_events():
-            payload = event.model_dump()
-            if session_id and payload.get("session_id") != session_id:
-                continue
-            if task_id and payload.get("task_id") != task_id:
-                continue
-            events.append(payload)
-            if len(events) >= limit:
-                break
-
-        # 最新事件在前
-        events.reverse()
+        interaction_filters = any(
+            value is not None
+            for value in (interaction_id, source_agent_id, target_agent_id, verdict)
+        )
+        if interaction_filters:
+            interaction_events = audit_store.query_interactions(
+                interaction_id=interaction_id,
+                source_agent_id=source_agent_id,
+                target_agent_id=target_agent_id,
+                verdict=verdict,
+                limit=limit,
+            )
+            events = [event.model_dump(mode="json") for event in interaction_events]
+        else:
+            events = []
+            async for event in audit_store.iter_events():
+                payload = event.model_dump()
+                if session_id and payload.get("session_id") != session_id:
+                    continue
+                if task_id and payload.get("task_id") != task_id:
+                    continue
+                events.append(payload)
+                if len(events) >= limit:
+                    break
+            events.reverse()
         return JSONResponse(AuditQueryResponse(events=events).model_dump())
 
     def _refresh_pending_approvals(self) -> None:
@@ -1065,6 +1115,11 @@ def build_app(
             Route("/v1/health", server._handle_health, methods=["GET"]),
             Route("/metrics", server._handle_metrics, methods=["GET"]),
             Route("/v1/govern/tool-call", server._handle_govern_tool_call, methods=["POST"]),
+            Route(
+                "/interaction/v1/delegations/authorize",
+                server._handle_delegation_authorize,
+                methods=["POST"],
+            ),
             Route(
                 "/r2/v1/delegations/authorize",
                 server._handle_delegation_authorize,

@@ -37,7 +37,9 @@ func TestRequestAllowed(t *testing.T) {
 	tasks := task.New(db.TaskStore())
 	issuer := token.NewHMACIssuer([]byte("secret"))
 	pub := stream.NewPublisher(db.EventStore())
-	d := New(reg, tasks, issuer, pub, time.Hour)
+	d := New(reg, tasks, issuer, pub, time.Hour).WithR2Authorizer(&StaticR2Authorizer{
+		Decision: models.DelegationResponse{Allowed: true},
+	})
 
 	resp, err := d.Request(context.Background(), models.DelegationRequest{
 		RequestID:        "req-1",
@@ -69,6 +71,22 @@ func (failingIssuer) Issue(token.DelegationClaims, time.Duration) (string, error
 	return "", errors.New("signing unavailable")
 }
 
+func TestRequestWithoutInteractionAuthorizerIsDenied(t *testing.T) {
+	reg := registry.New()
+	reg.Register(models.AgentCard{
+		AgentID: "executor", Capabilities: []string{"delegate_execution"},
+	})
+	db := openTestDB(t)
+	d := New(reg, task.New(db.TaskStore()), token.NewHMACIssuer([]byte("secret")), nil, time.Hour)
+	resp, err := d.Request(context.Background(), models.DelegationRequest{
+		RequestID: "req-1", InitiatorAgentID: "planner",
+		TargetAgentID: "executor", ToolName: "query_sales",
+	})
+	if err == nil || resp.Allowed || resp.Reason != "interaction authorizer is not configured" {
+		t.Fatalf("expected missing authorizer denial, got %+v, %v", resp, err)
+	}
+}
+
 func TestRequestTokenIssuanceFailureIsDenied(t *testing.T) {
 	reg := registry.New()
 	reg.Register(models.AgentCard{
@@ -76,7 +94,9 @@ func TestRequestTokenIssuanceFailureIsDenied(t *testing.T) {
 		Capabilities: []string{"delegate_execution"},
 	})
 	db := openTestDB(t)
-	d := New(reg, task.New(db.TaskStore()), failingIssuer{}, nil, time.Hour)
+	d := New(reg, task.New(db.TaskStore()), failingIssuer{}, nil, time.Hour).WithR2Authorizer(&StaticR2Authorizer{
+		Decision: models.DelegationResponse{Allowed: true},
+	})
 
 	resp, err := d.Request(context.Background(), models.DelegationRequest{
 		RequestID:        "req-1",
@@ -160,7 +180,9 @@ func TestRequestExistingTask(t *testing.T) {
 	tasks := task.New(db.TaskStore())
 	tsk := tasks.Create("session-1", "planner", "executor")
 	issuer := token.NewHMACIssuer([]byte("secret"))
-	d := New(reg, tasks, issuer, nil, time.Hour)
+	d := New(reg, tasks, issuer, nil, time.Hour).WithR2Authorizer(&StaticR2Authorizer{
+		Decision: models.DelegationResponse{Allowed: true},
+	})
 
 	resp, err := d.Request(context.Background(), models.DelegationRequest{
 		RequestID:        "req-1",

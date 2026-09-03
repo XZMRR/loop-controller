@@ -16,7 +16,7 @@ from typing import Any, TypeVar
 
 from loop_controller.controller import LoopController, build_controller
 from loop_controller.infra.config_loader import ConfigLoader
-from loop_controller.models import GovernanceDeniedError, GovernanceResult
+from loop_controller.models import ActionKind, GovernanceDeniedError, GovernanceResult
 from loop_controller.tool_governor import ToolGovernor
 
 T = TypeVar("T")
@@ -137,6 +137,8 @@ class GovernanceRuntime:
         task_context: str | None = None,
         session_id: str | None = None,
         task_id: str | None = None,
+        action_kind: ActionKind = "tool_call",
+        target_agent_id: str | None = None,
     ) -> Any:
         """提交工具调用并返回结果。
 
@@ -152,6 +154,8 @@ class GovernanceRuntime:
             task_context=task_context if task_context is not None else self._default_task_context,
             session_id=session_id,
             task_id=task_id,
+            action_kind=action_kind,
+            target_agent_id=target_agent_id,
         )
         if result.status == "allow":
             return result.content
@@ -262,6 +266,8 @@ _RESERVED_GOVERNANCE_KEYS = {
     "_loop_controller_session_id",
     "_loop_controller_task_id",
     "_loop_controller_task_context",
+    "_loop_controller_action_kind",
+    "_loop_controller_target_agent_id",
 }
 
 
@@ -287,6 +293,8 @@ def _make_governed_wrapper(
     *,
     tool_name: str,
     wait_for_approval: bool,
+    action_kind: ActionKind,
+    target_agent_id: str | None,
 ) -> Callable[..., Any]:
     """根据原函数是否 async，返回保持签名的治理包装函数。"""
     name = tool_name or fn.__name__
@@ -301,6 +309,8 @@ def _make_governed_wrapper(
             session_id=reserved.get("session_id"),
             task_id=reserved.get("task_id"),
             task_context=reserved.get("task_context"),
+            action_kind=reserved.get("action_kind", action_kind),
+            target_agent_id=reserved.get("target_agent_id", target_agent_id),
         )
 
     if inspect.iscoroutinefunction(fn):
@@ -337,6 +347,8 @@ def governed(  # noqa: UP047
     *,
     tool_name: str | None = None,
     wait_for_approval: bool = False,
+    action_kind: ActionKind = "tool_call",
+    target_agent_id: str | None = None,
 ) -> Callable[..., Any] | Callable[[Callable[..., T]], Callable[..., Any]]:
     """标记一个工具函数需要经过 Loop Controller 治理。
 
@@ -356,6 +368,8 @@ def governed(  # noqa: UP047
             func,
             tool_name=tool_name or func.__name__,
             wait_for_approval=wait_for_approval,
+            action_kind=action_kind,
+            target_agent_id=target_agent_id,
         )
 
     if fn is not None:

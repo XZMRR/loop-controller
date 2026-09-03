@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/loop-controller/go/internal/delegation"
 	"github.com/loop-controller/go/internal/models"
 )
 
@@ -23,6 +24,9 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
+	srv.SetR2Authorizer(&delegation.StaticR2Authorizer{
+		Decision: models.DelegationResponse{Allowed: true},
+	})
 	server := httptest.NewServer(muxFor(srv))
 	t.Cleanup(func() {
 		server.Close()

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
+import socket
 import subprocess
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -93,13 +97,61 @@ def _go_bin() -> str:
     raise RuntimeError("go executable not found in PATH")
 
 
+class _AllowIIGEHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        body = json.dumps(
+            {
+                "allowed": True,
+                "decision_id": "test-decision",
+                "task_id": payload.get("task_id", ""),
+                "reason": "test IIGE allow",
+                "protocol_version": "0.39.0",
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 @pytest.fixture(scope="module")
-def kernel_url() -> str:
-    port = 18081
+def kernel_url(tmp_path_factory: pytest.TempPathFactory) -> str:
+    port = _free_port()
+    interaction_port = _free_port()
     url = f"http://127.0.0.1:{port}"
+    interaction_server = ThreadingHTTPServer(
+        ("127.0.0.1", interaction_port), _AllowIIGEHandler
+    )
+    interaction_thread = threading.Thread(target=interaction_server.serve_forever, daemon=True)
+    interaction_thread.start()
     go_root = REPO_ROOT / "go"
+    db_path = tmp_path_factory.mktemp("go-kernel-integration") / "a2a.db"
     proc = subprocess.Popen(
-        [_go_bin(), "run", "./cmd/kernel", "-addr", f":{port}", "-secret", "test-secret"],
+        [
+            _go_bin(),
+            "run",
+            "./cmd/kernel",
+            "-addr",
+            f":{port}",
+            "-secret",
+            "test-secret",
+            "-db",
+            str(db_path),
+            "-interaction-url",
+            f"http://127.0.0.1:{interaction_port}",
+        ],
         cwd=go_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -127,6 +179,9 @@ def kernel_url() -> str:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5.0)
+    interaction_server.shutdown()
+    interaction_server.server_close()
+    interaction_thread.join(timeout=2.0)
 
 
 def _build_controller_with_bridge(audit_path: Path, bridge: GoKernelBridge) -> LoopController:

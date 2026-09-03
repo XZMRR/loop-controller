@@ -13,7 +13,7 @@ from loop_controller.go_kernel_bridge import (
 )
 from loop_controller.utils.canonical import canonical_json
 
-FIXTURE = Path(__file__).resolve().parents[1] / "contract" / "a2a_v0.37.0.json"
+FIXTURE = Path(__file__).resolve().parents[1] / "contract" / "a2a_v0.39.0.json"
 
 
 @pytest.fixture
@@ -29,12 +29,12 @@ def test_current_protocol_version_matches_fixture(contract: dict) -> None:
 @pytest.mark.parametrize(
     ("version", "should_raise"),
     [
-        ("0.37.0", False),
-        ("0.37.1", False),
-        ("0.37.99", False),
-        ("", False),
-        ("0.36.1", True),
-        ("0.38.0", True),
+        ("0.39.0", False),
+        ("0.39.1", False),
+        ("0.39.99", False),
+        ("", True),
+        ("0.38.1", True),
+        ("0.40.0", True),
         ("not-a-version", True),
     ],
 )
@@ -75,14 +75,13 @@ def test_delegation_request_roundtrip(contract: dict) -> None:
         initiator_agent_id=fixture["initiator_agent_id"],
         target_agent_id=fixture["target_agent_id"],
         tool_name=fixture["tool_name"],
-        arguments=json.loads(fixture["arguments_json"]),
+        arguments=fixture["arguments"],
         session_id=fixture["session_id"],
         task_id=fixture["task_id"],
         risk_level=fixture["risk_level"],
         protocol_version=fixture["protocol_version"],
     )
-    assert req.to_dict()["request_id"] == fixture["request_id"]
-    assert req.to_dict()["protocol_version"] == fixture["protocol_version"]
+    assert req.to_dict() == fixture
 
 
 def test_delegation_response_roundtrip(contract: dict) -> None:
@@ -93,7 +92,7 @@ def test_delegation_response_roundtrip(contract: dict) -> None:
 
 def test_delegation_response_default_protocol_version() -> None:
     resp = DelegationResponse(allowed=True)
-    assert resp.protocol_version == "0.37.0"
+    assert resp.protocol_version == "0.39.0"
 
 
 def test_task_fixture_is_canonical_and_has_stable_timestamps(contract: dict) -> None:
@@ -122,7 +121,7 @@ def test_all_roundtrip_fixtures_have_stable_canonical_json(contract: dict) -> No
 def test_error_response_fixture(contract: dict) -> None:
     fixture = contract["error_response"]
     assert fixture == {
-        "error": "protocol version 0.36.1 is incompatible",
+        "error": "protocol version 0.38.0 is incompatible",
         "code": "incompatible_protocol_version",
     }
 

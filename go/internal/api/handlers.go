@@ -40,7 +40,7 @@ type Server struct {
 // this kernel. Patch differences are allowed; major/minor differences are
 // fail-closed.
 const (
-	currentProtocolVersion = "0.37.0"
+	currentProtocolVersion = "0.39.0"
 	maxJSONBodyBytes       = 1 << 20
 )
 

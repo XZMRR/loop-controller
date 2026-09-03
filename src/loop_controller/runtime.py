@@ -116,6 +116,7 @@ class Runtime:
     persistence_status: PersistenceStatus = field(default_factory=PersistenceStatus)
     go_kernel_bridge: GoKernelBridge | None = None  # v0.36.0 A2A 交互治理桥接
     local_agent_config: dict[str, Any] = field(default_factory=dict)
+    config: AppConfig | None = None
 
     def require_execution_ready(self) -> None:
         if self.persistence_status.status not in {"healthy", "tail_repaired"}:
@@ -663,4 +664,5 @@ def build_runtime(
         local_agent_config=dict(
             config.go_kernel_config.get("go_kernel", {}).get("local_agent", {})
         ),
+        config=config,
     )
