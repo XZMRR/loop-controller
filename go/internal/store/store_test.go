@@ -121,13 +121,13 @@ func TestLifecycleOutboxIsTransactionalAndRetries(t *testing.T) {
 	if err := dispatcher.RunOnce(context.Background(), now); err != nil {
 		t.Fatalf("first dispatch: %v", err)
 	}
-	if due, err := outbox.ListDue(context.Background(), now, 10); err != nil || len(due) != 0 {
+	if due, err := outbox.ClaimDue(context.Background(), now, time.Minute, 10); err != nil || len(due) != 0 {
 		t.Fatalf("outbox should wait for retry: due=%+v err=%v", due, err)
 	}
 	if err := dispatcher.RunOnce(context.Background(), now.Add(time.Second)); err != nil {
 		t.Fatalf("retry dispatch: %v", err)
 	}
-	if due, err := outbox.ListDue(context.Background(), now.Add(time.Hour), 10); err != nil || len(due) != 0 {
+	if due, err := outbox.ClaimDue(context.Background(), now.Add(time.Hour), time.Minute, 10); err != nil || len(due) != 0 {
 		t.Fatalf("outbox should be delivered: due=%+v err=%v", due, err)
 	}
 	if auditor.calls != 2 || len(auditor.tasks) != 2 {
@@ -158,6 +158,62 @@ func TestLifecycleOutboxFailureRollsBackTaskTransition(t *testing.T) {
 	got, err := db.TaskStore().Get(context.Background(), task.TaskID)
 	if err != nil || got.Status != "pending" {
 		t.Fatalf("transition was not rolled back: task=%+v err=%v", got, err)
+	}
+}
+
+func TestLifecycleOutboxClaimIsExclusiveAcrossInstances(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a2a.db")
+	dbA, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open store A: %v", err)
+	}
+	defer dbA.Close()
+	dbB, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open store B: %v", err)
+	}
+	defer dbB.Close()
+
+	now := time.Now().UTC()
+	task := models.Task{
+		TaskID: "task-outbox-exclusive", SessionID: "session-1", InteractionID: "int-1", DecisionID: "dec-1",
+		InitiatorAgentID: "agent-a", TargetAgentID: "agent-b", Status: "pending", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := dbA.TaskStore().Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if _, _, err := dbA.TaskStore().UpdateStatus(context.Background(), task.TaskID, "pending", "accepted", nil, ""); err != nil {
+		t.Fatalf("accept task: %v", err)
+	}
+
+	storeA := dbA.LifecycleOutboxStore()
+	storeB := dbB.LifecycleOutboxStore()
+
+	claimedA, err := storeA.ClaimDue(context.Background(), now.Add(time.Second), time.Minute, 10)
+	if err != nil {
+		t.Fatalf("claim A: %v", err)
+	}
+	if len(claimedA) != 1 {
+		t.Fatalf("instance A claimed %d items, want 1", len(claimedA))
+	}
+
+	claimedB, err := storeB.ClaimDue(context.Background(), now.Add(time.Second), time.Minute, 10)
+	if err != nil {
+		t.Fatalf("claim B: %v", err)
+	}
+	if len(claimedB) != 0 {
+		t.Fatalf("instance B double-claimed %d items, want 0: %+v", len(claimedB), claimedB)
+	}
+
+	if err := storeA.MarkDelivered(context.Background(), claimedA[0].ID, now.Add(time.Second)); err != nil {
+		t.Fatalf("mark delivered: %v", err)
+	}
+	claimedB, err = storeB.ClaimDue(context.Background(), now.Add(2*time.Second), time.Minute, 10)
+	if err != nil {
+		t.Fatalf("claim B after deliver: %v", err)
+	}
+	if len(claimedB) != 0 {
+		t.Fatalf("delivered item was re-claimed: %+v", claimedB)
 	}
 }
 
@@ -498,5 +554,141 @@ func TestOpenCreatesMissingDirectory(t *testing.T) {
 	defer db.Close()
 	if db.Path() == "" {
 		t.Fatal("expected non-empty db path")
+	}
+}
+
+func seedRunningTask(t *testing.T, ts TaskStore, taskID string) {
+	t.Helper()
+	now := time.Now().UTC()
+	task := models.Task{
+		TaskID: taskID, SessionID: "session-1",
+		InitiatorAgentID: "agent-a", TargetAgentID: "agent-b", Status: "pending",
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := ts.Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if _, _, err := ts.UpdateStatus(context.Background(), taskID, "pending", "accepted", nil, ""); err != nil {
+		t.Fatalf("accept task: %v", err)
+	}
+	if _, _, err := ts.UpdateStatus(context.Background(), taskID, "accepted", "running", nil, ""); err != nil {
+		t.Fatalf("run task: %v", err)
+	}
+}
+
+func TestExecutionLeaseSetOnRunning(t *testing.T) {
+	db := openTestDB(t)
+	seedRunningTask(t, db.TaskStore(), "task-lease-001")
+
+	var owner string
+	var expiresAt int64
+	if err := db.QueryRowContext(context.Background(), `SELECT exec_owner, exec_lease_expires_at FROM tasks WHERE task_id = ?`, "task-lease-001").Scan(&owner, &expiresAt); err != nil {
+		t.Fatalf("query lease: %v", err)
+	}
+	if owner == "" {
+		t.Error("exec_owner should be set when a task enters running")
+	}
+	if expiresAt <= 0 {
+		t.Error("exec_lease_expires_at should be positive when a task enters running")
+	}
+}
+
+func TestRenewExecutionLease(t *testing.T) {
+	db := openTestDB(t)
+	ts := db.TaskStore()
+	seedRunningTask(t, ts, "task-lease-renew")
+
+	var before int64
+	if err := db.QueryRowContext(context.Background(), `SELECT exec_lease_expires_at FROM tasks WHERE task_id = ?`, "task-lease-renew").Scan(&before); err != nil {
+		t.Fatalf("query lease before: %v", err)
+	}
+	if err := ts.RenewExecutionLease(context.Background(), "task-lease-renew"); err != nil {
+		t.Fatalf("renew lease: %v", err)
+	}
+	var after int64
+	if err := db.QueryRowContext(context.Background(), `SELECT exec_lease_expires_at FROM tasks WHERE task_id = ?`, "task-lease-renew").Scan(&after); err != nil {
+		t.Fatalf("query lease after: %v", err)
+	}
+	if after <= before {
+		t.Errorf("exec_lease_expires_at = %d, want > %d", after, before)
+	}
+}
+
+func TestRecoverExpiredRunning(t *testing.T) {
+	db := openTestDB(t)
+	ts := db.TaskStore()
+	seedRunningTask(t, ts, "task-recover")
+
+	expired := time.Now().Add(-time.Minute).UnixNano()
+	if _, err := db.ExecContext(context.Background(), `UPDATE tasks SET exec_lease_expires_at = ? WHERE task_id = ?`, expired, "task-recover"); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+
+	recovered, err := ts.RecoverExpiredRunning(context.Background(), time.Now().UTC(), 10)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if len(recovered) != 1 {
+		t.Fatalf("recovered = %d, want 1", len(recovered))
+	}
+	if recovered[0].TaskID != "task-recover" || recovered[0].Status != "outcome_unknown" {
+		t.Fatalf("unexpected recovered task: %+v", recovered[0])
+	}
+
+	events, err := db.EventStore().ListAfter(context.Background(), "task-recover", "")
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if len(events) == 0 || events[len(events)-1].EventType != "task_outcome_unknown" {
+		t.Fatalf("recovery event missing: %+v", events)
+	}
+}
+
+func TestRecoverExpiredRunningIsExclusiveAcrossInstances(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a2a.db")
+	dbA, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open store A: %v", err)
+	}
+	defer dbA.Close()
+	dbB, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open store B: %v", err)
+	}
+	defer dbB.Close()
+
+	seedRunningTask(t, dbA.TaskStore(), "task-recover-exclusive")
+	expired := time.Now().Add(-time.Minute).UnixNano()
+	if _, err := dbA.ExecContext(context.Background(), `UPDATE tasks SET exec_lease_expires_at = ? WHERE task_id = ?`, expired, "task-recover-exclusive"); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	total := 0
+	errs := make(chan error, 2)
+	for _, ts := range []TaskStore{dbA.TaskStore(), dbB.TaskStore()} {
+		wg.Add(1)
+		go func(ts TaskStore) {
+			defer wg.Done()
+			recovered, err := ts.RecoverExpiredRunning(context.Background(), time.Now().UTC(), 10)
+			if err != nil {
+				errs <- err
+				return
+			}
+			mu.Lock()
+			total += len(recovered)
+			mu.Unlock()
+		}(ts)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("recover across instances: %v", err)
+		}
+	}
+	if total != 1 {
+		t.Fatalf("recovered total = %d, want exactly 1", total)
 	}
 }

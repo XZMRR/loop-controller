@@ -65,7 +65,7 @@ func TestInteractionLifecycleCarriesDecisionAndTaskLinkage(t *testing.T) {
 	if _, err := tasks.UpdateStatus(resp.TaskID, "accepted"); err != nil {
 		t.Fatalf("accept: %v", err)
 	}
-	items, err := db.LifecycleOutboxStore().ListDue(context.Background(), time.Now().UTC().Add(time.Second), 10)
+	items, err := db.LifecycleOutboxStore().ClaimDue(context.Background(), time.Now().UTC().Add(time.Second), time.Minute, 10)
 	if err != nil {
 		t.Fatalf("list lifecycle outbox: %v", err)
 	}

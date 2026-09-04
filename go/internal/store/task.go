@@ -37,11 +37,27 @@ type TaskStore interface {
 	SetDelegationToken(ctx context.Context, taskID, delegationToken string) error
 	ListBySession(ctx context.Context, sessionID string) ([]models.Task, error)
 	ListByTarget(ctx context.Context, targetAgentID string) ([]models.Task, error)
+	// RenewExecutionLease extends the lease of a running task owned by this
+	// instance, preventing another instance from reclaiming a still-alive run.
+	RenewExecutionLease(ctx context.Context, taskID string) error
+	// RecoverExpiredRunning transitions running tasks whose lease expired to
+	// outcome_unknown. Each transition is an atomic compare-and-set guarded by
+	// the lease expiry, so concurrent instances cannot double-recover a task.
+	RecoverExpiredRunning(ctx context.Context, now time.Time, limit int) ([]models.Task, error)
 }
 
 type taskStore struct {
 	db      *sql.DB
+	owner   string
+	lease   *time.Duration
 	counter uint64
+}
+
+func (s *taskStore) leaseDuration() time.Duration {
+	if s.lease == nil || *s.lease <= 0 {
+		return defaultExecutionLease
+	}
+	return *s.lease
 }
 
 func (s *taskStore) Create(ctx context.Context, t models.Task) error {
@@ -59,8 +75,8 @@ func (s *taskStore) CreateWithEvent(ctx context.Context, t models.Task) (models.
 		return models.TaskEvent{}, fmt.Errorf("marshal task event payload: %w", err)
 	}
 	event := models.TaskEvent{
-		ProtocolVersion: "0.40.0",
-		EventID:         fmt.Sprintf("ev-%s-%d-%d", t.TaskID, t.CreatedAt.UnixNano(), atomic.AddUint64(&s.counter, 1)),
+		ProtocolVersion: models.CurrentProtocolVersion,
+		EventID:         fmt.Sprintf("ev-%s-%s-%d-%d", s.owner, t.TaskID, t.CreatedAt.UnixNano(), atomic.AddUint64(&s.counter, 1)),
 		TaskID:          t.TaskID,
 		EventType:       "task_created",
 		Payload:         payload,
@@ -143,11 +159,15 @@ func (s *taskStore) UpdateStatus(ctx context.Context, taskID, expectedStatus, st
 		return models.Task{}, models.TaskEvent{}, fmt.Errorf("begin task transition: %w", err)
 	}
 	defer tx.Rollback()
+	leaseExpiresAt := now.Add(s.leaseDuration()).UnixNano()
 	res, err := tx.ExecContext(ctx, `
 		UPDATE tasks
-		SET status = ?, updated_at = ?, completed_at = COALESCE(?, completed_at), outcome = COALESCE(?, outcome), error_code = CASE WHEN ? = '' THEN error_code ELSE ? END
+		SET status = ?, updated_at = ?, completed_at = COALESCE(?, completed_at), outcome = COALESCE(?, outcome), error_code = CASE WHEN ? = '' THEN error_code ELSE ? END,
+		    exec_owner = CASE WHEN ? = 'running' THEN ? ELSE exec_owner END,
+		    exec_lease_expires_at = CASE WHEN ? = 'running' THEN ? ELSE exec_lease_expires_at END
 		WHERE task_id = ? AND status = ?
-	`, status, now.Format(time.RFC3339), completedAt, outcomeStr, errorCode, errorCode, taskID, expectedStatus)
+	`, status, now.Format(time.RFC3339), completedAt, outcomeStr, errorCode, errorCode,
+		status, s.owner, status, leaseExpiresAt, taskID, expectedStatus)
 	if err != nil {
 		return models.Task{}, models.TaskEvent{}, fmt.Errorf("update task status: %w", err)
 	}
@@ -171,7 +191,7 @@ func (s *taskStore) UpdateStatus(ctx context.Context, taskID, expectedStatus, st
 	}
 	event := models.TaskEvent{
 		ProtocolVersion: models.CurrentProtocolVersion,
-		EventID:         fmt.Sprintf("ev-%s-%d-%d", taskID, now.UnixNano(), atomic.AddUint64(&s.counter, 1)),
+		EventID:         fmt.Sprintf("ev-%s-%s-%d-%d", s.owner, taskID, now.UnixNano(), atomic.AddUint64(&s.counter, 1)),
 		TaskID:          taskID,
 		EventType:       eventTypeForStatus(status),
 		Payload:         payload,
@@ -221,6 +241,129 @@ func (s *taskStore) SetDelegationToken(ctx context.Context, taskID, delegationTo
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// RenewExecutionLease extends this instance's lease on a running task. It is a
+// no-op when the task is no longer running or is owned by another instance.
+func (s *taskStore) RenewExecutionLease(ctx context.Context, taskID string) error {
+	now := time.Now().UTC()
+	leaseExpiresAt := now.Add(s.leaseDuration()).UnixNano()
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET exec_lease_expires_at = ?, updated_at = ?
+		WHERE task_id = ? AND status = 'running' AND exec_owner = ?
+	`, leaseExpiresAt, now.Format(time.RFC3339), taskID, s.owner); err != nil {
+		return fmt.Errorf("renew execution lease: %w", err)
+	}
+	return nil
+}
+
+// RecoverExpiredRunning transitions running tasks whose lease has expired to
+// outcome_unknown. Only the lease-expiry guard can win a transition, so
+// concurrent recovery by multiple instances cannot double-recover a task.
+func (s *taskStore) RecoverExpiredRunning(ctx context.Context, now time.Time, limit int) ([]models.Task, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT task_id FROM tasks
+		WHERE status = 'running'
+		  AND exec_owner != ''
+		  AND exec_lease_expires_at > 0
+		  AND exec_lease_expires_at < ?
+		ORDER BY exec_lease_expires_at ASC
+		LIMIT ?
+	`, now.UnixNano(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list expired running tasks: %w", err)
+	}
+	var taskIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan expired task id: %w", err)
+		}
+		taskIDs = append(taskIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate expired task ids: %w", err)
+	}
+	rows.Close()
+
+	recovered := make([]models.Task, 0, len(taskIDs))
+	for _, taskID := range taskIDs {
+		t, err := s.recoverOne(ctx, taskID, now)
+		if err != nil {
+			return recovered, err
+		}
+		if t != nil {
+			recovered = append(recovered, *t)
+		}
+	}
+	return recovered, nil
+}
+
+func (s *taskStore) recoverOne(ctx context.Context, taskID string, now time.Time) (*models.Task, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin recovery: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE tasks
+		SET status = 'outcome_unknown', updated_at = ?
+		WHERE task_id = ? AND status = 'running'
+		  AND exec_owner != ''
+		  AND exec_lease_expires_at > 0
+		  AND exec_lease_expires_at < ?
+	`, now.Format(time.RFC3339), taskID, now.UnixNano())
+	if err != nil {
+		return nil, fmt.Errorf("recover task status: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("recovery rows affected: %w", err)
+	}
+	if n == 0 {
+		// The lease was renewed, or another instance already recovered it.
+		return nil, nil
+	}
+
+	updated, err := scanTask(tx.QueryRowContext(ctx, `
+		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token
+		FROM tasks WHERE task_id = ?
+	`, taskID))
+	if err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(updated)
+	if err != nil {
+		return nil, fmt.Errorf("marshal recovered task event payload: %w", err)
+	}
+	event := models.TaskEvent{
+		ProtocolVersion: models.CurrentProtocolVersion,
+		EventID:         fmt.Sprintf("ev-%s-%s-%d-%d", s.owner, taskID, now.UnixNano(), atomic.AddUint64(&s.counter, 1)),
+		TaskID:          taskID,
+		EventType:       eventTypeForStatus("outcome_unknown"),
+		Payload:         payload,
+		PublishedAt:     now,
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO events (event_id, task_id, event_type, payload_json, published_at, published)
+		VALUES (?, ?, ?, ?, ?, 0)
+	`, event.EventID, event.TaskID, event.EventType, string(event.Payload), event.PublishedAt.Format(time.RFC3339)); err != nil {
+		return nil, fmt.Errorf("insert recovery event: %w", err)
+	}
+	if err := insertLifecycleOutbox(ctx, tx, updated, "outcome_unknown", now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit recovery: %w", err)
+	}
+	return &updated, nil
 }
 
 func (s *taskStore) ListBySession(ctx context.Context, sessionID string) ([]models.Task, error) {

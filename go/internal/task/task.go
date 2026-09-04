@@ -37,14 +37,22 @@ type LifecycleAuditor interface {
 }
 
 type Manager struct {
-	store   store.TaskStore
-	fanout  EventFanout
-	auditor LifecycleAuditor
+	store      store.TaskStore
+	fanout     EventFanout
+	auditor    LifecycleAuditor
+	instanceID string
 }
 
 // New creates a Manager backed by the given store.
 func New(s store.TaskStore) *Manager {
 	return &Manager{store: s}
+}
+
+// WithInstanceID sets the owning kernel instance identity used to prefix
+// generated task IDs, keeping them unique across instances sharing a store.
+func (m *Manager) WithInstanceID(id string) *Manager {
+	m.instanceID = id
+	return m
 }
 
 // WithEventFanout delivers task events after their transaction commits.
@@ -85,7 +93,7 @@ func (m *Manager) CreateInteraction(sessionID, initiatorAgentID, targetAgentID, 
 	now := time.Now().UTC()
 	task := models.Task{
 		ProtocolVersion:     models.CurrentProtocolVersion,
-		TaskID:              generateID(),
+		TaskID:              m.generateID(),
 		SessionID:           sessionID,
 		InteractionID:       interactionID,
 		DecisionID:          decisionID,
@@ -167,6 +175,35 @@ func (m *Manager) SetDelegationToken(taskID, delegationToken string) error {
 	return nil
 }
 
+// RenewExecutionLease extends the execution lease of a running task owned by
+// this instance so a still-alive run is not reclaimed by a sibling instance.
+func (m *Manager) RenewExecutionLease(ctx context.Context, taskID string) error {
+	return m.store.RenewExecutionLease(ctx, taskID)
+}
+
+// RecoverExpiredRunning transitions running tasks whose execution lease expired
+// to outcome_unknown. Each transition is guarded by an atomic lease-expiry
+// compare-and-set, so concurrent instances cannot double-recover a task. The
+// recovery events are already persisted in the shared event store; this only
+// wakes in-process SSE subscribers to read them.
+func (m *Manager) RecoverExpiredRunning(ctx context.Context, now time.Time, limit int) ([]models.Task, error) {
+	recovered, err := m.store.RecoverExpiredRunning(ctx, now, limit)
+	if err != nil {
+		return recovered, err
+	}
+	if m.fanout != nil {
+		for _, t := range recovered {
+			m.fanout.PublishCommitted(models.TaskEvent{
+				ProtocolVersion: models.CurrentProtocolVersion,
+				TaskID:          t.TaskID,
+				EventType:       "task_outcome_unknown",
+				PublishedAt:     now,
+			})
+		}
+	}
+	return recovered, nil
+}
+
 // CreateWithID creates a new task with the supplied identifiers. It is used by
 // the entrypoint when the task record does not yet exist locally.
 func (m *Manager) CreateWithID(taskID, sessionID, initiatorAgentID, targetAgentID string) (models.Task, error) {
@@ -226,7 +263,10 @@ func expectedStatusFor(status string) (string, bool) {
 	return "", false
 }
 
-func generateID() string {
+func (m *Manager) generateID() string {
 	now := time.Now().UTC()
-	return fmt.Sprintf("task-%s-%d", now.Format("20060102-150405"), now.UnixNano())
+	if m.instanceID == "" {
+		return fmt.Sprintf("task-%s-%d", now.Format("20060102-150405"), now.UnixNano())
+	}
+	return fmt.Sprintf("task-%s-%s-%d", m.instanceID, now.Format("20060102-150405"), now.UnixNano())
 }

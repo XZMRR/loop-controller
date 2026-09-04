@@ -107,7 +107,7 @@ class _AllowIIGEHandler(BaseHTTPRequestHandler):
                 "decision_id": "test-decision",
                 "task_id": payload.get("task_id", ""),
                 "reason": "test IIGE allow",
-                "protocol_version": "0.40.0",
+                "protocol_version": "0.41.0",
             }
         ).encode()
         self.send_response(200)

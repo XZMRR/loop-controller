@@ -44,6 +44,7 @@ type Server struct {
 	executionsMu     sync.Mutex
 	executions       map[string]execution.Handle
 	outboxCancel     context.CancelFunc
+	recoveryCancel   context.CancelFunc
 }
 
 // currentProtocolVersion is the A2A HTTP/JSON protocol version implemented by
@@ -99,13 +100,13 @@ func NewServer(secret []byte, dbPath string, providers ...discovery.AgentDiscove
 		return nil, fmt.Errorf("open store: %w", err)
 	}
 	reg := registry.New()
-	pub := stream.NewPublisher(db.EventStore())
-	tasks := task.New(db.TaskStore()).WithEventFanout(pub)
+	pub := stream.NewPublisher(db.EventStore()).WithInstanceID(db.InstanceID())
+	tasks := task.New(db.TaskStore()).WithEventFanout(pub).WithInstanceID(db.InstanceID())
 	r := router.New(reg)
 	issuer := token.NewHMACIssuer(secret)
 	d := delegation.New(reg, tasks, issuer, pub, 5*time.Minute)
 	mgr := discovery.NewManager(reg, providers...)
-	return &Server{
+	srv := &Server{
 		registry:    reg,
 		tasks:       tasks,
 		router:      r,
@@ -117,7 +118,35 @@ func NewServer(secret []byte, dbPath string, providers ...discovery.AgentDiscove
 		messages:    db.MessageStore(),
 		idempotency: db.IdempotencyStore(),
 		executions:  make(map[string]execution.Handle),
-	}, nil
+	}
+	srv.startRecoveryLoop()
+	return srv, nil
+}
+
+// startRecoveryLoop periodically reclaims running tasks whose execution lease
+// expired, which typically means the owning instance crashed or lost contact.
+func (s *Server) startRecoveryLoop() {
+	interval := s.db.ExecutionLease() / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.recoveryCancel = cancel
+	go s.runRecoveryLoop(ctx, interval)
+}
+
+func (s *Server) runRecoveryLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Recovery is best-effort; a transient error is retried next tick.
+			_, _ = s.tasks.RecoverExpiredRunning(ctx, time.Now().UTC(), 100)
+		}
+	}
 }
 
 // SetR2Authorizer injects an interaction authorizer into the delegator.
@@ -148,6 +177,10 @@ func (s *Server) SetTargetExecutor(executor execution.TargetExecutor) {
 
 // Close releases database resources held by the server.
 func (s *Server) Close() error {
+	if s.recoveryCancel != nil {
+		s.recoveryCancel()
+		s.recoveryCancel = nil
+	}
 	if s.outboxCancel != nil {
 		s.outboxCancel()
 		s.outboxCancel = nil
@@ -722,7 +755,7 @@ func (s *Server) executionRequest(ctx context.Context, t models.Task) (execution
 }
 
 func (s *Server) finishExecution(taskID string, handle execution.Handle) {
-	result, ok := <-handle.Done()
+	result, ok := s.awaitExecution(taskID, handle)
 	s.executionsMu.Lock()
 	if s.executions[taskID] == handle {
 		delete(s.executions, taskID)
@@ -736,6 +769,28 @@ func (s *Server) finishExecution(taskID string, handle execution.Handle) {
 		return
 	}
 	_, _ = s.tasks.Complete(taskID, result.Status, result.Outcome, result.ErrorCode)
+}
+
+// awaitExecution waits for an execution result while periodically renewing the
+// task's execution lease, so a long-running execution is not reclaimed by the
+// recovery loop of a sibling instance.
+func (s *Server) awaitExecution(taskID string, handle execution.Handle) (execution.Result, bool) {
+	interval := s.db.ExecutionLease() / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case result, ok := <-handle.Done():
+			return result, ok
+		case <-ticker.C:
+			if err := s.tasks.RenewExecutionLease(context.Background(), taskID); err != nil {
+				return execution.Result{}, false
+			}
+		}
+	}
 }
 
 func (s *Server) handleEntrypointGet(w http.ResponseWriter, r *http.Request) {

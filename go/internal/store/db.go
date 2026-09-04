@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/loop-controller/go/internal/instance"
 	_ "modernc.org/sqlite"
 )
 
@@ -28,7 +30,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at TEXT,
     outcome TEXT,
     error_code TEXT,
-    delegation_token TEXT NOT NULL DEFAULT ''
+    delegation_token TEXT NOT NULL DEFAULT '',
+    exec_owner TEXT NOT NULL DEFAULT '',
+    exec_lease_expires_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_target ON tasks(target_agent_id);
@@ -66,6 +70,8 @@ CREATE TABLE IF NOT EXISTS lifecycle_outbox (
     next_attempt_at TEXT NOT NULL,
     delivered_at TEXT,
     last_error TEXT,
+    claimed_by TEXT NOT NULL DEFAULT '',
+    claim_expires_at INTEGER NOT NULL DEFAULT 0,
     UNIQUE(task_id, event)
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_outbox_pending ON lifecycle_outbox(delivered_at, next_attempt_at, outbox_id);
@@ -86,10 +92,16 @@ CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_a
 // DefaultDBPath is used when no explicit database path is provided.
 const DefaultDBPath = "./data/a2a.db"
 
+// defaultExecutionLease is how long an instance owns a running task before the
+// lease is considered expired and eligible for failover recovery.
+const defaultExecutionLease = time.Minute
+
 // DB wraps a sql.DB with the Loop Controller schema.
 type DB struct {
 	*sql.DB
-	path string
+	path           string
+	instanceID     string
+	executionLease time.Duration
 }
 
 // Open opens the SQLite database at path, creating the directory and schema
@@ -107,19 +119,16 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", abs)
+	// The DSN pragmas below are applied to every pooled connection, unlike a
+	// one-shot PRAGMA statement which only affects the single connection that
+	// ran it. Multiple kernel instances may share the same SQLite file, so
+	// foreign_keys and busy_timeout must hold for all connections.
+	dsn := abs + "?_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=ON"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 
-	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("enable foreign keys: %w", err)
-	}
-	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode = WAL"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("set wal mode: %w", err)
-	}
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
@@ -130,7 +139,19 @@ func Open(ctx context.Context, path string) (*DB, error) {
 			return nil, err
 		}
 	}
-	return &DB{DB: db, path: abs}, nil
+	for _, column := range []string{"exec_owner", "exec_lease_expires_at"} {
+		if err := ensureTaskColumn(ctx, db, column); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	for _, column := range []string{"claimed_by", "claim_expires_at"} {
+		if err := ensureOutboxColumn(ctx, db, column); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	return &DB{DB: db, path: abs, instanceID: instance.New().String(), executionLease: defaultExecutionLease}, nil
 }
 
 func ensureTaskTextColumn(ctx context.Context, db *sql.DB, column string) error {
@@ -160,11 +181,77 @@ func ensureTaskTextColumn(ctx context.Context, db *sql.DB, column string) error 
 	return nil
 }
 
+// ensureColumn adds a column to a table if it is absent. decl must be a full
+// SQLite column declaration such as "TEXT NOT NULL DEFAULT ''".
+func ensureColumn(ctx context.Context, db *sql.DB, table, column, decl string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return fmt.Errorf("inspect %s schema: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan %s schema: %w", table, err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect %s schema: %w", table, err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+decl); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+func ensureTaskColumn(ctx context.Context, db *sql.DB, column string) error {
+	switch column {
+	case "exec_owner":
+		return ensureColumn(ctx, db, "tasks", column, "TEXT NOT NULL DEFAULT ''")
+	case "exec_lease_expires_at":
+		return ensureColumn(ctx, db, "tasks", column, "INTEGER NOT NULL DEFAULT 0")
+	}
+	return ensureColumn(ctx, db, "tasks", column, "TEXT NOT NULL DEFAULT ''")
+}
+
+func ensureOutboxColumn(ctx context.Context, db *sql.DB, column string) error {
+	switch column {
+	case "claimed_by":
+		return ensureColumn(ctx, db, "lifecycle_outbox", column, "TEXT NOT NULL DEFAULT ''")
+	case "claim_expires_at":
+		return ensureColumn(ctx, db, "lifecycle_outbox", column, "INTEGER NOT NULL DEFAULT 0")
+	}
+	return ensureColumn(ctx, db, "lifecycle_outbox", column, "TEXT NOT NULL DEFAULT ''")
+}
+
 // Path returns the resolved filesystem path of the database.
 func (db *DB) Path() string { return db.path }
 
+// InstanceID returns this process's unique kernel instance identity.
+func (db *DB) InstanceID() string { return db.instanceID }
+
+// ExecutionLease returns how long an instance owns a running task.
+func (db *DB) ExecutionLease() time.Duration { return db.executionLease }
+
+// SetExecutionLease overrides the execution lease duration. It must be called
+// before any task starts running; existing task stores share the value by
+// reference, so late changes also affect them.
+func (db *DB) SetExecutionLease(d time.Duration) {
+	if d > 0 {
+		db.executionLease = d
+	}
+}
+
 // TaskStore returns a store backed by the underlying database.
-func (db *DB) TaskStore() TaskStore { return &taskStore{db: db.DB} }
+func (db *DB) TaskStore() TaskStore {
+	return &taskStore{db: db.DB, owner: db.instanceID, lease: &db.executionLease}
+}
 
 // MessageStore returns a store backed by the underlying database.
 func (db *DB) MessageStore() MessageStore { return &messageStore{db: db.DB} }
@@ -173,7 +260,9 @@ func (db *DB) MessageStore() MessageStore { return &messageStore{db: db.DB} }
 func (db *DB) EventStore() EventStore { return &eventStore{db: db.DB} }
 
 // LifecycleOutboxStore returns a durable lifecycle delivery outbox.
-func (db *DB) LifecycleOutboxStore() LifecycleOutboxStore { return &lifecycleOutboxStore{db: db.DB} }
+func (db *DB) LifecycleOutboxStore() LifecycleOutboxStore {
+	return &lifecycleOutboxStore{db: db.DB, owner: db.instanceID}
+}
 
 // IdempotencyStore returns a store backed by the underlying database.
 func (db *DB) IdempotencyStore() IdempotencyStore { return &idempotencyStore{db: db.DB} }
