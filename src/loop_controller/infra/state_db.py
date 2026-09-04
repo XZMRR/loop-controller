@@ -167,6 +167,26 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 CREATE INDEX IF NOT EXISTS idx_reports_session ON reports(session_id);
 CREATE INDEX IF NOT EXISTS idx_reports_task ON reports(task_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_task_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_agent ON sessions(user_id, agent_id);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    message_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
 """
 
 
@@ -1281,6 +1301,249 @@ class StateDatabase:
                 return [self._report_row_to_dict(row) for row in cur.fetchall()]
         except sqlite3.Error as exc:
             raise StateDatabaseError(f"枚举报告失败: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Session
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _session_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "session_id": row["session_id"],
+            "user_id": row["user_id"],
+            "agent_id": row["agent_id"],
+            "created_at": row["created_at"],
+            "last_task_at": row["last_task_at"],
+            "active": bool(row["active"]),
+        }
+
+    def save_session(self, session: dict[str, Any]) -> None:
+        """保存/更新 session；拒绝已关闭 session 的重新激活。"""
+        session_id = session["session_id"]
+        active = 1 if session["active"] else 0
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    cur = conn.execute(
+                        "SELECT active FROM sessions WHERE session_id = ?",
+                        (session_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is not None and not row["active"] and active:
+                        raise StateDatabaseError(f"session {session_id} 已结束")
+                    conn.execute(
+                        """
+                        INSERT INTO sessions (
+                            session_id, user_id, agent_id, created_at, last_task_at, active
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            user_id = excluded.user_id,
+                            agent_id = excluded.agent_id,
+                            created_at = excluded.created_at,
+                            last_task_at = excluded.last_task_at,
+                            active = excluded.active
+                        """,
+                        (
+                            session_id,
+                            session["user_id"],
+                            session["agent_id"],
+                            session["created_at"],
+                            session["last_task_at"],
+                            active,
+                        ),
+                    )
+        except StateDatabaseError:
+            raise
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"保存 session 失败: {exc}") from exc
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                return self._session_row_to_dict(row) if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询 session 失败: {exc}") from exc
+
+    def get_active_session(self, user_id: str, agent_id: str) -> dict[str, Any] | None:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM sessions WHERE user_id = ? AND agent_id = ? AND active = 1 "
+                    "ORDER BY rowid DESC LIMIT 1",
+                    (user_id, agent_id),
+                )
+                row = cur.fetchone()
+                return self._session_row_to_dict(row) if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询活跃 session 失败: {exc}") from exc
+
+    def touch_session(
+        self,
+        session_id: str,
+        last_task_at: str,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    cur = conn.execute(
+                        "SELECT * FROM sessions WHERE session_id = ?",
+                        (session_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise StateDatabaseError(f"session {session_id} 不存在")
+                    if not row["active"]:
+                        raise StateDatabaseError(f"session {session_id} 已结束")
+                    if user_id is not None and (
+                        row["user_id"] != user_id or row["agent_id"] != agent_id
+                    ):
+                        raise StateDatabaseError(
+                            f"session {session_id} 绑定 ({row['user_id']}, {row['agent_id']}) "
+                            f"与 task 的 ({user_id}, {agent_id}) 不一致"
+                        )
+                    conn.execute(
+                        "UPDATE sessions SET last_task_at = ? WHERE session_id = ?",
+                        (last_task_at, session_id),
+                    )
+                    updated = conn.execute(
+                        "SELECT * FROM sessions WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    return self._session_row_to_dict(updated)
+        except StateDatabaseError:
+            raise
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"刷新 session 失败: {exc}") from exc
+
+    def close_session(self, session_id: str) -> dict[str, Any]:
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    cur = conn.execute(
+                        "SELECT * FROM sessions WHERE session_id = ?",
+                        (session_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise StateDatabaseError(f"session {session_id} 不存在")
+                    if row["active"]:
+                        conn.execute(
+                            "UPDATE sessions SET active = 0 WHERE session_id = ?",
+                            (session_id,),
+                        )
+                    updated = conn.execute(
+                        "SELECT * FROM sessions WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    return self._session_row_to_dict(updated)
+        except StateDatabaseError:
+            raise
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"关闭 session 失败: {exc}") from exc
+
+    def get_or_create_active_session(
+        self,
+        user_id: str,
+        agent_id: str,
+        now_iso: str,
+        timeout_seconds: float,
+        new_session: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    cur = conn.execute(
+                        "SELECT * FROM sessions WHERE user_id = ? AND agent_id = ? AND active = 1 "
+                        "ORDER BY rowid DESC LIMIT 1",
+                        (user_id, agent_id),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        last_task_at = datetime.fromisoformat(row["last_task_at"])
+                        now = datetime.fromisoformat(now_iso)
+                        if (now - last_task_at).total_seconds() <= timeout_seconds:
+                            return self._session_row_to_dict(row)
+                    conn.execute(
+                        """
+                        INSERT INTO sessions (
+                            session_id, user_id, agent_id, created_at, last_task_at, active
+                        ) VALUES (?, ?, ?, ?, ?, 1)
+                        """,
+                        (
+                            new_session["session_id"],
+                            user_id,
+                            agent_id,
+                            new_session["created_at"],
+                            new_session["last_task_at"],
+                        ),
+                    )
+                    return dict(new_session)
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"创建或复用 session 失败: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Conversation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _conversation_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "message_id": row["message_id"],
+            "session_id": row["session_id"],
+            "task_id": row["task_id"],
+            "role": row["role"],
+            "content": row["content"],
+            "created_at": row["created_at"],
+        }
+
+    def save_message(self, message: dict[str, Any]) -> None:
+        try:
+            with self._connect() as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO conversations (
+                            message_id, session_id, task_id, role, content, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            message["message_id"],
+                            message["session_id"],
+                            message["task_id"],
+                            message["role"],
+                            message["content"],
+                            message["created_at"],
+                        ),
+                    )
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"保存会话消息失败: {exc}") from exc
+
+    def list_messages(self, session_id: str, limit: int) -> list[dict[str, Any]]:
+        """返回指定 session 的最近 ``limit`` 条消息（按插入顺序）。"""
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    SELECT * FROM conversations
+                    WHERE session_id = ?
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                    """,
+                    (session_id, limit),
+                )
+                rows = list(cur.fetchall())
+                rows.reverse()
+                return [self._conversation_row_to_dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举会话消息失败: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Migration helpers

@@ -14,7 +14,7 @@ go_kernel:
     entrypoint: "http://127.0.0.1:8000"
     capabilities:
       - "delegate_execution"
-    version: "0.44.0"
+    version: "0.45.0"
   # Go Kernel 非开发模式必须通过 -secret 或 GO_KERNEL_TOKEN_SECRET 注入密钥；
   # 本地开发需显式使用 -development，此时会禁用正式 HTTP entrypoint 派发。
   token_secret_env: "GO_KERNEL_TOKEN_SECRET"

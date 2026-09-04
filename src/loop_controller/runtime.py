@@ -44,6 +44,7 @@ from loop_controller.infra.config_loader import AppConfig, ConfigLoader
 from loop_controller.infra.conversation_store import (
     ConversationContext,
     ConversationMessage,
+    ConversationStore,
     JsonlConversationStore,
 )
 from loop_controller.infra.decision_store import JsonlDecisionStore
@@ -63,8 +64,10 @@ from loop_controller.infra.sqlite_alert_store import SqliteAlertStore
 from loop_controller.infra.sqlite_decision_store import SqliteDecisionStore
 from loop_controller.infra.sqlite_authority_store import SqliteAuthorityStore
 from loop_controller.infra.sqlite_budget_ledger import SqliteBudgetLedger
+from loop_controller.infra.sqlite_conversation_store import SqliteConversationStore
 from loop_controller.infra.sqlite_reservation_store import SqliteReservationStore
 from loop_controller.infra.sqlite_risk_state_store import SqliteRiskStateStore
+from loop_controller.infra.sqlite_session_backend import SqliteSessionBackend
 from loop_controller.infra.sqlite_task_store import SqliteTaskStore
 from loop_controller.infra.state_db import StateDatabase
 from loop_controller.infra.task_store import InMemoryTaskStore, JsonlTaskStore, TaskStore
@@ -107,7 +110,7 @@ class Runtime:
     profiles: dict[str, Any]  # CapabilityProfile
     session_manager: SessionManager
     risk_manager: RiskStateManager
-    conversation_store: JsonlConversationStore
+    conversation_store: ConversationStore
     task_store: TaskStore = field(default_factory=InMemoryTaskStore)
     reservation_store: ReservationStore = field(default_factory=InMemoryReservationStore)
     audit_analyzer: AuditAnalyzer | None = None
@@ -506,12 +509,23 @@ def build_runtime(
         )
     else:
         budget_ledger = JsonlBudgetLedger(config.budget_ledger_path, alert_store=alert_store)
-    session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
+    if _is_sqlite_path(config.session_path):
+        session_manager = SessionManager(
+            backend=SqliteSessionBackend(_state_db_for(config.session_path))
+        )
+    else:
+        session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
     risk_manager = RiskStateManager(risk_state_store)
-    conversation_store = JsonlConversationStore(
-        config.conversation_path,
-        max_messages_per_session=config.conversation_max_messages_per_session,
-    )
+    if _is_sqlite_path(config.conversation_path):
+        conversation_store = SqliteConversationStore(
+            _state_db_for(config.conversation_path),
+            max_messages_per_session=config.conversation_max_messages_per_session,
+        )
+    else:
+        conversation_store = JsonlConversationStore(
+            config.conversation_path,
+            max_messages_per_session=config.conversation_max_messages_per_session,
+        )
     task_store: TaskStore
     if _is_sqlite_path(config.task_store_path):
         task_store = SqliteTaskStore(_state_db_for(config.task_store_path))

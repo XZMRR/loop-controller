@@ -20,7 +20,7 @@ func TestRoutedMessageStoreSaveAndListByAgent(t *testing.T) {
 		Role:            "user",
 		Parts:           []models.Part{{Type: "text", Text: "hello"}},
 		Timestamp:       time.Now().UTC(),
-		ProtocolVersion: "0.44.0",
+		ProtocolVersion: "0.45.0",
 	}
 	if err := rms.Save(ctx, msg); err != nil {
 		t.Fatalf("save: %v", err)

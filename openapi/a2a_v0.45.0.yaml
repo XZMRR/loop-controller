@@ -1,10 +1,10 @@
 openapi: 3.1.0
 info:
   title: Loop Controller A2A Protocol
-  version: 0.44.0
+  version: 0.45.0
   description: |
     Authoritative OpenAPI description of the Loop Controller A2A HTTP/JSON
-    protocol v0.44.0. Delegation arguments are structured JSON objects and
+    protocol v0.45.0. Delegation arguments are structured JSON objects and
     protocol versions are required on all versioned request/response bodies.
 servers:
   - url: http://127.0.0.1:8080

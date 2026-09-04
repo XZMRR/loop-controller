@@ -14,8 +14,8 @@ from loop_controller.go_kernel_bridge import (
 from loop_controller.utils.canonical import canonical_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FIXTURE = PROJECT_ROOT / "contract" / "a2a_v0.44.0.json"
-OPENAPI = PROJECT_ROOT / "openapi" / "a2a_v0.44.0.yaml"
+FIXTURE = PROJECT_ROOT / "contract" / "a2a_v0.45.0.json"
+OPENAPI = PROJECT_ROOT / "openapi" / "a2a_v0.45.0.yaml"
 TASK_PATHS = PROJECT_ROOT / "openapi" / "paths" / "tasks.yaml"
 TASK_SCHEMA = PROJECT_ROOT / "openapi" / "schemas" / "task.yaml"
 
@@ -33,12 +33,12 @@ def test_current_protocol_version_matches_fixture(contract: dict) -> None:
 @pytest.mark.parametrize(
     ("version", "should_raise"),
     [
-        ("0.44.0", False),
-        ("0.44.1", False),
-        ("0.44.99", False),
+        ("0.45.0", False),
+        ("0.45.1", False),
+        ("0.45.99", False),
         ("", True),
-        ("0.43.0", True),
-        ("0.43.1", True),
+        ("0.44.0", True),
+        ("0.44.1", True),
         ("not-a-version", True),
     ],
 )
@@ -96,7 +96,7 @@ def test_delegation_response_roundtrip(contract: dict) -> None:
 
 def test_delegation_response_default_protocol_version() -> None:
     resp = DelegationResponse(allowed=True)
-    assert resp.protocol_version == "0.44.0"
+    assert resp.protocol_version == "0.45.0"
 
 
 def test_task_fixture_is_canonical_and_has_stable_timestamps(contract: dict) -> None:

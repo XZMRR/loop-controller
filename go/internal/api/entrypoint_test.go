@@ -778,9 +778,9 @@ func TestDelegationIdempotencyReturnsOriginalResponse(t *testing.T) {
 func TestDelegationIdempotencyEquivalentJSONReturnsOriginalResponse(t *testing.T) {
 	_, server := newTestServerWithMockR2(t, true)
 	registerExecutor(t, server)
-	first := []byte(`{"request_id":"req-idempotency-equivalent","initiator_agent_id":"planner","target_agent_id":"executor","tool_name":"echo","arguments":{"x":"hello","nested":{"a":1,"b":2}},"session_id":"","task_id":"","risk_level":"","protocol_version":"0.44.0"}`)
+	first := []byte(`{"request_id":"req-idempotency-equivalent","initiator_agent_id":"planner","target_agent_id":"executor","tool_name":"echo","arguments":{"x":"hello","nested":{"a":1,"b":2}},"session_id":"","task_id":"","risk_level":"","protocol_version":"0.45.0"}`)
 	second := []byte(`{
-		"protocol_version":"0.44.0", "risk_level":"", "task_id":"", "session_id":"",
+		"protocol_version":"0.45.0", "risk_level":"", "task_id":"", "session_id":"",
 		"arguments":{"nested":{"b":2,"a":1},"x":"hello"}, "tool_name":"echo",
 		"target_agent_id":"executor", "initiator_agent_id":"planner", "request_id":"req-idempotency-equivalent"
 	}`)
