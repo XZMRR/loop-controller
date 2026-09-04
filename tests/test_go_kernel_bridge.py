@@ -1,4 +1,4 @@
-"""Python bridge to the Go interaction governance kernel (v0.41.0)."""
+"""Python bridge to the Go interaction governance kernel (v0.42.0)."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ class _AllowIIGEHandler(BaseHTTPRequestHandler):
                 "decision_id": "test-decision",
                 "task_id": payload.get("task_id", ""),
                 "reason": "test IIGE allow",
-                "protocol_version": "0.41.0",
+                "protocol_version": "0.42.0",
             }
         ).encode()
         self.send_response(200)

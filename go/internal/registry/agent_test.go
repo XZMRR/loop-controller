@@ -1,6 +1,8 @@
 package registry
 
 import (
+	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/loop-controller/go/internal/models"
@@ -61,5 +63,73 @@ func TestDelete(t *testing.T) {
 	}
 	if _, err := r.Get("a"); err != ErrAgentNotFound {
 		t.Fatalf("expected agent to be deleted")
+	}
+}
+
+type fakeAgentStore struct {
+	cards   map[string]models.AgentCard
+	upserts int
+}
+
+func (f *fakeAgentStore) Upsert(_ context.Context, card models.AgentCard) error {
+	if f.cards == nil {
+		f.cards = make(map[string]models.AgentCard)
+	}
+	f.cards[card.AgentID] = card
+	f.upserts++
+	return nil
+}
+
+func (f *fakeAgentStore) Get(_ context.Context, agentID string) (models.AgentCard, error) {
+	card, ok := f.cards[agentID]
+	if !ok {
+		return models.AgentCard{}, sql.ErrNoRows
+	}
+	return card, nil
+}
+
+func (f *fakeAgentStore) Delete(_ context.Context, agentID string) error {
+	if _, ok := f.cards[agentID]; !ok {
+		return sql.ErrNoRows
+	}
+	delete(f.cards, agentID)
+	return nil
+}
+
+func (f *fakeAgentStore) List(_ context.Context) ([]models.AgentCard, error) {
+	out := make([]models.AgentCard, 0, len(f.cards))
+	for _, card := range f.cards {
+		out = append(out, card)
+	}
+	return out, nil
+}
+
+func TestStoreBackedRegisterAndGet(t *testing.T) {
+	store := &fakeAgentStore{}
+	r := NewStore(store)
+	card := models.AgentCard{AgentID: "agent-1", Name: "Persisted"}
+	if err := r.Register(card); err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+	got, err := r.Get("agent-1")
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if got.Name != "Persisted" {
+		t.Errorf("expected name %q, got %q", "Persisted", got.Name)
+	}
+}
+
+func TestStoreBackedGetNotFoundMapsError(t *testing.T) {
+	r := NewStore(&fakeAgentStore{cards: map[string]models.AgentCard{}})
+	if _, err := r.Get("missing"); err != ErrAgentNotFound {
+		t.Fatalf("expected ErrAgentNotFound, got %v", err)
+	}
+}
+
+func TestStoreBackedDeleteNotFoundMapsError(t *testing.T) {
+	r := NewStore(&fakeAgentStore{cards: map[string]models.AgentCard{}})
+	if err := r.Delete("missing"); err != ErrAgentNotFound {
+		t.Fatalf("expected ErrAgentNotFound, got %v", err)
 	}
 }

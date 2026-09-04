@@ -99,10 +99,10 @@ func NewServer(secret []byte, dbPath string, providers ...discovery.AgentDiscove
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
-	reg := registry.New()
+	reg := registry.NewStore(db.AgentStore())
 	pub := stream.NewPublisher(db.EventStore()).WithInstanceID(db.InstanceID())
 	tasks := task.New(db.TaskStore()).WithEventFanout(pub).WithInstanceID(db.InstanceID())
-	r := router.New(reg)
+	r := router.New(reg, db.RoutedMessageStore())
 	issuer := token.NewHMACIssuer(secret)
 	d := delegation.New(reg, tasks, issuer, pub, 5*time.Minute)
 	mgr := discovery.NewManager(reg, providers...)

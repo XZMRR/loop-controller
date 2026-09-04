@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -8,10 +9,30 @@ import (
 	"github.com/loop-controller/go/internal/registry"
 )
 
+type fakeRoutedMessageStore struct {
+	messages []models.Message
+}
+
+func (f *fakeRoutedMessageStore) Save(_ context.Context, msg models.Message) error {
+	f.messages = append(f.messages, msg)
+	return nil
+}
+
+func (f *fakeRoutedMessageStore) ListByAgent(_ context.Context, agentID string) ([]models.Message, error) {
+	var out []models.Message
+	for _, msg := range f.messages {
+		if msg.FromAgentID == agentID || msg.ToAgentID == agentID {
+			out = append(out, msg)
+		}
+	}
+	return out, nil
+}
+
 func TestRouteToRegisteredAgent(t *testing.T) {
 	reg := registry.New()
 	reg.Register(models.AgentCard{AgentID: "agent-b", Name: "B"})
-	r := New(reg)
+	store := &fakeRoutedMessageStore{}
+	r := New(reg, store)
 	msg := models.Message{
 		MessageID:   "msg-1",
 		FromAgentID: "agent-a",
@@ -34,7 +55,8 @@ func TestRouteToRegisteredAgent(t *testing.T) {
 
 func TestRouteToUnknownAgent(t *testing.T) {
 	reg := registry.New()
-	r := New(reg)
+	store := &fakeRoutedMessageStore{}
+	r := New(reg, store)
 	msg := models.Message{
 		MessageID:   "msg-1",
 		FromAgentID: "agent-a",

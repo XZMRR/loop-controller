@@ -1,4 +1,4 @@
-"""Python bridge to the Go interaction governance kernel (v0.41.0)."""
+"""Python bridge to the Go interaction governance kernel (v0.42.0)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Current A2A HTTP/JSON protocol version. Patch differences are tolerated;
 # major/minor differences are fail-closed.
-CURRENT_PROTOCOL_VERSION = "0.41.0"
+CURRENT_PROTOCOL_VERSION = "0.42.0"
 
 
 def check_protocol_version(version: str) -> None:

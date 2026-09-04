@@ -87,6 +87,29 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     locked INTEGER DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at);
+
+CREATE TABLE IF NOT EXISTS agents (
+    agent_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    entrypoint_type TEXT NOT NULL DEFAULT '',
+    entrypoint_url TEXT NOT NULL DEFAULT '',
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    trust_domain TEXT NOT NULL DEFAULT '',
+    version TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS routed_messages (
+    message_id TEXT PRIMARY KEY,
+    from_agent_id TEXT NOT NULL,
+    to_agent_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    parts_json TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    protocol_version TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_routed_messages_to ON routed_messages(to_agent_id);
+CREATE INDEX IF NOT EXISTS idx_routed_messages_from ON routed_messages(from_agent_id);
 `
 
 // DefaultDBPath is used when no explicit database path is provided.
@@ -266,3 +289,9 @@ func (db *DB) LifecycleOutboxStore() LifecycleOutboxStore {
 
 // IdempotencyStore returns a store backed by the underlying database.
 func (db *DB) IdempotencyStore() IdempotencyStore { return &idempotencyStore{db: db.DB} }
+
+// AgentStore returns a store for registered Agent Cards.
+func (db *DB) AgentStore() AgentStore { return &agentStore{db: db.DB} }
+
+// RoutedMessageStore returns a store for routed A2A messages.
+func (db *DB) RoutedMessageStore() RoutedMessageStore { return &routedMessageStore{db: db.DB} }

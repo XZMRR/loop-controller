@@ -1,5 +1,5 @@
 {
-  "protocol_version": "0.41.0",
+  "protocol_version": "0.42.0",
   "agent_card": {
     "agent_id": "agent-b",
     "name": "Agent B",
@@ -7,10 +7,10 @@
     "entrypoint": {"type": "http", "url": "http://127.0.0.1:9002"},
     "capabilities": ["delegate_execution"],
     "trust_domain": "test.loop-controller.local",
-    "version": "0.41.0"
+    "version": "0.42.0"
   },
   "task": {
-    "protocol_version": "0.41.0",
+    "protocol_version": "0.42.0",
     "task_id": "task-001",
     "session_id": "sess-001",
     "initiator_agent_id": "agent-a",
@@ -30,7 +30,7 @@
       {"type": "data", "data": {"path": "/data/kb/doc.md", "mode": "read"}}
     ],
     "timestamp": "2026-09-01T12:00:00Z",
-    "protocol_version": "0.41.0"
+    "protocol_version": "0.42.0"
   },
   "delegation_request": {
     "request_id": "req-001",
@@ -41,7 +41,7 @@
     "session_id": "sess-001",
     "task_id": "task-001",
     "risk_level": "high",
-    "protocol_version": "0.41.0"
+    "protocol_version": "0.42.0"
   },
   "delegation_response": {
     "allowed": true,
@@ -50,7 +50,7 @@
     "target_entrypoint": {"type": "http", "url": "http://127.0.0.1:9002"},
     "delegation_token": "token-001",
     "reason": "IIGE authorized delegation",
-    "protocol_version": "0.41.0"
+    "protocol_version": "0.42.0"
   },
   "error_response": {
     "error": "protocol version 0.40.0 is incompatible",
@@ -60,7 +60,7 @@
     "id": "ev-001",
     "event": "task_created",
     "data": {
-      "protocol_version": "0.41.0",
+      "protocol_version": "0.42.0",
       "event_id": "ev-001",
       "task_id": "task-001",
       "event_type": "task_created",
@@ -69,7 +69,7 @@
     }
   },
   "task_event": {
-    "protocol_version": "0.41.0",
+    "protocol_version": "0.42.0",
     "event_id": "ev-001",
     "task_id": "task-001",
     "event_type": "task_created",
@@ -89,7 +89,7 @@
         "role": "user",
         "parts": [{"type": "binary", "data": "AA=="}],
         "timestamp": "2026-09-01T12:00:00Z",
-        "protocol_version": "0.41.0"
+        "protocol_version": "0.42.0"
       }
     },
     {

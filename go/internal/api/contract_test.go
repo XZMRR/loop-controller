@@ -17,7 +17,7 @@ func loadFixture(t *testing.T) map[string]json.RawMessage {
 		t.Fatalf("getwd: %v", err)
 	}
 	// go/internal/api -> project root -> contract
-	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.41.0.json")
+	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.42.0.json")
 	data, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
@@ -34,15 +34,15 @@ func TestCheckProtocolVersion(t *testing.T) {
 		version string
 		wantErr bool
 	}{
-		{"0.41.0", false},
-		{"0.41.1", false},
-		{"0.41.99", false},
+		{"0.42.0", false},
+		{"0.42.1", false},
+		{"0.42.99", false},
 		{"", true},
-		{"0.41", true},
-		{"0.41.0.0", true},
-		{"v0.41.0", true},
-		{"0.40.1", true},
-		{"0.40.0", true},
+		{"0.42", true},
+		{"0.42.0.0", true},
+		{"v0.42.0", true},
+		{"0.41.1", true},
+		{"0.41.0", true},
 		{"not-a-version", true},
 	}
 	for _, c := range cases {
