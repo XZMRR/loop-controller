@@ -36,12 +36,18 @@ except ImportError:
         pass
 
 
+def _is_sqlite_path(path: Path) -> bool:
+    """SQLite 后端按扩展名识别，避免把数据库文件当 JSONL 解析。"""
+    return path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+
+
 @dataclass(frozen=True)
 class PersistenceTarget:
     name: str
     path: Path
     replace: bool = False
     critical: bool = True
+    sqlite: bool = False
 
 
 @dataclass
@@ -111,6 +117,9 @@ class PersistenceProbe:
     def _probe_target(self, target: PersistenceTarget, result: PersistenceStatus) -> None:
         path = target.path
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if target.sqlite or _is_sqlite_path(path):
+            self._probe_sqlite_target(target)
+            return
         probe = path.parent / f".{path.name}.probe.{os.getpid()}.{uuid.uuid4().hex}"
         if target.replace:
             target_lock = Path(f"{path}.lock")
@@ -160,3 +169,11 @@ class PersistenceProbe:
                 if checked.exists() and stat.S_IMODE(checked.stat().st_mode) != required_mode:
                     result.unsafe_permissions.append(target.name)
                     break
+
+    def _probe_sqlite_target(self, target: PersistenceTarget) -> None:
+        """SQLite 后端仅需父目录可写；不做 JSONL 尾部修复与文件锁探测。"""
+        path = target.path
+        if not os.access(path.parent, os.R_OK | os.W_OK | os.X_OK):
+            raise PermissionError(path.parent)
+        if path.exists() and not os.access(path, os.R_OK | os.W_OK):
+            raise PermissionError(path)

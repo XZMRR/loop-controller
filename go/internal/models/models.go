@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const CurrentProtocolVersion = "0.42.0"
+const CurrentProtocolVersion = "0.44.0"
 
 // AgentCard describes an agent that can participate in governed interactions.
 type AgentCard struct {

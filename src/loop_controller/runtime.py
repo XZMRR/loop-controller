@@ -21,7 +21,7 @@ from loop_controller.audit.evidence import Ed25519EvidenceSigner, EvidenceChain,
 from loop_controller.audit.evidence_backends import LocalFileEvidenceBackend
 from loop_controller.audit_analyzer import AuditAnalyzer, RuleBasedAuditAnalyzer
 from loop_controller.authority import EarnedAuthorityManager
-from loop_controller.budget import JsonlBudgetLedger
+from loop_controller.budget import BudgetLedger, JsonlBudgetLedger
 from loop_controller.checkpoint import Checkpoint, DecisionStore
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
 from loop_controller.executors import (
@@ -35,11 +35,11 @@ from loop_controller.executors.http_executor import HTTPExecutor
 from loop_controller.go_kernel_bridge import AgentCard, AgentEntrypoint, GoKernelBridge
 from loop_controller.identity import ConfigIdentityProvider, IdentityProvider
 from loop_controller.identity.revocation import RevocationList
-from loop_controller.infra.alert_store import JsonlAlertStore
+from loop_controller.infra.alert_store import AlertStore, JsonlAlertStore
 from loop_controller.infra.approval_crypto import ApprovalCrypto
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.audit_store import AuditStore, JsonlAuditStore
-from loop_controller.infra.authority_store import JsonlAuthorityStore
+from loop_controller.infra.authority_store import AuthorityStore, JsonlAuthorityStore
 from loop_controller.infra.config_loader import AppConfig, ConfigLoader
 from loop_controller.infra.conversation_store import (
     ConversationContext,
@@ -59,8 +59,13 @@ from loop_controller.infra.reservation_store import (
     JsonlReservationStore,
     ReservationStore,
 )
+from loop_controller.infra.sqlite_alert_store import SqliteAlertStore
 from loop_controller.infra.sqlite_decision_store import SqliteDecisionStore
+from loop_controller.infra.sqlite_authority_store import SqliteAuthorityStore
+from loop_controller.infra.sqlite_budget_ledger import SqliteBudgetLedger
+from loop_controller.infra.sqlite_reservation_store import SqliteReservationStore
 from loop_controller.infra.sqlite_risk_state_store import SqliteRiskStateStore
+from loop_controller.infra.sqlite_task_store import SqliteTaskStore
 from loop_controller.infra.state_db import StateDatabase
 from loop_controller.infra.task_store import InMemoryTaskStore, JsonlTaskStore, TaskStore
 from loop_controller.masker import Masker
@@ -467,7 +472,11 @@ def build_runtime(
     http_client = HTTPClient()
     http_executor = HTTPExecutor(http_client, config.http_tool_specs, secret_broker=secret_broker)
     local_executor = LocalFunctionExecutor(config.local_function_specs)
-    alert_store = JsonlAlertStore(config.alert_store_path)
+    alert_store: AlertStore
+    if _is_sqlite_path(config.alert_store_path):
+        alert_store = SqliteAlertStore(_state_db_for(config.alert_store_path))
+    else:
+        alert_store = JsonlAlertStore(config.alert_store_path)
     harness_executor = HarnessExecutor(
         config.harness_tool_specs,
         config.harness_backends,
@@ -490,18 +499,39 @@ def build_runtime(
         ExecutionModeResolver(config.harness_execution_policy, harness_executor)
     )
     masker = Masker(config.masking_rules)
-    budget_ledger = JsonlBudgetLedger(config.budget_ledger_path, alert_store=alert_store)
+    budget_ledger: BudgetLedger
+    if _is_sqlite_path(config.budget_ledger_path):
+        budget_ledger = SqliteBudgetLedger(
+            _state_db_for(config.budget_ledger_path), alert_store=alert_store
+        )
+    else:
+        budget_ledger = JsonlBudgetLedger(config.budget_ledger_path, alert_store=alert_store)
     session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
     risk_manager = RiskStateManager(risk_state_store)
     conversation_store = JsonlConversationStore(
         config.conversation_path,
         max_messages_per_session=config.conversation_max_messages_per_session,
     )
-    task_store = JsonlTaskStore(config.task_store_path)
-    reservation_store = JsonlReservationStore(config.reservation_store_path)
+    task_store: TaskStore
+    if _is_sqlite_path(config.task_store_path):
+        task_store = SqliteTaskStore(_state_db_for(config.task_store_path))
+    else:
+        task_store = JsonlTaskStore(config.task_store_path)
+
+    reservation_store: ReservationStore
+    if _is_sqlite_path(config.reservation_store_path):
+        reservation_store = SqliteReservationStore(_state_db_for(config.reservation_store_path))
+    else:
+        reservation_store = JsonlReservationStore(config.reservation_store_path)
+
+    authority_store: AuthorityStore
+    if _is_sqlite_path(config.authority_log_path):
+        authority_store = SqliteAuthorityStore(_state_db_for(config.authority_log_path))
+    else:
+        authority_store = JsonlAuthorityStore(config.authority_log_path)
     authority_manager = EarnedAuthorityManager(
         rules=config.authority_rules,
-        store=JsonlAuthorityStore(config.authority_log_path),
+        store=authority_store,
     )
     revocation_path = Path(config.policy_dir).parent / "config" / "revocation.yaml"
     evidence_chain = _build_evidence_chain(config)

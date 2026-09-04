@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -83,7 +85,92 @@ CREATE TABLE IF NOT EXISTS reservations (
 );
 CREATE INDEX IF NOT EXISTS idx_reservations_status_expires
     ON reservations(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS budget_ledger (
+    task_id TEXT PRIMARY KEY,
+    max_budget_token INTEGER NOT NULL DEFAULT 1000000,
+    reserved INTEGER NOT NULL DEFAULT 0,
+    committed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS budget_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    call_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    cost_token_count INTEGER NOT NULL DEFAULT 0,
+    cost_payment_amount REAL NOT NULL DEFAULT 0,
+    cost_currency TEXT NOT NULL DEFAULT 'USD',
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_budget_reservations_call_id ON budget_reservations(call_id);
+CREATE INDEX IF NOT EXISTS idx_budget_reservations_task_id ON budget_reservations(task_id);
+CREATE INDEX IF NOT EXISTS idx_budget_reservations_state ON budget_reservations(state);
+
+CREATE TABLE IF NOT EXISTS authority_tokens (
+    token_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    granted_capabilities_json TEXT NOT NULL DEFAULT '[]',
+    budget_token_count INTEGER NOT NULL DEFAULT 0,
+    budget_payment_amount REAL NOT NULL DEFAULT 0,
+    budget_currency TEXT NOT NULL DEFAULT 'USD',
+    remaining_token_count INTEGER NOT NULL DEFAULT 0,
+    remaining_payment_amount REAL NOT NULL DEFAULT 0,
+    remaining_currency TEXT NOT NULL DEFAULT 'USD',
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    audit_record_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authority_tokens_task ON authority_tokens(task_id);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    description TEXT NOT NULL,
+    tenant_id TEXT,
+    status TEXT NOT NULL DEFAULT 'created',
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    alert_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    task_id TEXT,
+    rule_id TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_session ON alerts(session_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_task ON alerts(task_id);
+
+CREATE TABLE IF NOT EXISTS reports (
+    report_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    task_id TEXT,
+    generated_at TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    alert_ids_json TEXT NOT NULL DEFAULT '[]',
+    event_count INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_reports_session ON reports(session_id);
+CREATE INDEX IF NOT EXISTS idx_reports_task ON reports(task_id);
 """
+
+
+_TERMINAL_RESERVATION_STATES = {"committed", "refunded", "expired"}
 
 
 class StateDatabaseError(Exception):
@@ -173,6 +260,23 @@ class StateDatabase:
             return conn
         except sqlite3.Error as exc:
             raise StateDatabaseError(f"无法连接状态数据库 {self._db_path}: {exc}") from exc
+
+    @contextmanager
+    def _immediate(self, conn: sqlite3.Connection) -> Iterator[None]:
+        """显式 ``BEGIN IMMEDIATE`` 事务。
+
+        由于连接以 ``isolation_level=None``（autocommit）打开，``with conn:`` 不会
+        隐式开启事务；check-then-act 类方法必须显式 ``BEGIN IMMEDIATE`` 以获取写锁，
+        避免多进程在读取与写入之间产生竞争。
+        """
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
 
     def _migrate_decisions_columns(self) -> None:
         """v0.36.1：增量为 decisions 表添加 modify 参数字段。"""
@@ -470,6 +574,713 @@ class StateDatabase:
     def iter_all_risk_events(self) -> list[dict[str, Any]]:
         """用于迁移。"""
         return self.load_risk_events()
+
+    # ------------------------------------------------------------------
+    # Budget ledger
+    # ------------------------------------------------------------------
+
+    def set_budget(self, task_id: str, max_budget_token: int) -> None:
+        """幂等设置任务预算上限，保留现有 reserved/committed。"""
+        try:
+            with self._connect() as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO budget_ledger (task_id, max_budget_token, reserved, committed)
+                        VALUES (?, ?, 0, 0)
+                        ON CONFLICT(task_id) DO UPDATE SET
+                            max_budget_token = excluded.max_budget_token
+                        """,
+                        (task_id, max_budget_token),
+                    )
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"设置预算失败: {exc}") from exc
+
+    def check_and_reserve(
+        self, task_id: str, token_count: int, default_max_budget_token: int
+    ) -> bool:
+        """原子预留预算；超限返回 ``False``。"""
+        try:
+            with self._connect() as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO budget_ledger
+                            (task_id, max_budget_token, reserved, committed)
+                        VALUES (?, ?, 0, 0)
+                        """,
+                        (task_id, default_max_budget_token),
+                    )
+                    cur = conn.execute(
+                        """
+                        UPDATE budget_ledger
+                        SET reserved = reserved + ?
+                        WHERE task_id = ?
+                          AND reserved + committed + ? <= max_budget_token
+                        """,
+                        (token_count, task_id, token_count),
+                    )
+                    return cur.rowcount > 0
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"预留预算失败: {exc}") from exc
+
+    def commit_budget(self, task_id: str, token_count: int) -> None:
+        try:
+            with self._connect() as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        UPDATE budget_ledger
+                        SET reserved = reserved - ?, committed = committed + ?
+                        WHERE task_id = ?
+                        """,
+                        (token_count, token_count, task_id),
+                    )
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"提交预算失败: {exc}") from exc
+
+    def refund_budget(self, task_id: str, token_count: int) -> None:
+        try:
+            with self._connect() as conn:
+                with conn:
+                    conn.execute(
+                        "UPDATE budget_ledger SET reserved = MAX(0, reserved - ?) WHERE task_id = ?",
+                        (token_count, task_id),
+                    )
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"返还预算失败: {exc}") from exc
+
+    def iter_reserved_budget(self) -> list[tuple[str, int]]:
+        """返回 ``reserved > 0`` 的 ``(task_id, reserved)``；用于启动孤儿预留告警。"""
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT task_id, reserved FROM budget_ledger WHERE reserved > 0"
+                )
+                return [(row["task_id"], row["reserved"]) for row in cur.fetchall()]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举预留预算失败: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Budget reservation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reservation_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "reservation_id": row["reservation_id"],
+            "task_id": row["task_id"],
+            "call_id": row["call_id"],
+            "tool_name": row["tool_name"],
+            "cost": {
+                "token_count": row["cost_token_count"],
+                "payment_amount": row["cost_payment_amount"],
+                "currency": row["cost_currency"],
+            },
+            "state": row["state"],
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+        }
+
+    def save_reservation(self, reservation: dict[str, Any]) -> None:
+        """保存/流转预留；已终态且对象不等时 fail-closed。"""
+        reservation_id = reservation["reservation_id"]
+        cost = reservation["cost"]
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    cur = conn.execute(
+                        "SELECT * FROM budget_reservations WHERE reservation_id = ?",
+                        (reservation_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        existing = self._reservation_row_to_dict(row)
+                        if existing["state"] in _TERMINAL_RESERVATION_STATES:
+                            if existing == reservation:
+                                return
+                            raise StateDatabaseError(
+                                f"reservation {reservation_id} 已处于终态 {existing['state']}"
+                            )
+                    conn.execute(
+                        """
+                        INSERT INTO budget_reservations (
+                            reservation_id, task_id, call_id, tool_name,
+                            cost_token_count, cost_payment_amount, cost_currency,
+                            state, created_at, expires_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(reservation_id) DO UPDATE SET
+                            task_id = excluded.task_id,
+                            call_id = excluded.call_id,
+                            tool_name = excluded.tool_name,
+                            cost_token_count = excluded.cost_token_count,
+                            cost_payment_amount = excluded.cost_payment_amount,
+                            cost_currency = excluded.cost_currency,
+                            state = excluded.state,
+                            created_at = excluded.created_at,
+                            expires_at = excluded.expires_at
+                        """,
+                        (
+                            reservation_id,
+                            reservation["task_id"],
+                            reservation["call_id"],
+                            reservation["tool_name"],
+                            cost["token_count"],
+                            cost["payment_amount"],
+                            cost["currency"],
+                            reservation["state"],
+                            reservation["created_at"],
+                            reservation["expires_at"],
+                        ),
+                    )
+        except StateDatabaseError:
+            raise
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"保存预留失败: {exc}") from exc
+
+    def get_reservation(self, reservation_id: str) -> dict[str, Any] | None:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM budget_reservations WHERE reservation_id = ?",
+                    (reservation_id,),
+                )
+                row = cur.fetchone()
+                return self._reservation_row_to_dict(row) if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询预留失败: {exc}") from exc
+
+    def get_reservation_by_call_id(self, call_id: str) -> dict[str, Any] | None:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM budget_reservations WHERE call_id = ?",
+                    (call_id,),
+                )
+                row = cur.fetchone()
+                return self._reservation_row_to_dict(row) if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询预留失败: {exc}") from exc
+
+    def list_reservations_by_task(self, task_id: str) -> list[dict[str, Any]]:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM budget_reservations WHERE task_id = ?",
+                    (task_id,),
+                )
+                return [self._reservation_row_to_dict(row) for row in cur.fetchall()]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举预留失败: {exc}") from exc
+
+    def list_all_reservations(self) -> list[dict[str, Any]]:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute("SELECT * FROM budget_reservations")
+                return [self._reservation_row_to_dict(row) for row in cur.fetchall()]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举预留失败: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Authority token
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _authority_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "token_id": row["token_id"],
+            "request_id": row["request_id"],
+            "agent_id": row["agent_id"],
+            "task_id": row["task_id"],
+            "granted_capabilities": json.loads(row["granted_capabilities_json"]),
+            "budget": {
+                "token_count": row["budget_token_count"],
+                "payment_amount": row["budget_payment_amount"],
+                "currency": row["budget_currency"],
+            },
+            "remaining_budget": {
+                "token_count": row["remaining_token_count"],
+                "payment_amount": row["remaining_payment_amount"],
+                "currency": row["remaining_currency"],
+            },
+            "expires_at": row["expires_at"],
+            "created_at": row["created_at"],
+            "revoked_at": row["revoked_at"],
+            "audit_record_id": row["audit_record_id"],
+        }
+
+    @staticmethod
+    def _authority_params(token: dict[str, Any]) -> tuple[Any, ...]:
+        budget = token["budget"]
+        remaining = token["remaining_budget"]
+        return (
+            token["token_id"],
+            token["request_id"],
+            token["agent_id"],
+            token["task_id"],
+            json.dumps(token["granted_capabilities"], ensure_ascii=False),
+            budget["token_count"],
+            budget["payment_amount"],
+            budget["currency"],
+            remaining["token_count"],
+            remaining["payment_amount"],
+            remaining["currency"],
+            token["expires_at"],
+            token["created_at"],
+            token["revoked_at"],
+            token["audit_record_id"],
+        )
+
+    def save_authority_token(self, token: dict[str, Any], event_type: str) -> None:
+        """保存/更新 token；对齐 JSONL 的严格 fail-closed 校验。"""
+        token_id = token["token_id"]
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    cur = conn.execute(
+                        "SELECT * FROM authority_tokens WHERE token_id = ?",
+                        (token_id,),
+                    )
+                    row = cur.fetchone()
+                    existing = self._authority_row_to_dict(row) if row is not None else None
+                    if event_type == "token_created" and existing is not None:
+                        if existing == token:
+                            return
+                        raise StateDatabaseError(f"token {token_id} 已存在")
+                    if event_type != "token_created" and existing is None:
+                        raise StateDatabaseError(f"token {token_id} 不存在")
+                    if (
+                        existing is not None
+                        and existing["revoked_at"] is not None
+                        and existing != token
+                    ):
+                        raise StateDatabaseError(f"token {token_id} 已撤销")
+                    if event_type == "token_used" and existing is not None:
+                        if (
+                            token["remaining_budget"]["token_count"]
+                            >= existing["remaining_budget"]["token_count"]
+                        ):
+                            raise StateDatabaseError(f"token {token_id} 消费状态冲突")
+                    if event_type == "token_refunded" and existing is not None:
+                        if (
+                            token["remaining_budget"]["token_count"]
+                            <= existing["remaining_budget"]["token_count"]
+                            or token["remaining_budget"]["token_count"]
+                            > token["budget"]["token_count"]
+                        ):
+                            raise StateDatabaseError(f"token {token_id} 返还状态冲突")
+                    conn.execute(
+                        """
+                        INSERT INTO authority_tokens (
+                            token_id, request_id, agent_id, task_id,
+                            granted_capabilities_json,
+                            budget_token_count, budget_payment_amount, budget_currency,
+                            remaining_token_count, remaining_payment_amount, remaining_currency,
+                            expires_at, created_at, revoked_at, audit_record_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(token_id) DO UPDATE SET
+                            request_id = excluded.request_id,
+                            agent_id = excluded.agent_id,
+                            task_id = excluded.task_id,
+                            granted_capabilities_json = excluded.granted_capabilities_json,
+                            budget_token_count = excluded.budget_token_count,
+                            budget_payment_amount = excluded.budget_payment_amount,
+                            budget_currency = excluded.budget_currency,
+                            remaining_token_count = excluded.remaining_token_count,
+                            remaining_payment_amount = excluded.remaining_payment_amount,
+                            remaining_currency = excluded.remaining_currency,
+                            expires_at = excluded.expires_at,
+                            created_at = excluded.created_at,
+                            revoked_at = excluded.revoked_at,
+                            audit_record_id = excluded.audit_record_id
+                        """,
+                        self._authority_params(token),
+                    )
+        except StateDatabaseError:
+            raise
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"保存权限令牌失败: {exc}") from exc
+
+    def create_authority_token_if_available(
+        self, token: dict[str, Any], now: datetime
+    ) -> bool:
+        """能力交集为空时创建 token；否则返回 ``False``。"""
+        task_id = token["task_id"]
+        requested = set(token["granted_capabilities"])
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    cur = conn.execute(
+                        "SELECT granted_capabilities_json, revoked_at, expires_at "
+                        "FROM authority_tokens WHERE task_id = ?",
+                        (task_id,),
+                    )
+                    for row in cur.fetchall():
+                        if row["revoked_at"] is None and now < datetime.fromisoformat(
+                            row["expires_at"]
+                        ):
+                            caps = set(json.loads(row["granted_capabilities_json"]))
+                            if requested.intersection(caps):
+                                return False
+                    conn.execute(
+                        """
+                        INSERT INTO authority_tokens (
+                            token_id, request_id, agent_id, task_id,
+                            granted_capabilities_json,
+                            budget_token_count, budget_payment_amount, budget_currency,
+                            remaining_token_count, remaining_payment_amount, remaining_currency,
+                            expires_at, created_at, revoked_at, audit_record_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        self._authority_params(token),
+                    )
+                    return True
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"创建权限令牌失败: {exc}") from exc
+
+    def get_authority_token(self, token_id: str) -> dict[str, Any] | None:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM authority_tokens WHERE token_id = ?",
+                    (token_id,),
+                )
+                row = cur.fetchone()
+                return self._authority_row_to_dict(row) if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询权限令牌失败: {exc}") from exc
+
+    def list_all_authority_tokens(self) -> list[dict[str, Any]]:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute("SELECT * FROM authority_tokens")
+                return [self._authority_row_to_dict(row) for row in cur.fetchall()]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举权限令牌失败: {exc}") from exc
+
+    def list_active_authority_tokens(self, now: datetime) -> list[dict[str, Any]]:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM authority_tokens WHERE revoked_at IS NULL AND expires_at > ?",
+                    (now.isoformat(),),
+                )
+                return [self._authority_row_to_dict(row) for row in cur.fetchall()]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举活跃权限令牌失败: {exc}") from exc
+
+    def list_authority_tokens_by_task(self, task_id: str) -> list[dict[str, Any]]:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM authority_tokens WHERE task_id = ?",
+                    (task_id,),
+                )
+                return [self._authority_row_to_dict(row) for row in cur.fetchall()]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举权限令牌失败: {exc}") from exc
+
+    def consume_authority_token(
+        self,
+        token_id: str,
+        cost_token_count: int,
+        now: datetime,
+        task_id: str,
+        agent_id: str,
+    ) -> dict[str, Any] | None:
+        """原子消费 token 预算；无效/余额不足返回 ``None``。"""
+        try:
+            with self._connect() as conn:
+                with conn:
+                    cur = conn.execute(
+                        """
+                        UPDATE authority_tokens
+                        SET remaining_token_count = remaining_token_count - ?
+                        WHERE token_id = ?
+                          AND task_id = ?
+                          AND agent_id = ?
+                          AND revoked_at IS NULL
+                          AND expires_at > ?
+                          AND remaining_token_count >= ?
+                        """,
+                        (
+                            cost_token_count,
+                            token_id,
+                            task_id,
+                            agent_id,
+                            now.isoformat(),
+                            cost_token_count,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        return None
+                    row = conn.execute(
+                        "SELECT * FROM authority_tokens WHERE token_id = ?",
+                        (token_id,),
+                    ).fetchone()
+                    return self._authority_row_to_dict(row) if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"消费权限令牌失败: {exc}") from exc
+
+    def refund_authority_token(
+        self, token_id: str, expected_remaining: int, cost_token_count: int
+    ) -> dict[str, Any] | None:
+        """CAS 返还 token 预算；``remaining_token_count`` 不匹配或超上限返回 ``None``。"""
+        try:
+            with self._connect() as conn:
+                with conn:
+                    cur = conn.execute(
+                        """
+                        UPDATE authority_tokens
+                        SET remaining_token_count = remaining_token_count + ?
+                        WHERE token_id = ?
+                          AND remaining_token_count = ?
+                          AND revoked_at IS NULL
+                          AND remaining_token_count + ? <= budget_token_count
+                        """,
+                        (cost_token_count, token_id, expected_remaining, cost_token_count),
+                    )
+                    if cur.rowcount != 1:
+                        return None
+                    row = conn.execute(
+                        "SELECT * FROM authority_tokens WHERE token_id = ?",
+                        (token_id,),
+                    ).fetchone()
+                    return self._authority_row_to_dict(row) if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"返还权限令牌失败: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Task
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _task_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "task_id": row["task_id"],
+            "session_id": row["session_id"],
+            "user_id": row["user_id"],
+            "agent_id": row["agent_id"],
+            "description": row["description"],
+            "tenant_id": row["tenant_id"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "completed_at": row["completed_at"],
+        }
+
+    def save_task(self, task: dict[str, Any]) -> None:
+        try:
+            with self._connect() as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO tasks (
+                            task_id, session_id, user_id, agent_id, description,
+                            tenant_id, status, created_at, completed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(task_id) DO UPDATE SET
+                            session_id = excluded.session_id,
+                            user_id = excluded.user_id,
+                            agent_id = excluded.agent_id,
+                            description = excluded.description,
+                            tenant_id = excluded.tenant_id,
+                            status = excluded.status,
+                            created_at = excluded.created_at,
+                            completed_at = excluded.completed_at
+                        """,
+                        (
+                            task["task_id"],
+                            task["session_id"],
+                            task["user_id"],
+                            task["agent_id"],
+                            task["description"],
+                            task["tenant_id"],
+                            task["status"],
+                            task["created_at"],
+                            task["completed_at"],
+                        ),
+                    )
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"保存任务失败: {exc}") from exc
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        """读取任务；``completed`` 状态返回 ``None``（对齐 JSONL 语义）。"""
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM tasks WHERE task_id = ?",
+                    (task_id,),
+                )
+                row = cur.fetchone()
+                if row is None or row["status"] == "completed":
+                    return None
+                return self._task_row_to_dict(row)
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询任务失败: {exc}") from exc
+
+    def complete_task(self, task_id: str) -> None:
+        try:
+            with self._connect() as conn:
+                with conn:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'completed', completed_at = ? WHERE task_id = ?",
+                        (_utc_now().isoformat(), task_id),
+                    )
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"完成任务失败: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Alert / Report
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _alert_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "alert_id": row["alert_id"],
+            "session_id": row["session_id"],
+            "task_id": row["task_id"],
+            "rule_id": row["rule_id"],
+            "severity": row["severity"],
+            "title": row["title"],
+            "description": row["description"],
+            "evidence": json.loads(row["evidence_json"] or "[]"),
+            "created_at": row["created_at"],
+        }
+
+    @staticmethod
+    def _report_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "report_id": row["report_id"],
+            "session_id": row["session_id"],
+            "task_id": row["task_id"],
+            "generated_at": row["generated_at"],
+            "summary": row["summary"],
+            "alert_ids": json.loads(row["alert_ids_json"] or "[]"),
+            "event_count": row["event_count"],
+            "metadata": json.loads(row["metadata_json"] or "{}"),
+        }
+
+    def save_alert(self, alert: dict[str, Any]) -> None:
+        """保存/覆盖告警；``alert_id`` 为主键，幂等覆盖。"""
+        try:
+            with self._connect() as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO alerts (
+                            alert_id, session_id, task_id, rule_id, severity,
+                            title, description, evidence_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(alert_id) DO UPDATE SET
+                            session_id = excluded.session_id,
+                            task_id = excluded.task_id,
+                            rule_id = excluded.rule_id,
+                            severity = excluded.severity,
+                            title = excluded.title,
+                            description = excluded.description,
+                            evidence_json = excluded.evidence_json,
+                            created_at = excluded.created_at
+                        """,
+                        (
+                            alert["alert_id"],
+                            alert["session_id"],
+                            alert["task_id"],
+                            alert["rule_id"],
+                            alert["severity"],
+                            alert["title"],
+                            alert["description"],
+                            json.dumps(alert["evidence"], ensure_ascii=False),
+                            alert["created_at"],
+                        ),
+                    )
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"保存告警失败: {exc}") from exc
+
+    def list_alerts(
+        self, session_id: str | None = None, task_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """按可选 ``session_id`` / ``task_id`` 过滤告警。"""
+        try:
+            with self._connect() as conn:
+                clauses: list[str] = []
+                params: list[Any] = []
+                if session_id is not None:
+                    clauses.append("session_id = ?")
+                    params.append(session_id)
+                if task_id is not None:
+                    clauses.append("task_id = ?")
+                    params.append(task_id)
+                where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+                cur = conn.execute("SELECT * FROM alerts" + where, tuple(params))
+                return [self._alert_row_to_dict(row) for row in cur.fetchall()]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举告警失败: {exc}") from exc
+
+    def save_report(self, report: dict[str, Any]) -> None:
+        """保存/覆盖报告；``report_id`` 为主键，幂等覆盖。"""
+        try:
+            with self._connect() as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO reports (
+                            report_id, session_id, task_id, generated_at, summary,
+                            alert_ids_json, event_count, metadata_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(report_id) DO UPDATE SET
+                            session_id = excluded.session_id,
+                            task_id = excluded.task_id,
+                            generated_at = excluded.generated_at,
+                            summary = excluded.summary,
+                            alert_ids_json = excluded.alert_ids_json,
+                            event_count = excluded.event_count,
+                            metadata_json = excluded.metadata_json
+                        """,
+                        (
+                            report["report_id"],
+                            report["session_id"],
+                            report["task_id"],
+                            report["generated_at"],
+                            report["summary"],
+                            json.dumps(report["alert_ids"], ensure_ascii=False),
+                            report["event_count"],
+                            json.dumps(report["metadata"], ensure_ascii=False),
+                        ),
+                    )
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"保存报告失败: {exc}") from exc
+
+    def get_report(self, report_id: str) -> dict[str, Any] | None:
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM reports WHERE report_id = ?",
+                    (report_id,),
+                )
+                row = cur.fetchone()
+                return self._report_row_to_dict(row) if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询报告失败: {exc}") from exc
+
+    def list_reports(
+        self, session_id: str | None = None, task_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """按可选 ``session_id`` / ``task_id`` 过滤报告。"""
+        try:
+            with self._connect() as conn:
+                clauses: list[str] = []
+                params: list[Any] = []
+                if session_id is not None:
+                    clauses.append("session_id = ?")
+                    params.append(session_id)
+                if task_id is not None:
+                    clauses.append("task_id = ?")
+                    params.append(task_id)
+                where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+                cur = conn.execute("SELECT * FROM reports" + where, tuple(params))
+                return [self._report_row_to_dict(row) for row in cur.fetchall()]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举报告失败: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Migration helpers

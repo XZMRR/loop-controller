@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "loop-controller"
-version = "0.42.0"
+version = "0.44.0"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.0",
