@@ -2,8 +2,8 @@
 package router
 
 import (
+	"context"
 	"errors"
-	"sync"
 
 	"github.com/loop-controller/go/internal/models"
 	"github.com/loop-controller/go/internal/registry"
@@ -11,18 +11,25 @@ import (
 
 var ErrTargetAgentNotRegistered = errors.New("target agent not registered")
 
+// RoutedMessageStore is the narrow persistence contract consumed by Router. It
+// keeps the same method set as store.RoutedMessageStore without importing the
+// store package.
+type RoutedMessageStore interface {
+	Save(ctx context.Context, msg models.Message) error
+	ListByAgent(ctx context.Context, agentID string) ([]models.Message, error)
+}
+
 // Router validates and routes messages.
 type Router struct {
 	registry *registry.Registry
-	mu       sync.RWMutex
-	messages []models.Message
+	messages RoutedMessageStore
 }
 
-// New creates a Router backed by the given Registry.
-func New(reg *registry.Registry) *Router {
+// New creates a Router backed by the given Registry and routed message store.
+func New(reg *registry.Registry, store RoutedMessageStore) *Router {
 	return &Router{
 		registry: reg,
-		messages: make([]models.Message, 0),
+		messages: store,
 	}
 }
 
@@ -35,21 +42,17 @@ func (r *Router) Route(msg models.Message) (models.SendMessageResponse, error) {
 	if _, err := r.registry.Get(msg.ToAgentID); err != nil {
 		return models.SendMessageResponse{Accepted: false, Reason: err.Error()}, ErrTargetAgentNotRegistered
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.messages = append(r.messages, msg)
+	if err := r.messages.Save(context.Background(), msg); err != nil {
+		return models.SendMessageResponse{Accepted: false, Reason: err.Error()}, err
+	}
 	return models.SendMessageResponse{Accepted: true, Reason: "routed"}, nil
 }
 
 // MessagesFor returns all messages routed to or from an agent.
 func (r *Router) MessagesFor(agentID string) []models.Message {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	var out []models.Message
-	for _, msg := range r.messages {
-		if msg.FromAgentID == agentID || msg.ToAgentID == agentID {
-			out = append(out, msg)
-		}
+	msgs, err := r.messages.ListByAgent(context.Background(), agentID)
+	if err != nil {
+		return nil
 	}
-	return out
+	return msgs
 }

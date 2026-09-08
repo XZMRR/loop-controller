@@ -1,0 +1,57 @@
+title: DelegationApproval
+type: object
+additionalProperties: false
+required:
+  - protocol_version
+  - approval_id
+  - request_id
+  - decision_id
+  - request_hash
+  - initiator_agent_id
+  - target_agent_id
+  - delegation_depth
+  - allowed_tools
+  - allowed_capabilities
+  - allow_redelegation
+  - budget
+  - expires_at
+  - status
+  - created_at
+  - updated_at
+  - version
+properties:
+  protocol_version:
+    $ref: './protocol-version.yaml'
+  approval_id: {type: string, pattern: '^[a-zA-Z0-9_.-]{1,128}$'}
+  request_id: {type: string, pattern: '^[a-zA-Z0-9_.-]{1,128}$'}
+  decision_id: {type: string, pattern: '^[a-zA-Z0-9_.-]{1,128}$'}
+  request_hash: {type: string, description: SHA-256 digest binding the complete request}
+  initiator_agent_id: {type: string}
+  target_agent_id: {type: string}
+  session_id: {type: string}
+  root_task_id: {type: string}
+  parent_task_id: {type: string}
+  delegation_depth: {type: integer, minimum: 0}
+  allowed_tools: {type: array, items: {type: string}}
+  allowed_capabilities: {type: array, items: {type: string}}
+  allow_redelegation: {type: boolean}
+  budget:
+    type: object
+    required: [token_count, payment_amount]
+    properties:
+      token_count: {type: integer, minimum: 0}
+      payment_amount: {type: number, minimum: 0}
+      currency: {type: string}
+  task_deadline: {type: string, format: date-time}
+  expires_at: {type: string, format: date-time}
+  status:
+    type: string
+    enum: [pending, approved, consumed, rejected, expired, cancelled]
+  approver_id: {type: string}
+  reason: {type: string}
+  created_at: {type: string, format: date-time}
+  updated_at: {type: string, format: date-time}
+  decided_at: {type: string, format: date-time}
+  task_id: {type: string}
+  version: {type: integer, minimum: 1}
+description: Public delegation approval state. Effective arguments are intentionally excluded.

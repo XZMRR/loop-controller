@@ -104,10 +104,11 @@ class _AllowIIGEHandler(BaseHTTPRequestHandler):
         body = json.dumps(
             {
                 "allowed": True,
+                "verdict": "allow",
                 "decision_id": "test-decision",
                 "task_id": payload.get("task_id", ""),
                 "reason": "test IIGE allow",
-                "protocol_version": "0.40.0",
+                "protocol_version": "0.48.0",
             }
         ).encode()
         self.send_response(200)

@@ -1,4 +1,4 @@
-"""Python bridge to the Go interaction governance kernel (v0.40.0)."""
+"""Python bridge to the Go interaction governance kernel (v0.48.0)."""
 
 from __future__ import annotations
 
@@ -47,10 +47,12 @@ class _AllowIIGEHandler(BaseHTTPRequestHandler):
         body = json.dumps(
             {
                 "allowed": True,
+                "verdict": "allow",
                 "decision_id": "test-decision",
                 "task_id": payload.get("task_id", ""),
+                "effective_args": payload.get("arguments", {}),
                 "reason": "test IIGE allow",
-                "protocol_version": "0.40.0",
+                "protocol_version": "0.48.0",
             }
         ).encode()
         self.send_response(200)
@@ -144,7 +146,13 @@ async def test_register_agent_and_request_delegation(bridge: GoKernelBridge) -> 
         arguments={"month": "2026-08"},
         session_id="session-1",
         risk_level="critical",
+        allowed_tools=["query_sales", "send_email"],
+        allowed_capabilities=["read_sales"],
+        allow_redelegation=True,
     )
+    assert req.to_dict()["allowed_tools"] == ["query_sales", "send_email"]
+    assert req.to_dict()["allowed_capabilities"] == ["read_sales"]
+    assert req.to_dict()["allow_redelegation"] is True
     resp = await bridge.request_delegation(req)
     assert resp.allowed
     assert resp.task_id

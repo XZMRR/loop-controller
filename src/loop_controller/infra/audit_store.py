@@ -364,7 +364,12 @@ class JsonlAuditStore:
     def _append_serialized(self, event: AuditEvent) -> None:
         with self._sync_lock, self._durable.transaction() as transaction:
             transaction.repair_incomplete_tail()
-            tail = self._tail_from_lines(transaction.read_complete_lines())
+            raw_lines = transaction.read_complete_lines()
+            if event.event_id.startswith("lifecycle:") and any(
+                json.loads(line).get("event_id") == event.event_id for line in raw_lines
+            ):
+                return
+            tail = self._tail_from_lines(raw_lines)
             disk_seq, disk_prev_hash, disk_chain_hash, last_algo = tail
             if last_algo is not None and last_algo != self._hash_algo:
                 raise RuntimeError("审计磁盘链算法与当前配置不一致")

@@ -25,11 +25,11 @@ func TestHTTPR2Authorizer_RecordLifecycleCarriesCorrelationFields(t *testing.T) 
 		TaskID: "task-1", SessionID: "session-1", InteractionID: "int-1", DecisionID: "dec-1",
 		RootInteractionID: "root-1", ParentInteractionID: "parent-1", InitiatorAgentID: "agent-a", TargetAgentID: "agent-b",
 	}
-	if err := auth.RecordLifecycle(context.Background(), task, "running"); err != nil {
+	if err := auth.RecordLifecycle(context.Background(), task, "running", "lifecycle:task-1:running"); err != nil {
 		t.Fatalf("record lifecycle: %v", err)
 	}
 	for field, want := range map[string]string{
-		"interaction_id": "int-1", "decision_id": "dec-1", "root_interaction_id": "root-1",
+		"event_id": "lifecycle:task-1:running", "interaction_id": "int-1", "decision_id": "dec-1", "root_interaction_id": "root-1",
 		"parent_interaction_id": "parent-1", "task_id": "task-1", "session_id": "session-1",
 	} {
 		if got := payload[field]; got != want {
@@ -44,6 +44,7 @@ func TestHTTPR2Authorizer_RecordLifecycleCarriesCorrelationFields(t *testing.T) 
 func TestHTTPR2Authorizer_Allowed(t *testing.T) {
 	want := models.DelegationResponse{
 		Allowed:         true,
+		Verdict:         "allow",
 		TaskID:          "task-001",
 		Reason:          "IIGE authorized delegation",
 		DelegationToken: "token-123",
@@ -102,10 +103,39 @@ func TestHTTPR2Authorizer_Allowed(t *testing.T) {
 	}
 }
 
+func TestHTTPR2Authorizer_ModifyRequiresEffectiveArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		effectiveArgs json.RawMessage
+		wantErr       bool
+	}{
+		{name: "object", effectiveArgs: json.RawMessage(`{"region":"APAC"}`)},
+		{name: "missing", wantErr: true},
+		{name: "array", effectiveArgs: json.RawMessage(`[]`), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(models.DelegationResponse{
+					Allowed: true, Verdict: "modify", EffectiveArgs: tc.effectiveArgs,
+					ProtocolVersion: interactionProtocolVersion,
+				})
+			}))
+			defer ts.Close()
+			auth := &HTTPR2Authorizer{BaseURL: ts.URL}
+			resp, err := auth.Authorize(context.Background(), models.DelegationRequest{
+				ProtocolVersion: interactionProtocolVersion,
+			})
+			if (err != nil) != tc.wantErr || resp.Allowed == tc.wantErr {
+				t.Fatalf("response = %+v, err = %v", resp, err)
+			}
+		})
+	}
+}
+
 func TestHTTPR2Authorizer_FallsBackOnlyOn404(t *testing.T) {
 	paths := make([]string, 0, 2)
 	response := models.DelegationResponse{
-		Allowed: true, ProtocolVersion: interactionProtocolVersion,
+		Allowed: true, Verdict: "allow", ProtocolVersion: interactionProtocolVersion,
 	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
@@ -131,7 +161,7 @@ func TestHTTPR2Authorizer_FallsBackOnlyOn404(t *testing.T) {
 
 func TestHTTPR2Authorizer_Denied(t *testing.T) {
 	resp := models.DelegationResponse{
-		Allowed: false, Reason: "target not trusted", ProtocolVersion: interactionProtocolVersion,
+		Allowed: false, Verdict: "deny", Reason: "target not trusted", ProtocolVersion: interactionProtocolVersion,
 	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(resp)
@@ -150,7 +180,7 @@ func TestHTTPR2Authorizer_Denied(t *testing.T) {
 func TestHTTPR2Authorizer_FailClosedOnIncompatibleResponse(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(models.DelegationResponse{
-			Allowed: true, ProtocolVersion: "0.38.0",
+			Allowed: true, Verdict: "allow", ProtocolVersion: "0.38.0",
 		})
 	}))
 	defer ts.Close()

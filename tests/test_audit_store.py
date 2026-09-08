@@ -36,6 +36,18 @@ def test_chain_initially_passes(tmp_path) -> None:
     assert store._seq == 2
 
 
+def test_duplicate_lifecycle_event_id_is_idempotent(tmp_path) -> None:
+    path = tmp_path / "audit.jsonl"
+    store = JsonlAuditStore(path)
+    event = _make_event().model_copy(update={"event_id": "lifecycle:task-1:running"})
+
+    store.append(event)
+    store.append(event)
+
+    assert len(path.read_text(encoding="utf-8").strip().splitlines()) == 1
+    assert store._seq == 1
+
+
 def test_seq_and_prev_hash_assigned(tmp_path) -> None:
     path = tmp_path / "audit.jsonl"
     store = JsonlAuditStore(path)

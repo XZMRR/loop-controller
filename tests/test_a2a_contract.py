@@ -7,6 +7,8 @@ from loop_controller.go_kernel_bridge import (
     CURRENT_PROTOCOL_VERSION,
     A2AMessage,
     AgentCard,
+    ApprovalActionRequest,
+    DelegationApproval,
     DelegationRequest,
     DelegationResponse,
     check_protocol_version,
@@ -14,8 +16,8 @@ from loop_controller.go_kernel_bridge import (
 from loop_controller.utils.canonical import canonical_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FIXTURE = PROJECT_ROOT / "contract" / "a2a_v0.40.0.json"
-OPENAPI = PROJECT_ROOT / "openapi" / "a2a_v0.40.0.yaml"
+FIXTURE = PROJECT_ROOT / "contract" / "a2a_v0.48.0.json"
+OPENAPI = PROJECT_ROOT / "openapi" / "a2a_v0.48.0.yaml"
 TASK_PATHS = PROJECT_ROOT / "openapi" / "paths" / "tasks.yaml"
 TASK_SCHEMA = PROJECT_ROOT / "openapi" / "schemas" / "task.yaml"
 
@@ -33,12 +35,12 @@ def test_current_protocol_version_matches_fixture(contract: dict) -> None:
 @pytest.mark.parametrize(
     ("version", "should_raise"),
     [
-        ("0.40.0", False),
-        ("0.40.1", False),
-        ("0.40.99", False),
+        ("0.48.0", False),
+        ("0.48.1", False),
+        ("0.48.99", False),
         ("", True),
-        ("0.39.1", True),
-        ("0.41.0", True),
+        ("0.44.0", True),
+        ("0.44.1", True),
         ("not-a-version", True),
     ],
 )
@@ -83,6 +85,12 @@ def test_delegation_request_roundtrip(contract: dict) -> None:
         session_id=fixture["session_id"],
         task_id=fixture["task_id"],
         risk_level=fixture["risk_level"],
+        allowed_tools=fixture["allowed_tools"],
+        allowed_capabilities=fixture["allowed_capabilities"],
+        allow_redelegation=fixture["allow_redelegation"],
+        parent_task_id=fixture["parent_task_id"],
+        budget=fixture["budget"],
+        deadline=fixture["deadline"],
         protocol_version=fixture["protocol_version"],
     )
     assert req.to_dict() == fixture
@@ -94,9 +102,18 @@ def test_delegation_response_roundtrip(contract: dict) -> None:
     assert resp.to_dict() == fixture
 
 
+def test_delegation_approval_roundtrip_does_not_expose_arguments(contract: dict) -> None:
+    fixture = contract["delegation_approval"]
+    approval = DelegationApproval.from_dict(fixture)
+    assert approval.to_dict() == fixture
+    assert "effective_args" not in approval.to_dict()
+    action = ApprovalActionRequest(**contract["approval_action_request"])
+    assert action.to_dict() == contract["approval_action_request"]
+
+
 def test_delegation_response_default_protocol_version() -> None:
     resp = DelegationResponse(allowed=True)
-    assert resp.protocol_version == "0.40.0"
+    assert resp.protocol_version == "0.48.0"
 
 
 def test_task_fixture_is_canonical_and_has_stable_timestamps(contract: dict) -> None:
@@ -114,6 +131,8 @@ def test_all_roundtrip_fixtures_have_stable_canonical_json(contract: dict) -> No
         "message",
         "delegation_request",
         "delegation_response",
+        "delegation_approval",
+        "approval_action_request",
         "error_response",
         "sse_event",
         "task_event",
@@ -125,7 +144,7 @@ def test_all_roundtrip_fixtures_have_stable_canonical_json(contract: dict) -> No
 def test_error_response_fixture(contract: dict) -> None:
     fixture = contract["error_response"]
     assert fixture == {
-        "error": "protocol version 0.39.0 is incompatible",
+        "error": "protocol version 0.40.0 is incompatible",
         "code": "incompatible_protocol_version",
     }
 

@@ -61,7 +61,7 @@ func TestPublisherSubscribeAndPublish(t *testing.T) {
 	}
 }
 
-func TestPublishCommittedFansOutWithoutAppending(t *testing.T) {
+func TestPublishCommittedDeliversPersistedEventWithoutAppending(t *testing.T) {
 	es := openTestEventStore(t, "task-1")
 	pub := NewPublisher(es)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -70,7 +70,13 @@ func TestPublishCommittedFansOutWithoutAppending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe failed: %v", err)
 	}
+
+	// PublishCommitted only signals subscribers to re-read the shared store, so
+	// the event must already be persisted (as task.Manager does before fan-out).
 	ev := models.TaskEvent{EventID: "ev-committed", TaskID: "task-1", EventType: "task_running", PublishedAt: time.Now().UTC()}
+	if err := es.Append(context.Background(), ev); err != nil {
+		t.Fatalf("append event: %v", err)
+	}
 	pub.PublishCommitted(ev)
 
 	select {
@@ -85,8 +91,63 @@ func TestPublishCommittedFansOutWithoutAppending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list history: %v", err)
 	}
-	if len(history) != 0 {
-		t.Fatalf("PublishCommitted unexpectedly appended %d events", len(history))
+	if len(history) != 1 {
+		t.Fatalf("PublishCommitted resulted in %d events, want exactly the 1 persisted event", len(history))
+	}
+}
+
+func TestPublisherSeesCrossInstanceEvents(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shared.db")
+
+	dbA, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open db A: %v", err)
+	}
+	t.Cleanup(func() { dbA.Close() })
+
+	dbB, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open db B: %v", err)
+	}
+	t.Cleanup(func() { dbB.Close() })
+
+	if err := dbA.TaskStore().Create(context.Background(), models.Task{
+		TaskID:           "task-1",
+		SessionID:        "session-1",
+		InitiatorAgentID: "agent-a",
+		TargetAgentID:    "agent-b",
+		Status:           "pending",
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	pubA := NewPublisher(dbA.EventStore())
+	pubB := NewPublisher(dbB.EventStore())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch, err := pubA.Subscribe(ctx, "task-1", "")
+	if err != nil {
+		t.Fatalf("subscribe on A: %v", err)
+	}
+
+	// Instance B commits an event to the shared store; a client connected to
+	// instance A must observe it without any in-process fan-out.
+	if err := pubB.Publish(context.Background(), models.Task{TaskID: "task-1", Status: "running"}); err != nil {
+		t.Fatalf("publish on B: %v", err)
+	}
+
+	select {
+	case got := <-ch:
+		if got.EventType != "task_running" {
+			t.Fatalf("event type = %q, want task_running", got.EventType)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for cross-instance event")
 	}
 }
 

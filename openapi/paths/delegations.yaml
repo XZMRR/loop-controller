@@ -17,6 +17,12 @@
           application/json:
             schema:
               $ref: '../schemas/delegation-response.yaml'
+      '202':
+        description: Delegation persisted and awaiting approval
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/delegation-response.yaml'
       '400':
         description: Invalid request
         content:

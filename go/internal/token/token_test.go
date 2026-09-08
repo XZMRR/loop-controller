@@ -10,11 +10,27 @@ import (
 func TestIssueAndValidate(t *testing.T) {
 	issuer := NewHMACIssuer([]byte("super-secret"))
 	claims := DelegationClaims{
-		RequestID:        "req-1",
-		InitiatorAgentID: "planner",
-		TargetAgentID:    "executor",
-		ToolName:         "query_sales",
-		TaskID:           "task-1",
+		RequestID:           "req-1",
+		SessionID:           "session-1",
+		InteractionID:       "interaction-1",
+		DecisionID:          "decision-1",
+		RootInteractionID:   "interaction-root",
+		ParentInteractionID: "interaction-parent",
+		InitiatorAgentID:    "planner",
+		TargetAgentID:       "executor",
+		ToolName:            "query_sales",
+		TaskID:              "task-1",
+		ArgumentsSHA256:     "args-digest",
+		AllowedTools:        []string{"query_sales"},
+		AllowedCapabilities: []string{"read_data"},
+		AllowRedelegation:   true,
+		RootTaskID:          "task-root",
+		ParentTaskID:        "task-parent",
+		DelegationDepth:     2,
+		Deadline:            1_800_000_000,
+		BudgetTokenCount:    100,
+		BudgetPaymentAmount: 2.5,
+		BudgetCurrency:      "USD",
 	}
 	token, err := issuer.Issue(claims, time.Hour)
 	if err != nil {
@@ -30,6 +46,17 @@ func TestIssueAndValidate(t *testing.T) {
 	}
 	if got.ToolName != "query_sales" {
 		t.Errorf("unexpected tool_name: %q", got.ToolName)
+	}
+	if got.SessionID != claims.SessionID || got.InteractionID != claims.InteractionID || got.DecisionID != claims.DecisionID ||
+		got.RootInteractionID != claims.RootInteractionID || got.ParentInteractionID != claims.ParentInteractionID ||
+		got.ArgumentsSHA256 != claims.ArgumentsSHA256 || got.RootTaskID != claims.RootTaskID || got.ParentTaskID != claims.ParentTaskID ||
+		got.DelegationDepth != claims.DelegationDepth || got.Deadline != claims.Deadline ||
+		got.BudgetTokenCount != claims.BudgetTokenCount || got.BudgetPaymentAmount != claims.BudgetPaymentAmount || got.BudgetCurrency != claims.BudgetCurrency {
+		t.Fatalf("delegation context was not fully bound: %+v", got)
+	}
+	if len(got.AllowedTools) != 1 || got.AllowedTools[0] != "query_sales" ||
+		len(got.AllowedCapabilities) != 1 || got.AllowedCapabilities[0] != "read_data" || !got.AllowRedelegation {
+		t.Fatalf("delegation scope was not fully bound: %+v", got)
 	}
 }
 

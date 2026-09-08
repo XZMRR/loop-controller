@@ -1,7 +1,7 @@
 # Loop Controller — 企业内部 Agent 工具调用治理基础设施
 
-> **当前版本**：v0.37.0（A2A 协议一致性、敏感数据加密与工程发布基线收敛）
-> **项目阶段**：MVP 已完成；当前提供 HTTP REST API、MCP Proxy 治理入口，以及可信身份、全局吊销、可插拔执行器、本地签名证据链、受治理的远程 HTTP Harness 出口与 Go 交互治理内核。v0.36.1 在 v0.36.0 的 A2A 骨架基础上，收敛治理语义、统一 A2A 协议契约、加密审批敏感载荷并补齐打包/安装/CI 发布基线。
+> **当前版本**：v0.48.0（委托审批持久化与可靠恢复派发）
+> **项目阶段**：双治理平面已落地——Python 工具调用治理层（R1 风险评估 → R2 Checkpoint 判定 → R3 审计证据链，`@governed` SDK / MCP Proxy / HTTP REST 三种接入，可信身份、全局吊销、可插拔执行器、受治理的 Harness 出口）+ Agent 交互治理平面（Go A2A 内核 + Python IIGE，含可信单跳/递归委托、委托审批状态机、分布式可靠性、SQLite 统一状态层）。
 > **首选语言**：Python（Agent 生态最丰富，社区传播友好）
 > **文档语言**：中文为主，代码与核心 API 文档以英文为主，便于国际化开源
 
@@ -73,7 +73,7 @@ Loop Controller 用同样的逻辑管理 Agent，抽象为 **R0-R3 四层治理�
 
 ```
 src/
-├── loop_controller/        # MVP 源码
+├── loop_controller/        # Python 治理层源码（R1/R2/R3、三入口、执行器、IIGE、Go 内核桥接）
 ├── Loop_Controller_MVP方案_纯工具调用_v1.1.md   # 当前权威实现依据
 ├── Loop_Controller_MVP开发指南_v1.0.md
 ├── development_log.md                          # 迭代开发记录
@@ -288,7 +288,16 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 - [x] v0.34.0：状态持久化 SQLite 化与 Harness 生产化（热更新、远程取消、幂等、资源隔离）
 - [x] v0.35.0：A2A 交互治理层骨架（Go kernel、Agent Registry、Task Manager、Delegation Manager）
 - [x] v0.36.0：A2A 自动发现、流式任务与 Runtime 委托集成
-- [ ] v0.37.0+：Go 交互治理层完整状态机、跨 Agent 审批委托、分布式发现
+- [x] v0.37.0：单实例可靠 A2A 闭环（OpenAPI 权威协议、SQLite 状态层、真实委托执行）
+- [x] v0.38.0：独立 Agent Interaction Governance（IIGE）平面
+- [x] v0.39.0：交互治理协议与运行闭环收敛
+- [x] v0.40.0：Agent 委托执行生命周期闭环（Task 状态机 CAS、SSE 重放、委派 token 参数绑定）
+- [x] v0.41.0：分布式可靠性（outbox 原子领取、exec 租约故障转移）
+- [x] v0.42.0：registry / router / discovery 持久化
+- [x] v0.43.0–v0.45.0：Python 治理核心状态 SQLite 化（预算/预留/权限令牌/任务/告警/会话/对话）
+- [x] v0.46.0：可信单跳 A2A 委托闭环（Bearer 身份绑定、独立工作负载凭证）
+- [x] v0.47.0：可信递归委托、权限与预算衰减
+- [x] v0.48.0：委托审批持久化与可靠恢复派发
 - [ ] T3.5（可选）：LLMPlanner JSON Schema 契约实现
 - [ ] 补充更多示例与文档
 - [ ] 建立完整 CI/CD、代码规范、贡献指南

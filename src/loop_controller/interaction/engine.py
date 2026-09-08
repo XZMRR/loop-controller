@@ -391,8 +391,10 @@ class InteractionGovernanceEngine:
             profile_version=decision.profile_version,
             metadata={
                 "interaction_id": proposal.interaction_id,
-                "root_interaction_id": proposal.interaction_id,
-                "parent_interaction_id": None,
+                "root_interaction_id": proposal.root_interaction_id or proposal.interaction_id,
+                "parent_interaction_id": proposal.parent_interaction_id or None,
+                "root_task_id": proposal.root_task_id or None,
+                "parent_task_id": proposal.parent_task_id or None,
                 "request_id": proposal.request_id,
                 "task_id": proposal.task_id or None,
                 "decision_id": decision.decision_id,
@@ -400,6 +402,9 @@ class InteractionGovernanceEngine:
                 "target_agent_id": proposal.target_agent_id,
                 "verdict": decision.verdict,
                 "delegation_depth": proposal.delegation_depth,
+                "budget": proposal.budget,
+                "deadline": proposal.deadline.isoformat() if proposal.deadline else None,
+                "parent_allow_redelegation": proposal.parent_allow_redelegation,
                 "policy_hits": decision.policy_hits,
                 "target_entrypoint": decision.target_entrypoint,
             },
@@ -421,7 +426,7 @@ class InteractionGovernanceEngine:
         }
         return AuditEvent(
             schema_version="1.0",
-            event_id=str(uuid4()),
+            event_id=str(payload["event_id"]),
             trace_id=str(payload["task_id"]),
             session_id=str(payload.get("session_id") or ""),
             actor_type="system",
@@ -441,6 +446,16 @@ class InteractionGovernanceEngine:
                 "target_agent_id": str(payload["target_agent_id"]),
                 "verdict": str(payload.get("verdict") or "allow"),
                 "lifecycle_event": lifecycle_event,
+                "root_task_id": payload.get("root_task_id") or payload["task_id"],
+                "parent_task_id": payload.get("parent_task_id"),
+                "delegation_depth": int(payload.get("delegation_depth") or 0),
+                "allowed_tools": payload.get("allowed_tools") or [],
+                "allowed_capabilities": payload.get("allowed_capabilities") or [],
+                "allow_redelegation": bool(payload.get("allow_redelegation")),
+                "budget": payload.get("budget") or {},
+                "reserved_budget": payload.get("reserved_budget") or {},
+                "consumed_budget": payload.get("consumed_budget") or {},
+                "deadline": payload.get("deadline"),
             },
         )
 
@@ -566,6 +581,13 @@ class InteractionAuthorizeEndpoint:
             risk_level=payload.get("risk_level", "low"),
             risk_tags=payload.get("risk_tags", []),
             delegation_depth=payload.get("delegation_depth", 0),
+            root_task_id=payload.get("root_task_id", ""),
+            parent_task_id=payload.get("parent_task_id", ""),
+            root_interaction_id=payload.get("root_interaction_id", ""),
+            parent_interaction_id=payload.get("parent_interaction_id", ""),
+            budget=payload.get("budget") or {},
+            deadline=payload.get("deadline"),
+            parent_allow_redelegation=bool(payload.get("parent_allow_redelegation", False)),
             interaction_context=payload.get("interaction_context", ""),
         )
 
@@ -589,4 +611,6 @@ class InteractionAuthorizeEndpoint:
             response["modified_args"] = decision.modified_args
         if decision.original_args is not None:
             response["original_args"] = decision.original_args
+        if decision.effective_args is not None:
+            response["effective_args"] = decision.effective_args
         return response

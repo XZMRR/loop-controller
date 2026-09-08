@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/loop-controller/go/internal/models"
 	"github.com/loop-controller/go/internal/store"
 )
 
@@ -245,5 +249,81 @@ func TestCompleteFromOutcomeUnknown(t *testing.T) {
 	}
 	if completed.Status != "completed" {
 		t.Errorf("expected completed, got %q", completed.Status)
+	}
+}
+
+type recordingFanout struct {
+	mu     sync.Mutex
+	events []models.TaskEvent
+}
+
+func (f *recordingFanout) PublishCommitted(ev models.TaskEvent) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, ev)
+}
+
+func (f *recordingFanout) snapshot() []models.TaskEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]models.TaskEvent, len(f.events))
+	copy(out, f.events)
+	return out
+}
+
+func TestGeneratedIDIncludesInstancePrefix(t *testing.T) {
+	m := New(openTestStore(t)).WithInstanceID("inst-test")
+	task, err := m.CreateReliable("session-1", "agent-a", "agent-b")
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	if !strings.HasPrefix(task.TaskID, "task-inst-test-") {
+		t.Fatalf("task id %q does not include instance prefix", task.TaskID)
+	}
+}
+
+func TestRecoverExpiredRunningPublishes(t *testing.T) {
+	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "tasks.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	fanout := &recordingFanout{}
+	m := New(db.TaskStore()).WithEventFanout(fanout).WithInstanceID("inst-a")
+	task, err := m.CreateReliable("session-1", "agent-a", "agent-b")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := m.UpdateStatus(task.TaskID, "accepted"); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if _, err := m.UpdateStatus(task.TaskID, "running"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	expired := time.Now().Add(-time.Minute).UnixNano()
+	if _, err := db.ExecContext(context.Background(), `UPDATE tasks SET exec_lease_expires_at = ? WHERE task_id = ?`, expired, task.TaskID); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+
+	fanout.mu.Lock()
+	fanout.events = nil
+	fanout.mu.Unlock()
+
+	recovered, err := m.RecoverExpiredRunning(context.Background(), time.Now().UTC(), 10)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if len(recovered) != 1 {
+		t.Fatalf("recovered = %d, want 1", len(recovered))
+	}
+
+	events := fanout.snapshot()
+	if len(events) == 0 {
+		t.Fatal("expected recovery fanout event")
+	}
+	if events[0].EventType != "task_outcome_unknown" || events[0].TaskID != task.TaskID {
+		t.Fatalf("unexpected fanout event: %+v", events[0])
 	}
 }

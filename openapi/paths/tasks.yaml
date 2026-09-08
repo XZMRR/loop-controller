@@ -97,7 +97,7 @@
             example: |
               id: ev-001
               event: task_created
-              data: {"protocol_version":"0.40.0","event_id":"ev-001","task_id":"task-001","event_type":"task_created","payload":{},"published_at":"2026-09-01T12:00:00Z"}
+              data: {"protocol_version":"0.48.0","event_id":"ev-001","task_id":"task-001","event_type":"task_created","payload":{},"published_at":"2026-09-01T12:00:00Z"}
 
 /a2a/v1/tasks/{id}/cancel:
   post:
@@ -168,6 +168,9 @@
               - tool_name
               - arguments
               - delegation_token
+              - allowed_tools
+              - allowed_capabilities
+              - allow_redelegation
             properties:
               protocol_version:
                 $ref: '../schemas/protocol-version.yaml'
@@ -190,6 +193,31 @@
                 additionalProperties: true
               delegation_token:
                 type: string
+              allowed_tools:
+                type: array
+                items:
+                  type: string
+              allowed_capabilities:
+                type: array
+                items:
+                  type: string
+              allow_redelegation:
+                type: boolean
+                default: false
+              root_task_id:
+                type: string
+              parent_task_id:
+                type: string
+              delegation_depth:
+                type: integer
+                minimum: 0
+              root_interaction_id:
+                type: string
+              parent_interaction_id:
+                type: string
+              deadline:
+                type: string
+                format: date-time
     responses:
       '201':
         description: Task received
@@ -409,6 +437,18 @@
                 description: Execution result or failure summary as a JSON value.
               error_code:
                 type: string
+              consumed_budget:
+                description: Actual measured consumption at a definite completed or failed outcome. Omit or send zero when unavailable; it is never inferred from the assigned envelope.
+                type: object
+                properties:
+                  token_count:
+                    type: integer
+                    minimum: 0
+                  payment_amount:
+                    type: number
+                    minimum: 0
+                  currency:
+                    type: string
     responses:
       '200':
         description: Result recorded

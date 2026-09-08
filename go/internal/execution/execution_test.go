@@ -17,6 +17,9 @@ func TestHTTPExecutorCompletes(t *testing.T) {
 		if r.URL.Path != "/v1/govern/tool-call" {
 			t.Errorf("path = %q", r.URL.Path)
 		}
+		if got := r.Header.Get("Authorization"); got != "Bearer service-token" {
+			t.Errorf("Authorization = %q", got)
+		}
 		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
@@ -24,10 +27,11 @@ func TestHTTPExecutorCompletes(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := &HTTPExecutor{BaseURL: server.URL, Client: server.Client()}
+	executor := &HTTPExecutor{BaseURL: server.URL, BearerToken: "service-token", Client: server.Client()}
 	handle, err := executor.Start(context.Background(), Request{
 		TaskID: "task-1", SessionID: "session-1", InitiatorAgentID: "planner", TargetAgentID: "executor",
 		ToolName: "echo", Arguments: json.RawMessage(`{"x":"hello"}`),
+		AllowedTools: []string{"echo"}, AllowedCapabilities: []string{"read_data"}, AllowRedelegation: true,
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -43,6 +47,10 @@ func TestHTTPExecutorCompletes(t *testing.T) {
 	if got["agent_id"] != "executor" || got["tool_name"] != "echo" {
 		t.Fatalf("unexpected execution request: %+v", got)
 	}
+	if tools, ok := got["allowed_tools"].([]any); !ok || len(tools) != 1 || tools[0] != "echo" ||
+		got["allow_redelegation"] != true {
+		t.Fatalf("execution scope was not forwarded: %+v", got)
+	}
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -51,8 +59,8 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { re
 
 func TestHTTPExecutorTransportFailureTracksWhetherRequestWasSent(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		wrote      bool
+		name      string
+		wrote     bool
 		mayBeSent bool
 	}{
 		{name: "connection failure", wrote: false, mayBeSent: false},
@@ -98,6 +106,26 @@ func TestHTTPExecutorInvalidResponseAfterSendIsUncertain(t *testing.T) {
 	result := <-handle.Done()
 	if result.ErrorCode != "executor_invalid_response" || !result.MayBeSent {
 		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestHTTPExecutorDeadlineCancelsSentRequestAsUncertain(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		httptrace.ContextClientTrace(req.Context()).WroteRequest(httptrace.WroteRequestInfo{})
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	deadline := time.Now().Add(30 * time.Millisecond)
+	handle, err := (&HTTPExecutor{BaseURL: "http://executor.test", Client: client}).Start(context.Background(), Request{
+		TaskID: "task-deadline", InitiatorAgentID: "planner", TargetAgentID: "executor",
+		ToolName: "wait", Arguments: json.RawMessage(`{}`), Deadline: &deadline,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	result := <-handle.Done()
+	if result.ErrorCode != "execution_deadline_exceeded" || !result.MayBeSent {
+		t.Fatalf("unexpected deadline result: %+v", result)
 	}
 }
 

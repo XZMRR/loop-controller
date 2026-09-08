@@ -95,6 +95,13 @@ class InteractionProposal(BaseModel):
     risk_level: str = "low"
     risk_tags: list[str] = Field(default_factory=list)
     delegation_depth: int = 0
+    root_task_id: str = ""
+    parent_task_id: str = ""
+    root_interaction_id: str = ""
+    parent_interaction_id: str = ""
+    budget: dict[str, Any] = Field(default_factory=dict)
+    deadline: datetime | None = None
+    parent_allow_redelegation: bool = False
     interaction_context: str = ""
 
 

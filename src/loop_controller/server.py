@@ -452,6 +452,7 @@ class ToolGovernServer:
             if not isinstance(payload, dict):
                 raise ValueError("request body must be an object")
             required = (
+                "event_id",
                 "interaction_id",
                 "decision_id",
                 "task_id",
@@ -462,6 +463,9 @@ class ToolGovernServer:
             missing = [field for field in required if not payload.get(field)]
             if missing:
                 raise ValueError(f"missing lifecycle fields: {', '.join(missing)}")
+            expected_event_id = f"lifecycle:{payload['task_id']}:{payload['event']}"
+            if payload["event_id"] != expected_event_id:
+                raise ValueError("lifecycle event_id does not match task and event")
             engine = InteractionGovernanceEngine(self._controller)
             event = engine.build_lifecycle_audit_event(payload)
         except (KeyError, ValueError) as exc:
@@ -506,6 +510,28 @@ class ToolGovernServer:
             agent_id = body.agent_id
             user_id = body.user_id
 
+        scope_error = self._validate_delegated_tool_scope(body)
+        if scope_error is not None:
+            return JSONResponse(
+                {
+                    "status": "blocked",
+                    "result": scope_error,
+                    "request_id": None,
+                    "error_code": "delegation_scope_denied",
+                },
+                status_code=403,
+            )
+        if body.deadline is not None and body.deadline.timestamp() <= time.time():
+            return JSONResponse(
+                {
+                    "status": "blocked",
+                    "result": "delegated task deadline has expired",
+                    "request_id": None,
+                    "error_code": "task_deadline_expired",
+                },
+                status_code=409,
+            )
+
         logger.info(
             "tool_call request agent=%s user=%s tool=%s",
             agent_id,
@@ -537,6 +563,43 @@ class ToolGovernServer:
             result.request_id,
         )
         return JSONResponse(response.model_dump())
+
+    def _validate_delegated_tool_scope(self, body: GovernToolRequest) -> str | None:
+        delegated = body.task_id is not None or body.allowed_tools is not None or body.allowed_capabilities is not None
+        if not delegated:
+            return None
+        if body.task_id is None:
+            return "delegated tool call requires task_id"
+        if body.allowed_tools is None or body.allowed_capabilities is None:
+            return "delegated tool call requires complete allowed_tools and allowed_capabilities scope"
+        if body.tool_name not in body.allowed_tools:
+            return f"tool {body.tool_name!r} is outside delegated allowed_tools"
+
+        config = getattr(self._controller._runtime, "config", None)
+        capability_rules = getattr(config, "capability_rules", None)
+        if capability_rules is None:
+            required_capabilities: set[str] = set()
+        else:
+            from loop_controller.capability import CapabilityGraphAnalyzer
+            from loop_controller.models import ActionProposal
+
+            proposal = ActionProposal(
+                task_id=body.task_id or "delegated-scope-check",
+                call_id="delegated-scope-check",
+                agent_id=body.agent_id,
+                tool_name=body.tool_name,
+                arguments=body.arguments,
+                task_context=body.task_context,
+            )
+            required_capabilities = CapabilityGraphAnalyzer(
+                capability_rules.capabilities, []
+            ).extract_capabilities(proposal)
+        missing = required_capabilities.difference(body.allowed_capabilities or [])
+        if missing:
+            return "tool requires capabilities outside delegated scope: " + ", ".join(
+                sorted(missing)
+            )
+        return None
 
     async def _handle_resume_after_approval(self, request: Request) -> JSONResponse:
         authorized, identity = await self._check_agent_auth(request)

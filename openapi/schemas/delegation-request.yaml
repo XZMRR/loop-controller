@@ -10,6 +10,9 @@ required:
   - session_id
   - task_id
   - risk_level
+  - allowed_tools
+  - allowed_capabilities
+  - allow_redelegation
 properties:
   protocol_version:
     $ref: './protocol-version.yaml'
@@ -41,4 +44,35 @@ properties:
       - medium
       - high
       - critical
+  allowed_tools:
+    type: array
+    items:
+      type: string
+    description: Caller-requested tool scope; each delegation narrows it by intersection.
+  allowed_capabilities:
+    type: array
+    items:
+      type: string
+    description: Caller-requested capability scope; each delegation narrows it by intersection.
+  allow_redelegation:
+    type: boolean
+    default: false
+  parent_task_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    description: Persisted parent task used by the kernel to derive trusted lineage.
+  budget:
+    type: object
+    properties:
+      token_count:
+        type: integer
+        minimum: 0
+      payment_amount:
+        type: number
+        minimum: 0
+      currency:
+        type: string
+  deadline:
+    type: string
+    format: date-time
 description: Request to delegate a tool execution to a target agent.

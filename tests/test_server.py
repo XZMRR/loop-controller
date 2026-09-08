@@ -246,6 +246,141 @@ def test_govern_tool_call() -> None:
     assert call["kwargs"]["session_id"] == "s-001"
 
 
+def test_govern_tool_call_enforces_delegated_allowed_tools() -> None:
+    client, controller = _build_client()
+    resp = client.post(
+        "/v1/govern/tool-call",
+        json={
+            "agent_id": "researcher_001",
+            "user_id": "alice",
+            "tool_name": "send_email",
+            "arguments": {},
+            "task_id": "delegated-task-1",
+            "allowed_tools": ["read_file"],
+            "allowed_capabilities": [],
+            "allow_redelegation": False,
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error_code"] == "delegation_scope_denied"
+    assert controller.tool_calls == []
+
+
+def test_govern_tool_call_rejects_expired_delegation_deadline() -> None:
+    client, controller = _build_client()
+    resp = client.post(
+        "/v1/govern/tool-call",
+        json={
+            "agent_id": "researcher_001",
+            "user_id": "alice",
+            "tool_name": "send_email",
+            "arguments": {},
+            "task_id": "delegated-task-expired",
+            "allowed_tools": ["send_email"],
+            "allowed_capabilities": [],
+            "deadline": "2020-01-01T00:00:00Z",
+        },
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "task_deadline_expired"
+    assert controller.tool_calls == []
+
+
+def test_govern_tool_call_accepts_tool_within_delegated_scope() -> None:
+    client, controller = _build_client()
+    resp = client.post(
+        "/v1/govern/tool-call",
+        json={
+            "agent_id": "researcher_001",
+            "user_id": "alice",
+            "tool_name": "send_email",
+            "arguments": {},
+            "task_id": "delegated-task-1",
+            "allowed_tools": ["send_email"],
+            "allowed_capabilities": [],
+        },
+    )
+    assert resp.status_code == 200
+    assert len(controller.tool_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "delegation_context",
+    [
+        {"task_id": "delegated-task-1"},
+        {
+            "task_id": "delegated-task-1",
+            "allowed_tools": ["send_email"],
+        },
+        {
+            "task_id": "delegated-task-1",
+            "allowed_capabilities": [],
+        },
+        {
+            "allowed_tools": ["send_email"],
+            "allowed_capabilities": [],
+        },
+    ],
+)
+def test_govern_tool_call_rejects_incomplete_delegated_scope(
+    delegation_context: dict[str, Any],
+) -> None:
+    client, controller = _build_client()
+    resp = client.post(
+        "/v1/govern/tool-call",
+        json={
+            "agent_id": "researcher_001",
+            "user_id": "alice",
+            "tool_name": "send_email",
+            "arguments": {},
+            **delegation_context,
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error_code"] == "delegation_scope_denied"
+    assert controller.tool_calls == []
+
+
+def test_govern_tool_call_enforces_delegated_capabilities() -> None:
+    from loop_controller.infra.config_loader import (
+        CapabilityDef,
+        CapabilityProducer,
+        CapabilityRules,
+    )
+
+    client, controller = _build_client()
+    controller._runtime.config = type(
+        "Config",
+        (),
+        {
+            "capability_rules": CapabilityRules(
+                capabilities={
+                    "send_external": CapabilityDef(
+                        name="send_external",
+                        produced_by=[CapabilityProducer(tool="send_email")],
+                    )
+                },
+                combination_rules=[],
+            )
+        },
+    )()
+    resp = client.post(
+        "/v1/govern/tool-call",
+        json={
+            "agent_id": "researcher_001",
+            "user_id": "alice",
+            "tool_name": "send_email",
+            "arguments": {},
+            "task_id": "delegated-task-1",
+            "allowed_tools": ["send_email"],
+            "allowed_capabilities": [],
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error_code"] == "delegation_scope_denied"
+    assert controller.tool_calls == []
+
+
 def test_govern_tool_call_require_approval() -> None:
     client, controller = _build_client()
     controller._tool_response = GovernanceResult(

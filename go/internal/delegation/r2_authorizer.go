@@ -34,16 +34,27 @@ type HTTPR2Authorizer struct {
 }
 
 type interactionAuthorizationRequest struct {
-	ProtocolVersion string          `json:"protocol_version"`
-	InteractionID   string          `json:"interaction_id"`
-	RequestID       string          `json:"request_id"`
-	SourceAgentID   string          `json:"source_agent_id"`
-	TargetAgentID   string          `json:"target_agent_id"`
-	ToolName        string          `json:"tool_name"`
-	Arguments       json.RawMessage `json:"arguments"`
-	SessionID       string          `json:"session_id"`
-	TaskID          string          `json:"task_id"`
-	RiskLevel       string          `json:"risk_level"`
+	ProtocolVersion         string                  `json:"protocol_version"`
+	InteractionID           string                  `json:"interaction_id"`
+	RequestID               string                  `json:"request_id"`
+	SourceAgentID           string                  `json:"source_agent_id"`
+	TargetAgentID           string                  `json:"target_agent_id"`
+	ToolName                string                  `json:"tool_name"`
+	Arguments               json.RawMessage         `json:"arguments"`
+	SessionID               string                  `json:"session_id"`
+	TaskID                  string                  `json:"task_id"`
+	RiskLevel               string                  `json:"risk_level"`
+	AllowedTools            []string                `json:"allowed_tools"`
+	AllowedCapabilities     []string                `json:"allowed_capabilities"`
+	AllowRedelegation       bool                    `json:"allow_redelegation"`
+	RootInteractionID       string                  `json:"root_interaction_id,omitempty"`
+	ParentInteractionID     string                  `json:"parent_interaction_id,omitempty"`
+	RootTaskID              string                  `json:"root_task_id,omitempty"`
+	ParentTaskID            string                  `json:"parent_task_id,omitempty"`
+	DelegationDepth         int                     `json:"delegation_depth"`
+	Deadline                *time.Time              `json:"deadline,omitempty"`
+	Budget                  models.DelegationBudget `json:"budget"`
+	ParentAllowRedelegation bool                    `json:"parent_allow_redelegation"`
 }
 
 func checkAuthorizationProtocolVersion(version string) error {
@@ -77,16 +88,27 @@ func (a *HTTPR2Authorizer) Authorize(ctx context.Context, req models.DelegationR
 		arguments = json.RawMessage(`{}`)
 	}
 	payload, err := json.Marshal(interactionAuthorizationRequest{
-		ProtocolVersion: req.ProtocolVersion,
-		InteractionID:   req.RequestID,
-		RequestID:       req.RequestID,
-		SourceAgentID:   req.InitiatorAgentID,
-		TargetAgentID:   req.TargetAgentID,
-		ToolName:        req.ToolName,
-		Arguments:       arguments,
-		SessionID:       req.SessionID,
-		TaskID:          req.TaskID,
-		RiskLevel:       req.RiskLevel,
+		ProtocolVersion:         req.ProtocolVersion,
+		InteractionID:           req.RequestID,
+		RequestID:               req.RequestID,
+		SourceAgentID:           req.InitiatorAgentID,
+		TargetAgentID:           req.TargetAgentID,
+		ToolName:                req.ToolName,
+		Arguments:               arguments,
+		SessionID:               req.SessionID,
+		TaskID:                  req.TaskID,
+		RiskLevel:               req.RiskLevel,
+		AllowedTools:            req.AllowedTools,
+		AllowedCapabilities:     req.AllowedCapabilities,
+		AllowRedelegation:       req.AllowRedelegation,
+		RootInteractionID:       req.RootInteractionID,
+		ParentInteractionID:     req.ParentInteractionID,
+		RootTaskID:              req.RootTaskID,
+		ParentTaskID:            req.ParentTaskID,
+		DelegationDepth:         req.DelegationDepth,
+		Deadline:                req.Deadline,
+		Budget:                  req.Budget,
+		ParentAllowRedelegation: req.ParentAllowRedelegation,
 	})
 	if err != nil {
 		return denied("failed to marshal delegation request"), fmt.Errorf("marshal delegation request: %w", err)
@@ -140,13 +162,43 @@ func (a *HTTPR2Authorizer) authorizeAt(ctx context.Context, path string, payload
 	if err := checkAuthorizationProtocolVersion(response.ProtocolVersion); err != nil {
 		return denied("incompatible interaction authorization protocol"), httpResp.StatusCode, err
 	}
+	switch response.Verdict {
+	case "allow":
+		if !response.Allowed {
+			return denied("inconsistent interaction authorization response"), httpResp.StatusCode, fmt.Errorf("allow verdict must set allowed=true")
+		}
+	case "modify":
+		if !response.Allowed || !isJSONObject(response.EffectiveArgs) {
+			return denied("invalid modify interaction authorization response"), httpResp.StatusCode, fmt.Errorf("modify verdict requires allowed=true and effective_args object")
+		}
+	case "deny", "require_approval":
+		if response.Allowed {
+			return denied("inconsistent interaction authorization response"), httpResp.StatusCode, fmt.Errorf("%s verdict must set allowed=false", response.Verdict)
+		}
+	default:
+		return denied("invalid interaction authorization verdict"), httpResp.StatusCode, fmt.Errorf("invalid interaction authorization verdict %q", response.Verdict)
+	}
 	if !response.Allowed {
 		if response.Reason == "" {
 			response.Reason = "IIGE denied delegation"
 		}
+		if response.Verdict == "require_approval" {
+			return response, httpResp.StatusCode, nil
+		}
 		return response, httpResp.StatusCode, fmt.Errorf("IIGE denied delegation: %s", response.Reason)
 	}
+	if len(response.EffectiveArgs) > 0 && !isJSONObject(response.EffectiveArgs) {
+		return denied("invalid interaction authorization effective_args"), httpResp.StatusCode, fmt.Errorf("effective_args must be a JSON object")
+	}
 	return response, httpResp.StatusCode, nil
+}
+
+func isJSONObject(value json.RawMessage) bool {
+	if len(value) == 0 {
+		return false
+	}
+	var object map[string]json.RawMessage
+	return json.Unmarshal(value, &object) == nil && object != nil
 }
 
 func denied(reason string) models.DelegationResponse {
@@ -158,8 +210,9 @@ func denied(reason string) models.DelegationResponse {
 }
 
 // RecordLifecycle appends a committed Task transition to the Python audit timeline.
-func (a *HTTPR2Authorizer) RecordLifecycle(ctx context.Context, task models.Task, event string) error {
+func (a *HTTPR2Authorizer) RecordLifecycle(ctx context.Context, task models.Task, event, eventID string) error {
 	payload, err := json.Marshal(map[string]any{
+		"event_id":              eventID,
 		"interaction_id":        task.InteractionID,
 		"root_interaction_id":   task.RootInteractionID,
 		"parent_interaction_id": task.ParentInteractionID,
@@ -169,6 +222,16 @@ func (a *HTTPR2Authorizer) RecordLifecycle(ctx context.Context, task models.Task
 		"source_agent_id":       task.InitiatorAgentID,
 		"target_agent_id":       task.TargetAgentID,
 		"event":                 event,
+		"root_task_id":          task.RootTaskID,
+		"parent_task_id":        task.ParentTaskID,
+		"delegation_depth":      task.DelegationDepth,
+		"allowed_tools":         task.AllowedTools,
+		"allowed_capabilities":  task.AllowedCapabilities,
+		"allow_redelegation":    task.AllowRedelegation,
+		"budget":                task.Budget,
+		"reserved_budget":       task.ReservedBudget,
+		"consumed_budget":       task.ConsumedBudget,
+		"deadline":              task.Deadline,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal interaction lifecycle: %w", err)

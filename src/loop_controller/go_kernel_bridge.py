@@ -1,4 +1,4 @@
-"""Python bridge to the Go interaction governance kernel (v0.40.0)."""
+"""Python bridge to the Go interaction governance kernel (v0.48.0)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Current A2A HTTP/JSON protocol version. Patch differences are tolerated;
 # major/minor differences are fail-closed.
-CURRENT_PROTOCOL_VERSION = "0.40.0"
+CURRENT_PROTOCOL_VERSION = "0.48.0"
 
 
 def check_protocol_version(version: str) -> None:
@@ -145,6 +145,12 @@ class DelegationRequest:
         session_id: str = "",
         task_id: str = "",
         risk_level: str = "critical",
+        allowed_tools: list[str] | None = None,
+        allowed_capabilities: list[str] | None = None,
+        allow_redelegation: bool = False,
+        parent_task_id: str = "",
+        budget: dict[str, Any] | None = None,
+        deadline: str | None = None,
         protocol_version: str = CURRENT_PROTOCOL_VERSION,
     ) -> None:
         self.request_id = request_id
@@ -155,6 +161,12 @@ class DelegationRequest:
         self.session_id = session_id
         self.task_id = task_id
         self.risk_level = risk_level
+        self.allowed_tools = list(allowed_tools) if allowed_tools is not None else [tool_name]
+        self.allowed_capabilities = list(allowed_capabilities or [])
+        self.allow_redelegation = allow_redelegation
+        self.parent_task_id = parent_task_id
+        self.budget = dict(budget or {})
+        self.deadline = deadline
         self.protocol_version = protocol_version
 
     def to_dict(self) -> dict[str, Any]:
@@ -167,8 +179,81 @@ class DelegationRequest:
             "session_id": self.session_id,
             "task_id": self.task_id,
             "risk_level": self.risk_level,
+            "allowed_tools": self.allowed_tools,
+            "allowed_capabilities": self.allowed_capabilities,
+            "allow_redelegation": self.allow_redelegation,
+            "parent_task_id": self.parent_task_id,
+            "budget": self.budget,
+            "deadline": self.deadline,
             "protocol_version": self.protocol_version,
         }
+
+
+class DelegationApproval:
+    """委托审批公开 DTO；不包含有效参数明文。"""
+
+    def __init__(
+        self,
+        *,
+        approval_id: str,
+        request_id: str,
+        decision_id: str,
+        request_hash: str,
+        initiator_agent_id: str,
+        target_agent_id: str,
+        session_id: str = "",
+        root_task_id: str = "",
+        parent_task_id: str = "",
+        delegation_depth: int = 0,
+        allowed_tools: list[str] | None = None,
+        allowed_capabilities: list[str] | None = None,
+        allow_redelegation: bool = False,
+        budget: dict[str, Any] | None = None,
+        task_deadline: str | None = None,
+        expires_at: str,
+        status: str,
+        approver_id: str = "",
+        reason: str = "",
+        created_at: str,
+        updated_at: str,
+        decided_at: str | None = None,
+        task_id: str = "",
+        version: int = 1,
+        protocol_version: str = CURRENT_PROTOCOL_VERSION,
+    ) -> None:
+        self.__dict__.update(locals())
+        del self.__dict__["self"]
+        self.allowed_tools = list(allowed_tools or [])
+        self.allowed_capabilities = list(allowed_capabilities or [])
+        self.budget = dict(budget or {})
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DelegationApproval:
+        return cls(**data)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = dict(self.__dict__)
+        for key in ("root_task_id", "parent_task_id", "approver_id", "reason", "task_id"):
+            if not data[key]:
+                data.pop(key)
+        for key in ("task_deadline", "decided_at"):
+            if data[key] is None:
+                data.pop(key)
+        return data
+
+
+class ApprovalActionRequest:
+    """审批动作请求 DTO。"""
+
+    def __init__(self, request_id: str, reason: str = "") -> None:
+        self.request_id = request_id
+        self.reason = reason
+
+    def to_dict(self) -> dict[str, str]:
+        data = {"request_id": self.request_id}
+        if self.reason:
+            data["reason"] = self.reason
+        return data
 
 
 class DelegationResponse:
@@ -178,18 +263,28 @@ class DelegationResponse:
         self,
         *,
         allowed: bool,
+        verdict: str = "",
+        approval_id: str = "",
         decision_id: str = "",
         task_id: str = "",
         target_entrypoint: AgentEntrypoint | None = None,
         delegation_token: str = "",
+        original_args: dict[str, Any] | None = None,
+        modified_args: dict[str, Any] | None = None,
+        effective_args: dict[str, Any] | None = None,
         reason: str = "",
         protocol_version: str = CURRENT_PROTOCOL_VERSION,
     ) -> None:
         self.allowed = allowed
+        self.verdict = verdict
+        self.approval_id = approval_id
         self.decision_id = decision_id
         self.task_id = task_id
         self.target_entrypoint = target_entrypoint
         self.delegation_token = delegation_token
+        self.original_args = original_args
+        self.modified_args = modified_args
+        self.effective_args = effective_args
         self.reason = reason
         self.protocol_version = protocol_version
 
@@ -198,10 +293,14 @@ class DelegationResponse:
         ep = data.get("target_entrypoint")
         return cls(
             allowed=data.get("allowed", False),
+            verdict=data.get("verdict", ""),
             decision_id=data.get("decision_id", ""),
             task_id=data.get("task_id", ""),
             target_entrypoint=AgentEntrypoint.from_dict(ep) if ep else None,
             delegation_token=data.get("delegation_token", ""),
+            original_args=data.get("original_args"),
+            modified_args=data.get("modified_args"),
+            effective_args=data.get("effective_args"),
             reason=data.get("reason", ""),
             protocol_version=data.get("protocol_version", CURRENT_PROTOCOL_VERSION),
         )
@@ -213,6 +312,10 @@ class DelegationResponse:
             "reason": self.reason,
             "protocol_version": self.protocol_version,
         }
+        if self.verdict:
+            data["verdict"] = self.verdict
+        if self.approval_id:
+            data["approval_id"] = self.approval_id
         if self.decision_id:
             data["decision_id"] = self.decision_id
         if self.target_entrypoint is not None:
@@ -222,6 +325,12 @@ class DelegationResponse:
             }
         if self.delegation_token:
             data["delegation_token"] = self.delegation_token
+        if self.original_args is not None:
+            data["original_args"] = self.original_args
+        if self.modified_args is not None:
+            data["modified_args"] = self.modified_args
+        if self.effective_args is not None:
+            data["effective_args"] = self.effective_args
         return data
 
 

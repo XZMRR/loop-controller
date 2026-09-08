@@ -4,6 +4,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,21 +30,26 @@ import (
 
 // Server holds the kernel state.
 type Server struct {
-	registry         *registry.Registry
-	tasks            *task.Manager
-	router           *router.Router
-	delegation       *delegation.Delegator
-	publisher        stream.TaskEventPublisher
-	discovery        *discovery.Manager
-	db               *store.DB
-	issuer           *token.HMACIssuer
-	messages         store.MessageStore
-	idempotency      store.IdempotencyStore
-	entrypointClient delegation.EntrypointClient
-	executor         execution.TargetExecutor
-	executionsMu     sync.Mutex
-	executions       map[string]execution.Handle
-	outboxCancel     context.CancelFunc
+	registry           *registry.Registry
+	tasks              *task.Manager
+	router             *router.Router
+	delegation         *delegation.Delegator
+	publisher          stream.TaskEventPublisher
+	discovery          *discovery.Manager
+	db                 *store.DB
+	issuer             *token.HMACIssuer
+	messages           store.MessageStore
+	idempotency        store.IdempotencyStore
+	entrypointClient   delegation.EntrypointClient
+	executor           execution.TargetExecutor
+	autoAcceptTarget   bool
+	autoStartTarget    bool
+	executionsMu       sync.Mutex
+	executions         map[string]execution.Handle
+	outboxCancel       context.CancelFunc
+	recoveryCancel     context.CancelFunc
+	controlToken       string
+	controlInitiatorID string
 }
 
 // currentProtocolVersion is the A2A HTTP/JSON protocol version implemented by
@@ -98,14 +104,14 @@ func NewServer(secret []byte, dbPath string, providers ...discovery.AgentDiscove
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
-	reg := registry.New()
-	pub := stream.NewPublisher(db.EventStore())
-	tasks := task.New(db.TaskStore()).WithEventFanout(pub)
-	r := router.New(reg)
+	reg := registry.NewStore(db.AgentStore())
+	pub := stream.NewPublisher(db.EventStore()).WithInstanceID(db.InstanceID())
+	tasks := task.New(db.TaskStore()).WithEventFanout(pub).WithInstanceID(db.InstanceID())
+	r := router.New(reg, db.RoutedMessageStore())
 	issuer := token.NewHMACIssuer(secret)
 	d := delegation.New(reg, tasks, issuer, pub, 5*time.Minute)
 	mgr := discovery.NewManager(reg, providers...)
-	return &Server{
+	srv := &Server{
 		registry:    reg,
 		tasks:       tasks,
 		router:      r,
@@ -117,7 +123,37 @@ func NewServer(secret []byte, dbPath string, providers ...discovery.AgentDiscove
 		messages:    db.MessageStore(),
 		idempotency: db.IdempotencyStore(),
 		executions:  make(map[string]execution.Handle),
-	}, nil
+	}
+	srv.startRecoveryLoop()
+	return srv, nil
+}
+
+// startRecoveryLoop periodically reclaims running tasks whose execution lease
+// expired, which typically means the owning instance crashed or lost contact.
+func (s *Server) startRecoveryLoop() {
+	interval := s.db.ExecutionLease() / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.recoveryCancel = cancel
+	go s.runRecoveryLoop(ctx, interval)
+}
+
+func (s *Server) runRecoveryLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Recovery is best-effort; transient errors are retried next tick.
+			now := time.Now().UTC()
+			_, _ = s.tasks.RecoverExpiredRunning(ctx, now, 100)
+			_, _ = s.db.DelegationApprovalStore().ExpireDue(ctx, now, 100)
+		}
+	}
 }
 
 // SetR2Authorizer injects an interaction authorizer into the delegator.
@@ -146,8 +182,25 @@ func (s *Server) SetTargetExecutor(executor execution.TargetExecutor) {
 	s.executor = executor
 }
 
+// SetControlAuth enables Bearer authentication on initiator-facing task APIs.
+// Empty values keep authentication disabled for tests and local embedding.
+func (s *Server) SetControlAuth(controlToken, initiatorAgentID string) {
+	s.controlToken = strings.TrimSpace(controlToken)
+	s.controlInitiatorID = strings.TrimSpace(initiatorAgentID)
+}
+
+// SetTargetTaskAutomation configures automatic target-side acceptance and execution.
+func (s *Server) SetTargetTaskAutomation(autoAccept, autoStart bool) {
+	s.autoAcceptTarget = autoAccept || autoStart
+	s.autoStartTarget = autoStart
+}
+
 // Close releases database resources held by the server.
 func (s *Server) Close() error {
+	if s.recoveryCancel != nil {
+		s.recoveryCancel()
+		s.recoveryCancel = nil
+	}
 	if s.outboxCancel != nil {
 		s.outboxCancel()
 		s.outboxCancel = nil
@@ -171,12 +224,16 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /a2a/v1/agents", s.handleRegisterAgent)
 	mux.HandleFunc("GET /a2a/v1/agents", s.handleListAgents)
 	mux.HandleFunc("GET /a2a/v1/agents/{id}", s.handleGetAgent)
-	mux.HandleFunc("POST /a2a/v1/tasks", s.handleCreateTask)
-	mux.HandleFunc("GET /a2a/v1/tasks/{id}", s.handleGetTask)
-	mux.HandleFunc("GET /a2a/v1/tasks/{id}/stream", s.handleTaskStream)
+	mux.HandleFunc("POST /a2a/v1/tasks", s.withControlAuth(true, s.handleCreateTask))
+	mux.HandleFunc("GET /a2a/v1/tasks/{id}", s.withControlAuth(false, s.handleGetTask))
+	mux.HandleFunc("GET /a2a/v1/tasks/{id}/stream", s.withControlAuth(false, s.handleTaskStream))
 	mux.HandleFunc("POST /a2a/v1/messages", s.handleSendMessage)
-	mux.HandleFunc("POST /a2a/v1/delegations", s.handleDelegation)
-	mux.HandleFunc("POST /a2a/v1/tasks/{id}/cancel", s.handleCancelTask)
+	mux.HandleFunc("POST /a2a/v1/delegations", s.withControlAuth(true, s.handleDelegation))
+	mux.HandleFunc("GET /a2a/v1/delegation-approvals/{id}", s.withInitiatorApprovalAuth(s.handleGetDelegationApproval))
+	mux.HandleFunc("POST /a2a/v1/delegation-approvals/{id}/approve", s.withApproverAuth(s.handleApproveDelegation))
+	mux.HandleFunc("POST /a2a/v1/delegation-approvals/{id}/reject", s.withApproverAuth(s.handleRejectDelegation))
+	mux.HandleFunc("POST /a2a/v1/delegation-approvals/{id}/cancel", s.withInitiatorApprovalAuth(s.handleCancelDelegation))
+	mux.HandleFunc("POST /a2a/v1/tasks/{id}/cancel", s.withControlAuth(false, s.handleCancelTask))
 	mux.HandleFunc("POST /a2a/v1/entrypoint/tasks", s.withEntrypointToken("create", true, s.handleEntrypointCreate))
 	mux.HandleFunc("POST /a2a/v1/entrypoint/tasks/{id}/accept", s.withEntrypointToken("accept", true, s.handleEntrypointAccept))
 	mux.HandleFunc("POST /a2a/v1/entrypoint/tasks/{id}/start", s.withEntrypointToken("start", true, s.handleEntrypointStart))
@@ -184,6 +241,36 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /a2a/v1/entrypoint/tasks/{id}", s.withEntrypointToken("get", false, s.handleEntrypointGet))
 	mux.HandleFunc("POST /a2a/v1/entrypoint/tasks/{id}/results", s.withEntrypointToken("results", true, s.handleEntrypointResults))
 	mux.HandleFunc("GET /health", s.handleHealth)
+}
+
+func (s *Server) withControlAuth(bindRequestInitiator bool, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.controlToken == "" {
+			next(w, r)
+			return
+		}
+		tokenStr, err := bearerToken(r.Header.Get("Authorization"))
+		if err != nil || subtle.ConstantTimeCompare([]byte(tokenStr), []byte(s.controlToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, "invalid_control_token", "valid Bearer control token is required")
+			return
+		}
+		if s.controlInitiatorID == "" {
+			writeError(w, http.StatusInternalServerError, "control_auth_misconfigured", "control initiator_agent_id is required")
+			return
+		}
+		if !bindRequestInitiator {
+			t, err := s.tasks.Get(r.PathValue("id"))
+			if err != nil {
+				writeError(w, http.StatusNotFound, "task_not_found", err.Error())
+				return
+			}
+			if t.InitiatorAgentID != s.controlInitiatorID {
+				writeError(w, http.StatusForbidden, "task_access_denied", "task is owned by another initiator")
+				return
+			}
+		}
+		next(w, r)
+	}
 }
 
 func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
@@ -265,6 +352,10 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "incompatible_protocol_version", err.Error())
 		return
 	}
+	if s.controlToken != "" && req.InitiatorAgentID != s.controlInitiatorID {
+		writeError(w, http.StatusForbidden, "initiator_mismatch", "initiator_agent_id does not match authenticated principal")
+		return
+	}
 	t, err := s.tasks.CreateReliable(req.SessionID, req.InitiatorAgentID, req.TargetAgentID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "task_create_failed", err.Error())
@@ -318,6 +409,10 @@ func (s *Server) handleDelegation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "incompatible_protocol_version", err.Error())
 		return
 	}
+	if s.controlToken != "" && req.InitiatorAgentID != s.controlInitiatorID {
+		writeError(w, http.StatusForbidden, "initiator_mismatch", "initiator_agent_id does not match authenticated principal")
+		return
+	}
 	scope := "delegation:" + req.InitiatorAgentID
 	requestData, err := json.Marshal(req)
 	if err != nil {
@@ -348,7 +443,10 @@ func (s *Server) handleDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.ProtocolVersion = currentProtocolVersion
 	status := http.StatusOK
-	if !resp.Allowed {
+	switch {
+	case resp.Verdict == "require_approval":
+		status = http.StatusAccepted
+	case !resp.Allowed:
 		status = http.StatusForbidden
 	}
 	body, err := json.Marshal(resp)
@@ -385,8 +483,8 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "task_not_found", err.Error())
 		return
 	}
-	// 调用方若携带 delegation token，则必须是绑定到该 task 的 token。
-	if auth := r.Header.Get("Authorization"); auth != "" {
+	// 未配置控制面认证时，保持兼容：若携带 delegation token 则校验任务绑定。
+	if auth := r.Header.Get("Authorization"); s.controlToken == "" && auth != "" {
 		tokenStr, berr := bearerToken(auth)
 		if berr != nil {
 			writeError(w, http.StatusUnauthorized, "invalid_delegation_token", berr.Error())
@@ -406,26 +504,18 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, t)
 		return
 	}
-	confirmed := true
-	if s.entrypointClient != nil {
-		var cancelErr error
-		confirmed, cancelErr = s.delegation.Cancel(r.Context(), t.TargetAgentID, taskID, t.DelegationToken)
-		if cancelErr != nil {
-			confirmed = false
+	descendants, err := s.tasks.ListDescendants(r.Context(), taskID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "descendant_lookup_failed", err.Error())
+		return
+	}
+	for _, descendant := range descendants {
+		if descendant.IsTerminal() {
+			continue
 		}
+		_, _ = s.cancelTaskExecution(r.Context(), descendant)
 	}
-	var updated models.Task
-	switch {
-	case confirmed:
-		updated, err = s.tasks.UpdateStatusFrom(taskID, t.Status, "cancelled")
-	case t.Status == "running":
-		// 已进入执行阶段且无法确认目标已停止时，必须进入 outcome_unknown。
-		updated, err = s.tasks.MarkOutcomeUnknown(taskID)
-	default:
-		// pending/accepted/outcome_unknown 阶段本地没有正在执行的副作用，
-		// 目标不可达时本地撤销不会伪报执行结果。
-		updated, err = s.tasks.UpdateStatusFrom(taskID, t.Status, "cancelled")
-	}
+	updated, err := s.cancelTaskExecution(r.Context(), t)
 	if err != nil {
 		if errors.Is(err, task.ErrInvalidStatus) {
 			writeError(w, http.StatusConflict, "invalid_status_transition", err.Error())
@@ -435,6 +525,21 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) cancelTaskExecution(ctx context.Context, t models.Task) (models.Task, error) {
+	confirmed := true
+	if s.entrypointClient != nil {
+		var cancelErr error
+		confirmed, cancelErr = s.delegation.Cancel(ctx, t.TargetAgentID, t.TaskID, t.DelegationToken)
+		if cancelErr != nil {
+			confirmed = false
+		}
+	}
+	if confirmed || t.Status != "running" {
+		return s.tasks.UpdateStatusFrom(t.TaskID, t.Status, "cancelled")
+	}
+	return s.tasks.MarkOutcomeUnknown(t.TaskID)
 }
 
 func (s *Server) withEntrypointToken(operation string, replayProtected bool, next http.HandlerFunc) http.HandlerFunc {
@@ -562,19 +667,35 @@ func (s *Server) handleEntrypointCreate(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusInternalServerError, "task_lookup_failed", err.Error())
 			return
 		}
-		t, err = s.tasks.CreateWithInteractionID(
+		t, err = s.tasks.CreateWithDelegation(
 			req.TaskID, req.SessionID, req.InitiatorAgentID, req.TargetAgentID,
 			req.InteractionID, req.DecisionID, req.RootInteractionID, req.ParentInteractionID,
+			req.RootTaskID, req.ParentTaskID, req.DelegationDepth, req.Deadline,
+			req.AllowedTools, req.AllowedCapabilities, req.AllowRedelegation, req.Budget,
 		)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "task_create_failed", err.Error())
 			return
 		}
 	}
+	if t.SessionID != req.SessionID || t.InteractionID != req.InteractionID || t.DecisionID != req.DecisionID ||
+		t.RootInteractionID != req.RootInteractionID || t.ParentInteractionID != req.ParentInteractionID ||
+		t.RootTaskID != req.RootTaskID || t.ParentTaskID != req.ParentTaskID || t.DelegationDepth != req.DelegationDepth ||
+		t.InitiatorAgentID != req.InitiatorAgentID || t.TargetAgentID != req.TargetAgentID ||
+		!sameScope(t.AllowedTools, req.AllowedTools) || !sameScope(t.AllowedCapabilities, req.AllowedCapabilities) ||
+		t.AllowRedelegation != req.AllowRedelegation || t.Budget != req.Budget || !sameDeadline(t.Deadline, req.Deadline) {
+		writeError(w, http.StatusForbidden, "entrypoint_task_mismatch", "existing task does not match entrypoint request")
+		return
+	}
 	if t.Status != "pending" {
 		writeError(w, http.StatusConflict, "invalid_status_transition", fmt.Sprintf("task is %s, expected pending", t.Status))
 		return
 	}
+	if err := s.tasks.SetDelegationToken(req.TaskID, req.DelegationToken); err != nil {
+		writeError(w, http.StatusInternalServerError, "delegation_scope_persist_failed", err.Error())
+		return
+	}
+	t.DelegationToken = req.DelegationToken
 
 	msg := models.Message{
 		MessageID:       fmt.Sprintf("msg-%s-%d", req.TaskID, time.Now().UTC().UnixNano()),
@@ -593,12 +714,29 @@ func (s *Server) handleEntrypointCreate(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "message_save_failed", err.Error())
 		return
 	}
+	if s.autoAcceptTarget {
+		t, err = s.tasks.UpdateStatus(req.TaskID, "accepted")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "auto_accept_failed", err.Error())
+			return
+		}
+	}
+	if s.autoStartTarget {
+		t, err = s.startTargetExecution(ctx, t)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "auto_start_failed", err.Error())
+			return
+		}
+	}
 
 	writeJSON(w, http.StatusCreated, t)
 }
 
 func (s *Server) handleEntrypointAccept(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
+	if expired, err := s.rejectExpiredTask(w, taskID); err != nil || expired {
+		return
+	}
 	if err := s.requireTaskPending(taskID); err != nil {
 		if errors.Is(err, task.ErrTaskNotFound) {
 			writeError(w, http.StatusNotFound, "task_not_found", err.Error())
@@ -636,31 +774,44 @@ func (s *Server) handleEntrypointStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "invalid_status_transition", fmt.Sprintf("task is %s, expected accepted", current.Status))
 		return
 	}
-	if s.executor == nil {
-		writeError(w, http.StatusServiceUnavailable, "executor_unavailable", "target executor is not configured")
+	if current.Deadline != nil && !current.Deadline.After(time.Now().UTC()) {
+		_, _ = s.tasks.UpdateStatusFrom(taskID, current.Status, "cancelled")
+		writeError(w, http.StatusConflict, "task_deadline_expired", "task deadline has expired")
 		return
 	}
-	executionReq, err := s.executionRequest(r.Context(), current)
+	updated, err := s.startTargetExecution(r.Context(), current)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "execution_scope_unavailable", err.Error())
-		return
-	}
-	updated, err := s.tasks.UpdateStatus(taskID, "running")
-	if err != nil {
-		writeError(w, http.StatusConflict, "invalid_status_transition", err.Error())
-		return
-	}
-	handle, err := s.executor.Start(r.Context(), executionReq)
-	if err != nil {
-		_, _ = s.tasks.Complete(taskID, "failed", nil, "execution_start_failed")
 		writeError(w, http.StatusBadGateway, "execution_start_failed", err.Error())
 		return
 	}
-	s.executionsMu.Lock()
-	s.executions[taskID] = handle
-	s.executionsMu.Unlock()
-	go s.finishExecution(taskID, handle)
 	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) startTargetExecution(ctx context.Context, current models.Task) (models.Task, error) {
+	if current.Deadline != nil && !current.Deadline.After(time.Now().UTC()) {
+		return models.Task{}, errors.New("task deadline has expired")
+	}
+	if s.executor == nil {
+		return models.Task{}, errors.New("target executor is not configured")
+	}
+	executionReq, err := s.executionRequest(ctx, current)
+	if err != nil {
+		return models.Task{}, err
+	}
+	updated, err := s.tasks.UpdateStatus(current.TaskID, "running")
+	if err != nil {
+		return models.Task{}, err
+	}
+	handle, err := s.executor.Start(ctx, executionReq)
+	if err != nil {
+		_, _ = s.tasks.Complete(current.TaskID, "failed", nil, "execution_start_failed")
+		return models.Task{}, err
+	}
+	s.executionsMu.Lock()
+	s.executions[current.TaskID] = handle
+	s.executionsMu.Unlock()
+	go s.finishExecution(current.TaskID, handle)
+	return updated, nil
 }
 
 func (s *Server) handleEntrypointCancel(w http.ResponseWriter, r *http.Request) {
@@ -704,25 +855,33 @@ func (s *Server) executionRequest(ctx context.Context, t models.Task) (execution
 	if err != nil {
 		return execution.Request{}, fmt.Errorf("load delegated request: %w", err)
 	}
+	claims, err := s.validateDelegationToken(t.DelegationToken)
+	if err != nil {
+		return execution.Request{}, fmt.Errorf("load delegated scope: %w", err)
+	}
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg := messages[i]
 		if msg.Role != "delegation" || len(msg.Parts) != 2 {
 			continue
 		}
 		return execution.Request{
-			TaskID:           t.TaskID,
-			SessionID:        t.SessionID,
-			InitiatorAgentID: t.InitiatorAgentID,
-			TargetAgentID:    t.TargetAgentID,
-			ToolName:         msg.Parts[0].Text,
-			Arguments:        msg.Parts[1].Data,
+			TaskID:              t.TaskID,
+			SessionID:           t.SessionID,
+			InitiatorAgentID:    t.InitiatorAgentID,
+			TargetAgentID:       t.TargetAgentID,
+			ToolName:            msg.Parts[0].Text,
+			Arguments:           msg.Parts[1].Data,
+			AllowedTools:        claims.AllowedTools,
+			AllowedCapabilities: claims.AllowedCapabilities,
+			AllowRedelegation:   claims.AllowRedelegation,
+			Deadline:            t.Deadline,
 		}, nil
 	}
 	return execution.Request{}, errors.New("delegated execution request not found")
 }
 
 func (s *Server) finishExecution(taskID string, handle execution.Handle) {
-	result, ok := <-handle.Done()
+	result, ok := s.awaitExecution(taskID, handle)
 	s.executionsMu.Lock()
 	if s.executions[taskID] == handle {
 		delete(s.executions, taskID)
@@ -736,6 +895,28 @@ func (s *Server) finishExecution(taskID string, handle execution.Handle) {
 		return
 	}
 	_, _ = s.tasks.Complete(taskID, result.Status, result.Outcome, result.ErrorCode)
+}
+
+// awaitExecution waits for an execution result while periodically renewing the
+// task's execution lease, so a long-running execution is not reclaimed by the
+// recovery loop of a sibling instance.
+func (s *Server) awaitExecution(taskID string, handle execution.Handle) (execution.Result, bool) {
+	interval := s.db.ExecutionLease() / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case result, ok := <-handle.Done():
+			return result, ok
+		case <-ticker.C:
+			if err := s.tasks.RenewExecutionLease(context.Background(), taskID); err != nil {
+				return execution.Result{}, false
+			}
+		}
+	}
 }
 
 func (s *Server) handleEntrypointGet(w http.ResponseWriter, r *http.Request) {
@@ -767,11 +948,15 @@ func (s *Server) handleEntrypointResults(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "task_not_found", err.Error())
 		return
 	}
+	if current.Status == req.Status {
+		writeJSON(w, http.StatusOK, current)
+		return
+	}
 	if current.Status != "running" && current.Status != "outcome_unknown" {
 		writeError(w, http.StatusConflict, "invalid_status_transition", fmt.Sprintf("task is %s, expected running or outcome_unknown", current.Status))
 		return
 	}
-	updated, err := s.tasks.Complete(taskID, req.Status, req.Outcome, req.ErrorCode)
+	updated, err := s.tasks.CompleteWithConsumption(taskID, req.Status, req.Outcome, req.ErrorCode, req.ConsumedBudget)
 	if err != nil {
 		writeError(w, http.StatusConflict, "invalid_status_transition", err.Error())
 		return
@@ -794,6 +979,10 @@ func (s *Server) verifyTokenMatchesTask(ctx context.Context, claims token.Delega
 	if claims.TaskID == "" || claims.TaskID != t.TaskID {
 		return fmt.Errorf("token task_id mismatch")
 	}
+	if claims.SessionID != t.SessionID || claims.InteractionID != t.InteractionID || claims.DecisionID != t.DecisionID ||
+		claims.RootInteractionID != t.RootInteractionID || claims.ParentInteractionID != t.ParentInteractionID {
+		return fmt.Errorf("token interaction linkage mismatch")
+	}
 	if claims.InitiatorAgentID == "" || claims.InitiatorAgentID != t.InitiatorAgentID {
 		return fmt.Errorf("token initiator mismatch")
 	}
@@ -805,6 +994,18 @@ func (s *Server) verifyTokenMatchesTask(ctx context.Context, claims token.Delega
 	}
 	if claims.ToolName == "" || claims.ArgumentsSHA256 == "" {
 		return fmt.Errorf("token execution scope missing")
+	}
+	if claims.RootTaskID != t.RootTaskID || claims.ParentTaskID != t.ParentTaskID || claims.DelegationDepth != t.DelegationDepth {
+		return fmt.Errorf("token delegation lineage mismatch")
+	}
+	if !sameScope(claims.AllowedTools, t.AllowedTools) || !sameScope(claims.AllowedCapabilities, t.AllowedCapabilities) || claims.AllowRedelegation != t.AllowRedelegation {
+		return fmt.Errorf("token delegation scope mismatch")
+	}
+	if (claims.Deadline == 0) != (t.Deadline == nil) || (t.Deadline != nil && claims.Deadline != t.Deadline.Unix()) {
+		return fmt.Errorf("token deadline mismatch")
+	}
+	if claims.BudgetTokenCount != t.Budget.TokenCount || claims.BudgetPaymentAmount != t.Budget.PaymentAmount || claims.BudgetCurrency != t.Budget.Currency {
+		return fmt.Errorf("token budget mismatch")
 	}
 	messages, err := s.messages.ListByTask(ctx, t.TaskID)
 	if err != nil {
@@ -823,8 +1024,15 @@ func (s *Server) verifyTokenMatchesTask(ctx context.Context, claims token.Delega
 }
 
 func (s *Server) verifyTokenMatchesRequest(claims token.DelegationClaims, req models.EntrypointTaskRequest) error {
+	if claims.RequestID == "" || claims.RequestID != req.RequestID {
+		return fmt.Errorf("token request_id mismatch")
+	}
 	if claims.TaskID == "" || claims.TaskID != req.TaskID {
 		return fmt.Errorf("token task_id mismatch")
+	}
+	if claims.SessionID != req.SessionID || claims.InteractionID != req.InteractionID || claims.DecisionID != req.DecisionID ||
+		claims.RootInteractionID != req.RootInteractionID || claims.ParentInteractionID != req.ParentInteractionID {
+		return fmt.Errorf("token interaction linkage mismatch")
 	}
 	if claims.InitiatorAgentID == "" || claims.InitiatorAgentID != req.InitiatorAgentID {
 		return fmt.Errorf("token initiator mismatch")
@@ -841,7 +1049,69 @@ func (s *Server) verifyTokenMatchesRequest(claims token.DelegationClaims, req mo
 	if claims.ArgumentsSHA256 == "" || claims.ArgumentsSHA256 != token.HashArguments(req.Arguments) {
 		return fmt.Errorf("token arguments mismatch")
 	}
+	if !sameScope(claims.AllowedTools, req.AllowedTools) || !containsScope(claims.AllowedTools, req.ToolName) {
+		return fmt.Errorf("token allowed_tools mismatch")
+	}
+	if !sameScope(claims.AllowedCapabilities, req.AllowedCapabilities) {
+		return fmt.Errorf("token allowed_capabilities mismatch")
+	}
+	if claims.AllowRedelegation != req.AllowRedelegation {
+		return fmt.Errorf("token allow_redelegation mismatch")
+	}
+	if claims.RootTaskID != req.RootTaskID || claims.ParentTaskID != req.ParentTaskID || claims.DelegationDepth != req.DelegationDepth {
+		return fmt.Errorf("token delegation lineage mismatch")
+	}
+	if (claims.Deadline == 0) != (req.Deadline == nil) || (req.Deadline != nil && claims.Deadline != req.Deadline.Unix()) {
+		return fmt.Errorf("token deadline mismatch")
+	}
+	if claims.BudgetTokenCount != req.Budget.TokenCount || claims.BudgetPaymentAmount != req.Budget.PaymentAmount || claims.BudgetCurrency != req.Budget.Currency {
+		return fmt.Errorf("token budget mismatch")
+	}
 	return nil
+}
+
+func containsScope(scope []string, value string) bool {
+	for _, item := range scope {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func sameDeadline(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
+}
+
+func sameScope(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for _, item := range left {
+		if !containsScope(right, item) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) rejectExpiredTask(w http.ResponseWriter, taskID string) (bool, error) {
+	t, err := s.tasks.Get(taskID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "task_not_found", err.Error())
+		return false, err
+	}
+	if t.Deadline == nil || t.Deadline.After(time.Now().UTC()) {
+		return false, nil
+	}
+	if !t.IsTerminal() && t.Status != "outcome_unknown" {
+		_, _ = s.tasks.UpdateStatusFrom(taskID, t.Status, "cancelled")
+	}
+	writeError(w, http.StatusConflict, "task_deadline_expired", "task deadline has expired")
+	return true, nil
 }
 
 func (s *Server) requireTaskPending(taskID string) error {

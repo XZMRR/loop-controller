@@ -17,7 +17,7 @@ func loadFixture(t *testing.T) map[string]json.RawMessage {
 		t.Fatalf("getwd: %v", err)
 	}
 	// go/internal/api -> project root -> contract
-	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.40.0.json")
+	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.48.0.json")
 	data, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
@@ -34,15 +34,15 @@ func TestCheckProtocolVersion(t *testing.T) {
 		version string
 		wantErr bool
 	}{
-		{"0.40.0", false},
-		{"0.40.1", false},
-		{"0.40.99", false},
+		{"0.48.0", false},
+		{"0.48.1", false},
+		{"0.48.99", false},
 		{"", true},
-		{"0.40", true},
-		{"0.40.0.0", true},
-		{"v0.40.0", true},
-		{"0.39.1", true},
-		{"0.41.0", true},
+		{"0.46", true},
+		{"0.48.0.0", true},
+		{"v0.48.0", true},
+		{"0.44.1", true},
+		{"0.44.0", true},
 		{"not-a-version", true},
 	}
 	for _, c := range cases {
@@ -76,8 +76,8 @@ func TestContractFixture_DecodeMessage(t *testing.T) {
 	if err := json.Unmarshal(fixture["message"], &msg); err != nil {
 		t.Fatalf("unmarshal message: %v", err)
 	}
-	if msg.ProtocolVersion != "0.40.0" {
-		t.Errorf("protocol_version = %q, want 0.40.0", msg.ProtocolVersion)
+	if msg.ProtocolVersion != currentProtocolVersion {
+		t.Errorf("protocol_version = %q, want %s", msg.ProtocolVersion, currentProtocolVersion)
 	}
 	if len(msg.Parts) != 2 {
 		t.Fatalf("parts length = %d, want 2", len(msg.Parts))
@@ -216,12 +216,27 @@ func TestContractFixture_DecodeDelegation(t *testing.T) {
 	if req.RequestID != "req-001" {
 		t.Errorf("request_id = %q, want req-001", req.RequestID)
 	}
-	if req.ProtocolVersion != "0.40.0" {
-		t.Errorf("protocol_version = %q, want 0.40.0", req.ProtocolVersion)
+	if req.ProtocolVersion != currentProtocolVersion {
+		t.Errorf("protocol_version = %q, want %s", req.ProtocolVersion, currentProtocolVersion)
 	}
 	if !json.Valid(req.Arguments) {
 		t.Errorf("arguments is not valid JSON: %s", req.Arguments)
 	}
+
+	var approval models.DelegationApproval
+	if err := json.Unmarshal(fixture["delegation_approval"], &approval); err != nil {
+		t.Fatalf("unmarshal delegation_approval: %v", err)
+	}
+	if approval.ApprovalID != "approval-001" || len(approval.EffectiveArgs) != 0 {
+		t.Fatalf("approval public contract leaked arguments or mismatched: %+v", approval)
+	}
+	assertCanonicalRoundTrip(t, fixture["delegation_approval"], approval)
+
+	var action models.ApprovalActionRequest
+	if err := json.Unmarshal(fixture["approval_action_request"], &action); err != nil {
+		t.Fatalf("unmarshal approval_action_request: %v", err)
+	}
+	assertCanonicalRoundTrip(t, fixture["approval_action_request"], action)
 
 	var resp models.DelegationResponse
 	if err := json.Unmarshal(fixture["delegation_response"], &resp); err != nil {
@@ -233,4 +248,5 @@ func TestContractFixture_DecodeDelegation(t *testing.T) {
 	if resp.TargetEntrypoint.Type != "http" {
 		t.Errorf("target_entrypoint.type = %q, want http", resp.TargetEntrypoint.Type)
 	}
+	assertCanonicalRoundTrip(t, fixture["delegation_response"], resp)
 }

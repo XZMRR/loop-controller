@@ -1,11 +1,14 @@
-"""旧 DelegationAuthorizer API 到 IIGE 的兼容测试（v0.40.0）。"""
+"""旧 DelegationAuthorizer API 到 IIGE 的兼容测试（v0.43.0）。"""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
 from loop_controller.delegation import DelegationAuthorizeEndpoint, DelegationAuthorizer
-from loop_controller.interaction.engine import InteractionGovernanceEngine
+from loop_controller.interaction.engine import (
+    InteractionAuthorizeEndpoint,
+    InteractionGovernanceEngine,
+)
 from loop_controller.interaction.models import InteractionDecision
 from loop_controller.models import ActionProposal, AuditEvent
 
@@ -100,6 +103,7 @@ def test_lifecycle_audit_keeps_interaction_decision_and_task_linkage() -> None:
     ):
         event = engine.build_lifecycle_audit_event(
             {
+                "event_id": f"lifecycle:task-1:{lifecycle}",
                 "interaction_id": "int-1",
                 "root_interaction_id": "root-1",
                 "parent_interaction_id": "parent-1",
@@ -109,15 +113,34 @@ def test_lifecycle_audit_keeps_interaction_decision_and_task_linkage() -> None:
                 "source_agent_id": "agent-a",
                 "target_agent_id": "agent-b",
                 "event": lifecycle,
+                "root_task_id": "root-task-1",
+                "parent_task_id": "parent-task-1",
+                "delegation_depth": 2,
+                "allowed_tools": ["read_file"],
+                "allowed_capabilities": ["read_data"],
+                "allow_redelegation": True,
+                "budget": {"token_count": 100, "payment_amount": 2.5, "currency": "USD"},
+                "reserved_budget": {"token_count": 20, "payment_amount": 0.5, "currency": "USD"},
+                "consumed_budget": {"token_count": 10, "payment_amount": 0.25, "currency": "USD"},
+                "deadline": "2026-09-07T12:00:00Z",
             }
         )
         assert isinstance(event, AuditEvent)
         assert event.action == f"interaction_{lifecycle}"
         assert event.trace_id == "task-1"
+        assert event.event_id == f"lifecycle:task-1:{lifecycle}"
         assert event.metadata["interaction_id"] == "int-1"
         assert event.metadata["root_interaction_id"] == "root-1"
         assert event.metadata["parent_interaction_id"] == "parent-1"
         assert event.metadata["decision_id"] == "dec-1"
+        assert event.metadata["root_task_id"] == "root-task-1"
+        assert event.metadata["parent_task_id"] == "parent-task-1"
+        assert event.metadata["delegation_depth"] == 2
+        assert event.metadata["allowed_tools"] == ["read_file"]
+        assert event.metadata["budget"]["token_count"] == 100
+        assert event.metadata["reserved_budget"]["token_count"] == 20
+        assert event.metadata["consumed_budget"]["token_count"] == 10
+        assert event.metadata["deadline"] == "2026-09-07T12:00:00Z"
         assert "delegation_token" not in event.model_dump_json()
 
 
@@ -126,7 +149,7 @@ async def test_legacy_endpoint_maps_initiator_to_source() -> None:
     endpoint = DelegationAuthorizeEndpoint(authorizer)
     response = await endpoint.handle(
         {
-            "protocol_version": "0.40.0",
+            "protocol_version": "0.48.0",
             "request_id": "req-1",
             "initiator_agent_id": "agent-a",
             "target_agent_id": "agent-b",
@@ -137,6 +160,32 @@ async def test_legacy_endpoint_maps_initiator_to_source() -> None:
     assert response["allowed"] is True
     proposal = engine.evaluate.await_args.args[0]
     assert proposal.source_agent_id == "agent-a"
+
+
+async def test_interaction_endpoint_exposes_modify_effective_args() -> None:
+    decision = _decision("modify", "arguments narrowed").model_copy(
+        update={
+            "original_args": {"path": "/tmp/x"},
+            "modified_args": {"path": "/safe/x"},
+            "effective_args": {"path": "/safe/x"},
+        }
+    )
+    _, engine = _authorizer(decision)
+    endpoint = InteractionAuthorizeEndpoint(engine)
+    response = await endpoint.handle(
+        {
+            "protocol_version": "0.48.0",
+            "request_id": "req-1",
+            "source_agent_id": "agent-a",
+            "target_agent_id": "agent-b",
+            "tool_name": "read_file",
+            "arguments": {"path": "/tmp/x"},
+        }
+    )
+    assert response["allowed"] is True
+    assert response["verdict"] == "modify"
+    assert response["modified_args"] == {"path": "/safe/x"}
+    assert response["effective_args"] == {"path": "/safe/x"}
 
 
 async def test_legacy_endpoint_protocol_version_fail_closed() -> None:
@@ -151,7 +200,7 @@ async def test_legacy_endpoint_protocol_version_fail_closed() -> None:
 async def test_legacy_endpoint_missing_fields_is_denied() -> None:
     authorizer, engine = _authorizer(_decision("allow", "allowed"))
     endpoint = DelegationAuthorizeEndpoint(authorizer)
-    response = await endpoint.handle({"protocol_version": "0.40.0"})
+    response = await endpoint.handle({"protocol_version": "0.48.0"})
     assert response["allowed"] is False
     assert "missing required delegation fields" in response["reason"]
     engine.evaluate.assert_not_awaited()

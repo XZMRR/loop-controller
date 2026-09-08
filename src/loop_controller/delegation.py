@@ -73,7 +73,13 @@ class DelegationAuthorizer:
         if not decision.allowed:
             return self._blocked(proposal, decision.reason, "delegation_denied")
 
-        effective_args = decision.effective_args or decision.modified_args or proposal.arguments
+        effective_args = (
+            decision.effective_args
+            if decision.effective_args is not None
+            else decision.modified_args
+            if decision.modified_args is not None
+            else proposal.arguments
+        )
         return GovernanceResult(
             status="delegated",
             call_id=proposal.call_id,
