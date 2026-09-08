@@ -1,0 +1,47 @@
+title: AgentCard
+type: object
+required:
+  - protocol_version
+  - agent_id
+  - entrypoint
+  - capabilities
+  - version
+properties:
+  protocol_version:
+    $ref: './protocol-version.yaml'
+  agent_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    description: Stable identifier for the agent.
+  name:
+    type: string
+    description: Human-readable agent name.
+  description:
+    type: string
+    description: Short description of the agent's purpose.
+  entrypoint:
+    type: object
+    required:
+      - type
+      - url
+    properties:
+      type:
+        type: string
+        enum:
+          - http
+      url:
+        type: string
+        format: uri
+    description: How to reach the agent.
+  capabilities:
+    type: array
+    items:
+      type: string
+    description: Capability labels advertised by the agent (e.g. delegate_execution).
+  trust_domain:
+    type: string
+    description: Trust domain to which the agent belongs.
+  version:
+    type: string
+    description: Agent implementation version.
+description: Describes an agent that can participate in governed A2A interactions.

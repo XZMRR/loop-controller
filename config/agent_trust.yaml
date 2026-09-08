@@ -1,0 +1,5 @@
+agent_trust:
+  - source_agent_id: researcher_001
+    target_agent_id: research-agent
+    trust_level: limited
+    conditions: {}

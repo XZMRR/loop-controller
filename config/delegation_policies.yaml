@@ -1,0 +1,6 @@
+delegation_policies:
+  - tool_name: analyze_sales
+    allowed: true
+    allowed_target_profiles: []
+    denied_target_profiles: []
+    reason: Approved research delegation capability

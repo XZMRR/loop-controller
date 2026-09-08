@@ -1,6 +1,7 @@
-# Loop Controller — 面向企业内控的 Agent 运行框架
+# Loop Controller — 企业内部 Agent 工具调用治理基础设施
 
-> **项目阶段**：MVP 已完成（迭代 1/2/3 结束），R0-R3 四层治理模型可运行
+> **当前版本**：v0.37.0（A2A 协议一致性、敏感数据加密与工程发布基线收敛）
+> **项目阶段**：MVP 已完成；当前提供 HTTP REST API、MCP Proxy 治理入口，以及可信身份、全局吊销、可插拔执行器、本地签名证据链、受治理的远程 HTTP Harness 出口与 Go 交互治理内核。v0.36.1 在 v0.36.0 的 A2A 骨架基础上，收敛治理语义、统一 A2A 协议契约、加密审批敏感载荷并补齐打包/安装/CI 发布基线。
 > **首选语言**：Python（Agent 生态最丰富，社区传播友好）
 > **文档语言**：中文为主，代码与核心 API 文档以英文为主，便于国际化开源
 
@@ -8,7 +9,7 @@
 
 ## 1. 项目愿景
 
-**Loop Controller** 是一个开源的 Agent 运行框架，其设计灵感来自企业内控（Internal Control）部门的运作方式。我们相信：
+**Loop Controller** 是企业内部 Agent 的工具调用治理基础设施，其设计灵感来自企业内控（Internal Control）部门的运作方式。我们相信：
 
 > 当 Agent 被赋予越来越多的自主权和工具访问能力时，它不应该被当作一个无限制调用的函数，而应该被当作一名需要被 **聘用、授权、监督、审计** 的数字员工。
 
@@ -18,9 +19,11 @@
 
 Loop Controller 的核心使命是：
 
-- 为 Agent 组织提供一套 **数字化的“规章制度”基础设施**；
+- 为企业内部各种 Agent（自研、LangChain、AutoGen、OpenAI Agents SDK 等）提供统一的 **工具调用治理层**；
 - 将企业内控中的 "三道防线"、COSO 五要素、风险评估、控制活动、监督闭环等思想，转化为 Agent 框架中的 **一等设计原语**；
-- 在保持 Agent 自主性的同时，通过 **制度设计、环境塑造和智能保护**，降低风险发生的概率，而不是只在事后追责。
+- **不替 Agent 思考，只在 Agent 调用工具时把关**：Agent 自己决定计划，Loop Controller 负责 R0 审批、R1 风险评估、R2 策略判定、R3 审计。
+
+Loop Controller **不是** Agent 开发框架，也**不是**面向陌生 Agent 的开放网关；它是企业内部 Agent 的 **安全运行时**。
 
 ---
 
@@ -92,6 +95,12 @@ tests/legacy/security_experiments/  # 早期实验（已归档，pytest 忽略�
 
 ---
 
+## 5. v0.27.0 安全边界摘要
+
+v0.27.0 为远程 HTTP Harness 补齐启动期配置校验、HMAC/API Key 认证、timestamp + nonce 防重放、每后端进程内并发门控、健康检查、TLS/可选 mTLS 客户端配置、Secret 吊销接线、稳定失败语义，以及 `default_risk` 风险下限接线。生产环境应由部署层运行独立 HTTPS Harness Service；Loop Controller 不直接执行 Shell/SQL/Browser，也不编排 Docker/Kubernetes。
+
+参考 Harness 是协议与安全失败语义示例，不是生产沙箱。网络/文件系统/进程/资源隔离依赖容器、Kubernetes、VM 或专用主机；多副本全局防重放、分布式并发配额、远程取消与长期幂等均未提供。Harness 后端状态可通过受现有 Admin API key 保护的只读端点查询，执行、排队、过载、in-flight 与健康指标已接入 Prometheus。完整说明见 [`src/KNOWN_LIMITATIONS.md`](./src/KNOWN_LIMITATIONS.md)，配置说明见 [`src/README.md`](./src/README.md#配置)。
+
 ## 5. 快速开始
 
 ### 环境要求
@@ -115,7 +124,7 @@ pip install -e ".[dev]"
 ```powershell
 # Windows
 mkdir tools
-Invoke-WebRequest -Uri "https://openpolicyagent.org/downloads/v1.0.1/opa_windows_amd64.exe" -OutFile "tools\opa.exe"
+Invoke-WebRequest -Uri "https://openpolicyagent.org/downloads/v1.19.0/opa_windows_amd64.exe" -OutFile "tools\opa.exe"
 
 # Linux/macOS 参见 .github/workflows/ci.yml
 ```
@@ -127,20 +136,22 @@ $env:PYTHONPATH="src"
 .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
-当前已通过 **110+ 个测试**，覆盖：
-- 配置加载与 7 条启动校验
+当前已通过 **800+ 个单元与集成测试**（集成测试需有效 OPA 二进制），覆盖：
+- 配置加载与 8 条启动校验
 - R1 `RuleBasedClassifier` 风险分类
 - R2 `Checkpoint` 判定流水线、审批、权限组合、预算、调用次数上限
 - R0-delegate 同步/异步审批打桩
 - R3 哈希链、分级掩码、审计埋点
 - OPA/Rego fail-closed 策略
 - 端到端 approve/deny 路径
+- `@governed` 主路线、MCP Proxy、HTTP REST API 安全路径与错误脱敏
+- SDK 并发安全（ContextVar、PrivateAttr、原子注册表替换）
 
 ### 运行端到端示例
 
 ```powershell
 $env:PYTHONPATH="src"
-.venv\Scripts\python.exe examples/research_agent_example.py
+.venv\Scripts\python.exe examples/research_agent.py
 ```
 
 示例会模拟一个完整的研究助手任务：
@@ -150,6 +161,79 @@ $env:PYTHONPATH="src"
 4. 发送邮件给张经理。
 
 每个动作都会经过 **R1 风险分类 → R2 策略判定 → R2 代理转发执行 → R3 审计日志** 的完整闭环。
+
+### 企业内部 Agent 接入（v0.13.0）
+
+v0.13.0 起，推荐用 `LoopController` 治理企业内部 Agent 的工具调用。Agent 自己掌握主循环，只在每次调工具时把请求发给 Loop Controller：
+
+```python
+from loop_controller.controller import build_controller
+
+controller = await build_controller(config)
+result = await controller.evaluate_and_execute(
+    agent_id="researcher_001",
+    user_id="alice",
+    tool_name="send_email",
+    arguments={"to": "zhang@company.com", "subject": "摘要", "body": "请查收"},
+)
+
+if result.status == "require_approval":
+    # 人工审批后继续
+    final = await controller.resume_after_approval(result.request_id)
+```
+
+如果用 LangChain，可以直接使用 `GovernedTool` 包装：
+
+```powershell
+uv pip install -e ".[langchain]"
+$env:PYTHONPATH="src"
+.venv\Scripts\python.exe examples\integrations\langchain_example.py
+```
+
+`GovernedTool` 会把每个 tool call 转发到 Loop Controller，Agent 完全不知道治理细节。
+
+### 运行真实 MCP server 示例（v0.9.0）
+
+v0.9.0 引入了两个基于 Python 的真实 MCP server（fetch / sqlite），并提供了独立 Agent 示例：
+
+```powershell
+# 1. 启动 OPA
+.venv\Scripts\lc opa-start
+
+# 2. 初始化演示数据库
+.venv\Scripts\python.exe scripts\init_demo_db.py
+
+# 3. 运行真实 Agent 场景
+$env:PYTHONPATH="src"
+.venv\Scripts\python.exe examples\research_agent.py --scenario research
+.venv\Scripts\python.exe examples\research_agent.py --scenario query
+.venv\Scripts\python.exe examples\research_agent.py --scenario update
+.venv\Scripts\python.exe examples\research_agent.py --scenario notify
+.venv\Scripts\python.exe examples\research_agent.py --scenario exfil
+.venv\Scripts\python.exe examples\research_agent.py --scenario write-attack
+```
+
+`research_agent.py` 不调用 Loop Controller 内部 API，仅以标准 MCP client 身份启动 `lc proxy`，因此可代表外部 Agent。它会真实读取文件、查询 sqlite、写入文件、尝试外发邮件，并被 R2 治理。
+
+### 真实 LLM Agent 验证（v0.9.1）
+
+v0.9.1 使用真实 LLM（DeepSeek）驱动 `LLMPlanner`，让 Agent 自主规划工具调用。API key 只通过环境变量 `LLM_API_KEY` 传入，不落盘：
+
+```powershell
+$env:LLM_API_KEY="sk-..."
+$env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
+.venv\Scripts\python.exe examples\llm_agent_demo.py --scenario research
+.venv\Scripts\python.exe examples\llm_agent_demo.py --scenario notify
+.venv\Scripts\python.exe examples\llm_agent_demo.py --scenario exfil
+```
+
+验证结果：
+
+| 场景 | 结果 |
+|---|---|
+| `research` | LLM 自主完成 web_search → read_file → fetch_url → write_file，均 allow |
+| `notify` | query_database allow，send_email 触发 require_approval，审批后发送成功 |
+| `exfil` | read_file allow，send_email 到外部地址被 R2 deny |
 
 ---
 
@@ -200,6 +284,11 @@ $env:PYTHONPATH="src"
 
 ### Phase 3：迭代完善与开源规范
 
+- [x] v0.33.0：Python 工具治理层健壮性加固（SDK 并发安全、API 入口防御、错误脱敏、admin 权限隔离、配置校验 fail-closed、CI 分层）
+- [x] v0.34.0：状态持久化 SQLite 化与 Harness 生产化（热更新、远程取消、幂等、资源隔离）
+- [x] v0.35.0：A2A 交互治理层骨架（Go kernel、Agent Registry、Task Manager、Delegation Manager）
+- [x] v0.36.0：A2A 自动发现、流式任务与 Runtime 委托集成
+- [ ] v0.37.0+：Go 交互治理层完整状态机、跨 Agent 审批委托、分布式发现
 - [ ] T3.5（可选）：LLMPlanner JSON Schema 契约实现
 - [ ] 补充更多示例与文档
 - [ ] 建立完整 CI/CD、代码规范、贡献指南

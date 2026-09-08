@@ -1,0 +1,20 @@
+# v0.36.1 Go 交互治理内核配置样例。
+# 默认禁用；启用后 Python Runtime 会自动连接 Go 内核并注册本地 Agent Card。
+go_kernel:
+  enabled: false
+  base_url: "http://127.0.0.1:8080"
+  timeout: 5.0
+  development: false
+  dispatch_entrypoints: true
+  discovery:
+    static_file: "config/a2a_agents.yaml"
+  local_agent:
+    agent_id: "loop-controller-local"
+    name: "Loop Controller Python Runtime"
+    entrypoint: "http://127.0.0.1:8000"
+    capabilities:
+      - "delegate_execution"
+    version: "0.40.0"
+  # Go Kernel 非开发模式必须通过 -secret 或 GO_KERNEL_TOKEN_SECRET 注入密钥；
+  # 本地开发需显式使用 -development，此时会禁用正式 HTTP entrypoint 派发。
+  token_secret_env: "GO_KERNEL_TOKEN_SECRET"

@@ -1,0 +1,6 @@
+persistence:
+  fsync_enabled: true
+  lock_timeout_seconds: 5
+  repair_incomplete_tail: true
+  enforce_permissions: true
+  fail_on_unsafe_permissions: true

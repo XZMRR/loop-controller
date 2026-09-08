@@ -1,12 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "loop-controller"
-version = "0.3.0"
+version = "0.40.0"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.0",
     "httpx>=0.27",
+    "jsonschema>=4.23",
     "pyyaml>=6.0",
-    "mcp>=1.0",
+    "mcp<2.0",
+    "pyjwt[crypto]>=2.8",
+    "cryptography>=44.0",
+    "portalocker>=2.0",
+]
+
+[project.optional-dependencies]
+server = [
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+    "prometheus-client>=0.20",
+]
+langchain = [
+    "langchain_core>=0.1.0",
 ]
 
 [project.scripts]
@@ -16,9 +34,11 @@ lc = "loop_controller.cli:main"
 dev = [
     "mypy>=2.3.0",
     "pre-commit>=4.6.1",
+    "psutil>=7.2.2",
     "pytest>=9.1.1",
     "pytest-asyncio>=0.23",
     "ruff>=0.16.1",
+    "types-pyyaml>=6.0.12.20260815",
 ]
 
 [[tool.uv.index]]
@@ -34,15 +54,38 @@ line-length = 100
 # but exclude bandit (`BLE`) rules for early-stage development
 select = ["E", "F", "W", "I", "N", "UP"]
 ignore = ["E501", "ANN", "D", "BLE"]
+exclude = ["go/*"]
+[tool.ruff.lint.per-file-ignores]
+"src/loop_controller/checkpoint.py" = ["N818"]
 
 [tool.mypy]
 python_version = "3.13"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
+exclude = ["go/", "examples/contrib/adapters/"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loop_controller"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/config",
+    "/policies",
+    "/go",
+    "/proto",
+    "/LICENSE",
+    "/README.md",
+    "/src/README.md",
+    "/src/KNOWN_LIMITATIONS.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 asyncio_mode = "auto"
 norecursedirs = ["legacy", "data", "venv", "__pycache__"]
+markers = [
+    "integration: 集成测试，需要 OPA/真实子进程/MCP server",
+]

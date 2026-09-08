@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package loop_controller.proto.v1;
+
+service ToolGovernance {
+  rpc EvaluateToolCall(EvaluateToolCallRequest) returns (EvaluateToolCallResponse);
+  rpc ResumeAfterApproval(ResumeAfterApprovalRequest) returns (EvaluateToolCallResponse);
+  rpc WaitForApproval(WaitForApprovalRequest) returns (stream EvaluateToolCallResponse);
+  rpc GetHealth(HealthRequest) returns (HealthResponse);
+  rpc ListPendingApprovals(ListPendingApprovalsRequest) returns (ListPendingApprovalsResponse);
+  rpc QueryAuditEvents(QueryAuditEventsRequest) returns (stream AuditEvent);
+  rpc Revoke(RevokeRequest) returns (RevokeResponse);
+  rpc SetKillSwitch(SetKillSwitchRequest) returns (KillSwitchResponse);
+  rpc GetRevocationList(GetRevocationListRequest) returns (RevocationListResponse);
+}
+
+message EvaluateToolCallRequest {
+  string agent_id = 1;
+  string user_id = 2;
+  string tool_name = 3;
+  string arguments_json = 4;
+  string task_context = 5;
+  string session_id = 6;
+  string task_id = 7;
+}
+
+message EvaluateToolCallResponse {
+  string status = 1;
+  string result = 2;
+  string request_id = 3;
+  string error_code = 4;
+}
+
+message ResumeAfterApprovalRequest {
+  string request_id = 1;
+}
+
+message WaitForApprovalRequest {
+  string request_id = 1;
+  int32 max_wait_seconds = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  bool opa_reachable = 2;
+  bool gateway_ready = 3;
+  float uptime_seconds = 4;
+  string evidence_status = 5;
+  string anchor_status = 6;
+  string anchor_stream_id = 7;
+  int64 anchor_last_success_seq = 8;
+  int64 anchor_lag_events = 9;
+  string anchor_last_error_code = 10;
+}
+
+message PendingApproval {
+  string request_id = 1;
+  string decision_id = 2;
+  string tool_name = 3;
+  string requester_id = 4;
+  string reason = 5;
+}
+
+message ListPendingApprovalsRequest {}
+
+message ListPendingApprovalsResponse {
+  repeated PendingApproval approvals = 1;
+}
+
+message QueryAuditEventsRequest {
+  string session_id = 1;
+  string task_id = 2;
+  int32 limit = 3;
+}
+
+message RevokeRequest {
+  string type = 1;
+  string id = 2;
+  string reason = 3;
+  string expires_at = 4;
+  string tenant_id = 5;
+  bool remove = 6;
+}
+
+message RevokeResponse {
+  bool success = 1;
+  bool removed = 2;
+}
+
+message SetKillSwitchRequest {
+  bool enabled = 1;
+  string reason = 2;
+  repeated string except_tools = 3;
+  repeated string except_agents = 4;
+}
+
+message KillSwitchResponse {
+  bool enabled = 1;
+  string reason = 2;
+  repeated string except_tools = 3;
+  repeated string except_agents = 4;
+}
+
+message GetRevocationListRequest {}
+
+message RevocationEntry {
+  string type = 1;
+  string id = 2;
+  string reason = 3;
+  string revoked_at = 4;
+  string expires_at = 5;
+  string tenant_id = 6;
+}
+
+message RevocationListResponse {
+  repeated RevocationEntry revocations = 1;
+  KillSwitchResponse kill_switch = 2;
+}
+
+message AuditEvent {
+  string event_id = 1;
+  string trace_id = 2;
+  string session_id = 3;
+  string action = 4;
+  string actor_type = 5;
+  string actor_id = 6;
+  string target = 7;
+  string decision = 8;
+  string reason = 9;
+  string timestamp = 10;
+  string payload_json = 11;
+}

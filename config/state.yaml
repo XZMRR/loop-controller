@@ -1,0 +1,10 @@
+# 统一 SQLite 状态数据库配置样例（v0.34.0）
+# 当前版本 `Runtime` 已根据文件扩展名自动选择 SQLite/JSONL 后端，
+# 但 `migrate_from_jsonl` 等迁移开关尚未在 `ConfigLoader` 中启用。
+# 本文件作为配置基线样例，生产部署时应根据实际数据目录调整路径。
+
+state:
+  db_path: ./data/state.db
+  migrate_from_jsonl: false
+  audit:
+    index_db_path: ./data/audit_index.db

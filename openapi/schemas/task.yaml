@@ -1,0 +1,50 @@
+title: Task
+type: object
+required:
+  - protocol_version
+  - task_id
+  - session_id
+  - initiator_agent_id
+  - target_agent_id
+  - status
+  - created_at
+  - updated_at
+properties:
+  protocol_version:
+    $ref: './protocol-version.yaml'
+  task_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  session_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  initiator_agent_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  target_agent_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  status:
+    type: string
+    enum:
+      - pending
+      - accepted
+      - running
+      - completed
+      - failed
+      - cancelled
+      - outcome_unknown
+  created_at:
+    type: string
+    format: date-time
+  updated_at:
+    type: string
+    format: date-time
+  completed_at:
+    type: string
+    format: date-time
+  outcome:
+    description: Successful result or failure summary as a JSON value; may be absent.
+  error_code:
+    type: string
+description: Represents a delegated task and its current lifecycle state.

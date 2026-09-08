@@ -10,9 +10,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+
+if TYPE_CHECKING:
+    from loop_controller.controller import LoopController
 
 # ---------------------------------------------------------------------------
 # 枚举类型（照抄方案，不自行发明取值）
@@ -20,6 +23,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 RiskLevel = Literal["low", "medium", "high", "critical"]
 Verdict = Literal["allow", "deny", "modify", "require_approval"]
+ActionKind = Literal["tool_call", "delegation"]
+AuditDecision = Literal["allow", "deny", "modify", "require_approval", "blocked"]
 ToolResultStatus = Literal["success", "error", "blocked"]
 ActorType = Literal["agent", "user", "r0_delegate", "system", "checkpoint"]
 AuditAction = Literal[
@@ -29,12 +34,35 @@ AuditAction = Literal[
     "evaluate",
     "approve",
     "deny",
-    "execute",
+    "execute",  # v0.36.1 起保留为兼容性别名，推荐用 execution_*
+    "execution_authorized",  # v0.36.1：Decision 已消费、执行器调用前
+    "execution_completed",  # v0.36.1：执行器明确成功
+    "execution_failed",  # v0.36.1：执行器明确失败
+    "execution_outcome_unknown",  # v0.36.1：执行器调用后无法确认结果（如超时）
+    "execution_blocked",  # v0.36.1：执行前被策略/吊销/配置阻断
+    "interaction_dispatched",
+    "interaction_dispatch_outcome_unknown",
+    "interaction_accepted",
+    "interaction_running",
+    "interaction_completed",
+    "interaction_failed",
+    "interaction_cancelled",
+    "interaction_outcome_unknown",
     "task_end",
     "seal",
     "planner_error",
     "approval_expired",
     "approval_consumed",
+    "reservation_expired",  # v0.29.0：过期预算预留清理
+    "authority_granted",  # v0.11.0：动态权限提升授予
+    "authority_used",  # v0.11.0：动态权限提升使用
+    "authority_revoked",  # v0.11.0：动态权限提升撤销
+    "authority_expired",  # v0.11.0：动态权限提升过期
+    "admin_operation",
+    "revocation_blocked",
+    "anchor_bootstrap",  # v0.28.0：可信锚点 bootstrap
+    "anchor_verify",  # v0.28.0：可信锚点管理校验
+    "anchor_publish",  # v0.28.0：可信锚点管理发布
 ]
 ApprovalVerdict = Literal["approve", "deny"]
 ConversationRole = Literal["user", "agent"]
@@ -57,6 +85,8 @@ class Task(BaseModel):
     v1.2 起废除 ``session_id == task_id`` 约定：session 为同一 ``(user_id, agent_id)``
     的连续任务流，由 ``SessionManager`` 分配与复用。
     ``description`` 原文不进入 Rego input，仅用于 R1 规划与 R3 审计。
+
+    v0.6.0 新增 ``status`` 与 ``completed_at``，支持 ``JsonlTaskStore`` 持久化生命周期。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -66,7 +96,10 @@ class Task(BaseModel):
     user_id: str
     agent_id: str
     description: str
+    tenant_id: str | None = None  # v0.22.0 多租户预留
+    status: Literal["created", "completed"] = "created"
     created_at: datetime = Field(default_factory=_utc_now)
+    completed_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +116,8 @@ class Agent(BaseModel):
     name: str
     profile_id: str  # MVP 一对一静态绑定，不支持运行时切换
     owner_id: str  # 所属人类用户/部门，用于审批路由
+    identity: dict[str, Any] | None = None  # v0.20.0 外部身份元数据
+    tenant_id: str | None = None  # v0.22.0 多租户预留
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +157,7 @@ class CapabilityProfile(BaseModel):
     max_budget_payment: float = 0.0
     fixed_ceiling: dict[str, Any] = Field(default_factory=dict)  # Earned Authority post-MVP
     session_risk_threshold: float = Field(default=0.6, ge=0.0, le=1.0)  # v1.2 会话级风险门控阈值
+    session_block_threshold: int = Field(default=5, ge=1)  # v0.4.0 连续 deny 熔断阈值
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +180,14 @@ class ActionProposal(BaseModel):
     tool_name: str  # 规范化工具名
     arguments: dict[str, Any]
     task_context: str  # 由 Task.description 纯截断（前 200 字符）生成
+    action_kind: ActionKind = "tool_call"  # v0.37.0: tool_call 或 delegation
+    target_agent_id: str | None = None  # v0.37.0: delegation 目标 Agent
+    delegation_context: dict[str, Any] | None = None  # v0.37.0: 委托附加元数据
     risk_level: RiskLevel = "low"
     risk_tags: list[str] = Field(default_factory=list)
+    combination_risk_tags: list[str] = Field(default_factory=list)  # v0.10.0：能力组合风险标签
+    combination_risk_score: int = 0  # v0.10.0：能力组合风险分数
+    authority_token_ids: list[str] = Field(default_factory=list)  # v0.11.0：持有的动态权限令牌
     reason: str = ""  # R1 认为需要此动作的理由，供审批人与审计阅读
 
 
@@ -178,6 +220,9 @@ class Decision(BaseModel):
 
     ``expires_at`` 的分档逻辑（allow/modify 5min、require_approval 15min、deny 立即过期）
     由 Checkpoint 的工厂方法集中处理，不在此模型内。
+
+    v0.36.1：新增 original_args / policy_modified_args / effective_args 以明确 modify
+    语义。为向后兼容，``modified_args`` 保留作为 ``policy_modified_args`` 的别名。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -185,9 +230,16 @@ class Decision(BaseModel):
     decision_id: str  # R2 生成的 UUID
     call_id: str
     task_id: str
+    action_kind: ActionKind = "tool_call"  # v0.37.0
+    target_agent_id: str | None = None  # v0.37.0
+    delegation_token: str | None = None  # v0.37.0: 成功授权后由 Go 内核签发
+    target_entrypoint: dict[str, Any] | None = None  # v0.37.0
     verdict: Verdict
     reason: str  # 不允许为空字符串（审批可读性与审计可解释性底线）
-    modified_args: dict[str, Any] | None = None  # verdict == "modify" 时回写
+    modified_args: dict[str, Any] | None = None  # 向后兼容：等价于 policy_modified_args
+    original_args: dict[str, Any] | None = None  # v0.36.1：modify 前的原始参数
+    policy_modified_args: dict[str, Any] | None = None  # v0.36.1：策略返回的改写后参数
+    effective_args: dict[str, Any] | None = None  # v0.36.1：复核后最终执行的参数
     escalation_target: str | None = None  # verdict == "require_approval" 时指向审批人
     policy_hits: list[str] = Field(default_factory=list)  # 由 OPA 返回，Checkpoint 透传
     policy_version: str = ""  # 判定时生效的策略版本
@@ -224,6 +276,7 @@ class ToolResult(BaseModel):
     content: Any
     error_code: str | None = None
     elapsed_ms: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)  # v0.25.0 Harness 透传元数据
 
 
 # ---------------------------------------------------------------------------
@@ -241,13 +294,41 @@ class BudgetCost(BaseModel):
     currency: str = "USD"
 
 
+ReservationState = Literal[
+    "pending",
+    "pending_approval",
+    "committed",
+    "refunded",
+    "expired",
+]
+
+
+class BudgetReservation(BaseModel):
+    """v0.6.1：预算预留状态机实体。
+
+    由 ``Checkpoint`` 在 ``evaluate()`` 成功后创建，并在执行/拒绝/审批/异常路径上
+    统一流转状态。``reservation_id`` 与 ``call_id`` 一一对应。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    reservation_id: str
+    task_id: str
+    call_id: str
+    tool_name: str
+    cost: BudgetCost
+    state: ReservationState
+    created_at: datetime = Field(default_factory=_utc_now)
+    expires_at: datetime | None = None
+
+
 # ---------------------------------------------------------------------------
 # §3.9 RiskProfile
 # ---------------------------------------------------------------------------
 
 
 class RiskProfile(BaseModel):
-    """Session 级风险画像（MVP 打桩：仅统计计数供审计引用，不参与判定）。"""
+    """Session 级风险画像。"""
 
     model_config = ConfigDict(frozen=True)
 
@@ -256,6 +337,7 @@ class RiskProfile(BaseModel):
     recent_tags: list[str] = Field(default_factory=list)
     denied_count: int = 0
     approval_count: int = 0
+    consecutive_deny_count: int = 0  # v0.4.0：连续 deny 计数，用于会话级硬熔断
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +350,9 @@ class ApprovalRequest(BaseModel):
 
     ``decision_id`` 强绑定触发审批的 Decision，不允许为空。
     审批人看到的是掩码后参数（``arguments_masked``）。
+
+    v0.5.1 新增：``tool_arguments`` 保存原始未掩码参数，``original_decision``
+    保存触发审批的原始 Decision，用于 MCP Proxy 审批通过后重试时恢复执行。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -279,6 +364,8 @@ class ApprovalRequest(BaseModel):
     agent_id: str
     tool_name: str
     arguments_masked: dict
+    tool_arguments: dict[str, Any] = Field(default_factory=dict)
+    original_decision: Decision | None = None
     reason: str  # R2 给出的升级理由
     requester_id: str  # 任务发起者 user_id
     approver_id: str  # 被指派的审批人
@@ -324,7 +411,7 @@ class AuditEvent(BaseModel):
     actor_id: str
     action: AuditAction
     target: str | None = None  # tool_name 或 "checkpoint"
-    decision: Verdict | None = None
+    decision: AuditDecision | None = None
     args_hash: str | None = None  # 规范 JSON 的 SHA-256 / HMAC-SHA256
     hash_algo: str = "sha256"  # "sha256" | "hmac-sha256"；升级 HMAC 时改此字段，schema 不变
     key_id: str | None = None  # HMAC key 标识，为轮换留口
@@ -407,3 +494,265 @@ class TaskRunResult(BaseModel):
     request_id: str | None = None  # status == "needs_approval" 时非空
     pending_decision: Decision | None = None  # needs_approval 时保存完整 Decision
     pending_proposal: ActionProposal | None = None  # needs_approval 时保存完整 ActionProposal
+
+
+# ---------------------------------------------------------------------------
+# v0.13.0 Agent 驱动治理接口
+# ---------------------------------------------------------------------------
+
+
+class EvaluationResult(BaseModel):
+    """R1 + R2 对单次工具调用请求的判定结果，不含执行。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: Literal["allow", "deny", "require_approval", "blocked"]
+    decision: Decision | None = None
+    request_id: str | None = None
+    reason: str = ""
+    risk_signal: RiskSignal | None = None
+
+
+class GovernanceDeniedError(Exception):
+    """Loop Controller 拒绝、阻断、执行出错或审批被拒绝/超时抛出。"""
+
+    def __init__(self, result: GovernanceResult) -> None:
+        self.result = result
+        super().__init__(f"{result.status}: {result.reason}")
+
+
+class GovernanceResult(BaseModel):
+    """Agent 驱动模式下，Loop Controller 对单次工具调用的完整响应。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: Literal["allow", "deny", "require_approval", "blocked", "error", "delegated"]
+    call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    decision: Decision | None = None  # allow/modify 时有
+    request_id: str | None = None  # require_approval 时有
+    reason: str = ""
+    content: Any = None  # allow 后执行的结果内容
+    error_code: str | None = None
+
+    # 内部保留：用于审批后自动重试；不参与序列化/深拷贝
+    _controller: Any = PrivateAttr(default=None)
+    _runtime: Any = PrivateAttr(default=None)
+
+    def with_controller(self, controller: Any, runtime: Any | None = None) -> GovernanceResult:
+        """返回携带内部 controller 引用的副本，用于 wait_for_approval。"""
+        copied = self.model_copy(deep=True)
+        copied._controller = controller
+        copied._runtime = runtime or getattr(controller, "_runtime", None)
+        return copied
+
+    async def wait_for_approval(
+        self,
+        *,
+        timeout: float | None = 60.0,
+        poll_interval: float = 1.0,
+    ) -> GovernanceResult:
+        """阻塞等待审批完成，返回最终 GovernanceResult。
+
+        - 审批通过：返回 allow 的 GovernanceResult，content 为执行结果；
+        - 审批拒绝/超时：抛出 GovernanceDeniedError。
+        """
+        import asyncio
+
+        if self.status != "require_approval":
+            return self
+        if self.request_id is None:
+            raise RuntimeError("require_approval GovernanceResult 缺少 request_id")
+        controller = cast("LoopController", self._controller)
+        if controller is None:
+            raise RuntimeError(
+                "GovernanceResult 未绑定 controller；"
+                "请通过 GovernanceRuntime.call() 或 @governed 调用获得"
+            )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout if timeout is not None else None
+
+        while True:
+            result = await controller.resume_after_approval(self.request_id)
+            if result.status != "require_approval":
+                return result
+            if deadline is not None:
+                now = loop.time()
+                if now >= deadline:
+                    if hasattr(controller, "cancel_approval"):
+                        await controller.cancel_approval(self.request_id)
+                    raise GovernanceDeniedError(
+                        self.model_copy(
+                            update={"status": "error", "reason": "等待审批超时", "error_code": "approval_timeout"}
+                        )
+                    )
+                await asyncio.sleep(min(poll_interval, deadline - now))
+            else:
+                await asyncio.sleep(poll_interval)
+
+    async def retry_after_approval(
+        self,
+        *,
+        timeout: float | None = 60.0,
+        poll_interval: float = 1.0,
+    ) -> Any:
+        """等待审批通过后，返回最终执行结果（allow 的 content）。
+
+        审批拒绝、超时或其他状态抛出 GovernanceDeniedError。
+        """
+        result = await self.wait_for_approval(timeout=timeout, poll_interval=poll_interval)
+        if result.status == "allow":
+            return result.content
+        raise GovernanceDeniedError(result)
+
+
+# ---------------------------------------------------------------------------
+# v0.11.0 Earned Authority Manager（动态权限提升）
+# ---------------------------------------------------------------------------
+
+
+class AuthorityRequest(BaseModel):
+    """Agent 向治理系统申请临时能力的请求。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    request_id: str
+    agent_id: str
+    task_id: str
+    requested_capabilities: list[str]
+    reason: str
+    user_confirmation: bool = False
+
+
+class AuthorityToken(BaseModel):
+    """治理系统签发的临时能力令牌。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    token_id: str
+    request_id: str
+    agent_id: str
+    task_id: str
+    granted_capabilities: list[str]
+    budget: BudgetCost  # 令牌预算上限
+    remaining_budget: BudgetCost  # 剩余预算
+    expires_at: datetime
+    created_at: datetime = Field(default_factory=_utc_now)
+    revoked_at: datetime | None = None
+    audit_record_id: str
+
+
+class AuthorityConditions(BaseModel):
+    """动态权限授予条件（声明式）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    user_confirmation: bool = False
+    budget_remaining: int | None = None  # 任务剩余预算阈值
+    no_recent_denials_within_steps: int | None = None
+    require_task_context_regex: str | None = None
+
+
+class AuthorityGrantRule(BaseModel):
+    """单个能力的动态授予规则。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    capability: str
+    description: str
+    conditions: AuthorityConditions
+    max_duration_seconds: int
+    budget_limit: BudgetCost
+
+
+class AuthorityRules(BaseModel):
+    """动态权限规则配置容器。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = True
+    grants: dict[str, AuthorityGrantRule] = Field(default_factory=dict)
+
+
+class AuthorityEvaluationContext(BaseModel):
+    """评估动态权限提升请求时的上下文信息。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    task_budget_remaining: int = 0
+    recent_denial_count: int = 0
+    task_context: str = ""
+    history: list[ActionProposal] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# v0.12.0 R3 Asynchronous Audit Analyzer
+# ---------------------------------------------------------------------------
+
+
+class AuditAlert(BaseModel):
+    """审计分析器生成的风险告警。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    alert_id: str
+    session_id: str
+    task_id: str | None = None
+    rule_id: str
+    severity: Literal["low", "medium", "high", "critical"]
+    title: str
+    description: str
+    evidence: list[str] = Field(default_factory=list)  # event_id 列表
+    created_at: datetime = Field(default_factory=_utc_now)
+
+
+class AuditReport(BaseModel):
+    """审计分析报告。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    report_id: str
+    session_id: str
+    task_id: str | None = None
+    generated_at: datetime = Field(default_factory=_utc_now)
+    summary: str
+    alert_ids: list[str] = Field(default_factory=list)
+    event_count: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuditRuleConditions(BaseModel):
+    """审计规则条件（声明式）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    min_denies_count: int | None = None
+    min_denies_within_seconds: int | None = None
+    consecutive_denies: int | None = None
+    action_sequence: list[str] | None = None
+    has_any_action: list[str] | None = None
+    has_all_actions: list[str] | None = None
+    authority_token_exhausted: bool = False
+
+
+class AuditRule(BaseModel):
+    """单条审计分析规则。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    rule_id: str
+    description: str
+    severity: Literal["low", "medium", "high", "critical"]
+    conditions: AuditRuleConditions
+
+
+class AuditRules(BaseModel):
+    """审计规则配置容器。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = True
+    rules: list[AuditRule] = Field(default_factory=list)
+

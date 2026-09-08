@@ -1,0 +1,28 @@
+# Loop Controller 身份 Provider 配置（v0.20.0）
+#
+# provider 可选：static（开发/测试）、jwt（生产）、mtls（生产）
+identity:
+  provider: static
+  static:
+    allowed_tokens:
+      - token: dev-token-researcher-001
+        agent_id: researcher_001
+        user_id: alice
+
+  # 生产环境示例：JWT
+  # jwt:
+  #   issuer: https://auth.company.com
+  #   audience: loop-controller
+  #   jwks_url: https://auth.company.com/.well-known/jwks.json
+  #   claim_mappings:
+  #     agent_id: agent_id
+  #     user_id: user_id
+  #     harness_id: harness_id
+
+  # 生产环境示例：mTLS
+  # mtls:
+  #   cert_subject_template: "agent-researcher-prod-{harness_id}"
+  #   cert_mappings:
+  #     - subject: "CN=agent-researcher-prod-001,O=company"
+  #       agent_id: researcher_001
+  #       harness_id: prod-001

@@ -152,14 +152,36 @@ class MCPGateway:
         return tools
 
     async def call_tool(
-        self, tool_name: str, arguments: dict, call_id: str, task_id: str
+        self,
+        tool_name: str,
+        arguments: dict,
+        call_id: str,
+        task_id: str,
+        *,
+        agent_id: str | None = None,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        tenant_id: str | None = None,
     ) -> ToolResult:
-        """按规范化工具名转发；失败注入为 ``error`` 状态的 ToolResult。"""
+        """按规范化工具名转发；失败注入为 ``error`` 状态的 ToolResult。
+
+        v0.23.1 起支持透传治理上下文字段（agent_id / user_id / session_id / tenant_id），
+        供 MCP 工具侧做审计与多租户路由。
+        """
         entry = self._mapping.get(tool_name)
         if entry is None:
             raise MCPGatewayError(f"tool_mapping 中不存在 {tool_name!r}")
         client = self._servers[entry.server]
         start = time.perf_counter()
+        logger.debug(
+            "MCP 调用 %s(%s) 治理上下文 agent_id=%s user_id=%s session_id=%s tenant_id=%s",
+            tool_name,
+            call_id,
+            agent_id,
+            user_id,
+            session_id,
+            tenant_id,
+        )
         try:
             content, is_error = await client.call(entry.mcp_name, arguments)
         except Exception as exc:  # noqa: BLE001 - 任何异常都转成 error 结果

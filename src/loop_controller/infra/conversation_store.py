@@ -12,6 +12,7 @@ from datetime import UTC
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from loop_controller.infra.durable_io import DurableJsonlFile
 from loop_controller.models import ConversationContext, ConversationMessage
 
 logger = logging.getLogger(__name__)
@@ -37,57 +38,40 @@ class JsonlConversationStore:
 
     def __init__(self, path: str | Path, max_messages_per_session: int = 100) -> None:
         self._path = Path(path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._durable = DurableJsonlFile(self._path)
         self._max_messages = max_messages_per_session
         self._messages: dict[str, list[ConversationMessage]] = {}
         self._load()
 
     def _load(self) -> None:
         """启动时重放 JSONL，恢复每个 session 的最近消息。"""
+        self._messages.clear()
         if not self._path.exists():
             return
-        raw_lines = self._path.read_text(encoding="utf-8").splitlines(keepends=True)
-        for line_no, raw in enumerate(raw_lines, start=1):
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                message = ConversationMessage(**data)
-            except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                is_last = line_no == len(raw_lines)
-                if is_last:
-                    logger.warning(
-                        "conversations.jsonl 末行（第 %d 行）不完整，已忽略：%s",
-                        line_no,
-                        exc,
-                    )
-                else:
-                    logger.warning(
-                        "conversations.jsonl 第 %d 行解析失败（%s），已忽略",
-                        line_no,
-                        exc,
-                    )
-                continue
-            self._add_to_memory(message, persist=False)
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            raw_lines = transaction.read_complete_lines()
+        for raw in raw_lines:
+            data = json.loads(raw)
+            self._add_to_memory(ConversationMessage(**data), persist=False)
 
     def _add_to_memory(
         self, message: ConversationMessage, *, persist: bool = True
     ) -> None:
         """把消息加入内存缓冲；可选同时落盘。"""
+        if persist:
+            self._append_to_disk(message)
         session_messages = self._messages.setdefault(message.session_id, [])
         session_messages.append(message)
         if len(session_messages) > self._max_messages:
             session_messages.pop(0)
-        if persist:
-            self._append_to_disk(message)
 
     def _append_to_disk(self, message: ConversationMessage) -> None:
         """追加单条消息到 JSONL。"""
-        line = message.model_dump_json() + "\n"
-        with self._path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
-            fh.flush()
+        with self._durable.transaction() as transaction:
+            transaction.repair_incomplete_tail()
+            transaction.read_complete_lines()
+            transaction.append_json(message.model_dump(mode="json"))
 
     def append_message(self, message: ConversationMessage) -> None:
         """写入一条消息；超过上限时淘汰最旧的一条。"""
@@ -95,6 +79,7 @@ class JsonlConversationStore:
 
     def get_context(self, session_id: str) -> ConversationContext:
         """获取指定 session 的当前上下文。"""
+        self._load()
         messages = list(self._messages.get(session_id, []))
         if messages:
             updated_at = messages[-1].created_at

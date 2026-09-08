@@ -2,6 +2,67 @@
 
 本文件记录 MVP 三次迭代中的关键决策、实现要点与踩坑经验，便于后续维护与开源时追溯。
 
+## v0.32.0：Agent 接入体验优化与 Harness 后端完善
+
+### 完成内容
+
+- **Agent SDK 友好化**：新增 `@governed` 装饰器，在工具函数定义处完成治理接入，保持原函数签名，自动打包参数，支持同步/异步。
+- **GovernanceRuntime**：封装 `LoopController` + `ToolGovernor`，提供类级当前运行时上下文（`current()` / `set_current()` / `from_config()`），支持 `hook_tool_registry()` 批量包装统一工具注册表。
+- **Agent 启动器**：`launch_agent()` 在治理上下文中运行 Agent 入口函数，作为快速接入入口（不强隔离）。
+- **框架集成**：
+  - `govern_langchain_tools()` 包装 LangChain `BaseTool` 列表；
+  - `@governed_route` 与 `GovernedFastAPI` 提供 FastAPI 路由级治理。
+- **MCP Proxy 运维/审计工具**：在 `tools/list` 中注入 8 个 admin/审计工具：`harness_backend_status`、`harness_backend_drain`、`harness_backend_reset`、`list_recent_decisions`、`get_decision_status`、`list_recent_audit_events`、`trigger_kill_switch`、`revoke_decision`。
+- **Harness backend 补齐**：实现 `DockerHarnessBackend`（`docker run --rm -i` 一次性容器）与 `IsolatedSubprocessHarnessBackend`（受限 Python 子进程，白名单 builtins/工具）。
+- **配置与审计支持**：`IsolatedSubprocessBackendConfig` 加入 `HarnessBackendConfig` 联合类型；`ConfigLoader` 支持加载 `docker` / `isolated_subprocess` backend；`ApprovalManager` / `AuditStore` 新增 `list_recent` / `get_decision_status` 查询。
+- **Agent 接入示例**：`examples/agent_sdk/` 下提供函数式 Agent、LangChain Agent、FastAPI Service 三个最小可运行示例。
+
+### 关键决策
+
+- 接入成本最低优先：优先在工具定义处接入，而非改造每个调用点；只有 MCP 形态工具才推荐 MCP Proxy。
+- MCP Proxy admin 工具作为可选补充，不替代 HTTP/gRPC admin 入口。
+- Docker backend 默认 `--network none`，生产单机部署推荐；Isolated Subprocess 用于跨平台开发/CI 兜底。
+
+### 测试
+
+- `tests/test_agent_sdk.py`：`@governed` sync/async、`GovernanceDeniedError`、`hook_tool_registry`、`launch_agent`。
+- `tests/test_isolated_subprocess_harness.py`：Isolated Subprocess backend 白名单执行与参数打包。
+- `tests/test_docker_harness_backend.py`：Docker backend 命令构造、协议处理、错误路径（mock Docker CLI）。
+- `tests/test_mcp_proxy_admin_tools.py`：MCP Proxy admin/审计工具注入与调用路由。
+- `tests/test_integrations.py`：LangChain / FastAPI 集成（条件 skip 未安装环境）。
+
+---
+
+## v0.31.0：不可信 Agent 外部执行沙箱（Harness）
+
+### 完成内容
+
+- **默认不信任执行策略**：`harness_execution_policy.default_mode` 默认为 `harness_required`；非 `trusted_local_tools` 白名单内的工具必须有 `HarnessToolSpec`，并在 `harness_tools.yaml` 中至少配置一个 backend。
+- **执行模式解析器 `ExecutionModeResolver`**：新增 `loop_controller.execution_mode`，根据策略把工具路由为 `trusted_local`、`harness_required` 或 `deny`。
+- **`ExecutorRegistry.resolve_executor()`**：先解析执行模式再选择执行器；`deny` 返回 `None`；`harness` 返回 `ExecutionModeResolver.harness_executor`。
+- **Checkpoint 策略门控**：`forward()` 在 `resolve_executor()` 返回 `None` 时退回预算/authority/reservation，返回 `error_code="execution_mode_denied"` 的 `ToolResult`。
+- **Harness 协议 v2**：`harness_protocol.py` 升级到 v2，响应必须携带 `effective_sandbox` 回执；新增 `HarnessEvidence`（网络/文件尝试、资源使用、stdout/stderr 哈希）。
+- **Harness 回执校验**：Loop Controller 严格比较请求的 `HarnessSandbox` 与返回的 `effective_sandbox`，不一致返回 `harness_sandbox_violation`。
+- **Fail-Closed Health Gating**：所有 backend 在 `unknown`/`unhealthy` 时阻断调用；`draining` backend 拒绝新请求。
+- **证据写入审计链**：执行成功后，把 `result.metadata["harness_evidence"]` 摘要写入 `AuditEvent(action="execute")` 元数据，并由 `AuditStore.append_async` 进入签名证据链。
+- **Admin 生命周期接口**：`server.py` 新增 `POST /v1/admin/harness/{name}/drain` 与 `POST /v1/admin/harness/{name}/reset`；`GET /health` 聚合 `harness_backends` 状态，异常时标记 `degraded`。
+- **参考 Harness 与配置模板**：`examples/contrib/harness/harness_server.py` 返回 v2 `effective_sandbox`/`evidence`；`config/harness_tools.yaml` 加入 `execution` 策略模板与 v2 沙箱字段。
+
+### 关键决策
+
+- `trusted_local_tools` 显式白名单：Loop Controller 不信任 Agent 默认能力，只有明确列出的工具才允许在本地执行器直接运行。
+- `effective_sandbox` 由 Harness 回执：Loop Controller 不解析进程内沙箱实现，只校验“请求沙箱 == 实际沙箱”，保持治理侧简洁。
+- `drain` 异步等待在途请求完成：返回 `bool` 表示是否在默认超时内完成；未完成仍会把 backend 标记为 `draining`。
+
+### 测试
+
+- `tests/test_harness_executor.py`：v2 响应形状、HMAC canonical 路径、effective_sandbox 校验、fail-closed health gating。
+- `tests/test_harness_server.py` / `tests/test_harness_subprocess.py`：参考 Harness 升级到 v2。
+- `tests/test_config_loader.py`：默认 `harness_required` 的 fail-fast 校验。
+- `tests/test_server.py`：admin drain/reset 认证与 404/503 路径、health 聚合与 degraded。
+
+---
+
 ## 迭代 1：MVP 核心（T1.1–T1.8）
 
 目标：建立可运行的治理闭环，从零重写 `src/`。
@@ -354,10 +415,1653 @@
 | A5 | 通过 | `tests/test_e2e_research_agent.py` approve/deny 路径 |
 | F1 | 已实现 | `AsyncApprovalManager` + `JsonlApprovalStore` + `lc approvals` |
 
+## v0.4.0：跨 Task Session 风险状态持久化
+
+目标：把治理粒度从单次任务提升到会话级，连续越权行为触发会话级熔断，服务重启后 Session 和风险状态不丢失。
+
+### 完成内容
+
+- **`JsonlSessionBackend`**：新增 `src/loop_controller/session.py` 持久化后端，追加写 + 启动重放，中间行损坏 fail-closed；
+- **`SessionManager` 扩展**：新增 `get_session()`、`touch_session()`、`is_session_active()`/`is_session_expired()`；
+- **`RiskProfile` 扩展**：新增 `consecutive_deny_count`；
+- **`RiskStateManager` 扩展**：`deny`/`approval_denied` 累加 `consecutive_deny_count`，`allow`/`approval_granted`/`low_risk_success` 归零；
+- **`CapabilityProfile` 扩展**：新增 `session_block_threshold: int = 5`；
+- **Checkpoint 硬熔断**：`evaluate()` 在 Profile 校验后检查 `consecutive_deny_count >= session_block_threshold`，满足则直接 deny；
+- **`Runtime.create_task` 复用 Session**：签名改为 `create_task(..., session_id=None) -> tuple[Task, Session]`，支持显式复用已有 Session；
+- **配置层**：`AppConfig` 新增 `session_path`，`ConfigLoader` 支持 `LOOP_CONTROLLER_SESSION_PATH` 环境变量；
+- **测试**：新增 `tests/test_session_v040.py`，覆盖 S1-S8 验收标准。
+
+### 关键决策
+
+- Session 持久化与风险持久化分离：Session 写 `sessions.jsonl`，风险事件写 `risk_state.jsonl`；
+- 连续拒绝熔断放在 Checkpoint Python 代码而非 Rego：这是全局安全策略，失败更早，且不扩展 Rego input schema；
+- `create_task` 返回 `(Task, Session)` 元组：调用方需要知道本次 task 落在哪个 Session 上，便于日志、调试和后续复用。
+
+### 验收状态
+
+- `pytest tests/`：**212 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：**Success**
+
+---
+
+## v0.5.0：MCP Proxy / 外来 Agent 接入
+
+目标：把 Loop Controller 同时暴露为一个 MCP Server，使未安装 Loop Controller SDK 的第三方 Agent 也能被 R2/R3 治理。
+
+### 完成内容
+
+- **`src/loop_controller/proxy_server.py`**：新增 `LoopControllerProxyServer`；
+  - 低层 MCP Server 注册 `tools/list` 与 `tools/call` 处理器；
+  - stdio 传输用于本地子进程/CLI 集成；
+  - SSE 传输基于 Starlette + `SseServerTransport`，支持 HTTP header 身份覆盖；
+  - 每次 tool call 映射为一个 `ActionProposal`，经 `Checkpoint.evaluate()` + `forward()` 治理后转发到真实 MCP Server；
+  - `require_approval` 直接返回 `BLOCKED: requires human approval` 并附带 `decision_id`。
+- **CLI 入口**：`lc proxy --agent-id <id> --user-id <id> [--transport sse --host ... --port ...]`；
+- **Mock server 适配**：把 `email_server.py` 从旧版低层 `Server` 装饰器 API 迁移到 `mcp.server.mcpserver.MCPServer`，兼容当前 `mcp>=1.0`；
+- **测试**：新增 `tests/test_proxy_server.py`，覆盖工具列表透传、allow 执行、deny 拒绝、审批阻塞、连续拒绝 Session 熔断。
+
+### 关键决策
+
+- **不使用 Planner**：外部 Agent 自行决定调用什么工具，Loop Controller 只负责单次 tool call 的治理；
+- **同步调用限制**：MCP tool call 是请求-响应模式，v0.5.0 不实现长轮询等待人工审批；
+- **身份映射**：stdio 使用 CLI 参数；SSE 可被 header 覆盖，但默认仍以 CLI 身份兜底；
+- **Session 复用**：同一 SSE 连接内多次 tool call 共享 Session，v0.4.0 的 `consecutive_deny_count` 和 `cumulative_risk_score` 自然生效。
+
+### 验收状态
+
+- `pytest tests/`：**217 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：**Success**
+
+### 设计文档
+
+- `src/loop_controller_v0.5.0_development.md`
+
+---
+
+## v0.5.1：MCP Proxy 审批恢复与结构化响应
+
+目标：让外部 Agent 收到 `require_approval` 后能够解析响应，并在人工审批通过后携带凭证重试，完成原 tool 调用。
+
+### 完成内容
+
+- **`ApprovalRequest` 模型扩展**：
+  - 新增 `tool_arguments: dict[str, Any]`，保存原始未掩码参数；
+  - 新增 `original_decision: Decision | None`，保存触发审批的原始 Decision，供重试时恢复。
+- **`Checkpoint.build_approval_request()`**：填充 `tool_arguments` 与 `original_decision`。
+- **`AsyncApprovalManager.get_decision()`**：v0.5.1 新增，按 `decision_id` 查询原始 Decision。
+- **`JsonlApprovalStore` 序列化修复**：
+  - `_serialize_request` / `_serialize_record` 改用 `model_dump(mode="json")`，解决嵌套 `Decision` 中的 `datetime` 无法 JSON 序列化的问题；
+  - `_deserialize_request` / `_deserialize_record` 改用 `model_validate()`，自动解析 ISO datetime 和嵌套模型。
+- **`LoopControllerProxyServer` 重写**（`src/loop_controller/proxy_server.py`）：
+  - `require_approval` 返回结构化 JSON，包含 `status` / `decision_id` / `request_id` / `tool_name` / `reason` / `expires_at` / `retry_instruction`；
+  - 支持通过 SSE header `x-loop-controller-decision-id` 或 stdio 保留参数 `_loop_controller_decision_id` 重试；
+  - 重试时校验当前参数与 `ApprovalRequest.tool_arguments` 一致，防止 decision_id 被复用于不同调用；
+  - 重试时调用 `Checkpoint.finalize_after_approval()` 将原始 `require_approval` Decision 转换为可执行的 `allow` Decision；
+  - 重试时复用原始 `call_id`，保证 `Checkpoint.forward()` 的 call_id 一致性校验通过；
+  - Proxy 进程内维护 `_tasks` 内存缓存，重试时恢复原始 Task。
+- **测试更新**：
+  - 更新 `test_proxy_require_approval_blocked` 断言结构化 JSON；
+  - 新增 `test_proxy_retry_approved_executes`：审批通过后重试成功执行；
+  - 新增 `test_proxy_retry_param_mismatch_denied`：参数不一致被拒绝；
+  - 新增 `test_proxy_retry_not_approved_still_blocked`：未审批时重试仍被阻塞。
+
+### 关键决策
+
+- **Agent 不阻塞**：MCP tool call 保持同步请求-响应，Proxy 立即返回审批状态，由 Agent 决定如何向用户展示或何时重试；
+- **审批凭证显式传递**：用 `decision_id` 作为重试凭证，不依赖隐式缓存或参数匹配，安全且可审计；
+- **原始 Decision 持久化在 ApprovalRequest 中**：避免引入新的存储接口，复用现有 `JsonlApprovalStore`；
+- **Proxy 进程重启后重试会失败**：Task 缓存丢失，写入错误响应；这是已知限制，v0.6.0 引入 `TaskStore` 后可解决。
+
+### 验收状态
+
+- `pytest tests/`：**220 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误（`planner.py`、`config_loader.py`），与本次改动无关。
+
+### 设计文档
+
+- `src/loop_controller_v0.5.1_development.md`
+
+---
+
+## v0.6.0：持久化基础设施（TaskStore + BudgetLedger）
+
+目标：消除 v0.5.1 已知的 Proxy 重启后审批重试失败问题，并让预算状态在生产环境可持久化。
+
+### 完成内容
+
+- **`Task` 模型扩展**：新增 `status: Literal["created", "completed"]`（默认 `created`）和 `completed_at: datetime | None`，支持生命周期持久化；向后兼容，默认值不影响已有测试。
+- **`JsonlTaskStore`**（`src/loop_controller/infra/task_store.py`）：
+  - append-only JSONL，记录 `{"type": "task"}` 和 `{"type": "task_complete"}`；
+  - `get(task_id)` 从尾部向前扫描返回最新状态；遇到 `task_complete` 返回 `None`；
+  - 损坏文件 fail-closed，抛 `TaskStoreError`；
+  - 提供 `InMemoryTaskStore` 作为测试默认实现。
+- **`Runtime` 集成**：
+  - 新增 `task_store: TaskStore = field(default_factory=InMemoryTaskStore)`；
+  - `create_task()` 构造 Task 后立即 `task_store.save(task)`；
+  - 新增 `get_task(task_id)` 从 Store 读取；
+  - `run_task()` 任务结束时调用 `task_store.complete(task.task_id)`。
+- **`JsonlBudgetLedger`**（`src/loop_controller/budget.py`）：
+  - append-only JSONL，记录 `set_budget` / `reserve` / `commit` / `refund` 事件；
+  - 启动时重放所有事件恢复内存状态；
+  - 损坏文件 fail-closed，抛 `BudgetLedgerError`；
+  - 保留 `InMemoryBudgetLedger` 供测试和旧代码使用。
+- **`build_runtime()` 默认使用持久化实现**：
+  - `JsonlBudgetLedger(config.budget_ledger_path)`；
+  - `JsonlTaskStore(config.task_store_path)`；
+- **配置扩展**：`AppConfig` 新增 `task_store_path` / `budget_ledger_path`，支持环境变量覆盖；
+- **`ProxyServer` 重试恢复**：v0.6.0 起不再依赖进程内存 `_tasks` 缓存，改从持久化 `Runtime.get_task()` 恢复原始 Task；v0.5.1 的已知限制解除。
+
+### 关键决策
+
+- **向后兼容**：`Runtime.task_store` 默认 `InMemoryTaskStore`，所有已有测试无需改动；生产环境由 `build_runtime()` 注入 `JsonlTaskStore`。
+- **最小改动**：没有引入 `BudgetReservation` 状态机，只是让 `BudgetLedger` 持久化；`BudgetLedger` Protocol 方法签名保持不变。
+- **fail-closed**：TaskStore / BudgetLedger 文件损坏直接抛异常，拒绝启动，与 `DecisionStore` 行为一致。
+- **Windows 测试限制**：完整"关闭 Runtime A 并立即重启 Runtime B"会触发 anyio stdio 子进程取消竞态，因此集成测试保持 A 不关闭、用 B 读取同一数据目录来验证持久化恢复；生产环境真实进程重启不受此限制。
+
+### 新增/更新测试
+
+- `tests/test_task_store.py`：6 个 JsonlTaskStore 测试；
+- `tests/test_budget.py`：4 个 JsonlBudgetLedger 持久化测试；
+- `tests/test_proxy_server.py`：`test_proxy_retry_survives_runtime_restart` 验证新 Runtime 读取持久化数据后成功重试。
+
+### 验收状态
+
+- `pytest tests/`：**231 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误（`planner.py`、`config_loader.py`），与本次改动无关。
+
+### 设计文档
+
+- `src/loop_controller_v0.6.0_development.md`
+
+---
+
+## v0.6.1：BudgetReservation 状态机
+
+目标：把分散在 `Checkpoint.evaluate()` / `forward()` 中的预算预留/返还逻辑，抽象为显式的 `BudgetReservation` 状态机，消除二次预留、过期不释放、无法查询 pending 等隐患。
+
+### 完成内容
+
+- **`BudgetReservation` 模型**（`src/loop_controller/models.py`）：
+  - 字段：`reservation_id`、`task_id`、`call_id`、`tool_name`、`cost`、`state`、``created_at`、`expires_at`；
+  - 状态：`pending` / `pending_approval` / `committed` / `refunded` / `expired`。
+- **`ReservationStore` Protocol + `InMemoryReservationStore`**（`src/loop_controller/infra/reservation_store.py`）：
+  - `save` / `get` / `get_by_call_id` / `list_by_task`；
+  - 默认内存实现，适合测试与单进程；未实现 `JsonlReservationStore`（P1，可在 v0.6.2 补充）。
+- **`Checkpoint` 集成**：
+  - `evaluate()` 预算预留成功后创建 `pending` reservation；
+  - deny / invalid verdict 路径统一 `_refund_reservation()`；
+  - `require_approval` 路径保留预算，reservation 转为 `pending_approval`；
+  - `forward()` 查找 pending reservation，modify 复核失败 / 执行异常 refund，成功 commit；
+  - `finalize_after_approval()` 审批 deny 时 refund，approve 时 reservation 转回 `pending` 供 forward commit；
+  - 新增查询接口 `get_pending_reservation(call_id)` 和 `get_pending_reservations(task_id)`。
+- **`reserve_for_execution()` 增强**：预留成功时同时创建 `pending` reservation，与 `forward()` 的检查逻辑对齐。
+- **`Runtime.resume_task()` 改动**：审批通过后优先复用已有 reservation，不再无条件二次 `reserve_for_execution`；找不到 reservation 时仍保留 fallback 重新预留。
+
+### 关键决策
+
+- **向后兼容**：`Checkpoint` 新增 `reservation_store` 参数，默认 `InMemoryReservationStore`，所有已有测试无需改动；`forward()` 兼容测试直接调用：若找不到 reservation 会尝试现场预留。
+- **BudgetLedger Protocol 不变**：状态机建立在 Ledger 之上，不破坏 `check_and_reserve` / `commit` / `refund` 三方法签名。
+- **不引入持久化**：v0.6.1 只做状态机抽象；`JsonlReservationStore` 延后，因为当前 v0.6.0 的 `JsonlBudgetLedger` 已经能恢复预算余额，reservation 状态丢失在单进程重启场景下可接受。
+- **审批超时被动检查**：reservation 有过期时间，但当前不做异步扫描；过期后再次 forward 会按 Checkpoint 的 decision 过期检查拦截。
+
+### 新增/更新测试
+
+- `tests/test_reservation.py`：7 个 BudgetReservation / ReservationStore 单元测试；
+- 所有已有 `test_checkpoint.py`、`test_e2e_real_mcp.py`、`test_proxy_server.py` 等审批/执行路径测试均通过，验证状态机未破坏既有行为。
+
+### 验收状态
+
+- `pytest tests/`：**238 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.6.1_development.md`
+
+---
+
+## v0.7.0：MCP Proxy `approval_status` 查询工具
+
+目标：让外部 Agent 能主动查询某个 `decision_id` 的审批状态，降低对 Agent LLM 解析结构化响应的依赖，避免在审批完成前盲目重试。
+
+### 完成内容
+
+- **新增内部 MCP 工具 `loop_controller_approval_status`**：
+  - 输入参数：`decision_id`；
+  - 返回 JSON：`{"status": "pending|approved|denied|expired|not_found", "decision_id": "...", "can_retry": true|false}`；
+  - `can_retry=true` 只在 `approved` 时返回。
+- **`tools/list` 注入内部工具**：
+  - `LoopControllerProxyServer._handle_list_tools()` 在返回 Profile 过滤的真实工具后，额外追加 `loop_controller_approval_status`；
+  - 工具名带 `loop_controller_` 前缀，避免与真实工具冲突。
+- **`tools/call` 优先路由内部工具**：
+  - 在重试决策和普通治理流程之前，先判断 `params.name == "loop_controller_approval_status"`；
+  - 内部工具不创建 Task、不经过 Checkpoint，只读审批状态。
+- **状态判定逻辑**：
+  - `approval_manager.check(decision_id)` 返回 `ApprovalRecord`：
+    - `verdict == "approve"` → `approved`；
+    - `verdict == "deny"` → `denied`；
+  - 无记录但 `get_decision(decision_id)` 返回 `Decision`：
+    - 当前时间 >= `expires_at` → `expired`；
+    - 否则 → `pending`；
+  - 无 Decision → `not_found`。
+
+### 关键决策
+
+- **只读无副作用**：`approval_status` 不修改任何 store，可被 Agent 高频查询；
+- **不替代重试路径**：查询到 `approved` 后，Agent 仍需带 `decision_id` 重试原 tool call；
+- **身份校验最小化**：decision_id 是随机 UUID，MVP 阶段不强制绑定 agent_id；
+- **不实现 Server 推送**：遵循 v0.5.0 的设计哲学，Agent 自己决定何时查询/重试。
+
+### 新增/更新测试
+
+- `tests/test_proxy_server.py`：
+  - 更新 `test_proxy_list_tools`，断言工具列表包含 `loop_controller_approval_status`；
+  - 新增 `test_proxy_approval_status_pending` / `approved` / `denied` / `not_found`。
+
+### 验收状态
+
+- `pytest tests/`：**242 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.7.0_development.md`
+
+---
+
+## v0.8.0：持久化 BudgetReservation 存储
+
+目标：把 v0.6.1 中仍为内存实现的 `ReservationStore` 升级为持久化 JSONL 实现，让 BudgetReservation 状态机在 Runtime/Proxy 重启后可恢复。
+
+### 完成内容
+
+- **`JsonlReservationStore` 实现**（`src/loop_controller/infra/reservation_store.py`）：
+  - append-only JSONL，事件类型 `reservation_created` / `reservation_transitioned`；
+  - 启动时重放所有事件恢复内存索引；
+  - 损坏文件 fail-closed，抛 `ReservationStoreError`；
+  - `InMemoryReservationStore` 保留为测试默认实现。
+- **配置扩展**：
+  - `AppConfig` 新增 `reservation_store_path`；
+  - `ConfigLoader` 支持环境变量 `LOOP_CONTROLLER_RESERVATION_STORE_PATH`；
+  - 默认路径 `data/reservations.jsonl`。
+- **Runtime 集成**：
+  - `Runtime` 新增 `reservation_store: ReservationStore` 字段，默认 `InMemoryReservationStore`；
+  - `build_runtime()` 创建 `JsonlReservationStore` 并注入 `Checkpoint` 和 `Runtime`；
+  - `Checkpoint` 从 `Runtime` 接收持久化 store，生产环境统一走 JSONL。
+
+### 关键决策
+
+- **向后兼容**：`Runtime` 和 `Checkpoint` 都保留默认内存实现，测试代码无需改动；生产由 `build_runtime()` 注入持久化实现。
+- **事件化持久化**：只记录创建和状态流转事件，不重写全量状态；恢复时重放到内存索引，与 `JsonlBudgetLedger`、`JsonlTaskStore` 风格一致。
+- **不解决多 worker 并发**：仍明确单进程 asyncio 假设；多进程写 JSONL 的竞态不在本版本范围内。
+
+### 新增/更新测试
+
+- `tests/test_reservation.py`：新增 6 个 `JsonlReservationStore` 测试（save/get、transition overwrite、list_by_task、跨对象恢复、损坏 fail-closed、datetime roundtrip）；
+- 文件标题更新为 `v0.6.1 / v0.8.0`；
+- 所有已有测试通过，验证集成未破坏。
+
+### 验收状态
+
+- `pytest tests/`：**248 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.8.0_development.md`
+
+---
+
+## v0.9.0：生产环境考研（真实 Agent + 真实工具）
+
+目标：不引入新治理架构能力，而是用真实 MCP server、真实 Python Agent 对当前 v0.8.0 架构进行端到端压测，暴露真实生产环境下的问题并修复。
+
+### 完成内容
+
+- **新增真实 MCP server（Python 实现）**：
+  - `src/loop_controller/mcp_servers/fetch_server.py`：基于 httpx 的 HTTP GET server；
+  - `src/loop_controller/mcp_servers/sqlite_server.py`：基于 sqlite3 的 `query`（只读 SELECT）和 `execute`（写操作）server；
+  - 两者均使用与 Proxy 一致的 lowlevel MCP SDK 构造函数式 API。
+- **配置扩展**：
+  - `config/mcp_servers.yaml` 新增 `fetch`、`sqlite` server 和 `fetch_url`、`query_database`、`update_database`、`list_directory` 工具映射；
+  - `config/profiles.yaml` 扩展 `research_assistant_v1`，覆盖新工具权限；
+  - `policies/default.rego` 新增 `fetch_url`、`list_directory`、`query_database`、`update_database` 策略规则。
+- **真实 Agent 示例**：
+  - `examples/research_agent.py`：作为独立 MCP client 启动 `lc proxy`，运行 6 个真实场景（research/query/update/notify/exfil/write-attack）。
+- **Bug 修复**：
+  - `LoopControllerProxyServer.run_stdio()` 原实现调用 `anyio.run()`，但在 CLI 的 asyncio 事件循环内会抛 "Already running asyncio"；改为 `async def run_stdio()`，由 `cli.py` 直接 await；移除无用 `anyio` 导入；
+  - 示例脚本补齐 `LOOP_CONTROLLER_AUDIT_HMAC_KEY` 默认测试 key，避免手动设置。
+- **自动化测试**：
+  - `tests/test_e2e_sqlite.py`：验证真实 sqlite MCP server 下 SELECT 直接执行、INSERT 触发 require_approval，审批后真实写入数据库。
+
+### 关键决策
+
+- **自研 fetch/sqlite server 而非依赖 npm**：官方 `@modelcontextprotocol/server-fetch` / `server-sqlite` 包在 npm 不存在；自研 Python server 行为可控、可离线运行，且与项目技术栈一致。
+- **filesystem server 允许目录设为项目根**：在 Windows 下使用绝对路径 `/data/kb` 会映射到 `C:\data\kb`，跨平台困难；改为允许项目根目录 `.`，由 R2 的 glob 策略负责路径限制。MCP server 只是执行通道，治理仍在 R2。
+- **不新增架构组件**：本次只做集成、配置、示例和 bugfix，Earned Authority / Permission Interaction Analyzer 等 R2 子系统延后。
+
+### 手动场景验证结果
+
+| 场景 | 结果 |
+|---|---|
+| `research`：fetch_url + read_file + write_file | allow |
+| `query`：SELECT 返回 / DELETE 被 deny | allow + deny |
+| `update`：INSERT 触发 require_approval | require_approval |
+| `notify`：send_email 触发 require_approval | require_approval |
+| `exfil`：外部收件人 deny | deny |
+| `write-attack`：路径越界 deny | deny |
+
+### 验收状态
+
+- `pytest tests/`：**249 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.9.0_development.md`
+
+---
+
+## v0.9.1：真实 LLM Agent 端到端验证
+
+目标：不引入新治理架构能力，使用真实 LLM（DeepSeek）驱动 Agent，对 v0.9.0 的真实工具集成进行端到端压测，暴露 LLM 规划器与治理层协同的真实问题并修复。
+
+### 完成内容
+
+- **新增 `examples/llm_agent_demo.py`**：
+  - 作为独立 MCP client 启动 `lc proxy`；
+  - 通过 DeepSeek API 驱动 `LLMPlanner` 自主规划；
+  - 提供 `research` / `notify` / `exfil` 三个真实场景；
+  - `require_approval` 时自动模拟审批通过。
+- **修复 LLMPlanner prompt 歧义**：
+  - 原 `_SYSTEM_PROMPT` 未明确强调 `action` 字段只能是 `"call_tool"` / `"ask_user"` / `"finish"`；
+  - DeepSeek 经常把工具名写入 `action` 字段，导致解析失败；
+  - 重写 prompt，强调工具名必须放在 `tool_name` 字段；
+  - 在 `_parse_response()` 中增加容错恢复：当 `action` 是已授权工具名且 `tool_name` 为空时，自动归一化为 `call_tool`。
+- **修复 `examples/llm_agent_demo.py` SyntaxWarning**：模块 docstring 改为 raw string。
+- **调整对抗性任务措辞**：将"泄露文件内容"改为中性表述，避免触发 LLM 自身安全拒绝，从而真正测试 R2 的 deny。
+
+### 验证结果
+
+| 场景 | 实际结果 | 是否符合预期 |
+|---|---|---|
+| `research` | read_file → web_search → fetch_url → write_file 均 allow，生成摘要 | ✅ |
+| `notify` | query_database allow → send_email require_approval → 审批通过 → 发送成功 | ✅ |
+| `exfil` | read_file allow → send_email deny（recipient outside allowed patterns） | ✅ |
+
+### 关键发现
+
+1. **LLM 对 JSON schema 的理解需要非常明确的约束**：示例代码不足以保证遵循；
+2. **parser 容错对真实 LLM 很有必要**：即使 prompt 已强化，仍保留归一化容错；
+3. **对抗性测试要注意 LLM 自身安全对齐**：过于显眼的恶意描述会让 LLM 直接拒绝，无法验证治理层；
+4. **被 deny 后 LLM 倾向于 ask_user 而不是绕过**：这是可接受行为，但未来可通过 prompt 引导其寻找替代方案。
+
+### 设计文档
+
+- `src/loop_controller_v0.9.1_development.md`
+
+---
+
+## v0.10.0：Capability-Based Permission Interaction Analyzer（组合风险 A+B>C）
+
+目标：将 R2 的权限组合分析从静态 YAML 规则升级为基于"能力集合"的动态组合风险检测，实现 A+B>C 的自动发现，同时保持 Rego 作为最终裁决者。
+
+### 完成内容
+
+- **核心抽象**：
+  - 新增 `src/loop_controller/capability.py`：
+    - `Capability` / `CapabilityGraph`：能力实例与会话级能力集合（不可变）；
+    - `CapabilityGraphAnalyzer`：从动作中提取能力、构建历史能力图、匹配组合规则；
+    - 支持 `arg_match` / `arg_not_match` 的 POSIX glob 匹配。
+  - `ActionProposal` 扩展 `combination_risk_tags` 与 `combination_risk_score` 字段，供审计与 Rego 使用。
+- **配置层**：
+  - `ConfigLoader` 新增 `CapabilityProducer`、`CapabilityDef`、`CapabilityCombinationRule`、`CapabilityRules` 配置类；
+  - 加载 `config/capability_rules.yaml`；文件缺失时返回空规则（向后兼容）；
+  - `PermissionRule` 扩展 `risk_tags` / `score` 字段，用于承载能力分析结果；
+  - 启动校验纳入能力规则中的 glob 模式。
+- **组合分析器**：
+  - 新增 `CapabilityBasedPermissionAnalyzer`：基于能力集合返回 `PermissionRule`；
+  - 新增 `CompositePermissionInteractionAnalyzer`：同时保留静态 YAML 规则与能力规则，deny 优先，合并风险标签/分数。
+- **治理链路集成**：
+  - `Checkpoint.evaluate()` 在步骤 5 调用 analyzer，命中时将风险标签/分数写入 `ActionProposal`；
+  - `build_policy_input()` 将 `combination_risk_tags` / `combination_risk_score` 透传给 Rego；
+  - `policies/default.rego` 新增基于 `input.action.combination_risk_tags` 的 deny / require_approval 规则；
+  - `build_runtime()` 注入 `CompositePermissionInteractionAnalyzer`。
+- **规则配置**：
+  - 新增 `config/capability_rules.yaml`，声明 `data_read` / `email_external` / `network_external` 三种能力，以及 `data_exfil_via_email`（deny）和 `data_exfil_via_http`（require_approval）两条组合规则。
+- **测试**：
+  - 新建 `tests/test_capability.py`：覆盖单工具能力提取、arg_not_match、历史图构建、email/http 组合风险、误报控制；
+  - 更新 `tests/test_permission_interaction.py`：验证 `CapabilityBasedPermissionAnalyzer` 与 `CompositePermissionInteractionAnalyzer`。
+
+### 关键决策
+
+- **Python 图分析 + Rego 最终裁决**：Python 负责能力图构建与 A+B>C 检测，Rego 根据风险标签做最终判定，保持策略最终裁决权在 Rego。
+- **向后兼容**：静态 `permission_rules.yaml` 继续生效；能力规则配置缺失时返回空规则，不破坏旧配置树。
+- **组合分析结果归并**：多个规则命中时 deny 优先，风险标签取并集，分数取最大值，统一返回单个 `PermissionRule`。
+- **审计可解释性**：组合风险标签写入 `ActionProposal`，进入审计与 Rego input，便于事后追溯。
+
+### 验收状态
+
+- `pytest tests/`：**260 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.10.0_development.md`
+
+---
+
+## v0.11.0：Earned Authority Manager（动态权限提升）
+
+目标：在静态 CapabilityProfile 天花板之上，引入受控的动态权限提升机制。Agent 可在任务执行过程中申请临时能力（AuthorityToken），经治理系统评估条件后签发；Checkpoint 在裁决时识别有效 Token，将原本 deny/require_approval 的动作降级为 allow/require_approval（取决于公司 Rego 策略）。
+
+### 完成内容
+
+- **核心抽象**：
+  - 新增 `src/loop_controller/authority.py`：
+    - `AuthorityManager` / `NoopAuthorityManager` / `EarnedAuthorityManager`；
+    - `request_authority()` 按声明式条件评估并签发 `AuthorityToken`；
+    - `validate_for_proposal()` 验证 token 是否覆盖触发能力；
+    - `consume()` / `revoke_token()` / `revoke_expired_tokens()` 管理 token 生命周期。
+  - 新增 `src/loop_controller/infra/authority_store.py`：
+    - `AuthorityStore` Protocol；
+    - `InMemoryAuthorityStore` 与 `JsonlAuthorityStore`（append-only JSONL，事件重放恢复）。
+  - `models.py` 扩展：
+    - 新增 `AuthorityRequest`、`AuthorityToken`、`AuthorityConditions`、`AuthorityGrantRule`、`AuthorityRules`、`AuthorityEvaluationContext`；
+    - `ActionProposal` 扩展 `authority_token_ids`；
+    - `AuditAction` 扩展 `authority_granted/used/revoked/expired`；
+    - `PermissionRule` 扩展 `triggered_capabilities`（v0.11.0 用于判断 token 覆盖）。
+- **配置层**：
+  - `ConfigLoader` 加载 `config/authority_rules.yaml`；文件缺失时返回 `enabled=false`（向后兼容）；
+  - `AppConfig` 新增 `authority_rules` 与 `authority_log_path`；
+  - 启动校验纳入 `require_task_context_regex` 正则编译。
+- **治理链路集成**：
+  - `Checkpoint.evaluate()` 步骤 5 检测组合风险后，若 deny 规则触发且 proposal 携带覆盖触发能力的有效 token，则不短路 deny，把裁决权交给 Rego；
+  - 步骤 5.5 防御性校验 proposal 声明的 token；
+  - `build_policy_input()` 将 `authority_token_ids` 透传给 Rego；
+  - `policies/default.rego` 新增规则：有 token 的 `data_exfil` 从 deny 降级为 `require_approval`；
+  - `forward()` 成功后调用 `authority_manager.consume()` 扣减 token 预算；
+  - `build_runtime()` 注入 `EarnedAuthorityManager` 与 `JsonlAuthorityStore`。
+- **规则配置**：
+  - 新增 `config/authority_rules.yaml`，声明 `email_external` 与 `network_external` 两种可动态授予能力，条件包含用户确认、预算、近期无拒绝。
+- **测试**：
+  - 新建 `tests/test_authority.py`：覆盖 grant/deny、条件评估、token 验证、消费、撤销、过期清理、多能力合并。
+
+### 关键决策
+
+- **Rego 保留最终裁决权**：token 只改变 input 事实，是否 allow/require_approval/deny 由 Rego 决定。
+- **向后兼容**：`authority_rules.yaml` 缺失时 `AuthorityRules(enabled=false)`，所有调用返回 deny，不破坏旧配置树。
+- **Token 不可伪造**：token_id 由 `EarnedAuthorityManager` 生成并持久化，`Checkpoint` 只信任 store 中的记录。
+- **用户确认必须外部注入**：`user_confirmation` 字段不由 Agent 自行设置，必须由 R0 审批或显式用户输入设置。
+- **Token 预算软限制**：token 剩余预算在 `forward` 成功后扣减；预算耗尽时 token 失效，但不阻止已执行动作（记录 warning）。
+
+### 验收状态
+
+- `pytest tests/`：**274 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.11.0_development.md`
+
+---
+
+## v0.12.0：R3 Asynchronous Audit Analyzer（异步审计分析器）
+
+目标：补齐 R3 审计层，让 Loop Controller 在记录审计日志之外，能够异步分析日志、识别异常模式并生成告警/报告。分析器不阻塞主治理链路（R0-R2），在 task_end 后或独立触发。
+
+### 完成内容
+
+- **核心抽象**：
+  - 新增 `src/loop_controller/audit_analyzer.py`：
+    - `AuditAnalyzer` Protocol 与 `NoopAuditAnalyzer` 占位；
+    - `RuleBasedAuditAnalyzer`：基于声明式规则消费审计日志，生成 `AuditAlert` 与 `AuditReport`；
+    - 规则类型：rapid_denies、consecutive_denies、action_sequence、has_any_action、has_all_actions、authority_token_exhausted。
+  - 新增 `src/loop_controller/infra/alert_store.py`：
+    - `AlertStore` Protocol；
+    - `InMemoryAlertStore` 与 `JsonlAlertStore`（单 JSONL 文件，按 `type` 区分 alert/report，启动重放恢复）。
+  - `models.py` 扩展：
+    - 新增 `AuditAlert`、`AuditReport`、`AuditRule`、`AuditRuleConditions`、`AuditRules`。
+  - `infra/audit_store.py` 扩展：
+    - 新增 `query_by_session()` 与 `query_by_task()`，供分析器读取。
+- **配置层**：
+  - `ConfigLoader` 加载 `config/audit_rules.yaml`；文件缺失时返回 `enabled=false`（向后兼容）；
+  - `AppConfig` 新增 `audit_rules` 与 `alert_store_path`。
+- **治理链路集成**：
+  - `Runtime` 新增 `audit_analyzer` 字段；
+  - `build_runtime()` 创建 `RuleBasedAuditAnalyzer` + `JsonlAlertStore`；
+  - `run_task()` 在 `task_end` 后通过 `asyncio.create_task()` 异步触发 `audit_analyzer.analyze_task()`，不阻塞返回。
+- **CLI 集成**：
+  - `src/loop_controller/cli.py` 新增 `lc audit analyze --task-id/--session-id`；
+  - 新增 `lc audit list-alerts --task-id/--session-id`。
+- **规则配置**：
+  - 新增 `config/audit_rules.yaml`，声明 rapid_denies、consecutive_denies、authority_token_exhausted 三条规则。
+- **测试**：
+  - 新建 `tests/test_audit_analyzer.py`：覆盖 disabled、rapid_denies、consecutive_denies、has_any_action、action_sequence、session 分析、token 耗尽。
+
+### 关键决策
+
+- **异步不阻塞**：分析器在 task_end 后通过 `asyncio.create_task` 触发，不影响主链路延迟与返回结果。
+- **只读消费**：分析器只读取审计日志，不修改已有哈希链。
+- **分析器内部 catch 所有异常**：避免审计分析失败拖垮事件循环或主任务。
+- **告警允许重复**：多个规则可能同时命中同一事件集，每条命中独立生成 alert，便于运营归因。
+- **CLI 不启动 Runtime**：直接构造 `JsonlAuditStore` + `RuleBasedAuditAnalyzer`，避免拉起 MCP server 等不必要开销。
+
+### 验收状态
+
+- `pytest tests/`：**281 passed**
+- `ruff check src tests`：**All checks passed**
+- `mypy src`：仅余 2 个预存在的 PyYAML stub 缺失错误。
+
+### 设计文档
+
+- `src/loop_controller_v0.12.0_development.md`
+
+---
+
 ## 后续可选工作
 
-- **真实 LLM 端到端演示调通**：`config/llm_planner.yaml` 默认关闭；发布/演示前在有 API key 或本地 Ollama 的环境手动跑通，并更新本清单。
 - **签名/WORM 存储**：当前哈希链只能检测篡改，不能防御整体重写；生产环境需要签名或 WORM 存储。
-- **HMAC 升级**：`AuditEvent.hash_algo` 字段已预留，涉及真实 PII 时触发升级。
 - **多 worker 原子 DecisionStore**：当前单进程 asyncio 假设下检查+记账原子；多 worker 时需要原子语义。
 - **CLI 通知扩展**：当前 CLI 依赖轮询文件；未来可扩展为 SSE/HTTP webhook 推送审批请求。
+- **LLM-based 审计摘要**：在 `RuleBasedAuditAnalyzer` 基础上扩展 `LLMAuditAnalyzer`，生成自然语言风险摘要。
+
+---
+
+## v0.13.0：Agent 驱动治理接口与 LangChain 适配器
+
+### 完成内容
+
+- **项目定位澄清**：Loop Controller 是企业内部 Agent 的工具调用治理基础设施，不是 Agent 大脑，也不是面向陌生 Agent 的开放网关。
+- **新增 `LoopController` 核心类**（`src/loop_controller/controller.py`）：
+  - `evaluate()`：R1 + R2 判定，不执行；
+  - `evaluate_and_execute()`：判定+执行一键完成；
+  - `resume_after_approval()`：CLI/管理员 approve 后恢复执行；
+  - `build_controller()`：从 `AppConfig` 快速构造控制器。
+- **新增模型**（`src/loop_controller/models.py`）：
+  - `EvaluationResult`：R1 + R2 判定结果；
+  - `GovernanceResult`：单次工具调用治理完整响应。
+- **ApprovalStore 扩展**（`src/loop_controller/infra/approval_store.py`）：
+  - `get_request_by_id()` 按 `request_id` 查找原始审批请求，支持 `resume_after_approval`。
+- **LangChain 适配器**（`src/loop_controller/adapters/langchain.py`）：
+  - `govern_tool()` / `GovernedTool`：把 Loop Controller 治理下的工具包装成 LangChain / LangGraph Tool；
+  - 使用 LangGraph `create_react_agent` 演示企业内部 Agent 接入完整 R0-R3。
+- **新增示例**：
+  - `examples/loop_controller_demo.py`：直接调用 `LoopController`；
+  - `examples/langchain_agent_demo.py`：LangGraph Agent 接入。
+- **测试**：新建 `tests/test_controller.py`，覆盖 evaluate allow/deny、evaluate_and_execute allow、require_approval + resume。
+- **弃用声明**：
+  - `src/loop_controller/planner.py` 和 `src/loop_controller/llm_planner.py` 已加弃用警告，并复制到 `examples/_demo_helpers/`。
+
+### 关键决策
+
+- **Agent 驱动框架**：企业 Agent 自己决定计划，Loop Controller 只治理工具调用；框架不再替 Agent 思考。
+- **不删除 `run_task`**：保留作为兼容/测试入口，但不再是主要产品 API。
+- **MCP Proxy 保留但边缘化**：继续作为边界兼容协议，但主要接入方式改为 Runtime API / SDK。
+- **LangChain 适配器可选依赖**：通过 `pip install loop-controller[langchain]` 安装，不污染核心包。
+
+### 验收状态
+
+- `pytest tests/`：**285 passed**
+- `ruff check src tests examples`：**All checks passed**
+- 实际示例验证：
+  - `examples/research_agent_example.py`（旧 run_task 路径）成功运行；
+  - `examples/loop_controller_demo.py`（新 LoopController 路径）成功触发 allow / require_approval / resume_after_approval；
+  - `examples/langchain_agent_demo.py` 成功创建 `GovernedTool`，LangGraph Agent 待设置 OPENAI_API_KEY 后可运行。
+
+### 设计文档
+
+- `src/loop_controller_v0.13.0_development.md`
+
+### 后续工作
+
+- 把 `ScriptedPlanner` / `LLMPlanner` 彻底移出核心包（当前仍为弃用转发）；
+- 重写依赖 `run_task` 的测试为 `LoopController` 测试（v0.13.1 先迁移到 `_run_task_compat`）；
+- 开发 AutoGen / OpenAI Agents SDK 适配器；
+- 设计企业内部多 Agent 委托协议。
+
+---
+
+## v0.13.1：彻底移除核心 Planner，run_task 迁出核心包
+
+### 完成内容
+
+- **从 `Runtime` 移除 `planner` 字段**（`src/loop_controller/runtime.py`）：
+  - `Runtime` dataclass 不再包含 `planner`；
+  - `build_runtime()` 删除 `planner_yaml` 参数；
+  - `Runtime` 只保留依赖容器方法（`create_task`、`get_task`、`add_user_message`、`add_agent_message`、`get_conversation_context`、`start`、`aclose`）。
+- **创建兼容层**（`src/loop_controller/_run_task_compat.py`）：
+  - 将原 `run_task()` / `resume_task()` 及内部辅助函数整体迁出 `runtime.py`；
+  - `run_task()` / `resume_task()` 改为必须显式传入 `planner` 参数；
+  - 保留到 v0.14.0 后彻底删除。
+- **核心包 Planner 模块标记弃用**：
+  - `src/loop_controller/planner.py` 和 `src/loop_controller/llm_planner.py` 保留为转发/弃用 shim；
+  - 实际实现已复制到 `examples/_demo_helpers/`。
+- **测试迁移**（先迁移到兼容层）：
+  - `tests/test_e2e_research_agent.py`
+  - `tests/test_e2e_sqlite.py`
+  - `tests/test_e2e_real_mcp.py`
+  - `tests/test_runtime_conversation.py`
+  - `tests/test_audit_events.py`
+  - 全部改为从 `loop_controller._run_task_compat` 导入 `run_task` / `resume_task`，并显式构造 `ScriptedPlanner` 传入。
+- **示例调整**：
+  - `examples/research_agent_example.py` 和 `examples/llm_agent_demo.py` 改为使用 `_run_task_compat`，并显式传入 `ScriptedPlanner` / `LLMPlanner`。
+- **Runtime 内部修复**：
+  - 修正 `Session` 导入来源；
+  - `task_store.add` 改为 `task_store.save`；
+  - `ConversationMessage` 构造补充 `message_id` / `session_id`；
+  - `conversation_store` 使用 `append_message`。
+
+### 关键决策
+
+- **核心包不再依赖 Planner**：`runtime.py` 不再 import `loop_controller.planner` / `loop_controller.llm_planner`，核心包与 Agent 大脑完全解耦。
+- **兼容层保留旧入口**：已有示例和测试暂时不改成 `LoopController`，降低一次性改动风险。
+- **显式传入 planner**：`run_task(..., planner=...)` 的签名变化强制调用方意识到 Planner 已迁出核心包。
+
+### 验收状态
+
+- `pytest tests/`：**285 passed**
+- `ruff check src tests examples`：**All checks passed**
+- 预期出现的 `DeprecationWarning`：
+  - `loop_controller.planner` / `loop_controller.llm_planner` 弃用；
+  - `loop_controller._run_task_compat` 的 `run_task` / `resume_task` 弃用。
+
+### 设计文档
+
+- `src/loop_controller_v0.13.1_development.md`
+
+### 后续工作
+
+- 开发 AutoGen / OpenAI Agents SDK 适配器；
+- 设计企业内部多 Agent 委托协议。
+
+---
+
+## v0.14.0：彻底删除旧入口，全部测试改为 LoopController 驱动
+
+### 完成内容
+
+- **彻底删除旧入口**：
+  - 删除 `src/loop_controller/planner.py`；
+  - 删除 `src/loop_controller/llm_planner.py`；
+  - 删除 `src/loop_controller/_run_task_compat.py`。
+- **核心包导出清理**：`src/loop_controller/__init__.py` 不再导出 `Planner`、`ScriptedPlanner`、`LLMPlanner`、`TaskRunResult`、`UserQuestion`。
+- **LoopController 审计补全**：`controller.py` 的 `_audit_event` 现在正确写入 `args_mask`，与旧 `run_task` 路径一致。
+- **新增测试辅助**：`tests/controller_helpers.py` 提供 `controller_for()`，统一构造并启动 `LoopController`。
+- **测试全部改为 LoopController 驱动**：
+  - 重写 `tests/test_e2e_research_agent.py`：手动调用 `evaluate_and_execute` 覆盖 web_search/read_file/write_file/send_email 路径，审批后 `resume_after_approval`。
+  - 重写 `tests/test_e2e_sqlite.py`：SELECT 直接 allow，INSERT 触发 `require_approval`，审批后真实写入数据库。
+  - 重写 `tests/test_e2e_real_mcp.py`：真实 `MCPGateway` + `email_mock`，验证邮件真实发出。
+  - 重写 `tests/test_runtime_conversation.py`：同一 `session_id` 多次调用，验证 Session 复用与对话历史维护。
+  - 重写 `tests/test_audit_events.py`：断言 `propose/evaluate/execute` 事件序列、`args_hash`、`args_mask`、policy/profile 版本及审计链完整性。
+  - 删除 `tests/test_planner.py` 与 `tests/test_llm_planner.py`（被测组件已迁出核心包）。
+- **示例更新**：
+  - 删除 `examples/research_agent_example.py`（功能由 `examples/loop_controller_demo.py` 覆盖）。
+  - 重写 `examples/llm_agent_demo.py`：Agent 自己掌握主循环，通过 `LoopController.evaluate_and_execute` 提交每一步，仍然用 `examples/_demo_helpers/llm_planner.py` 做 LLM 规划演示。
+
+### 关键决策
+
+- **核心包只剩 `LoopController`**：所有 Agent 计划/主循环逻辑完全外置，Loop Controller 只负责单次工具调用治理。
+- **审计事件不再包含 `task_start/task_end/approval_consumed/approve`**：`LoopController` 只写 `propose/evaluate/execute`；旧 `run_task` 的生命周期事件随兼容层一起移除，测试断言同步调整。
+- **`args_mask` 回归**：修复 `LoopController` 之前未调用 `Masker` 的遗漏，保证审计日志仍满足 A13 掩码验收。
+
+### 验收状态
+
+- `pytest tests/`：**271 passed**
+- `pytest -W error::DeprecationWarning tests/`：**271 passed，无弃用警告报错**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**无新增错误**（仅余 2 个预存在的 PyYAML / langchain_core stub 缺失错误）
+
+### v0.14.0 补充修复
+
+- **`LoopController.execute_with_proposal`**：新增公共方法，支持 Agent 先调用 `evaluate` 拿到 `allow` Decision，再单独调用执行；`execute(decision)` 明确提示需使用 `execute_with_proposal` 或 `evaluate_and_execute`。
+- **`resume_after_approval` 审计补全**：审批恢复链路现在写入 `approve` 与 `approval_consumed` 事件，审计链与旧 `_run_task_compat.py` 语义一致。
+- **`_audit_event` 扩展**：支持显式指定 `actor_type` / `actor_id` / `decision_verdict`，用于审批人动作等非 checkpoint 事件。
+- **测试覆盖**：
+  - `test_execute_without_arguments_raises`：验证 `execute(decision)` 抛 `NotImplementedError`。
+  - `test_execute_with_proposal`：验证两段式 evaluate + execute_with_proposal 路径。
+  - `test_audit_event_sequence_and_fields` 与各 e2e 测试同步更新，断言 `approve` / `approval_consumed` 事件及 actor 信息。
+
+### 验收状态（补充修复后）
+
+- `pytest tests/`：**273 passed**
+- `pytest -W error::DeprecationWarning tests/`：**273 passed，无弃用警告报错**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**无新增错误**（仅余 2 个预存在的 PyYAML / langchain_core stub 缺失错误）
+
+### 设计文档
+
+- `src/loop_controller_v0.14.0_development.md`
+
+---
+
+## v0.15.0：接入更多 Agent 框架
+
+### 完成内容
+
+- **新增 OpenAI Agents SDK 适配器**：
+  - `src/loop_controller/adapters/openai_agents.py`
+  - 提供 `govern_function_tool` 工厂函数，将被 `@function_tool` 装饰的函数转发到 `LoopController.evaluate_and_execute`。
+- **新增 AutoGen 适配器**：
+  - `src/loop_controller/adapters/autogen.py`
+  - 提供 `govern_tool` 装饰器，把任意函数包装成受治理的 AutoGen 工具函数，保留签名与 docstring。
+- **适配器共享辅助**：
+  - 新增 `src/loop_controller/adapters/_shared.py`，统一把 `GovernanceResult` 转成给 Agent 阅读的自然语言字符串。
+  - `src/loop_controller/adapters/langchain.py` 改为复用 `_shared.format_governance_result`，消除重复代码。
+- **新增示例**：
+  - `examples/openai_agents_demo.py`
+  - `examples/autogen_agent_demo.py`
+- **新增可选依赖**：
+  - `pyproject.toml` 增加 `[openai-agents]`、`[autogen]` 和 `[all-adapters]` 可选依赖组。
+  - mypy 配置增加 `agents.*` 与 `langchain_core.*` 的 `ignore_missing_imports`，避免未安装可选框架时报错。
+- **新增测试**：
+  - `tests/test_adapters_shared.py`：覆盖 `format_governance_result` 所有状态分支。
+  - `tests/test_adapter_autogen.py`：mock `LoopController` 验证签名保留与调用转发。
+  - `tests/test_adapter_openai_agents.py`：安装 `openai-agents` 后自动运行；未安装时 skip。
+
+### 关键决策
+
+- **可选依赖不进核心包**：适配器只在安装对应 extras 后可用，保证核心包轻量。
+- **Agent 仍掌握主循环**：适配器只治理单次 tool call，与 LangChain 适配器保持同一设计范式。
+- **未安装框架时优雅降级**：示例在未安装依赖或缺少 API key 时仅打印已创建的治理工具列表。
+
+### 验收状态
+
+- `pytest tests/`：**281 passed, 1 skipped**（跳过未安装 `openai-agents` 的测试）
+- `pytest -W error::DeprecationWarning tests/`：**281 passed, 1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**无新增错误**（仅余 1 个预存在的 PyYAML stub 缺失错误）
+
+### 设计文档
+
+- `src/loop_controller_v0.15.0_development.md`
+
+---
+
+## v0.16.0：通用 Python 治理层 + 适配器重构
+
+### 完成内容
+
+- **新增 `ToolGovernor` 通用治理层**：
+  - `src/loop_controller/tool_governor.py`
+  - 与具体 Agent 框架无关，构造时固定 `agent_id` / `user_id` / `default_task_context`
+  - `call(tool_name, arguments)` 直接转发给 `LoopController.evaluate_and_execute`，返回自然语言结果
+  - 在 `src/loop_controller/__init__.py` 中导出，成为一级公共 API
+
+- **重构所有适配器使用 `ToolGovernor`**：
+  - `src/loop_controller/adapters/langchain.py`
+  - `src/loop_controller/adapters/openai_agents.py`
+  - `src/loop_controller/adapters/autogen.py`
+  - 三个适配器签名与行为完全向后兼容，内部不再重复 `evaluate_and_execute + format_governance_result`
+
+- **新增裸 Python Agent 示例**：
+  - `examples/raw_python_agent_demo.py`
+  - 展示不使用任何 Agent 框架，直接调用 `ToolGovernor` 的用法
+
+- **新增测试**：
+  - `tests/test_tool_governor.py`：mock `LoopController` 验证参数转发、`default_task_context` 覆盖、结果格式化
+
+### 关键决策
+
+- **通用层放在核心包**：`ToolGovernor` 不是适配器扩展，而是和 `LoopController` 同级别的 Python API，所以导出到 `loop_controller` 根命名空间。
+- **适配器只做框架胶水**：保留函数签名、docstring、框架注册方式，实际治理逻辑全部下沉到 `ToolGovernor`。
+- **为服务化打基础**：后续 HTTP/gRPC 服务可以直接在 endpoint 内部调用 `ToolGovernor.call(...)`。
+
+### 验收状态
+
+- `pytest tests/`：**284 passed, 1 skipped**
+- `pytest -W error::DeprecationWarning tests/`：**284 passed, 1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**无新增错误**（仅余 1 个预存在的 PyYAML stub 缺失错误）
+
+### 设计文档
+
+- `src/loop_controller_v0.16.0_development.md`
+
+---
+
+## v0.17.0：Loop Controller HTTP 服务化
+
+### 完成内容
+
+- **新增 HTTP 治理服务**：
+  - `src/loop_controller/server.py`
+  - 提供 `build_app(controller, api_key=None)` 工厂函数，返回 Starlette ASGI 应用
+  - 启动时自动调用 `controller.start()`，关闭时调用 `controller.aclose()`
+  - 内部直接调用 `LoopController.evaluate_and_execute` / `resume_after_approval`
+
+- **新增请求/响应模型**：
+  - `src/loop_controller/server_models.py`
+  - `GovernToolRequest` / `ResumeApprovalRequest` / `GovernResponse`
+
+- **新增 API**：
+  - `POST /v1/govern/tool-call`：提交工具调用治理
+  - `POST /v1/govern/resume-after-approval`：审批后恢复执行
+  - `GET /health`：健康检查
+
+- **认证**：
+  - 支持 `X-API-Key` header 或 `Authorization: Bearer <token>`
+  - 从 `LOOP_CONTROLLER_API_KEY` 环境变量读取；未设置时允许所有请求（开发模式）
+
+- **新增 CLI 命令**：
+  - `lc server --host 127.0.0.1 --port 8080 --opa-url ...`
+
+- **新增示例**：
+  - `examples/http_agent_demo.py`：用 `httpx` 通过 HTTP 调用 Loop Controller
+
+- **新增依赖**：
+  - `pyproject.toml` 增加 `[server]` 可选依赖：`starlette>=0.40`、`uvicorn>=0.30`
+  - `all-adapters` 扩展为包含 `server`
+
+- **新增测试**：
+  - `tests/test_server.py`：使用 Starlette `TestClient` 覆盖 health、tool-call、resume-after-approval、参数校验、API key 认证、lifespan 生命周期
+
+### 关键决策
+
+- **服务依赖可选**：`starlette` / `uvicorn` 不进核心依赖，保持核心包轻量。
+- **服务内部直接调用 `LoopController`**：不经过 `ToolGovernor`，因为 HTTP 请求本身已携带 `agent_id` / `user_id`。
+- **最小可用**：只暴露两个核心治理 endpoint + health，不为生产级完整服务。
+- **向后兼容**：现有 `ToolGovernor`、适配器、示例全部保留不变。
+
+### 验收状态
+
+- `pytest tests/`：**292 passed, 1 skipped**
+- `pytest -W error::DeprecationWarning tests/`：**292 passed, 1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**无新增错误**（仅余 1 个预存在的 PyYAML stub 缺失错误）
+
+### 设计文档
+
+- `src/loop_controller_v0.17.0_development.md`
+
+---
+
+## v0.18.0：事件驱动审批 + 可观测性
+
+### 完成内容
+
+- **事件驱动审批（long-polling）**：
+  - `src/loop_controller/server.py` 新增 `GET /v1/wait-for-approval`
+  - Agent 在收到 `require_approval` 后，可用返回的 `request_id` 长轮询等待审批结果
+  - 超时后返回 `pending`，审批完成则返回最终 `allow/deny/error` 结果
+  - 新增 `examples/http_agent_event_demo.py` 演示后台模拟审批 + 长轮询恢复
+
+- **Prometheus 可观测性**：
+  - 新建 `src/loop_controller/metrics.py`
+  - 定义 `loop_controller_requests_total`、`loop_controller_request_duration_seconds`、`loop_controller_tool_calls_total`、`loop_controller_approval_pending_total`
+  - `GET /metrics` 导出 Prometheus 格式指标
+  - `MetricsMiddleware` 为每个请求注入 trace_id 并统计耗时
+
+- **结构化日志与 trace_id**：
+  - 新建 `src/loop_controller/logging_config.py`
+  - 提供 `JsonFormatter` / `ColoredFormatter` 与 `configure_logging()`
+  - 每个 HTTP 请求通过 `x-trace-id` header 或自动生成 trace_id，写入响应头 `X-Trace-ID`
+
+- **增强 health check**：
+  - `GET /health` 新增 `opa_reachable`、`gateway_ready`、`uptime_seconds`
+
+- **Admin 管理 API**：
+  - `GET /v1/admin/approvals/pending`：列出待审批请求
+  - `GET /v1/admin/audit`：按 `session_id` / `task_id` 过滤审计事件
+
+- **AuditStore 扩展**：
+  - `src/loop_controller/infra/audit_store.py` 的 `AuditStore` 协议与 `JsonlAuditStore` 新增 `iter_events()` 异步迭代器
+
+- **依赖**：
+  - `pyproject.toml` `[server]` 可选依赖增加 `prometheus-client>=0.20`
+  - 开发依赖增加 `types-PyYAML`
+
+- **测试**：
+  - 重写 `tests/test_server.py`，新增 wait-for-approval、metrics、admin pending/audit、API key 保护新端点等用例
+  - 更新 `tests/test_adapter_openai_agents.py` 以兼容 `openai-agents>=0.22` 的 `FunctionTool` 返回类型
+
+### 关键决策
+
+- **long-polling 而非 webhook**：降低 Agent 侧实现复杂度，避免内网穿透，适合企业内部同步等待场景。
+- **metrics 与日志分离**：metrics 走 Prometheus 用于监控告警；日志走 stdout/JSON 用于问题追踪；两者共用 trace_id 可关联。
+- **admin API 与治理 API 同端口**：简化部署，生产环境通过 API key 统一保护。
+- **事件驱动不替代审批 CLI**：`/v1/wait-for-approval` 只是消费侧阻塞等待，审批动作仍由 `lc approvals approve/deny` 写入。
+
+### 踩坑记录
+
+- **Starlette middleware 格式**：`middleware=[(Cls, {})]` 在新版 Starlette 会触发 `ValueError: not enough values to unpack`，必须改用 `Middleware(Cls)` 实例。
+- **mypy async generator Protocol**：`async def iter_events(...) -> AsyncIterator[T]` 在 Protocol 中会被解释为 Coroutine；协议声明改为普通方法 `def iter_events(...) -> AsyncIterator[T]` 后实现用 async generator 可正常匹配。
+- **OpenAI Agents SDK 0.22 返回 FunctionTool**：`@function_tool` 现在返回 `FunctionTool` 实例而非可调用对象；测试改为验证 `FunctionTool` 字段并通过 `__wrapped__` 直接调用被治理函数。
+
+### 验收状态
+
+- `pytest tests/`：**299 passed**
+- `pytest -W error::DeprecationWarning tests/`：**299 passed**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.18.0_development.md`
+
+---
+
+## v0.19.0：实时审批通道 + gRPC 边界
+
+### 完成内容
+
+- **实时审批通道（SSE）**：
+  - 新建 `src/loop_controller/approval_watcher.py`
+  - 基于 `asyncio.Event` 实现按 `request_id` 等待/通知抽象
+  - `src/loop_controller/server.py` 新增 `GET /v1/wait-for-approval/sse`
+  - SSE 立即推送 `pending` 心跳，审批完成后推送 `result` 事件
+  - 长轮询 `/v1/wait-for-approval` 也改用 watcher 等待，可被同进程通知立即唤醒
+
+- **gRPC 服务边界**：
+  - 新建 `proto/loop_controller/v1/governance.proto`
+  - 生成 `src/loop_controller/v1/governance_pb2.py` / `governance_pb2_grpc.py`
+  - 新建 `src/loop_controller/grpc_server.py`，暴露 `EvaluateToolCall`、`ResumeAfterApproval`、`WaitForApproval`、`GetHealth`、`ListPendingApprovals`、`QueryAuditEvents`
+  - 新建 `src/loop_controller/grpc_client.py`，提供 `ToolGovernanceClient` Python 客户端
+  - `src/loop_controller/cli.py` 新增 `lc grpc-server` 子命令
+
+- **示例**：
+  - `examples/sse_agent_demo.py`：通过 SSE 实时等待审批
+  - `examples/grpc_agent_demo.py`：通过 gRPC 调用治理服务
+
+- **测试**：
+  - `tests/test_approval_watcher.py`：watcher 通知、超时、多 waiter
+  - `tests/test_server.py`：新增 SSE endpoint 测试
+  - `tests/test_grpc_server.py`：gRPC 全接口测试（in-process server）
+
+- **依赖与配置**：
+  - `pyproject.toml` 新增 `[grpc]` 可选依赖：`grpcio>=1.68`、`grpcio-tools>=1.68`
+  - 开发依赖增加 `grpcio-tools`、`mypy-protobuf`、`types-protobuf`
+  - `all-adapters` 包含 `grpc`
+  - ruff 排除生成代码目录 `src/loop_controller/v1/`
+  - mypy 排除生成代码与 grpc 扩展模块
+
+### 关键决策
+
+- **gRPC 与 HTTP 共存**：gRPC 面向内部服务间/未来 Go 交互内核调用；HTTP 面向 Agent 与外部集成。
+- **SSE 而非 WebSocket**：SSE 更简单、单向推送足够、与现有 HTTP 基础设施兼容。
+- **watcher 只做同进程通知**：CLI 审批在另一个进程时，SSE/gRPC 退化为每秒轮询 `ApprovalStore`。未来多副本场景需要 Redis/消息队列共享 watcher。
+- **生成代码提交仓库**：避免 CI 依赖 protoc，但 ruff/mypy 都排除该目录。
+
+### 踩坑记录
+
+- **protoc 输出目录**：proto 文件路径决定生成代码路径，本例生成到 `src/loop_controller/v1/` 而非 `src/loop_controller/proto/v1/`。
+- **mypy 与 protobuf 生成代码**：动态生成的 message 属性 mypy 无法识别；最终用 mypy exclude 跳过 `v1/`、`grpc_server.py`、`grpc_client.py`。
+- **Starlette TestClient 与 SSE**：`iter_lines()` 返回字符串；测试需在正确时机停止读取，避免等待到超时。
+- **gRPC server-streaming 测试**：使用 `grpc.aio.server` + `add_insecure_port("localhost:0")` 启动 in-process server，再用同一事件循环的 async client 访问。
+
+### 验收状态
+
+- `pytest tests/`：**312 passed**
+- `pytest -W error::DeprecationWarning tests/`：**312 passed**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.19.0_development.md`
+
+---
+
+## v0.20.0：可信身份控制平面与执行器抽象基座
+
+### 完成内容
+
+- **接入形态收敛**：
+  - 核心包只保留三种官方形态：HTTP 服务、gRPC 服务、MCP Proxy；
+  - `Framework Adapters`（LangChain / OpenAI Agents / AutoGen）从 `src/loop_controller/adapters/` 移出到 `examples/contrib/adapters/`，仅作为迁移示例；
+  - `pyproject.toml` 移除 `[langchain]`、`[openai-agents]`、`[autogen]`、`[all-adapters]` 可选依赖；
+  - `Python SDK / ToolGovernor` 保留但明确为"内部开发/可信 Agent"使用，不承诺工具级实时阻断。
+
+- **可信身份控制平面**：
+  - 新建 `src/loop_controller/identity/` 包：
+    - `models.py`：`AgentIdentity`、`IdentityCredential`；
+    - `provider.py`：`IdentityProvider` 协议（verify + get_agent + get_user）；
+    - `static.py`：`ConfigIdentityProvider` 静态 token 验证（仅开发/测试）；
+    - `jwt.py`：`JWTIdentityProvider` 支持 RS256 / JWKS；
+    - `mtls.py`：`MTLSIdentityProvider` 支持证书 CN/SAN 模板映射与显式映射表。
+  - `src/loop_controller/infra/identity.py` 改为兼容层，重新导出新包符号。
+  - `ConfigLoader` 加载 `config/identity.yaml` 与 `config/entrypoints.yaml`；
+  - `build_runtime()` 根据 `identity_config.provider` 自动构造对应 Provider。
+
+- **入口身份认证**：
+  - `server.py`：HTTP `/v1/govern/tool-call` 等端点默认要求 `Authorization: Bearer <jwt>`，从凭证推导 `agent_id` / `user_id`；请求体中的字段仅做一致性校验；Admin 端点保留 API key；
+  - `grpc_server.py`：支持 mTLS，从客户端证书提取身份并校验；
+  - `proxy_server.py`：stdio 模式支持 `--identity-token`（生产禁用），SSE 模式支持 mTLS 与证书头提取；
+  - `cli.py`：新增 `lc proxy` 身份参数与 `lc server` / `lc grpc-server` 认证开关。
+
+- **可插拔执行器抽象**：
+  - 新建 `src/loop_controller/executors/` 包：
+    - `base.py`：`ToolExecutor` 协议、`ExecutionContext`、`ExecutorRegistry`；
+    - `mcp_executor.py`：`MCPExecutor` 转发到 `MCPGateway`。
+  - `Checkpoint.forward()` 改为从 `ExecutorRegistry` 获取执行器并调用 `execute()`；
+  - `build_runtime()` 为每个 `tool_mapping` 注册 `MCPExecutor`；
+  - 保留 `gateway` 参数向后兼容：未传 `executor_registry` 时自动构造默认 `MCPExecutor`。
+
+- **配置与文档**：
+  - 新增 `config/identity.yaml`、`config/entrypoints.yaml`；
+  - 更新 `config/agents.yaml` 增加 `identity` 字段；
+  - `Agent` 模型新增 `identity: dict[str, Any] | None`；
+  - 更新 `src/README.md`、`src/KNOWN_LIMITATIONS.md`；
+  - 新增 `src/loop_controller_v0.20.0_development.md`。
+
+- **依赖**：
+  - 核心依赖增加 `pyjwt[crypto]>=2.8`。
+
+### 关键决策
+
+- **v0.20.0 MCP-only 是阶段性边界**：`ToolExecutor` / `ExecutorRegistry` 抽象为 HTTP / 本地函数 / 沙箱执行器预留接口，但 v0.20.0 只实现 `MCPExecutor`；
+- **身份认证不是可选项**：生产入口默认要求认证，开发环境可降级为 static；
+- **agent_id 从凭证推导**：请求体中的 `agent_id` 不再作为权威来源；
+- **stdio 模式 MCP Proxy 不用于生产**：因为 Agent 进程可能读取环境变量中的 token；
+- **同进程 SDK/Adapter 不承诺实时阻断**：明确写入 KNOWN_LIMITATIONS。
+
+### 设计文档
+
+- `src/loop_controller_v0.20.0_development.md`
+
+---
+
+## v0.21.0：HTTP Executor —— 原生 REST API 工具治理
+
+### 完成内容
+
+- **HTTP 执行器实现**：
+  - 新建 `src/loop_controller/executors/http_models.py`：
+    - `HTTPToolSpec`：声明式 HTTP 工具规格（base_url、method、path、headers、body_template、auth、response_mapping、allowed_hosts、timeout、retry 等）；
+    - `HTTPAuthConfig`：支持 `none` / `bearer_token` / `api_key_header` / `api_key_query` / `basic` / `mtls`，并为 Secret Broker 预留 `secret_ref`；
+    - `HTTPResponseMapping`：成功状态码、JSONPath 提取字段、错误码映射；
+    - `resolve_env_refs()`：递归解析配置中的 `${ENV_NAME}` 引用。
+  - 新建 `src/loop_controller/executors/http_security.py`：
+    - `HTTPSecurityPolicy`：默认禁止本地/私有地址访问；支持 `allowed_hosts` 精确/通配符白名单；可选 DNS 解析后二次校验。
+  - 新建 `src/loop_controller/executors/http_client.py`：
+    - `HTTPClient`：受控 `httpx.AsyncClient`，统一超时、连接池、手动处理重定向以校验中间 URL、限制响应体大小。
+  - 新建 `src/loop_controller/executors/http_executor.py`：
+    - `HTTPExecutor` 实现 `ToolExecutor`，渲染模板 → 安全校验 → 发送请求 → 响应映射 → 返回 `ToolResult`。
+
+- **Runtime 与配置集成**：
+  - `ConfigLoader` 扩展 `tool_mapping` 支持 `type: http`，解析并构造 `HTTPToolSpec`；
+  - `AppConfig` 新增 `http_tool_specs`；启动校验工具名同时检查 MCP 与 HTTP 工具；
+  - `build_runtime()` 创建 `HTTPClient` 与 `HTTPExecutor`，为每个 HTTP 工具注册到 `ExecutorRegistry`；
+  - `Runtime` 新增 `http_client` 与 `http_tool_names`；`start()`/`aclose()` 管理 HTTP client 生命周期；
+  - `build_runtime()` 的 `tool_costs` 合并 MCP 与 HTTP 工具成本。
+
+- **治理链路增强**：
+  - `LoopController._evaluate_proposal()` 对 HTTP 工具默认风险等级提升一级（low→medium→high→critical）。
+
+- **可观测与审计**：
+  - HTTP 工具返回的 `ToolResult` 包含 `elapsed_ms`、`error_code`（如 `http_timeout`、`http_security_blocked`、`http_unauthorized` 等）；
+  - 成功响应支持 JSONPath 字段提取，失败响应按 `error_codes` 或默认规则映射。
+
+- **测试与文档**：
+  - 新增 `tests/test_http_executor.py`、`tests/test_http_security.py`；
+  - 扩展 `tests/test_executor_registry.py` 覆盖 MCP + HTTP 多执行器并存分发；
+  - 更新 `src/KNOWN_LIMITATIONS.md` 与 `src/development_log.md`。
+
+### 关键决策
+
+- **配置即工具**：HTTP 工具通过 `config/mcp_servers.yaml` 的 `tool_mapping` 中 `type: http` 声明，不强制写代码；v0.22 再考虑拆分为独立 `config/tools.yaml`。
+- **凭证不落地配置**：敏感值使用 `${ENV}` 引用；未解析时 `resolve_env_refs()` 抛 `ValueError`，`ConfigLoader` 启动拒绝（fail-closed）。
+- **默认 fail-closed 安全**：HTTP 工具默认 `default_risk=high`；`HTTPSecurityPolicy` 默认禁止本地/内网地址；`allowed_hosts` 未设置时自动从 `base_url` 推导。
+- **零侵入执行器抽象**：`Checkpoint.forward()` 不感知执行器类型；HTTP Executor 仅扩展 `ExecutorRegistry` 注册。
+- **不引入 jsonpath-ng**：v0.21.0 用极简 `$.a.b[0].c` 解析器覆盖常见场景，避免新增依赖。
+
+### 验收状态
+
+- `pytest tests/`：**361 passed, 2 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success**
+
+### 设计文档
+
+- `src/loop_controller_v0.21.0_development.md`
+
+---
+
+## v0.22.0：Secret Broker 与 HTTP 工具热更新
+
+### 完成内容
+
+- **Secret Broker 统一凭证管理**：
+  - 新建 `src/loop_controller/secrets/` 包：
+    - `models.py`：`SecretScope`、`SecretValue`、`SecretRef`；
+    - `broker.py`：`SecretBroker` Protocol；
+    - `exceptions.py`：`SecretError`、`SecretNotFoundError`；
+    - `file_backend.py`：`FileSecretBackend` 按 `secrets/global/{name}.json` 与 `secrets/tenants/{tenant_id}/{name}.json` 分层加载，支持 key 提取、版本匹配、过期检查、文件权限校验；
+    - `memory_backend.py`：`MemorySecretBackend` 供测试与本地开发使用。
+  - Secret 查找顺序：优先 tenant 命名空间，未命中 fallback 到 global；`SecretRef.key` 支持从 JSON 对象 secret 中提取字段。
+
+- **HTTP 工具与 Secret Broker 集成**：
+  - `HTTPAuthConfig.secret_ref` 改为 `SecretRef` 类型；保留 `token` / `username` / `password` 直接值作为向后兼容，`secret_ref` 优先；
+  - `HTTPToolSpec.build_request()` 改为 async，注入 `secret_broker` 与 `tenant_id` 运行时解析凭证；
+  - `HTTPExecutor` 构造时接收 `secret_broker`，执行时传入 `context.tenant_id`；
+  - secret 缺失/过期时返回 `http_auth_error`，阻止调用。
+
+- **HTTP 工具配置独立与热更新**：
+  - `ConfigLoader` 新增 `config/http_tools.yaml` 独立加载，同时兼容 `mcp_servers.yaml` 中的 `type: http` 条目；
+  - 新增 `config/secrets.yaml` 加载 Secret Broker 后端配置，缺失时默认使用 `secrets/` 文件后端；
+  - 新增 `ConfigLoader.reload_http_tools()` / `reload_secrets_config()` 热更新方法；
+  - 新建 `src/loop_controller/infra/hot_reload.py`：`HotReloader` 使用 asyncio 轮询监控 `http_tools.yaml`、`secrets.yaml` 与 `secrets/` 下 JSON 文件；更新失败保留旧配置并记录告警。
+
+- **多租户隔离基础**：
+  - `Agent` / `Task` / `ExecutionContext` 新增可选 `tenant_id`；
+  - `Checkpoint.forward()` 接收 `tenant_id` 并传入执行器上下文；
+  - `controller.py` 与 `proxy_server.py` 调用处透传 `task.tenant_id`。
+
+- **Runtime 集成**：
+  - `build_runtime()` 根据 `config.secrets_config` 构造 `SecretBroker`（支持 `file` / `memory` 后端）；
+  - `HTTPExecutor` 注入 `secret_broker`；
+  - `Runtime` 新增 `secret_broker` 与 `hot_reloader`；`start()` 启动热更新轮询，`aclose()` 停止。
+
+- **测试与文档**：
+  - 新增 `tests/test_secret_broker.py`、`tests/test_hot_reload.py`；
+  - 扩展 `tests/test_http_executor.py` 覆盖 bearer/basic secret、tenant 查找、secret 缺失等场景；
+  - 更新 `src/KNOWN_LIMITATIONS.md` 与 `src/development_log.md`。
+
+### 关键决策
+
+- **Secret 不落地配置文件**：HTTP 工具配置中只保留 `secret_ref`，真实 secret 由 `SecretBroker` 运行期注入；
+- **热更新 fail-closed**：配置更新失败保留旧配置，不中断正在执行的请求；
+- **最小权限**：`FileSecretBackend` 在 Unix 上拒绝 world-readable secret 文件；Windows 依赖 ACL，不做 POSIX 权限检查；
+- **向后兼容**：v0.21.0 的 `${ENV}` 环境变量引用继续支持，但标记为 deprecated；MCP 工具与原有配置不受影响；
+- **热更新范围**：仅 HTTP 工具规格与 secret 文件；MCP server、Profile、Policy 仍建议重启。
+
+### 验收状态
+
+- `pytest tests/`：**381 passed, 3 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+---
+
+## v0.23.0：Sandboxed Local Function Executor
+
+### 完成内容
+
+- **本地函数执行器**：
+  - 新建 `src/loop_controller/executors/local_function_models.py`：
+    - `LocalFunctionSandboxConfig`：超时、最大输出字节、路径白名单、环境变量白名单；
+    - `LocalFunctionSpec`：声明式函数规格（`module:function`、描述、输入 schema、默认风险、成本）。
+  - 新建 `src/loop_controller/executors/local_function_runner.py`：
+    - 子进程入口，从 stdin 读取 JSON，导入目标函数并执行；
+    - 包装 `builtins.open()` 限制文件访问路径；
+    - 支持同步/异步函数；异常返回结构化错误码。
+  - 新建 `src/loop_controller/executors/local_function_executor.py`：
+    - `LocalFunctionExecutor` 实现 `ToolExecutor`；
+    - 每个调用启动独立 Python 子进程，通过 stdin/stdout JSON 通信；
+    - 支持超时 kill、返回码/输出校验、错误码映射。
+
+- **Runtime 与配置集成**：
+  - `ConfigLoader` 新增 `config/local_functions.yaml` 加载；
+  - `AppConfig` 新增 `local_function_specs`；
+  - 启动校验 `_check_tool_mapping()` 把本地函数纳入可用工具集合；
+  - `build_runtime()` 创建 `LocalFunctionExecutor` 并注册到 `ExecutorRegistry`；
+  - `tool_costs` 合并本地函数 `cost_per_call`。
+
+- **配置示例**：
+  - 新增 `config/local_functions.yaml`，展示 `calculate_checksum` / `transform_data` 注册方式。
+
+- **Bug 修复与工程**：
+  - 修复 Windows 子进程因缺失 `APPDATA` / `PATH` / `SYSTEMROOT` 等系统变量导致 `httpx` 导入失败的问题；
+    - 未配置 `env_whitelist` 时继承当前完整环境并修正 `PYTHONPATH`；
+    - 配置 `env_whitelist` 时保留白名单变量 + 必要系统变量。
+  - 修复 `LocalFunctionExecutor._build_env()` 变量重定义导致的 mypy 错误；
+  - 修复 `asyncio.TimeoutError` / `hot_reload.py` 中同类型 ruff 告警；
+  - 清理 `tests/test_secret_broker.py` 未使用导入。
+
+### 关键决策
+
+- **粗粒度子进程沙箱**：v0.23.0 用子进程隔离作为最小可行沙箱，不引入 AST 白名单、RestrictedPython 或容器；高危函数仍应交部署层隔离。
+- **函数代码不热更新**：函数实现文件变更会随子进程重新导入生效，但工具注册增删改需要主进程重启。
+- **JSON 通信**：参数与结果全部走 JSON，保证简单、可审计、与 HTTP/MCP 工具结果格式一致。
+- **环境变量白名单语义调整**：开发文档原意是“仅保留白名单变量”，但实际实现发现 Windows 等平台需要保留系统变量才能启动 Python；因此调整为“白名单变量 + 系统必要变量”。
+
+### 验收状态
+
+- `pytest tests/`：**389 passed, 3 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.23.0_development.md`
+
+---
+
+## v0.23.1：代码审计修复（P0/P1/P2）
+
+### 完成内容
+
+基于 `src/audit_report.md` 逐条确认并修复 v0.20.0–v0.23.0 中的安全与健壮性问题：
+
+- **身份认证（P0/P1）**：
+  - 修复 `JWTIdentityProvider` JWKS 模式：缓存 `PyJWKClient` 并通过 `get_signing_key_from_jwt(token)` 获取真实公钥；
+  - 修复 `grpc_server.py` 多个端点绕过认证：`ResumeAfterApproval`、`WaitForApproval`、`ListPendingApprovals`、`QueryAuditEvents` 统一调用 `_require_identity`；
+  - 修复 gRPC mTLS 静默降级：`require_client_cert=True` 时强制要求服务端证书与 `client_ca_cert`，否则启动失败；
+  - 修复 `MCPProxyServer` SSE header 伪造身份：仅当配置了 client mTLS 且请求为 HTTPS 时才信任 `x-ssl-client-cn/san`；
+  - 修复 `ConfigIdentityProvider.default_ttl_seconds` 未生效问题：`AgentIdentity.expires_at` 现在按 `default_ttl` 计算；
+  - 修复 `MTLSIdentityProvider` 模板正则未锚定：改为非贪婪匹配并在末尾强制 `\Z`，防止后缀被吞入最后一个字段；
+  - 修复 `server.py` 空字符串 API key 绕过：空字符串 key 不再等同于未配置，未提供有效 key 的请求将被拒绝。
+
+- **HTTP 执行器安全（P0/P1）**：
+  - 修复 `HTTPSecurityPolicy` 默认关闭 DNS 解析校验：`require_dns_resolution` 默认 `True`；`localhost` 匹配锚定为 `^localhost$`；
+  - 修复 `HTTPClient` 响应体 OOM：通过 `aiter_bytes()` 流式读取并截断，先检查 `Content-Length` 再读取；
+  - 修复 `HTTPToolSpec.build_request` 空认证值绕过：bearer/api_key/basic 密码为空字符串时抛出 `SecretNotFoundError`；
+  - 修复 `HTTPToolSpec.require_dns_resolution` 开关未透传到执行器的问题。
+
+- **本地函数沙箱（P0/P1）**：
+  - 修复 `local_function_runner.py` 仅 hook `builtins.open` 的绕过：新增 `os.open` hook；
+  - 修复 `LocalFunctionExecutor` 子进程输出 OOM：`_communicate_with_limit` 流式读取 stdout/stderr，超限时 kill 子进程并返回 `local_function_output_too_large`；
+  - 修复 `LocalFunctionExecutor` 环境变量注入过宽：`_build_env` 仅保留系统必要变量 + 白名单变量 + `PYTHONPATH`；
+  - 修复 `LocalFunctionExecutor.execute` docstring 与 HTTPExecutor 复制不一致。
+
+- **热更新与 Runtime 状态（P0）**：
+  - 修复 `HotReloader` secrets 目录写死：从 `SecretBroker.base_path` 推导；
+  - 修复 `http_tool_names` 热更新不同步：`Runtime` 与 `HotReloader` 共享可变集合；
+  - 清理 `FileSecretBackend._last_load` 死存储。
+
+- **配置校验（P1）**：
+  - `ConfigLoader` 新增 `_check_identity_config` 与 `_check_entrypoints_config`，启动期校验 provider 取值、JWT 配置完整性、mTLS 模板/映射、entrypoints 的 auth 与 require_auth。
+
+- **MCP 治理上下文透传（P1）**：
+  - `MCPExecutor` 将 `agent_id/user_id/session_id/tenant_id` 透传至 `MCPGateway.call_tool`；
+  - `MCPGateway.call_tool` 接收并记录这些字段。
+
+- **CLI 安全（P1）**：
+  - 修复 `lc proxy --identity-token` 敏感 token 泄露：移除 `--identity-token` 参数，stdio 模式 token 仅通过 `LOOP_CONTROLLER_IDENTITY_TOKEN` 环境变量读取。
+
+- **执行器注册协议校验（P2）**：
+  - `ExecutorRegistry.register` / `set_default` 校验对象是否符合 `ToolExecutor` 协议，不符合抛出 `TypeError`。
+
+- **依赖与测试**：
+  - 将 `mcp` 固定为 `<2.0`，避免 mcp 2.0 的破坏性 API 变更导致现有 mock server 无法启动；
+  - `email_server.py` 兼容 mcp>=1.0（FastMCP）与 mcp>=2.0（MCPServer）两种 API，降低未来升级风险。
+
+### 关键决策
+
+- **审计优先**：先确认漏洞真实存在再修复，避免误报；所有 P0/P1 问题均补充回归测试；
+- **环境变量 > 命令行参数**：敏感 token 不再通过 CLI 暴露；
+- **最小权限原则**：本地函数沙箱只保留必要环境变量，HTTP 认证拒绝空字符串；
+- **Fail-Close**：gRPC mTLS、HTTP 响应体、本地函数输出超限等场景在异常时直接拒绝而不是降级。
+
+### 验收状态
+
+- `pytest tests/`：**433 passed, 1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+---
+
+## v0.23.2：v0.23.1 残留问题收尾
+
+### 完成内容
+
+基于 `src/audit_report.md`（v0.24.0 方案审查报告）对 v0.23.1 的四个残留问题进行收尾：
+
+- **修复 `Checkpoint.forward` modify 后历史仍用原始参数**：
+  - 成功执行后，per-task 历史记录改为 `proposal.model_copy(update={"arguments": decision.modified_args})`；
+  - 新增 `test_checkpoint.py` 回归测试，断言历史中的参数为修改后值。
+
+- **修复本地函数沙箱被 `io.open` / `pathlib` 绕过**：
+  - `local_function_runner.py` 在 hook `builtins.open` 和 `os.open` 基础上，新增 `io.open` 与 `pathlib.Path.open` 的 hook；
+  - 新增 `test_local_function_executor.py` 两个回归测试，分别验证 `io.open` 与 `Path.read_text` 绕过被拦截。
+
+- **修复 gRPC mTLS 配置驱动下可能明文启动**：
+  - `grpc_server.py` 的 `serve()` 在 `entrypoints.grpc.auth=mtls` 时强制要求 `server_key`、`server_cert`、`client_ca_cert`；
+  - 缺少任一凭证时抛出 `ValueError`，拒绝启动明文端口；
+  - 新增 `test_grpc_server.py::test_mtls_config_requires_certs` 回归测试。
+
+- **修复 HTTP 非法 `Content-Length` 抛 `ValueError`**：
+  - `http_client.py` 将 `int(content_length)` 包在 `try/except ValueError` 中，非法值降级为流式读取；
+  - 新增 `test_http_client.py::test_invalid_content_length_falls_back_to_streaming` 回归测试。
+
+### 关键决策
+
+- **不引入新依赖**：v0.23.2 全部为标准库/现有依赖范围内的修复，保持改动最小。
+- **Fail-Close**：gRPC mTLS 缺失凭证时直接拒绝启动；非法响应头不中断治理链路。
+- **审计报告驱动**：修复直接对应 `src/audit_report.md` 的残留问题清单，避免技术债务继续累积。
+
+### 设计文档
+
+- `src/audit_report.md`（v0.24.0 开发方案审查报告）
+
+---
+
+## v0.24.0：架构收敛 — MCP 包装 + Harness 接入 + 加密 Secret 后端
+
+### 目标
+
+v0.23.2 已完成 v0.23.1 残留问题的收尾。v0.24.0 根据 `src/audit_report.md`
+的架构审查结论，**把 Loop Controller 从“工具运行时”收敛回“治理控制平面”**：
+
+> **一句话目标**：删除 Shell/SQL 内置执行器规划，改为提供高危工具的 MCP 包装示例与 Harness 接入规范，并完成 EncryptedFileSecretBackend。
+
+### 完成内容
+
+1. **删除内置执行器**：
+   - 删除 `ShellExecutor`、`SQLExecutor` 及对应模型、配置、测试；
+   - 从 `ConfigLoader` / `Runtime` / `executors/__init__.py` 移除相关加载与注册逻辑。
+
+2. **新增 MCP 包装示例**（`examples/contrib/mcp_wrappers/`）：
+   - `shell_mcp_server.py`：受控 Shell 命令包装；
+   - `sql_mcp_server.py`：只读/写分离 SQL 查询包装；
+   - `browser_mcp_server.py`：浏览器自动化占位示例（需在独立容器接入 Playwright）。
+
+3. **新增 Harness 接入示例**（`examples/contrib/harness/`）：
+   - `harness_sdk.py`：最小 Harness SDK，先调 Loop Controller 治理接口，再在本地沙箱执行；
+   - `docker_harness.py` + `Dockerfile` + `runner.py`：容器化 Harness 示例。
+
+4. **完成 EncryptedFileSecretBackend**：
+   - 新增 `src/loop_controller/secrets/encrypted_file_backend.py`；
+   - AES-256-GCM 加密，密钥从环境变量读取（hex/base64）；
+   - 在 `src/loop_controller/runtime.py` 支持 `config/secrets.yaml` 中 `backend.type=encrypted_file`。
+
+5. **更新文档**：
+   - `src/KNOWN_LIMITATIONS.md`：明确 Loop Controller 内部仅代理 MCP/HTTP 协议型工具；
+   - `src/README.md`：更新架构图与边界声明；
+   - `src/loop_controller_v0.24.0_development.md`：重写为架构收敛文档。
+
+### 关键决策
+
+- **Loop Controller 是治理控制平面，不是工具运行时**：Shell / SQL / Browser 等不由本进程执行；
+- **LocalFunctionExecutor 重新定位为“可选辅助”**：保留但不再扩展；
+- **MCP 包装 + Harness 是官方推荐接入方式**：示例代码可直接作为企业参考实现；
+- **加密 Secret 后端作为基础设施完成**：依赖 `cryptography>=44.0`，密钥只走环境变量。
+
+### 验收标准
+
+- `pytest tests/`：全量通过，无回归；
+- `ruff check src tests examples`：通过；
+- `mypy src`：通过；
+- 新增 `EncryptedFileSecretBackend` 测试覆盖加密解密、密钥缺失、密钥长度、明文兼容；
+- 文档更新到位，明确 v0.24.0 架构边界。
+
+---
+
+## v0.25.0：Harness 作为生产级执行后端
+
+### 目标
+
+把 Harness 从 v0.24.0 的示例提升为生产级可插拔执行后端，让 Loop Controller 能够把任意工具调用安全地路由到外部 Harness 执行，Loop Controller 只做治理决策，Harness 负责实际执行与隔离。
+
+### 完成内容
+
+- **Loop Controller ↔ Harness 通信协议**：
+  - 新增 `src/loop_controller/executors/harness_protocol.py`：
+    - `HarnessContext`：透传 `call_id/task_id/agent_id/user_id/session_id/tenant_id`；
+    - `HarnessSandbox`：超时、输出大小、网络/路径/环境变量白名单；
+    - `HarnessExecuteRequest` / `HarnessExecuteResponse`：标准请求/响应模型。
+  - 采用轻量级 HTTP/JSON 协议，未来可扩展为 gRPC。
+
+- **HarnessExecutor 实现**：
+  - 新增 `src/loop_controller/executors/harness_executor.py`：
+    - `HarnessExecutor` 实现 `ToolExecutor` 协议；
+    - 支持 HTTP 后端、子进程后端两种生产/开发形态；
+    - Docker 后端保留配置模型（`DockerBackendConfig`），执行层作为示例保留；
+    - `list_tools()` 按 Profile 过滤返回 `Tool` 元数据；
+    - `Runtime.start()` / `aclose()` 自动管理 Harness 后端生命周期。
+  - 新增 `src/loop_controller/executors/harness_models.py`：
+    - `HarnessToolSpec`、`HarnessSandboxConfig`；
+    - `SubprocessBackendConfig`、`DockerBackendConfig`、`HTTPBackendConfig`。
+
+- **Runtime 与配置集成**：
+  - `ConfigLoader` 新增 `config/harness_tools.yaml` 加载；
+  - `AppConfig` 新增 `harness_tool_specs` 与 `harness_backends`；
+  - 启动校验 `_check_tool_mapping()` 把 Harness 工具纳入可用工具集合；
+  - `build_runtime()` 创建 `HarnessExecutor` 并注册到 `ExecutorRegistry`；
+  - `tool_costs` 合并 Harness 工具 `cost_per_call`。
+
+- **参考 Harness 服务器与后端示例**：
+  - 重写 `examples/contrib/harness/harness_server.py`：基于 Starlette，接收 `/harness/v1/execute`，内置 echo/shell 示例工具；
+  - 新增 `examples/contrib/harness/subprocess_backend.py`：直接子进程执行示例；
+  - 新增 `examples/contrib/harness/docker_backend.py`：Docker 容器执行示例；
+  - `config/harness_tools.yaml` 提供默认注释示例，避免测试/启动时自动拉起子进程 Harness。
+
+- **测试与验证**：
+  - 新增 `tests/test_harness_executor.py`：覆盖 HTTP 后端成功/错误、后端未找到、工具未注册、list_tools 过滤、请求形状校验；
+  - 新增 `tests/test_harness_subprocess.py`：覆盖子进程 Harness echo 调用；
+  - 全量 `pytest tests/`：**429 passed, 3 skipped**；
+  - `ruff check src tests examples`：**All checks passed**；
+  - `mypy src`：**Success: no issues found**。
+
+### 关键决策
+
+- **治理与执行彻底分离**：Loop Controller 只负责身份、策略、审批、审计，Harness 负责实际执行与隔离；
+- **Harness 默认不启用**：`config/harness_tools.yaml` 全部注释，用户显式启用后才拉起后端，避免测试/无 Harness 环境启动失败；
+- **HTTP/JSON 优先于 gRPC**：复用现有 HTTP 基础设施，降低初期复杂度；
+- **ToolResult 扩展 `metadata`**：允许 Harness 透传执行元数据（如实际耗时、容器 ID 等），默认空 dict 保持向后兼容；
+- **子进程后端仅用于开发/测试**：生产环境应使用 Docker 容器或远程 HTTP Harness，避免与 Loop Controller 共享资源。
+
+### 验收状态
+
+- `pytest tests/`：**429 passed, 3 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.25.0_development.md`
+
+---
+
+## v0.26.0：吊销与签名证据链
+
+### 完成内容
+
+- 新增 agent/user/tool/secret 全局吊销与 Kill Switch，覆盖初次判定、审批恢复和执行前检查；
+- 新增 HTTP/gRPC 管理接口，吊销状态持久化到 `config/revocation.yaml` 并支持热更新；
+- 新增 HMAC-SHA256、Ed25519 签名器与本地 JSONL 证据链，审计事件可同步生成可验证证据；
+- 新增 `config/revocation.yaml`、`config/evidence.yaml` 示例配置。
+
+### 明确边界
+
+- 多租户隔离、分布式状态一致性、KMS/HSM 与远程/WORM 证据存储不在本版本范围；
+- 本地证据链只能检测篡改，不能阻止拥有文件系统权限的攻击者删除文件。
+
+### 设计文档
+
+- `src/loop_controller_v0.26.0_development.md`
+
+---
+
+## v0.26.1：吊销与证据链可靠性修复
+
+### 完成内容
+
+- Secret 吊销改为同时解析执行器当前生效配置中的可信 Secret 引用，调用参数仅作为补充，HTTP 工具热更新后立即使用新引用；
+- Controller、MCP Proxy、SDK/`ToolGovernor` 与 `execute_with_proposal` 在最终执行边界统一复查吊销和 Kill Switch；阻断时释放未提交 reservation，并写入结构化 `revocation_blocked` 审计；
+- gRPC Admin RPC 增加 `entrypoints.grpc.admin_agent_ids` allowlist 授权；未配置时默认拒绝普通已认证身份；
+- `RevocationEntry` 严格拒绝无时区 `revoked_at`/`expires_at`，合法时间统一转换为 UTC；
+- AuditStore 增加真正的异步有序写入路径，移除每条事件创建线程并 `join()` 的事件循环阻塞方式；
+- 启动时交叉验证审计、签名证据与签名本地尾状态 checkpoint；不一致时将证据状态标记为 `degraded` 并告警，但不阻塞服务启动；
+- 管理接口持久化失败不再返回成功，且保持内存状态不变。
+
+### 本地 checkpoint 安全边界
+
+- checkpoint 与当前审计/证据尾部联合校验，可发现相对上次本地状态的序号回退、尾哈希不一致，以及审计或证据的单边尾部/整体丢失；
+- checkpoint 载荷由 EvidenceSigner 签名，并通过临时文件写入后原子替换；它是本地一致性记录，不是远程可信锚点、WORM 或主机级不可删除证明；
+- 拥有主机权限的攻击者若同时删除全部本地审计、证据和 checkpoint，系统仍会把该状态视为新部署，无法检测此前数据被删除；生产环境仍需外部可信锚点、远程不可变存储或独立备份；
+- 验证失败采用可用性优先策略：告警并暴露 `evidence_status=degraded`，不阻止服务启动。
+
+### 配置变更
+
+- `config/entrypoints.yaml`：`entrypoints.grpc.admin_agent_ids` 为显式管理员 Agent ID 列表，默认空列表语义为全部 Admin RPC 拒绝；
+- `config/evidence.yaml`：`evidence.local.checkpoint_path` 可覆盖默认 `<evidence.local.path>/checkpoint.json`；checkpoint 与证据使用同一签名器；
+- `config/revocation.yaml`：吊销时间必须是带时区的 ISO 8601 值（如 `2026-08-28T12:00:00Z`），无时区值会被拒绝且热更新保留旧快照。
+
+### 明确边界
+
+- 仍不提供多进程/多 worker 对同一 JSONL 文件的安全并发写入；
+- 仍不提供完整多租户隔离、KMS/HSM、远程证据后端或外部可信锚点；
+- 本地 Ed25519 私钥保护等级不等同于 KMS/HSM。
+
+### 设计文档
+
+- `src/loop_controller_v0.26.1_development.md`
+
+---
+
+## v0.27.0：Harness 生产闭环
+
+### 完成内容
+
+- 远程 HTTP Harness 增加 HMAC-SHA256/API Key 认证、timestamp + nonce 签名协议与参考服务防重放；
+- 增加 HTTPS 强制、loopback HTTP 显式豁免、TLS 企业 CA 和可选 mTLS 客户端证书配置；
+- 每个 backend 使用共享 `asyncio.Semaphore` 执行进程内并发门控，获取超时返回 `harness_overloaded`，异常与取消路径释放槽位；
+- 增加启动健康检查、周期探活、净化后的 backend 状态与受 Admin API key 保护的只读 HTTP 状态端点；不健康 backend fail-closed；
+- 接入 Harness 调用、耗时、排队、in-flight、过载和健康 Prometheus 指标；
+- 配置加载期校验 tool/backend 引用、认证环境变量、TLS 文件、JSON Schema 基本结构，并在启动期拒绝 Docker backend；
+- Harness `default_risk` 接入统一分类器，作为规则风险的下限；backend 认证 Secret 引用进入统一吊销检查；
+- 参考 Harness 增加协议版本检查、严格工具注册和参数校验、超时终止、stdout/stderr 合计输出限制、最小环境与不支持沙箱字段 fail-closed；
+- 更新 `config/harness_tools.yaml` 为默认注释的 HTTPS + HMAC 生产模板，版本升级为 `0.27.0`。
+
+### 准确边界
+
+- Loop Controller 仍是控制平面，不提供 Shell/SQL/Browser 内置生产沙箱，也不编排 Docker/Kubernetes；
+- subprocess 与参考 Harness 仅用于开发、集成和协议示例；生产隔离由容器/Kubernetes/VM/专用主机承担；
+- 防重放 nonce store、并发门控和健康状态均为单实例语义，不提供分布式一致性；
+- HTTP 超时后的执行结果可能未知，不自动重试；调用取消不会取消远端执行，未提供远程取消和长期幂等；
+- Harness 只读 backend 状态端点复用现有 HTTP Admin API key；当前没有对应 gRPC Admin RPC，也没有统一 HTTP/gRPC Admin RBAC；
+- Harness 配置、认证密钥和 TLS 文件不支持运行期热更新或轮换。
+
+### 验证
+
+- Harness 配置、执行器、分类器和参考服务测试覆盖认证、防重放、并发、健康、风险与 fail-closed 行为；
+- 发布验证结果以本次实际运行的 pytest、ruff、mypy 输出为准。
+
+### 设计文档
+
+- `src/loop_controller_v0.27.0_development.md`
+
+---
+
+## v0.28.0：可信锚点与审计链外部闭环
+
+### 完成内容
+
+- **锚点数据模型与密码学协议**：
+  - 新增 `src/loop_controller/audit/anchors.py`：`AnchorPayload`、`AnchorReceipt` 冻结模型；
+  - canonical JSON、严格 Base64、固定六位微秒 UTC RFC3339；
+  - SHA-256 幂等键与 Ed25519 receipt 签名验证；
+  - 拒绝额外字段、未知 schema version 和非规范时间表示。
+
+- **HTTP 可信锚点后端**：
+  - 新增 `src/loop_controller/audit/anchor_backends.py`：`HTTPAnchorBackend`；
+  - `PUT /v1/anchors/{stream_id}` + `GET .../latest`；
+  - Bearer 认证、企业 CA / mTLS、独立 connect/request 超时；
+  - 稳定脱敏错误码：`anchor_authentication_failed`、`anchor_conflict`、`anchor_rollback_rejected`、`anchor_rate_limited`、`anchor_timeout`、`anchor_unavailable`、`anchor_receipt_invalid`；
+  - PUT 超时等不确定结果通过 `latest` 消解，避免重复提交或错误冲突。
+
+- **AuditStore 集成**：
+  - `JsonlAuditStore` 在 checkpoint 成功后自动向远程锚点发布当前审计链状态；
+  - 启动时交叉验证本地证据/审计与远程最新锚点；远程序号超前时校验历史锚点与本地后缀一致性，合法则重建本地 checkpoint；
+  - 冲突或回滚时进入 `anchor_conflict` / `anchor_rollback_rejected`，阻断后续写入并生成 critical alert；
+  - 支持管理员显式 `verify_anchor`、`publish_anchor`、`bootstrap_anchor`。
+
+- **配置与 Runtime 集成**：
+  - `config/evidence.yaml` 增加 `anchor` 配置块；
+  - `ConfigLoader` 严格校验 anchor enabled 依赖、HTTPS URL、stream ID 路径穿越、timeout、认证、TLS、mTLS、receipt 公钥与启动策略；
+  - `Runtime` 构造 `HTTPAnchorBackend` 并在关闭时释放客户端。
+
+- **管理接口**：
+  - `GET /v1/admin/evidence/anchor`：净化后的锚点摘要；
+  - `POST /v1/admin/evidence/anchor/verify`：手动触发远程校验；
+  - `POST /v1/admin/evidence/anchor/publish`：手动触发锚点发布；
+  - `POST /v1/admin/evidence/anchor/bootstrap`：受控 bootstrap。
+
+- **SQLite 参考锚点服务**：
+  - 新增 `examples/contrib/anchor/anchor_service.py`；
+  - Bearer 认证、请求体限制、严格 payload 校验、幂等键校验；
+  - `BEGIN IMMEDIATE` 事务单调 CAS，同序号分叉与回滚拒绝；
+  - Ed25519 receipt 签发，进程重启后 latest 不回退；
+  - 稳定错误码，不泄露认证 Secret。
+
+- **指标**：
+  - 新增 `loop_controller_anchor_publish_total`、`loop_controller_anchor_publish_duration_seconds`、`loop_controller_anchor_last_success_seq`、`loop_controller_anchor_lag_events`、`loop_controller_anchor_status`、`loop_controller_anchor_conflicts_total`。
+
+### 准确边界
+
+- 锚点服务依赖外部可信运行实例，Loop Controller 只验证 receipt 签名与链一致性，不信任服务端本身；
+- HTTP 后端在不确定结果时通过 `latest` 消解，不自动重试；远端执行中的更新仍可能被视为冲突；
+- 本地 JSONL 证据/审计文件仍是单进程追加写，不提供多 writer 并发安全；
+- bootstrap 需要管理员显式调用，不会在启动时自动执行；
+- 当前 receipt 验证仅支持 Ed25519，不支持多签或 threshold 签名。
+
+### 验证
+
+- `pytest tests/`：**623 passed，1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.28.0_development.md`
+
+---
+
+## v0.29.0：审批与状态恢复闭环
+
+### 完成内容
+
+- **审批结果跨进程可见（P0-1）**：
+  - `ApprovalStore` 协议新增 `refresh()`；`JsonlApprovalStore` 实现基于字节偏移的增量刷新；
+  - 文件截断/重建后自动重置偏移全量重放；末行/损坏行忽略并告警；
+  - `AsyncApprovalManager.check/get_request/get_request_by_id/get_decision` 调用前先 `refresh()`；
+  - 新增 `ApprovalStoreError`；`record_response` 拒绝覆盖同一 `decision_id` 的旧结果，相同内容幂等；
+  - `_load` / `refresh` 中 `response` 行使用 `setdefault` 保留第一条。
+
+- **审批共享校验与 Admin 端点**：
+  - 新增 `src/loop_controller/approval_service.py`：`build_approval_record()` 统一校验审批人身份、请求者/执行 Agent 隔离、过期 Decision、deny 必填 comment；
+  - CLI 与 HTTP Admin 端点复用同一校验逻辑；
+  - 新增 `POST /v1/admin/approvals/{decision_id}/approve` 与 `/deny`；写入后调用 `ApprovalWatcher.notify()` 唤醒同进程等待者。
+
+- **跨进程写锁（P0-3）**：
+  - `JsonlApprovalStore._append` 使用 `portalocker` 跨进程文件锁（Windows `msvcrt.locking` / POSIX `fcntl.flock`）；
+  - `pyproject.toml` 新增 `portalocker>=2.0` 依赖。
+
+- **预算预留清扫（P0-2）**：
+  - `Checkpoint.recover_stale_reservations()` 扫描过期 `pending` / `pending_approval`，执行 `refund`、标记 `expired`、写入 `reservation_expired` 审计事件；
+  - `Runtime.start()` 在锚点验证通过后调用清扫；
+  - `get_pending_reservation/get_pending_reservations` 过滤已过期项；
+  - `forward()` 中查到的 reservation 在后续 `CheckpointError` 抛出前统一 `refund`。
+
+- **Decision 状态机与跨重启防重放（R1-R8）**：
+  - `_transition_reservation` 定义合法转移表，非法转移抛 `CheckpointError`；
+  - `_commit_reservation` 校验当前状态必须为 `pending/pending_approval`；
+  - `_refund_reservation` 改为先写 reservation 状态、再 `budget.refund`（崩溃时不重复 commit）；
+  - `JsonlDecisionStore` 新增 `record_finalized()` 与 `is_decision_finalized()`，重放恢复 `_finalized_decisions`；
+  - `finalize_after_approval` 把 finalized 记录移到所有校验通过之后；未知 verdict 抛 `CheckpointError`；
+  - 新增 `DecisionAlreadyConsumed` 异常，`controller.resume_after_approval` 第二次返回 `error_code=decision_already_consumed`。
+
+- **边界修正（R5-R9）**：
+  - CLI 审批前校验 Decision 过期，`lc approvals list` 标注 `[expired]`；
+  - `forward()` modify 复核改为 `canonical_json` 全量比较。
+
+- **ReservationStore 增强**：
+  - `ReservationStore` 协议及实现新增 `list_all()`，供 `recover_stale_reservations` 扫描。
+
+### 关键决策
+
+- **可见性优先于推送**：本版本不实现服务端主动推送；Runtime/Agent 通过主动轮询或重试触发 `refresh()`，即可看到 CLI/Admin 写入的审批结果；
+- **fail-closed 的单写覆盖**：审批结果一旦落盘不可静默覆盖，避免双进程/双入口竞态导致决定被翻转；
+- **预算侧优先安全**：`_refund_reservation` 先落盘 reservation 状态，宁可出现孤儿 reserve 告警，也不允许重复 commit 突破预算上限；
+- **状态机显式化**：reservation 的合法流转从注释变成强制校验，非法调用直接抛错。
+
+### 验证
+
+- `pytest tests/`：**665 passed，1 skipped**
+- `ruff check src tests examples`：**All checks passed**
+- `mypy src`：**Success: no issues found**
+
+### 设计文档
+
+- `src/loop_controller_v0.29.0_development.md`

@@ -1,0 +1,37 @@
+/a2a/v1/delegations:
+  post:
+    operationId: requestDelegation
+    summary: Request authorization for a delegated tool execution
+    tags:
+      - Delegations
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '../schemas/delegation-request.yaml'
+    responses:
+      '200':
+        description: Delegation authorization result
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/delegation-response.yaml'
+      '400':
+        description: Invalid request
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+      '403':
+        description: Delegation denied or target agent not trusted
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'
+      '409':
+        description: Conflict with an in-flight idempotent request
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'

@@ -18,22 +18,55 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
+from urllib.parse import urlparse
 
 import httpx
 import yaml
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+from pydantic import ValidationError
 
+from loop_controller.executors.harness_models import (
+    DockerBackendConfig,
+    HarnessExecutionPolicy,
+    HarnessToolSpec,
+    HTTPBackendConfig,
+    IsolatedSubprocessBackendConfig,
+    SubprocessBackendConfig,
+    ToolExecutionPolicy,
+)
+from loop_controller.executors.http_models import HTTPToolSpec, resolve_env_refs
+from loop_controller.executors.local_function_models import LocalFunctionSpec
+from loop_controller.interaction.config import (
+    InteractionConfig,
+    InteractionConfigError,
+    load_interaction_config,
+)
 from loop_controller.models import (
     Agent,
+    AuditRule,
+    AuditRuleConditions,
+    AuditRules,
+    AuthorityConditions,
+    AuthorityGrantRule,
+    AuthorityRules,
+    BudgetCost,
     CapabilityProfile,
     ToolPermission,
 )
 from loop_controller.utils.globmatch import compile_glob
+
+T = TypeVar("T")
 
 POLICY_PACKAGE = "loop_controller.tool_permission"
 
@@ -98,6 +131,53 @@ class PermissionRule:
     when_all: list[PermissionCondition]
     action: Literal["deny", "require_approval"]
     reason: str
+    risk_tags: list[str] = field(default_factory=list)  # v0.10.0：能力组合风险标签
+    score: int = 0  # v0.10.0：组合风险分数
+    triggered_capabilities: list[str] = field(default_factory=list)  # v0.11.0：命中规则时触发的当前能力
+
+
+# ---------------------------------------------------------------------------
+# v0.10.0 Capability-Based Permission Interaction Analyzer 配置类型
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CapabilityProducer:
+    """工具调用 → 能力的产生条件。"""
+
+    tool: str
+    arg_match: dict[str, str] | None = None
+    arg_not_match: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class CapabilityDef:
+    """能力定义：一组产生条件，任一条件满足即产生该能力。"""
+
+    name: str
+    produced_by: list[CapabilityProducer]
+
+
+@dataclass(frozen=True)
+class CapabilityCombinationRule:
+    """能力组合规则：历史能力 + 当前能力 → 风险标签与裁决建议。"""
+
+    id: str
+    description: str
+    requires_any: list[str]
+    triggers_any: list[str]
+    action: Literal["deny", "require_approval"]
+    reason: str
+    risk_tags: list[str]
+    score: int
+
+
+@dataclass(frozen=True)
+class CapabilityRules:
+    """能力规则配置容器。"""
+
+    capabilities: dict[str, CapabilityDef]
+    combination_rules: list[CapabilityCombinationRule]
 
 
 @dataclass(frozen=True)
@@ -131,6 +211,15 @@ class ApprovalConfig:
     rules: list[ApprovalRule] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class PersistenceConfig:
+    fsync_enabled: bool = True
+    lock_timeout_seconds: float = 5.0
+    repair_incomplete_tail: bool = True
+    enforce_permissions: bool = True
+    fail_on_unsafe_permissions: bool = True
+
+
 AuditHashAlgorithm = Literal["sha256", "hmac-sha256"]
 
 
@@ -141,21 +230,45 @@ class AppConfig:
     profiles: dict[str, CapabilityProfile]
     mcp_servers: dict[str, MCPServerConfig]
     tool_mapping: dict[str, ToolMappingEntry]
+    http_tool_specs: dict[str, HTTPToolSpec]  # v0.21.0 HTTP 工具规格
+    local_function_specs: dict[str, LocalFunctionSpec]  # v0.23.0 本地函数规格
+    harness_tool_specs: dict[str, HarnessToolSpec]  # v0.25.0 Harness 工具规格
+    harness_backends: dict[
+        str,
+        SubprocessBackendConfig | DockerBackendConfig | IsolatedSubprocessBackendConfig | HTTPBackendConfig,
+    ]  # v0.25.0 Harness 后端
+    harness_execution_policy: HarnessExecutionPolicy  # v0.31.0 执行策略
     permission_rules: list[PermissionRule]
+    capability_rules: CapabilityRules  # v0.10.0
+    authority_rules: AuthorityRules  # v0.11.0
+    audit_rules: AuditRules  # v0.12.0
     masking_rules: MaskingRules
     approval: ApprovalConfig
+    persistence: PersistenceConfig
     policy_dir: str
     audit_log_path: str
     decision_log_path: str
     risk_state_path: str = "./data/risk_state.jsonl"  # v1.2 会话级风险状态持久化路径
+    session_path: str = "./data/sessions.jsonl"  # v0.4.0 Session 持久化路径
     conversation_path: str = "./data/conversations.jsonl"  # v0.3.0 会话上下文持久化路径
     conversation_max_messages_per_session: int = 100  # v0.3.0 每个 session 保留消息数
     approval_store_path: str = "./data/approvals.jsonl"  # v0.3.0 审批请求/结果持久化路径
+    task_store_path: str = "./data/tasks.jsonl"  # v0.6.0 Task 持久化路径
+    budget_ledger_path: str = "./data/budget.jsonl"  # v0.6.0 预算事件持久化路径
+    reservation_store_path: str = "./data/reservations.jsonl"  # v0.8.0 reservation 持久化路径
+    authority_log_path: str = "./data/authority.jsonl"  # v0.11.0 authority token 持久化路径
+    alert_store_path: str = "./data/alerts.jsonl"  # v0.12.0 alert/report 持久化路径
     llm_planner: LLMPlannerConfig | None = None
     audit_hash_algo: AuditHashAlgorithm = "sha256"
     audit_hmac_key_env: str = "LOOP_CONTROLLER_AUDIT_HMAC_KEY"
     audit_key_id: str = "default"  # HMAC key 标识，为密钥轮换留口
-
+    identity_config: dict[str, Any] = field(default_factory=dict)  # v0.20.0 身份 Provider 配置
+    entrypoints_config: dict[str, Any] = field(default_factory=dict)  # v0.20.0 入口认证配置
+    secrets_config: dict[str, Any] = field(default_factory=dict)  # v0.22.0 Secret Broker 配置
+    revocation_config: dict[str, Any] = field(default_factory=dict)  # v0.26.0 吊销配置
+    evidence_config: dict[str, Any] = field(default_factory=dict)  # v0.26.0 证据链配置
+    go_kernel_config: dict[str, Any] = field(default_factory=dict)  # v0.36.0 Go 交互治理内核配置
+    interaction_config: InteractionConfig = field(default_factory=InteractionConfig)  # v0.38.0
 
 # ---------------------------------------------------------------------------
 # ConfigLoader
@@ -180,11 +293,35 @@ class ConfigLoader:
 
         agents, users = self._load_agents(config_dir / "agents.yaml")
         profiles = self._load_profiles(config_dir / "profiles.yaml")
-        mcp_servers, tool_mapping = self._load_mcp_servers(config_dir / "mcp_servers.yaml")
-        permission_rules = self._load_permission_rules(config_dir / "permission_rules.yaml")
-        masking_rules = self._load_masking_rules(config_dir / "masking_rules.yaml")
+        mcp_servers, tool_mapping, legacy_http_specs = self._load_mcp_servers(config_dir / "mcp_servers.yaml")
+        http_tool_specs = self._load_http_tools(config_dir / "http_tools.yaml")
+        # mcp_servers.yaml 中的 type: http 条目作为向后兼容补充
+        http_tool_specs.update(legacy_http_specs)
+        local_function_specs = self._load_local_functions(config_dir / "local_functions.yaml")
+        harness_tool_specs, harness_backends, harness_execution_policy = self._load_harness_tools(
+            config_dir / "harness_tools.yaml",
+            config_dir / "execution_policy.yaml",
+        )
+        secrets_config = self._load_secrets_config(config_dir / "secrets.yaml", root)
+        revocation_config = self._load_optional_config(config_dir / "revocation.yaml")
+        evidence_config = self._load_optional_config(config_dir / "evidence.yaml")
+        persistence = self._load_persistence(config_dir / "persistence.yaml")
         approval = self._load_approval(config_dir / "approval.yaml")
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
+        identity_config = self._load_identity_config(config_dir / "identity.yaml")
+        entrypoints_config = self._load_entrypoints_config(config_dir / "entrypoints.yaml")
+        go_kernel_config = self._load_optional_config(config_dir / "go_kernel.yaml")
+        try:
+            interaction_profiles, interaction_trust, interaction_policies = load_interaction_config(
+                config_dir
+            )
+        except InteractionConfigError as exc:
+            raise ConfigValidationError(str(exc)) from exc
+        permission_rules = self._load_permission_rules(config_dir / "permission_rules.yaml")
+        capability_rules = self._load_capability_rules(config_dir / "capability_rules.yaml")
+        authority_rules = self._load_authority_rules(config_dir / "authority_rules.yaml")
+        audit_rules = self._load_audit_rules(config_dir / "audit_rules.yaml")
+        masking_rules = self._load_masking_rules(config_dir / "masking_rules.yaml")
 
         audit_hash_algo = cast(
             AuditHashAlgorithm,
@@ -208,6 +345,18 @@ class ConfigLoader:
         approval_store_path = os.environ.get(
             "LOOP_CONTROLLER_APPROVAL_STORE_PATH", str(root / "data" / "approvals.jsonl")
         )
+        session_path = os.environ.get(
+            "LOOP_CONTROLLER_SESSION_PATH", str(root / "data" / "sessions.jsonl")
+        )
+        task_store_path = os.environ.get(
+            "LOOP_CONTROLLER_TASK_STORE_PATH", str(root / "data" / "tasks.jsonl")
+        )
+        budget_ledger_path = os.environ.get(
+            "LOOP_CONTROLLER_BUDGET_LEDGER_PATH", str(root / "data" / "budget.jsonl")
+        )
+        reservation_store_path = os.environ.get(
+            "LOOP_CONTROLLER_RESERVATION_STORE_PATH", str(root / "data" / "reservations.jsonl")
+        )
 
         app_config = AppConfig(
             agents=agents,
@@ -215,21 +364,50 @@ class ConfigLoader:
             profiles=profiles,
             mcp_servers=mcp_servers,
             tool_mapping=tool_mapping,
+            http_tool_specs=http_tool_specs,
+            local_function_specs=local_function_specs,
+            harness_tool_specs=harness_tool_specs,
+            harness_backends=harness_backends,
+            harness_execution_policy=harness_execution_policy,
             permission_rules=permission_rules,
+            capability_rules=capability_rules,
+            authority_rules=authority_rules,
+            audit_rules=audit_rules,
             masking_rules=masking_rules,
             approval=approval,
+            persistence=persistence,
             policy_dir=str(root / "policies"),
             audit_log_path=str(root / "data" / "audit.jsonl"),
             decision_log_path=str(root / "data" / "decisions.jsonl"),
             risk_state_path=str(root / "data" / "risk_state.jsonl"),
+            session_path=session_path,
             conversation_path=conversation_path,
             approval_store_path=approval_store_path,
+            task_store_path=task_store_path,
+            budget_ledger_path=budget_ledger_path,
+            reservation_store_path=reservation_store_path,
+            authority_log_path=str(root / "data" / "authority.jsonl"),
+            alert_store_path=str(root / "data" / "alerts.jsonl"),
             llm_planner=llm_planner,
             audit_hash_algo=audit_hash_algo,
             audit_key_id=audit_key_id,
+            identity_config=identity_config,
+            entrypoints_config=entrypoints_config,
+            secrets_config=secrets_config,
+            revocation_config=revocation_config,
+            evidence_config=evidence_config,
+            go_kernel_config=go_kernel_config,
+            interaction_config=InteractionConfig(
+                profiles=interaction_profiles,
+                trust=interaction_trust,
+                policies=interaction_policies,
+                policy_dir=str(root / "policies"),
+            ),
         )
 
         self._check_profile_exists(app_config)
+        self._check_interaction_profile_exists(app_config)
+        self._check_interaction_agents_exist(app_config)
         self._check_tool_mapping(app_config)
         if opa_base_url is not None:
             self._check_policy_loadable(opa_base_url, app_config)
@@ -239,6 +417,10 @@ class ConfigLoader:
         self._check_approver_exists(app_config)
         self._check_llm_planner_api_key(app_config)
         self._check_audit_key(app_config)
+        self._check_harness_config(app_config)
+        self._check_identity_config(app_config)
+        self._check_entrypoints_config(app_config)
+        self._check_evidence_config(app_config)
         return app_config
 
     # -- 各 YAML 解析 -------------------------------------------------------
@@ -247,7 +429,9 @@ class ConfigLoader:
         data = self._read_yaml(path)
         agents: dict[str, Agent] = {}
         for item in data.get("agents", []):
-            agent = Agent(**item)
+            agent = self._construct(
+                path, "Agent", partial(Agent, **item)
+            )
             agents[agent.agent_id] = agent
         users: dict[str, str] = {}
         for item in data.get("users", []):
@@ -262,59 +446,463 @@ class ConfigLoader:
             tools_raw = item.pop("tools", {})
             tools: dict[str, ToolPermission] = {}
             for tool_name, perm in tools_raw.items():
-                tools[tool_name] = ToolPermission(tool_name=tool_name, **perm)
-            profile = CapabilityProfile(version=version, tools=tools, **item)
+                tools[tool_name] = self._construct(
+                    path,
+                    f"Profile tool {tool_name}",
+                    partial(ToolPermission, tool_name=tool_name, **perm),
+                )
+            profile = self._construct(
+                path,
+                f"Profile {item.get('profile_id', '<unknown>')}",
+                partial(CapabilityProfile, version=version, tools=tools, **item),
+            )
             profiles[profile.profile_id] = profile
         return profiles
 
     def _load_mcp_servers(
         self, path: Path
-    ) -> tuple[dict[str, MCPServerConfig], dict[str, ToolMappingEntry]]:
+    ) -> tuple[dict[str, MCPServerConfig], dict[str, ToolMappingEntry], dict[str, HTTPToolSpec]]:
         data = self._read_yaml(path)
         servers: dict[str, MCPServerConfig] = {}
         for name, conf in data.get("servers", {}).items():
-            servers[name] = MCPServerConfig(name=name, **conf)
+            servers[name] = self._construct(
+                path,
+                f"MCP server {name}",
+                partial(MCPServerConfig, name=name, **conf),
+            )
         mapping: dict[str, ToolMappingEntry] = {}
+        http_specs: dict[str, HTTPToolSpec] = {}
         for canonical, entry in data.get("tool_mapping", {}).items():
-            mapping[canonical] = ToolMappingEntry(**entry)
-        return servers, mapping
+            entry_type = entry.get("type", "mcp")
+            if entry_type == "http":
+                # 解析 ${ENV} 引用，然后构造 HTTPToolSpec
+                resolved = resolve_env_refs(entry)
+                http_specs[canonical] = self._construct(
+                    path,
+                    f"HTTP tool {canonical}",
+                    partial(HTTPToolSpec, tool_name=canonical, **resolved),
+                )
+            else:
+                mapping[canonical] = self._construct(
+                    path,
+                    f"Tool mapping {canonical}",
+                    partial(ToolMappingEntry, **entry),
+                )
+        return servers, mapping, http_specs
+
+    def _load_http_tools(self, path: Path) -> dict[str, HTTPToolSpec]:
+        """加载 HTTP 工具规格（v0.22.0 独立配置）。
+
+        文件缺失时返回空 dict（向后兼容）。
+        """
+        specs: dict[str, HTTPToolSpec] = {}
+        if not path.exists():
+            return specs
+        data = self._read_yaml(path)
+        for canonical, entry in (data.get("tools") or {}).items():
+            resolved = resolve_env_refs(entry)
+            specs[canonical] = self._construct(
+                path,
+                f"HTTP tool {canonical}",
+                partial(HTTPToolSpec, tool_name=canonical, **resolved),
+            )
+        return specs
+
+    def _load_secrets_config(
+        self, path: Path, root: Path
+    ) -> dict[str, Any]:
+        """加载 Secret Broker 后端配置（v0.22.0）。
+
+        文件缺失时使用默认文件后端：``<root>/secrets``。
+        """
+        if not path.exists():
+            return {
+                "backend": {
+                    "type": "file",
+                    "base_path": str(root / "secrets"),
+                },
+                "hot_reload": {"enabled": True, "poll_interval_seconds": 30},
+            }
+        data = self._read_yaml(path)
+        config = cast(dict[str, Any], data)
+        if "backend" not in config:
+            config["backend"] = {"type": "file", "base_path": str(root / "secrets")}
+        if "hot_reload" not in config:
+            config["hot_reload"] = {"enabled": True, "poll_interval_seconds": 30}
+        return config
+
+    def _load_local_functions(self, path: Path) -> dict[str, LocalFunctionSpec]:
+        """加载本地函数规格（v0.23.0）。
+
+        文件缺失时返回空 dict（向后兼容）。
+        """
+        specs: dict[str, LocalFunctionSpec] = {}
+        if not path.exists():
+            return specs
+        data = self._read_yaml(path)
+        for canonical, entry in (data.get("tools") or {}).items():
+            specs[canonical] = self._construct(
+                path,
+                f"Local function {canonical}",
+                partial(LocalFunctionSpec, tool_name=canonical, **entry),
+            )
+        return specs
+
+    def _load_harness_tools(
+        self,
+        path: Path,
+        execution_policy_path: Path | None = None,
+    ) -> tuple[
+        dict[str, HarnessToolSpec],
+        dict[
+            str,
+            SubprocessBackendConfig | DockerBackendConfig | IsolatedSubprocessBackendConfig | HTTPBackendConfig,
+        ],
+        HarnessExecutionPolicy,
+    ]:
+        """加载 Harness 后端、工具规格与独立执行策略。"""
+        tool_specs: dict[str, HarnessToolSpec] = {}
+        backends: dict[
+            str,
+            SubprocessBackendConfig | DockerBackendConfig | IsolatedSubprocessBackendConfig | HTTPBackendConfig,
+        ] = {}
+        data = self._read_yaml(path) if path.exists() else {}
+        if "execution" in data:
+            execution_raw = data.get("execution") or {}
+        elif execution_policy_path is not None and execution_policy_path.exists():
+            policy_data = self._read_yaml(execution_policy_path)
+            execution_raw = policy_data.get("execution") or {}
+        else:
+            execution_raw = {}
+        try:
+            policy = HarnessExecutionPolicy(**execution_raw)
+        except ValidationError as exc:
+            raise ConfigValidationError(f"Harness 执行策略配置非法：{exc}") from exc
+        for name, entry in (data.get("backends") or {}).items():
+            backend_type = entry.get("type", "subprocess")
+            try:
+                if backend_type == "subprocess":
+                    backends[name] = SubprocessBackendConfig(name=name, **entry)
+                elif backend_type == "docker":
+                    backends[name] = DockerBackendConfig(name=name, **entry)
+                elif backend_type == "isolated_subprocess":
+                    backends[name] = IsolatedSubprocessBackendConfig(name=name, **entry)
+                elif backend_type == "http":
+                    backends[name] = HTTPBackendConfig(name=name, **entry)
+                else:
+                    raise ConfigValidationError(
+                        f"Harness 后端 {name} 的类型 {backend_type!r} 不受支持"
+                    )
+            except ValidationError as exc:
+                raise ConfigValidationError(f"Harness 后端 {name} 配置非法：{exc}") from exc
+        for canonical, entry in (data.get("tools") or {}).items():
+            try:
+                tool_specs[canonical] = HarnessToolSpec(tool_name=canonical, **entry)
+            except ValidationError as exc:
+                raise ConfigValidationError(f"Harness 工具 {canonical} 配置非法：{exc}") from exc
+        return tool_specs, backends, policy
+
+    def reload_http_tools(self, config_dir: str | Path) -> dict[str, HTTPToolSpec]:
+        """热更新：仅重新加载 HTTP 工具规格。"""
+        config_dir = Path(config_dir)
+        http_specs = self._load_http_tools(config_dir / "http_tools.yaml")
+        mcp_path = config_dir / "mcp_servers.yaml"
+        if mcp_path.exists():
+            _, _, legacy_http_specs = self._load_mcp_servers(mcp_path)
+            http_specs.update(legacy_http_specs)
+        return http_specs
+
+    def reload_harness_tools(
+        self, config_dir: str | Path
+    ) -> tuple[
+        dict[str, HarnessToolSpec],
+        dict[
+            str,
+            SubprocessBackendConfig | DockerBackendConfig | IsolatedSubprocessBackendConfig | HTTPBackendConfig,
+        ],
+        HarnessExecutionPolicy,
+    ]:
+        """热更新：重新加载 Harness 工具、后端与执行策略。"""
+        config_dir = Path(config_dir)
+        return self._load_harness_tools(
+            config_dir / "harness_tools.yaml",
+            config_dir / "execution_policy.yaml",
+        )
+
+    def reload_secrets_config(
+        self, config_dir: str | Path
+    ) -> dict[str, Any]:
+        """热更新：重新加载 secrets.yaml，返回最新配置。"""
+        config_dir = Path(config_dir)
+        root = config_dir.parent
+        return self._load_secrets_config(config_dir / "secrets.yaml", root)
+
+    def reload_revocation_config(self, config_dir: str | Path) -> dict[str, Any]:
+        """热更新：重新加载 revocation.yaml。"""
+        return self._load_optional_config(Path(config_dir) / "revocation.yaml")
+
+    def _load_optional_config(self, path: Path) -> dict[str, Any]:
+        """加载可选 YAML 配置；文件缺失时保持旧版本行为。"""
+        if not path.exists():
+            return {}
+        return self._read_yaml(path)
+
+    def _load_persistence(self, path: Path) -> PersistenceConfig:
+        if not path.exists():
+            return PersistenceConfig()
+        data = self._read_yaml(path)
+        raw = data.get("persistence", data)
+        if not isinstance(raw, dict):
+            raise ConfigValidationError("persistence 配置必须是映射")
+        try:
+            config = PersistenceConfig(**raw)
+        except (ValidationError, TypeError) as exc:
+            raise ConfigValidationError(f"persistence 配置非法：{exc}") from exc
+        if config.lock_timeout_seconds <= 0:
+            raise ConfigValidationError("persistence.lock_timeout_seconds 必须大于 0")
+        return config
 
     def _load_permission_rules(self, path: Path) -> list[PermissionRule]:
         data = self._read_yaml(path)
         rules: list[PermissionRule] = []
         for item in data.get("rules", []):
-            conditions = [PermissionCondition(**c) for c in item.get("when_all", [])]
+            conditions = [
+                self._construct(
+                    path,
+                    "Permission rule condition",
+                    partial(PermissionCondition, **c),
+                )
+                for c in item.get("when_all", [])
+            ]
             rules.append(
-                PermissionRule(
-                    id=item["id"],
-                    description=item.get("description", ""),
-                    when_all=conditions,
-                    action=item["action"],
-                    reason=item.get("reason", ""),
+                self._construct(
+                    path,
+                    f"Permission rule {item.get('id', '<unknown>')}",
+                    partial(
+                        PermissionRule,
+                        id=item["id"],
+                        description=item.get("description", ""),
+                        when_all=conditions,
+                        action=item["action"],
+                        reason=item.get("reason", ""),
+                        risk_tags=item.get("risk_tags", []),
+                        score=item.get("score", 0),
+                    ),
                 )
             )
         return rules
 
+    def _load_capability_rules(self, path: Path) -> CapabilityRules:
+        """加载能力规则配置；文件缺失时返回空规则（向后兼容）。"""
+        if not path.exists():
+            return CapabilityRules(capabilities={}, combination_rules=[])
+        data = self._read_yaml(path)
+        capabilities: dict[str, CapabilityDef] = {}
+        for name, cap in (data.get("capabilities") or {}).items():
+            producers = [
+                self._construct(
+                    path,
+                    f"Capability producer for {name}",
+                    partial(
+                        CapabilityProducer,
+                        tool=p["tool"],
+                        arg_match=p.get("arg_match"),
+                        arg_not_match=p.get("arg_not_match"),
+                    ),
+                )
+                for p in cap.get("produced_by", [])
+            ]
+            capabilities[name] = self._construct(
+                path,
+                f"Capability {name}",
+                partial(CapabilityDef, name=name, produced_by=producers),
+            )
+        combination_rules: list[CapabilityCombinationRule] = []
+        for item in data.get("combination_rules", []):
+            combination_rules.append(
+                self._construct(
+                    path,
+                    f"Capability combination rule {item.get('id', '<unknown>')}",
+                    partial(
+                        CapabilityCombinationRule,
+                        id=item["id"],
+                        description=item.get("description", ""),
+                        requires_any=list(item.get("requires_any", [])),
+                        triggers_any=list(item.get("triggers_any", [])),
+                        action=item["action"],
+                        reason=item.get("reason", ""),
+                        risk_tags=list(item.get("risk_tags", [])),
+                        score=item.get("score", 0),
+                    ),
+                )
+            )
+        return self._construct(
+            path,
+            "Capability rules",
+            partial(
+                CapabilityRules,
+                capabilities=capabilities,
+                combination_rules=combination_rules,
+            ),
+        )
+
+    def _load_authority_rules(self, path: Path) -> AuthorityRules:
+        """加载动态权限规则配置；文件缺失时返回空规则（向后兼容）。"""
+        if not path.exists():
+            return AuthorityRules(enabled=False)
+        data = self._read_yaml(path)
+        grants: dict[str, AuthorityGrantRule] = {}
+        for capability, item in (data.get("authority_grants") or {}).items():
+            cond = item.get("conditions", {})
+            conditions = self._construct(
+                path,
+                f"Authority conditions for {capability}",
+                partial(
+                    AuthorityConditions,
+                    user_confirmation=cond.get("user_confirmation", False),
+                    budget_remaining=cond.get("budget_remaining"),
+                    no_recent_denials_within_steps=cond.get(
+                        "no_recent_denials_within_steps"
+                    ),
+                    require_task_context_regex=cond.get(
+                        "require_task_context_regex"
+                    ),
+                ),
+            )
+            budget_limit = self._construct(
+                path,
+                f"Authority budget limit for {capability}",
+                partial(
+                    BudgetCost,
+                    **item.get("budget_limit", {"token_count": 0}),
+                ),
+            )
+            grants[capability] = self._construct(
+                path,
+                f"Authority grant {capability}",
+                partial(
+                    AuthorityGrantRule,
+                    capability=capability,
+                    description=item.get("description", ""),
+                    conditions=conditions,
+                    max_duration_seconds=item.get("max_duration_seconds", 300),
+                    budget_limit=budget_limit,
+                ),
+            )
+        return self._construct(
+            path,
+            "Authority rules",
+            partial(AuthorityRules, enabled=data.get("enabled", True), grants=grants),
+        )
+
+    def _load_audit_rules(self, path: Path) -> AuditRules:
+        """加载审计分析规则；文件缺失时返回空规则（向后兼容）。"""
+        if not path.exists():
+            return AuditRules(enabled=False)
+        data = self._read_yaml(path)
+        rules: list[AuditRule] = []
+        for item in data.get("rules", []):
+            cond = item.get("conditions", {})
+            conditions = self._construct(
+                path,
+                f"Audit conditions for {item.get('id', '<unknown>')}",
+                partial(
+                    AuditRuleConditions,
+                    min_denies_count=cond.get("min_denies_count"),
+                    min_denies_within_seconds=cond.get("min_denies_within_seconds"),
+                    consecutive_denies=cond.get("consecutive_denies"),
+                    action_sequence=cond.get("action_sequence"),
+                    has_any_action=cond.get("has_any_action"),
+                    has_all_actions=cond.get("has_all_actions"),
+                    authority_token_exhausted=cond.get(
+                        "authority_token_exhausted", False
+                    ),
+                ),
+            )
+            rules.append(
+                self._construct(
+                    path,
+                    f"Audit rule {item.get('id', '<unknown>')}",
+                    partial(
+                        AuditRule,
+                        rule_id=item["id"],
+                        description=item.get("description", ""),
+                        severity=item.get("severity", "medium"),
+                        conditions=conditions,
+                    ),
+                )
+            )
+        return self._construct(
+            path,
+            "Audit rules",
+            partial(AuditRules, enabled=data.get("enabled", True), rules=rules),
+        )
+
     def _load_masking_rules(self, path: Path) -> MaskingRules:
         data = self._read_yaml(path)
-        patterns = [ValuePattern(**p) for p in data.get("value_patterns", [])]
-        return MaskingRules(
-            field_name_blacklist=data.get("field_name_blacklist", []),
-            value_patterns=patterns,
-            masking_applies_to=data.get("masking_applies_to", {}),
+        patterns = [
+            self._construct(
+                path,
+                f"Masking value pattern {p.get('name', '<unknown>')}",
+                partial(ValuePattern, **p),
+            )
+            for p in data.get("value_patterns", [])
+        ]
+        return self._construct(
+            path,
+            "Masking rules",
+            lambda: MaskingRules(
+                field_name_blacklist=data.get("field_name_blacklist", []),
+                value_patterns=patterns,
+                masking_applies_to=data.get("masking_applies_to", {}),
+            ),
         )
 
     def _load_approval(self, path: Path) -> ApprovalConfig:
         data = self._read_yaml(path)
-        rules = [ApprovalRule(**r) for r in data.get("rules", [])]
-        return ApprovalConfig(default=data.get("approvers", {}).get("default", ""), rules=rules)
+        rules = [
+            self._construct(
+                path,
+                f"Approval rule {r.get('tool_name', '<unknown>')}",
+                partial(ApprovalRule, **r),
+            )
+            for r in data.get("rules", [])
+        ]
+        return self._construct(
+            path,
+            "Approval config",
+            partial(
+                ApprovalConfig,
+                default=data.get("approvers", {}).get("default", ""),
+                rules=rules,
+            ),
+        )
 
     def _load_llm_planner(self, path: Path) -> LLMPlannerConfig | None:
         """加载 LLMPlanner 配置；文件缺失时返回 None 以兼容旧配置树（测试用）。"""
         if not path.exists():
             return None
         data = self._read_yaml(path)
-        return LLMPlannerConfig(**data)
+        return self._construct(
+            path, "LLM planner", partial(LLMPlannerConfig, **data)
+        )
+
+    def _load_identity_config(self, path: Path) -> dict[str, Any]:
+        """加载身份 Provider 配置；文件缺失返回空 dict（向后兼容）。"""
+        if not path.exists():
+            return {}
+        data = self._read_yaml(path)
+        return cast(dict[str, Any], data.get("identity", {}))
+
+    def _load_entrypoints_config(self, path: Path) -> dict[str, Any]:
+        """加载入口认证配置；文件缺失返回空 dict（向后兼容）。
+
+        返回整个 YAML 内容，以便同时支持 ``entrypoints.*`` 与顶层 ``admin`` 等扩展配置。
+        """
+        if not path.exists():
+            return {}
+        data = self._read_yaml(path)
+        return cast(dict[str, Any], data)
 
     # -- 7 条启动校验 -------------------------------------------------------
 
@@ -325,12 +913,38 @@ class ConfigLoader:
                     f"Agent {agent_id} 引用的 profile_id {agent.profile_id} 不存在"
                 )
 
+    def _check_interaction_profile_exists(self, config: AppConfig) -> None:
+        seen_agents: set[str] = set()
+        for profile_id, profile in config.interaction_config.profiles.items():
+            if profile.agent_id not in config.agents:
+                raise ConfigValidationError(
+                    f"InteractionProfile {profile_id} 引用的 agent_id {profile.agent_id} 不存在"
+                )
+            if profile.agent_id in seen_agents:
+                raise ConfigValidationError(
+                    f"Agent {profile.agent_id} 绑定了多个 InteractionProfile"
+                )
+            seen_agents.add(profile.agent_id)
+
+    def _check_interaction_agents_exist(self, config: AppConfig) -> None:
+        for trust in config.interaction_config.trust.values():
+            if trust.source_agent_id not in config.agents:
+                raise ConfigValidationError(
+                    f"agent_trust 引用的 source_agent_id {trust.source_agent_id} 不存在"
+                )
+
     def _check_tool_mapping(self, config: AppConfig) -> None:
+        all_tools = (
+            set(config.tool_mapping)
+            | set(config.http_tool_specs)
+            | set(config.local_function_specs)
+            | set(config.harness_tool_specs)
+        )
         for profile_id, profile in config.profiles.items():
             for tool_name in profile.tools:
-                if tool_name not in config.tool_mapping:
+                if tool_name not in all_tools:
                     raise ConfigValidationError(
-                        f"Profile {profile_id} 的工具 {tool_name} 不在 tool_mapping 中"
+                        f"Profile {profile_id} 的工具 {tool_name} 不在 tool_mapping / http_tool_specs / local_function_specs / harness_tool_specs 中"
                     )
 
     def _check_policy_loadable(self, opa_base_url: str, config: AppConfig) -> None:
@@ -348,6 +962,36 @@ class ConfigLoader:
         if not isinstance(decision, dict) or decision.get("verdict") != "deny":
             raise ConfigValidationError(
                 "OPA 试查询未返回结构合法的 deny（空 input 必须命中 default deny）"
+            )
+        interaction_configured = any(
+            (
+                config.interaction_config.profiles,
+                config.interaction_config.trust,
+                config.interaction_config.policies,
+            )
+        )
+        interaction_rego = policy_dir / "interaction" / "default.rego"
+        if not interaction_rego.exists():
+            if interaction_configured:
+                raise ConfigValidationError(
+                    f"policy_dir {policy_dir} 下缺少 interaction/default.rego"
+                )
+            return
+        try:
+            interaction_result = self._query_opa(
+                opa_base_url, "loop_controller.interaction.delegation", {}
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-closed 启动拒绝
+            raise ConfigValidationError(
+                f"interaction OPA 试查询失败（{opa_base_url}）：{exc}"
+            ) from exc
+        interaction_decision = interaction_result.get("decision", {})
+        if (
+            not isinstance(interaction_decision, dict)
+            or interaction_decision.get("verdict") != "deny"
+        ):
+            raise ConfigValidationError(
+                "interaction OPA 试查询未返回结构合法的 deny"
             )
 
     @staticmethod
@@ -370,14 +1014,25 @@ class ConfigLoader:
         return cast(dict[str, Any], result)
 
     def _check_dirs_writable(self, config: AppConfig) -> None:
-        for label, path_str in (
+        paths = [
             ("audit_log", config.audit_log_path),
             ("decision_log", config.decision_log_path),
             ("risk_state", config.risk_state_path),
             ("conversation", config.conversation_path),
             ("approval_store", config.approval_store_path),
-        ):
+            ("session", config.session_path),
+            ("task_store", config.task_store_path),
+            ("budget_ledger", config.budget_ledger_path),
+            ("reservation_store", config.reservation_store_path),
+            ("authority_log", config.authority_log_path),
+            ("alert_store", config.alert_store_path),
+        ]
+        seen: set[Path] = set()
+        for label, path_str in paths:
             path = Path(path_str)
+            if path.parent in seen:
+                continue
+            seen.add(path.parent)
             probe = path.parent / f".write_probe_{label}"
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,6 +1055,12 @@ class ConfigLoader:
                     patterns.extend(cond.history_arg_match.values())
                 if cond.current_arg_not_match:
                     patterns.extend(cond.current_arg_not_match.values())
+        for cap in config.capability_rules.capabilities.values():
+            for producer in cap.produced_by:
+                if producer.arg_match:
+                    patterns.extend(producer.arg_match.values())
+                if producer.arg_not_match:
+                    patterns.extend(producer.arg_not_match.values())
         for pattern in patterns:
             try:
                 compile_glob(pattern)
@@ -414,6 +1075,14 @@ class ConfigLoader:
                 raise ConfigValidationError(
                     f"非法掩码正则 {vp.pattern!r}：{exc}"
                 ) from exc
+        for rule in config.authority_rules.grants.values():
+            if rule.conditions.require_task_context_regex:
+                try:
+                    re.compile(rule.conditions.require_task_context_regex)
+                except re.error as exc:
+                    raise ConfigValidationError(
+                        f"非法 authority 正则 {rule.conditions.require_task_context_regex!r}：{exc}"
+                    ) from exc
 
     def _check_approver_exists(self, config: AppConfig) -> None:
         """v1.1（评审#9）校验 7：approver 存在于 users 且不等于任何 agent_id。"""
@@ -474,14 +1143,362 @@ class ConfigLoader:
             raise ValueError(f"key 长度 {len(key)} 字节，必须 ≥32 字节")
         return key
 
+    def _check_harness_config(self, config: AppConfig) -> None:
+        """校验 Harness backend/tool 引用、传输、认证与执行策略边界。"""
+        policy = config.harness_execution_policy
+        all_known_tools = (
+            set(config.tool_mapping)
+            | set(config.http_tool_specs)
+            | set(config.local_function_specs)
+            | set(config.harness_tool_specs)
+        )
+        for tool_name in policy.trusted_local_tools:
+            if tool_name not in all_known_tools:
+                raise ConfigValidationError(
+                    f"trusted_local 工具 {tool_name} 未在 tool_mapping / http_tools / local_functions / harness_tools 中注册"
+                )
+
+        for tool_name, tool_policy in policy.tools.items():
+            if tool_name not in all_known_tools:
+                raise ConfigValidationError(
+                    f"执行策略覆盖的工具 {tool_name} 未在工具注册表中注册"
+                )
+            if tool_policy.mode in ("harness_required", "harness_preferred"):
+                if tool_name not in config.harness_tool_specs:
+                    raise ConfigValidationError(
+                        f"工具 {tool_name} 模式为 {tool_policy.mode}，必须在 harness_tools 中定义"
+                    )
+
+        for tool_name, spec in config.harness_tool_specs.items():
+            if spec.harness not in config.harness_backends:
+                raise ConfigValidationError(
+                    f"Harness 工具 {tool_name} 引用的 backend {spec.harness} 不存在"
+                )
+            try:
+                json.dumps(spec.input_schema)
+                validator_for(spec.input_schema).check_schema(spec.input_schema)
+            except Exception as exc:
+                raise ConfigValidationError(
+                    f"Harness 工具 {tool_name} 的 input_schema 不是合法 JSON Schema：{exc}"
+                ) from exc
+
+        # v0.31.0：默认需要 Harness 时，非 trusted_local 工具必须存在 Harness spec。
+        harness_required_tools: set[str] = set()
+        if policy.default_mode == "harness_required":
+            for tool_name in all_known_tools:
+                if tool_name in policy.trusted_local_tools:
+                    continue
+                override: ToolExecutionPolicy | None = policy.tools.get(tool_name)
+                if override is not None and override.mode == "trusted_local":
+                    continue
+                harness_required_tools.add(tool_name)
+                if tool_name not in config.harness_tool_specs:
+                    raise ConfigValidationError(
+                        f"默认执行策略为 harness_required，工具 {tool_name} 未配置 Harness 规格且不在 trusted_local 白名单"
+                    )
+
+        # 仅当确有工具需要 Harness 时才要求 backend；全量显式 trusted_local 的开发配置可加载。
+        if harness_required_tools and not config.harness_backends:
+            raise ConfigValidationError(
+                "默认执行策略为 harness_required，但 harness_tools.yaml 未配置任何 backend"
+            )
+
+        for name, backend in config.harness_backends.items():
+            if not isinstance(backend, HTTPBackendConfig):
+                continue
+            parsed = urlparse(backend.base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ConfigValidationError(
+                    f"Harness HTTP 后端 {name} 的 base_url 必须是有效的 HTTP(S) URL"
+                )
+            loopback = parsed.hostname in {"localhost", "127.0.0.1"}
+            if parsed.scheme == "http" and not (loopback and backend.allow_insecure_http):
+                raise ConfigValidationError(
+                    f"Harness HTTP 后端 {name} 必须使用 HTTPS；仅 loopback 可显式设置 allow_insecure_http"
+                )
+            if parsed.scheme == "https" and not backend.tls.verify:
+                raise ConfigValidationError(
+                    f"Harness HTTP 后端 {name} 的生产 HTTPS 不得关闭 TLS 校验"
+                )
+            if backend.auth.type != "none":
+                env_name = backend.auth.key_env
+                if not env_name or not os.environ.get(env_name, "").strip():
+                    raise ConfigValidationError(
+                        f"Harness HTTP 后端 {name} 的认证环境变量 {env_name!r} 未设置或为空"
+                    )
+            for field_name in ("ca_file", "client_cert_file", "client_key_file"):
+                file_name = getattr(backend.tls, field_name)
+                if not file_name:
+                    continue
+                path = Path(file_name)
+                if not path.is_file() or not os.access(path, os.R_OK):
+                    raise ConfigValidationError(
+                        f"Harness HTTP 后端 {name} 的 TLS 文件 {field_name} 不存在或不可读"
+                    )
+
+    def _check_evidence_config(self, config: AppConfig) -> None:
+        """校验 v0.28 Evidence Anchor 的启动期安全边界。"""
+        evidence = config.evidence_config.get("evidence")
+        if evidence is None:
+            return
+        if not isinstance(evidence, dict):
+            raise ConfigValidationError("evidence 必须是对象")
+        evidence_enabled = evidence.get("enabled", False)
+        if not isinstance(evidence_enabled, bool):
+            raise ConfigValidationError("evidence.enabled 必须是布尔值")
+        if evidence_enabled and evidence.get("backend", "local") != "local":
+            raise ConfigValidationError("evidence.backend 当前只能是 local")
+        anchor = evidence.get("anchor")
+        if anchor is None:
+            return
+        if not isinstance(anchor, dict):
+            raise ConfigValidationError("evidence.anchor 必须是对象")
+        anchor_enabled = anchor.get("enabled", False)
+        if not isinstance(anchor_enabled, bool):
+            raise ConfigValidationError("evidence.anchor.enabled 必须是布尔值")
+        if not anchor_enabled:
+            return
+        if not evidence_enabled:
+            raise ConfigValidationError(
+                "evidence.anchor.enabled=true 时 evidence.enabled 必须为 true"
+            )
+        if anchor.get("type") != "http":
+            raise ConfigValidationError("evidence.anchor.type 当前只能是 http")
+
+        stream_id = anchor.get("stream_id")
+        if not isinstance(stream_id, str) or not stream_id.strip():
+            raise ConfigValidationError("evidence.anchor.stream_id 必须是非空字符串")
+        if (
+            stream_id != stream_id.strip()
+            or "\\" in stream_id
+            or any(part in {"", ".", ".."} for part in stream_id.split("/"))
+            or any(ord(char) < 32 for char in stream_id)
+        ):
+            raise ConfigValidationError("evidence.anchor.stream_id 包含非法路径字符")
+
+        base_url = anchor.get("base_url")
+        if not isinstance(base_url, str):
+            raise ConfigValidationError("evidence.anchor.base_url 必须是有效的 HTTPS URL")
+        parsed = urlparse(base_url)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ConfigValidationError(
+                "evidence.anchor.base_url 必须是无 userinfo、query、fragment 的 HTTPS URL"
+            )
+
+        for name in ("connect_timeout_seconds", "request_timeout_seconds"):
+            value = anchor.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 60:
+                raise ConfigValidationError(f"evidence.anchor.{name} 必须大于 0 且不超过 60 秒")
+        if isinstance(anchor.get("every_n_events"), bool) or anchor.get("every_n_events") != 1:
+            raise ConfigValidationError("evidence.anchor.every_n_events 当前必须严格等于 1")
+
+        auth = anchor.get("auth")
+        if not isinstance(auth, dict) or auth.get("type") != "bearer":
+            raise ConfigValidationError("evidence.anchor.auth.type 当前只能是 bearer")
+        token_env = auth.get("token_env")
+        if not isinstance(token_env, str) or not token_env.strip():
+            raise ConfigValidationError("evidence.anchor.auth.token_env 必须是非空环境变量名")
+        if not os.environ.get(token_env, "").strip():
+            raise ConfigValidationError(
+                f"evidence.anchor 认证环境变量 {token_env!r} 未设置或为空"
+            )
+
+        tls = anchor.get("tls")
+        if not isinstance(tls, dict) or tls.get("verify") is not True:
+            raise ConfigValidationError("evidence.anchor.tls.verify 必须为 true")
+        cert_file = tls.get("client_cert_file")
+        key_file = tls.get("client_key_file")
+        if bool(cert_file) != bool(key_file):
+            raise ConfigValidationError("evidence.anchor TLS 客户端证书和私钥必须同时配置")
+        root = Path(config.policy_dir).parent
+        for name in ("ca_file", "client_cert_file", "client_key_file"):
+            value = tls.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigValidationError(f"evidence.anchor.tls.{name} 必须是非空文件路径")
+            path = Path(value)
+            if not path.is_absolute():
+                path = root / path
+            if not path.is_file() or not os.access(path, os.R_OK):
+                raise ConfigValidationError(
+                    f"evidence.anchor TLS 文件 {name} 不存在或不可读"
+                )
+
+        receipt = anchor.get("receipt")
+        if not isinstance(receipt, dict) or receipt.get("algorithm") != "ed25519":
+            raise ConfigValidationError("evidence.anchor.receipt.algorithm 当前只能是 ed25519")
+        key_id = receipt.get("service_key_id")
+        if not isinstance(key_id, str) or not key_id.strip():
+            raise ConfigValidationError("evidence.anchor.receipt.service_key_id 必须非空")
+        public_key_file = receipt.get("public_key_file")
+        if not isinstance(public_key_file, str) or not public_key_file.strip():
+            raise ConfigValidationError("evidence.anchor.receipt.public_key_file 必须配置")
+        try:
+            self.resolve_anchor_public_key(config)
+        except ValueError:
+            raise ConfigValidationError(
+                "evidence.anchor receipt 公钥不存在、不可读或不是有效 Ed25519 公钥"
+            ) from None
+
+        startup = anchor.get("startup")
+        if not isinstance(startup, dict):
+            raise ConfigValidationError("evidence.anchor.startup 必须是对象")
+        if startup.get("unavailable_policy") != "degrade":
+            raise ConfigValidationError(
+                "evidence.anchor.startup.unavailable_policy 当前只能是 degrade"
+            )
+        if startup.get("conflict_policy") != "block_writes":
+            raise ConfigValidationError(
+                "evidence.anchor.startup.conflict_policy 当前只能是 block_writes"
+            )
+
+    @staticmethod
+    def resolve_anchor_public_key(config: AppConfig) -> Ed25519PublicKey:
+        receipt = config.evidence_config["evidence"]["anchor"]["receipt"]
+        path = Path(receipt["public_key_file"])
+        if not path.is_absolute():
+            path = Path(config.policy_dir).parent / path
+        try:
+            encoded = path.read_bytes()
+            try:
+                key = serialization.load_pem_public_key(encoded)
+            except ValueError:
+                try:
+                    key = serialization.load_ssh_public_key(encoded)
+                except ValueError:
+                    key = Ed25519PublicKey.from_public_bytes(encoded)
+        except (OSError, ValueError):
+            raise ValueError("receipt 公钥无效") from None
+        if not isinstance(key, Ed25519PublicKey):
+            raise ValueError("receipt 公钥算法不是 Ed25519")
+        return key
+
+    def _check_identity_config(self, config: AppConfig) -> None:
+        """校验 identity provider 配置，避免启动后因配置错误才发现问题。"""
+        identity = config.identity_config
+        if not identity:
+            return
+        provider = identity.get("provider", "static")
+        if provider not in {"static", "jwt", "mtls"}:
+            raise ConfigValidationError(
+                f"identity.provider 必须是 static / jwt / mtls 之一，当前值：{provider!r}"
+            )
+
+        if provider == "jwt":
+            jwt_cfg = identity.get("jwt", {})
+            if not jwt_cfg.get("issuer"):
+                raise ConfigValidationError("identity.provider=jwt 时必须配置 jwt.issuer")
+            if not jwt_cfg.get("jwks_url") and not jwt_cfg.get("public_key"):
+                raise ConfigValidationError(
+                    "identity.provider=jwt 时必须配置 jwt.jwks_url 或 jwt.public_key"
+                )
+
+        if provider == "mtls":
+            mtls_cfg = identity.get("mtls", {})
+            if not mtls_cfg.get("cert_subject_template") and not mtls_cfg.get("cert_mappings"):
+                raise ConfigValidationError(
+                    "identity.provider=mtls 时必须配置 mtls.cert_subject_template 或 mtls.cert_mappings"
+                )
+
+        if provider == "static":
+            static_cfg = identity.get("static", {})
+            tokens = static_cfg.get("allowed_tokens", [])
+            if not isinstance(tokens, list):
+                raise ConfigValidationError("identity.static.allowed_tokens 必须是列表")
+            for idx, entry in enumerate(tokens):
+                if not isinstance(entry, dict):
+                    raise ConfigValidationError(
+                        f"identity.static.allowed_tokens[{idx}] 必须是对象"
+                    )
+                for field in ("token", "agent_id", "user_id"):
+                    if not entry.get(field):
+                        raise ConfigValidationError(
+                            f"identity.static.allowed_tokens[{idx}] 缺少或空字段 {field}"
+                        )
+
+    def _check_entrypoints_config(self, config: AppConfig) -> None:
+        """校验入口认证配置，避免未知的 auth 类型或格式错误。"""
+        entrypoints = config.entrypoints_config
+        if not entrypoints:
+            return
+
+        # 兼容直接传入 inner dict 的测试/旧用法
+        inner = entrypoints.get("entrypoints", entrypoints)
+        if not isinstance(inner, dict):
+            raise ConfigValidationError("entrypoints 必须是对象")
+
+        allowed_auths = {"jwt", "mtls", "static_token", "none"}
+        for name, cfg in inner.items():
+            if not isinstance(cfg, dict):
+                raise ConfigValidationError(f"entrypoints.{name} 必须是对象")
+            auth = cfg.get("auth")
+            if auth is not None and auth not in allowed_auths:
+                raise ConfigValidationError(
+                    f"entrypoints.{name}.auth 必须是 {allowed_auths} 之一，当前值：{auth!r}"
+                )
+            require_auth = cfg.get("require_auth")
+            if require_auth is not None and not isinstance(require_auth, bool):
+                raise ConfigValidationError(
+                    f"entrypoints.{name}.require_auth 必须是布尔值"
+                )
+        # v0.33.0 admin profile 白名单
+        admin = entrypoints.get("admin")
+        if admin is None:
+            return
+        if not isinstance(admin, dict):
+            raise ConfigValidationError("admin 必须是对象")
+        profiles = admin.get("agent_profiles")
+        if profiles is not None and (
+            not isinstance(profiles, list)
+            or any(not isinstance(p, str) or not p for p in profiles)
+        ):
+            raise ConfigValidationError("admin.agent_profiles 必须是非空字符串列表")
+
     # -- 工具 ---------------------------------------------------------------
+
+    @staticmethod
+    def _construct(path: Path, context: str, build: Callable[[], T]) -> T:
+        """统一包装模型/数据类构造异常，确保启动期给出 ConfigValidationError。"""
+        try:
+            return build()
+        except (ValidationError, TypeError) as exc:
+            raise ConfigValidationError(f"{context} 配置非法：{exc}") from exc
 
     @staticmethod
     def _read_yaml(path: Path) -> dict[str, Any]:
         if not path.exists():
             raise ConfigValidationError(f"配置文件缺失：{path}")
+
+        class UniqueKeyLoader(yaml.SafeLoader):
+            pass
+
+        def construct_unique_mapping(
+            loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False
+        ) -> dict[Any, Any]:
+            mapping: dict[Any, Any] = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in mapping:
+                    raise ConfigValidationError(
+                        f"配置文件 {path} 包含重复名称 {key!r}"
+                    )
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
+
+        UniqueKeyLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            construct_unique_mapping,
+        )
         with path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+            data = yaml.load(f, Loader=UniqueKeyLoader)
         if data is None:
             return {}
         if not isinstance(data, dict):

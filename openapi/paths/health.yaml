@@ -1,0 +1,23 @@
+/health:
+  get:
+    operationId: healthCheck
+    summary: Health check
+    tags:
+      - Health
+    responses:
+      '200':
+        description: Kernel is healthy
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - protocol_version
+                - status
+              properties:
+                protocol_version:
+                  $ref: '../schemas/protocol-version.yaml'
+                status:
+                  type: string
+                  enum:
+                    - ok

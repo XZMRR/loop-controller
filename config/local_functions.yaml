@@ -1,0 +1,40 @@
+# v0.23.0 本地函数注册表示例。
+# 实际函数需要可通过 PYTHONPATH 导入；下面的 module 仅作占位，请按真实项目修改。
+tools:
+  calculate_checksum:
+    module: my_company.local_tools
+    function: calculate_file_sha256
+    description: 计算本地文件 SHA-256 校验和
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+      required: [path]
+    cost_per_call: 100
+    default_risk: medium
+    sandbox:
+      timeout_seconds: 10
+      max_output_bytes: 65536
+      allowed_paths: ["/data/input/**", "/data/output/**"]
+      env_whitelist: []
+
+  transform_data:
+    module: my_company.local_tools
+    function: transform_json_data
+    description: 对 JSON 数据做内部转换
+    input_schema:
+      type: object
+      properties:
+        data:
+          type: object
+        operation:
+          type: string
+      required: [data, operation]
+    cost_per_call: 50
+    default_risk: low
+    sandbox:
+      timeout_seconds: 30
+      max_output_bytes: 65536
+      allowed_paths: []
+      env_whitelist: []

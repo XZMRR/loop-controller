@@ -1,0 +1,16 @@
+title: ErrorResponse
+type: object
+required:
+  - protocol_version
+  - error
+  - code
+properties:
+  protocol_version:
+    $ref: './protocol-version.yaml'
+  error:
+    type: string
+    description: Human-readable error message.
+  code:
+    type: string
+    description: Stable machine-readable error code.
+description: Standard error envelope returned by all A2A endpoints.

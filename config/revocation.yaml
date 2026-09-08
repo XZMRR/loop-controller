@@ -1,0 +1,11 @@
+kill_switch:
+  enabled: false
+  reason: ""
+  except_tools:
+    - health_check
+  except_agents:
+    - admin-agent
+
+# revoked_at / expires_at 必须包含时区（例如 2026-08-28T12:00:00Z）；
+# 无时区值会被拒绝，热更新失败时保留旧内存快照。
+revocations: []

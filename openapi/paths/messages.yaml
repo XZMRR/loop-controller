@@ -1,0 +1,35 @@
+/a2a/v1/messages:
+  post:
+    operationId: sendMessage
+    summary: Send a Message between agents
+    tags:
+      - Messages
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '../schemas/message.yaml'
+    responses:
+      '200':
+        description: Message accepted
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - protocol_version
+                - accepted
+              properties:
+                protocol_version:
+                  $ref: '../schemas/protocol-version.yaml'
+                accepted:
+                  type: boolean
+                reason:
+                  type: string
+      '400':
+        description: Invalid request
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/error-response.yaml'

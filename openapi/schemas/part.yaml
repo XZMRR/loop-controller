@@ -1,0 +1,38 @@
+title: Part
+type: object
+required:
+  - type
+properties:
+  type:
+    type: string
+    enum:
+      - text
+      - data
+description: A fragment of a Message; exactly one of text or data is present.
+oneOf:
+  - title: TextPart
+    type: object
+    required:
+      - type
+      - text
+    properties:
+      type:
+        type: string
+        enum:
+          - text
+      text:
+        type: string
+    additionalProperties: false
+  - title: DataPart
+    type: object
+    required:
+      - type
+      - data
+    properties:
+      type:
+        type: string
+        enum:
+          - data
+      data:
+        description: Arbitrary JSON value; must not be a double-encoded JSON string.
+    additionalProperties: false
