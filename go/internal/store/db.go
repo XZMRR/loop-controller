@@ -22,6 +22,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     decision_id TEXT NOT NULL DEFAULT '',
     root_interaction_id TEXT NOT NULL DEFAULT '',
     parent_interaction_id TEXT NOT NULL DEFAULT '',
+    root_task_id TEXT NOT NULL DEFAULT '',
+    parent_task_id TEXT NOT NULL DEFAULT '',
+    delegation_depth INTEGER NOT NULL DEFAULT 0,
+    deadline TEXT,
+    budget_token_count INTEGER NOT NULL DEFAULT 0 CHECK (budget_token_count >= 0),
+    budget_payment_amount REAL NOT NULL DEFAULT 0 CHECK (budget_payment_amount >= 0),
+    budget_currency TEXT NOT NULL DEFAULT '',
+    reserved_token_count INTEGER NOT NULL DEFAULT 0 CHECK (reserved_token_count >= 0),
+    reserved_payment_amount REAL NOT NULL DEFAULT 0 CHECK (reserved_payment_amount >= 0),
+    consumed_token_count INTEGER NOT NULL DEFAULT 0 CHECK (consumed_token_count >= 0),
+    consumed_payment_amount REAL NOT NULL DEFAULT 0 CHECK (consumed_payment_amount >= 0),
+    allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+    allowed_capabilities_json TEXT NOT NULL DEFAULT '[]',
+    allow_redelegation INTEGER NOT NULL DEFAULT 0,
     initiator_agent_id TEXT NOT NULL,
     target_agent_id TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending','accepted','running','completed','failed','cancelled','outcome_unknown')),
@@ -71,6 +85,7 @@ CREATE TABLE IF NOT EXISTS lifecycle_outbox (
     delivered_at TEXT,
     last_error TEXT,
     claimed_by TEXT NOT NULL DEFAULT '',
+    claim_token TEXT NOT NULL DEFAULT '',
     claim_expires_at INTEGER NOT NULL DEFAULT 0,
     UNIQUE(task_id, event)
 );
@@ -87,6 +102,73 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     locked INTEGER DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at);
+
+CREATE TABLE IF NOT EXISTS delegation_approvals (
+    approval_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    decision_id TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL,
+    initiator_agent_id TEXT NOT NULL,
+    target_agent_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    root_task_id TEXT NOT NULL DEFAULT '',
+    parent_task_id TEXT NOT NULL DEFAULT '',
+    delegation_depth INTEGER NOT NULL DEFAULT 0,
+    effective_args_json TEXT NOT NULL,
+    allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+    allowed_capabilities_json TEXT NOT NULL DEFAULT '[]',
+    allow_redelegation INTEGER NOT NULL DEFAULT 0,
+    budget_token_count INTEGER NOT NULL DEFAULT 0,
+    budget_payment_amount REAL NOT NULL DEFAULT 0,
+    budget_currency TEXT NOT NULL DEFAULT '',
+    task_deadline TEXT,
+    expires_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending','approved','consumed','rejected','expired','cancelled')),
+    approver_id TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    decided_at TEXT,
+    task_id TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    action_request_id TEXT NOT NULL DEFAULT '',
+    action_hash TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_delegation_approvals_expiry ON delegation_approvals(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_delegation_approvals_initiator ON delegation_approvals(initiator_agent_id, approval_id);
+
+CREATE TABLE IF NOT EXISTS approval_audit_outbox (
+    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    approval_id TEXT NOT NULL REFERENCES delegation_approvals(approval_id),
+    event TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    delivered_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    claimed_by TEXT NOT NULL DEFAULT '',
+    claim_token TEXT NOT NULL DEFAULT '',
+    claim_expires_at INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(approval_id, event)
+);
+CREATE INDEX IF NOT EXISTS idx_approval_audit_due ON approval_audit_outbox(delivered_at, next_attempt_at, outbox_id);
+
+CREATE TABLE IF NOT EXISTS delegation_dispatch_outbox (
+    delivery_id TEXT PRIMARY KEY,
+    approval_id TEXT NOT NULL UNIQUE REFERENCES delegation_approvals(approval_id),
+    task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id),
+    entrypoint_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    delivered_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    claimed_by TEXT NOT NULL DEFAULT '',
+    claim_token TEXT NOT NULL DEFAULT '',
+    claim_expires_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_delegation_dispatch_due ON delegation_dispatch_outbox(delivered_at, next_attempt_at, delivery_id);
 
 CREATE TABLE IF NOT EXISTS agents (
     agent_id TEXT PRIMARY KEY,
@@ -156,19 +238,23 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
-	for _, column := range []string{"interaction_id", "decision_id", "root_interaction_id", "parent_interaction_id", "delegation_token"} {
+	for _, column := range []string{"interaction_id", "decision_id", "root_interaction_id", "parent_interaction_id", "root_task_id", "parent_task_id", "budget_currency", "delegation_token", "allowed_tools_json", "allowed_capabilities_json"} {
 		if err := ensureTaskTextColumn(ctx, db, column); err != nil {
 			db.Close()
 			return nil, err
 		}
 	}
-	for _, column := range []string{"exec_owner", "exec_lease_expires_at"} {
+	for _, column := range []string{"delegation_depth", "budget_token_count", "budget_payment_amount", "reserved_token_count", "reserved_payment_amount", "consumed_token_count", "consumed_payment_amount", "allow_redelegation", "exec_owner", "exec_lease_expires_at"} {
 		if err := ensureTaskColumn(ctx, db, column); err != nil {
 			db.Close()
 			return nil, err
 		}
 	}
-	for _, column := range []string{"claimed_by", "claim_expires_at"} {
+	if err := ensureColumn(ctx, db, "tasks", "deadline", "TEXT"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	for _, column := range []string{"claimed_by", "claim_token", "claim_expires_at"} {
 		if err := ensureOutboxColumn(ctx, db, column); err != nil {
 			db.Close()
 			return nil, err
@@ -205,7 +291,7 @@ func ensureTaskTextColumn(ctx context.Context, db *sql.DB, column string) error 
 }
 
 // ensureColumn adds a column to a table if it is absent. decl must be a full
-// SQLite column declaration such as "TEXT NOT NULL DEFAULT ''".
+// SQLite column declaration such as "TEXT NOT NULL DEFAULT ”".
 func ensureColumn(ctx context.Context, db *sql.DB, table, column, decl string) error {
 	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
 	if err != nil {
@@ -237,7 +323,11 @@ func ensureTaskColumn(ctx context.Context, db *sql.DB, column string) error {
 	switch column {
 	case "exec_owner":
 		return ensureColumn(ctx, db, "tasks", column, "TEXT NOT NULL DEFAULT ''")
-	case "exec_lease_expires_at":
+	case "delegation_depth", "allow_redelegation":
+		return ensureColumn(ctx, db, "tasks", column, "INTEGER NOT NULL DEFAULT 0")
+	case "budget_payment_amount", "reserved_payment_amount", "consumed_payment_amount":
+		return ensureColumn(ctx, db, "tasks", column, "REAL NOT NULL DEFAULT 0")
+	case "budget_token_count", "reserved_token_count", "consumed_token_count", "exec_lease_expires_at":
 		return ensureColumn(ctx, db, "tasks", column, "INTEGER NOT NULL DEFAULT 0")
 	}
 	return ensureColumn(ctx, db, "tasks", column, "TEXT NOT NULL DEFAULT ''")

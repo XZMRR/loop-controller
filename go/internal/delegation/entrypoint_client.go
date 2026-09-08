@@ -52,6 +52,9 @@ func (c *HTTPEntrypointClient) Dispatch(ctx context.Context, entrypoint models.A
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+req.DelegationToken)
+	if req.DeliveryID != "" {
+		httpReq.Header.Set("Idempotency-Key", req.DeliveryID)
+	}
 	client := c.Client
 	if client == nil {
 		client = http.DefaultClient

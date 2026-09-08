@@ -33,7 +33,7 @@ type EventFanout interface {
 }
 
 type LifecycleAuditor interface {
-	RecordLifecycle(context.Context, models.Task, string) error
+	RecordLifecycle(context.Context, models.Task, string, string) error
 }
 
 type Manager struct {
@@ -55,6 +55,17 @@ func (m *Manager) WithInstanceID(id string) *Manager {
 	return m
 }
 
+func (m *Manager) DelegationApprovalStore() store.DelegationApprovalStore {
+	if provider, ok := m.store.(interface {
+		DelegationApprovalStore() store.DelegationApprovalStore
+	}); ok {
+		return provider.DelegationApprovalStore()
+	}
+	return nil
+}
+
+func (m *Manager) InstanceID() string { return m.instanceID }
+
 // WithEventFanout delivers task events after their transaction commits.
 func (m *Manager) WithEventFanout(fanout EventFanout) *Manager {
 	m.fanout = fanout
@@ -71,7 +82,7 @@ func (m *Manager) RecordLifecycle(ctx context.Context, task models.Task, lifecyc
 		return err
 	}
 	if m.auditor != nil {
-		return m.auditor.RecordLifecycle(ctx, task, lifecycle)
+		return m.auditor.RecordLifecycle(ctx, task, lifecycle, fmt.Sprintf("lifecycle:%s:%s", task.TaskID, lifecycle))
 	}
 	return nil
 }
@@ -90,10 +101,7 @@ func (m *Manager) CreateReliable(sessionID, initiatorAgentID, targetAgentID stri
 
 // CreateInteraction creates a task bound to its interaction authorization.
 func (m *Manager) CreateInteraction(sessionID, initiatorAgentID, targetAgentID, interactionID, decisionID, rootInteractionID, parentInteractionID string) (models.Task, error) {
-	now := time.Now().UTC()
-	task := models.Task{
-		ProtocolVersion:     models.CurrentProtocolVersion,
-		TaskID:              m.generateID(),
+	return m.CreateInteractionTask(models.Task{
 		SessionID:           sessionID,
 		InteractionID:       interactionID,
 		DecisionID:          decisionID,
@@ -101,11 +109,24 @@ func (m *Manager) CreateInteraction(sessionID, initiatorAgentID, targetAgentID, 
 		ParentInteractionID: parentInteractionID,
 		InitiatorAgentID:    initiatorAgentID,
 		TargetAgentID:       targetAgentID,
-		Status:              "pending",
-		CreatedAt:           now,
-		UpdatedAt:           now,
+	})
+}
+
+// CreateInteractionTask creates a task with kernel-derived delegation linkage.
+func (m *Manager) CreateInteractionTask(task models.Task) (models.Task, error) {
+	now := time.Now().UTC()
+	task.ProtocolVersion = models.CurrentProtocolVersion
+	task.TaskID = m.generateID()
+	task.Status = "pending"
+	task.CreatedAt = now
+	task.UpdatedAt = now
+	var event models.TaskEvent
+	var err error
+	if task.ParentTaskID == "" {
+		event, err = m.store.CreateWithEvent(context.Background(), task)
+	} else {
+		event, err = m.store.CreateChildWithBudget(context.Background(), task)
 	}
-	event, err := m.store.CreateWithEvent(context.Background(), task)
 	if err != nil {
 		return models.Task{}, fmt.Errorf("persist task and created event: %w", err)
 	}
@@ -145,6 +166,23 @@ func (m *Manager) UpdateStatusFrom(taskID, expectedStatus, status string) (model
 // may enter this recoverable state.
 func (m *Manager) MarkOutcomeUnknown(taskID string) (models.Task, error) {
 	return m.updateStatus(taskID, "running", "outcome_unknown", nil, "")
+}
+
+func (m *Manager) ListDescendants(ctx context.Context, taskID string) ([]models.Task, error) {
+	return m.store.ListDescendants(ctx, taskID)
+}
+
+func (m *Manager) CancelDescendants(ctx context.Context, taskID string) ([]models.Task, error) {
+	cancelled, err := m.store.CancelDescendants(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if m.fanout != nil {
+		for _, t := range cancelled {
+			m.fanout.PublishCommitted(models.TaskEvent{ProtocolVersion: models.CurrentProtocolVersion, TaskID: t.TaskID, EventType: "task_cancelled", PublishedAt: t.UpdatedAt})
+		}
+	}
+	return cancelled, nil
 }
 
 func (m *Manager) updateStatus(taskID, expectedStatus, status string, outcome json.RawMessage, errorCode string) (models.Task, error) {
@@ -212,6 +250,10 @@ func (m *Manager) CreateWithID(taskID, sessionID, initiatorAgentID, targetAgentI
 
 // CreateWithInteractionID creates a target-side task retaining authorization linkage.
 func (m *Manager) CreateWithInteractionID(taskID, sessionID, initiatorAgentID, targetAgentID, interactionID, decisionID, rootInteractionID, parentInteractionID string) (models.Task, error) {
+	return m.CreateWithDelegation(taskID, sessionID, initiatorAgentID, targetAgentID, interactionID, decisionID, rootInteractionID, parentInteractionID, "", "", 0, nil)
+}
+
+func (m *Manager) CreateWithDelegation(taskID, sessionID, initiatorAgentID, targetAgentID, interactionID, decisionID, rootInteractionID, parentInteractionID, rootTaskID, parentTaskID string, delegationDepth int, deadline *time.Time, scope ...any) (models.Task, error) {
 	now := time.Now().UTC()
 	task := models.Task{
 		ProtocolVersion:     models.CurrentProtocolVersion,
@@ -221,11 +263,23 @@ func (m *Manager) CreateWithInteractionID(taskID, sessionID, initiatorAgentID, t
 		DecisionID:          decisionID,
 		RootInteractionID:   rootInteractionID,
 		ParentInteractionID: parentInteractionID,
+		RootTaskID:          rootTaskID,
+		ParentTaskID:        parentTaskID,
+		DelegationDepth:     delegationDepth,
+		Deadline:            deadline,
 		InitiatorAgentID:    initiatorAgentID,
 		TargetAgentID:       targetAgentID,
 		Status:              "pending",
 		CreatedAt:           now,
 		UpdatedAt:           now,
+	}
+	if len(scope) >= 3 {
+		task.AllowedTools, _ = scope[0].([]string)
+		task.AllowedCapabilities, _ = scope[1].([]string)
+		task.AllowRedelegation, _ = scope[2].(bool)
+	}
+	if len(scope) >= 4 {
+		task.Budget, _ = scope[3].(models.DelegationBudget)
 	}
 	event, err := m.store.CreateWithEvent(context.Background(), task)
 	if err != nil {
@@ -240,6 +294,13 @@ func (m *Manager) CreateWithInteractionID(taskID, sessionID, initiatorAgentID, t
 // Complete transitions a task to a terminal completed/failed state and stores
 // the outcome or error code.
 func (m *Manager) Complete(taskID, status string, outcome json.RawMessage, errorCode string) (models.Task, error) {
+	return m.CompleteWithConsumption(taskID, status, outcome, errorCode, models.DelegationBudget{})
+}
+
+// CompleteWithConsumption settles a child reservation using measured consumption.
+// A zero value means no measured consumption; the assigned envelope is never
+// treated as actual consumption.
+func (m *Manager) CompleteWithConsumption(taskID, status string, outcome json.RawMessage, errorCode string, consumed models.DelegationBudget) (models.Task, error) {
 	if status != "completed" && status != "failed" {
 		return models.Task{}, ErrInvalidStatus
 	}
@@ -247,10 +308,29 @@ func (m *Manager) Complete(taskID, status string, outcome json.RawMessage, error
 	if err != nil {
 		return models.Task{}, ErrTaskNotFound
 	}
+	if current.Status == status {
+		return current, nil
+	}
 	if current.Status != "running" && current.Status != "outcome_unknown" {
 		return models.Task{}, ErrInvalidStatus
 	}
-	return m.updateStatus(taskID, current.Status, status, outcome, errorCode)
+	updated, event, err := m.store.UpdateStatusWithConsumption(context.Background(), taskID, current.Status, status, outcome, errorCode, consumed)
+	if errors.Is(err, store.ErrStatusConflict) {
+		settled, getErr := m.store.Get(context.Background(), taskID)
+		if getErr == nil && settled.Status == status {
+			return settled, nil
+		}
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrStatusConflict) || errors.Is(err, store.ErrInvalidTransition) || errors.Is(err, store.ErrBudgetExceeded) {
+			return models.Task{}, ErrInvalidStatus
+		}
+		return models.Task{}, ErrTaskNotFound
+	}
+	if m.fanout != nil {
+		m.fanout.PublishCommitted(event)
+	}
+	return updated, nil
 }
 
 func expectedStatusFor(status string) (string, bool) {

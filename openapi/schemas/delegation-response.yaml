@@ -3,15 +3,27 @@ type: object
 required:
   - protocol_version
   - allowed
+  - verdict
   - reason
 properties:
   protocol_version:
     $ref: './protocol-version.yaml'
   allowed:
     type: boolean
+  verdict:
+    type: string
+    enum:
+      - allow
+      - modify
+      - deny
+      - require_approval
   decision_id:
     type: string
     pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  approval_id:
+    type: string
+    pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+    description: Stable approval identifier returned for require_approval.
   task_id:
     type: string
     pattern: '^[a-zA-Z0-9_.-]{1,128}$'
@@ -30,6 +42,15 @@ properties:
         format: uri
   delegation_token:
     type: string
+  original_args:
+    type: object
+    additionalProperties: true
+  modified_args:
+    type: object
+    additionalProperties: true
+  effective_args:
+    type: object
+    additionalProperties: true
   reason:
     type: string
 description: Result of a delegation authorization request.

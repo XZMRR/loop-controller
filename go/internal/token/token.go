@@ -18,17 +18,32 @@ import (
 
 // DelegationClaims holds the claims embedded in a delegation token.
 type DelegationClaims struct {
-	RequestID        string `json:"request_id"`
-	InitiatorAgentID string `json:"initiator_agent_id"`
-	TargetAgentID    string `json:"target_agent_id"`
-	ToolName         string `json:"tool_name"`
-	TaskID           string `json:"task_id"`
-	TokenID          string `json:"jti"`
-	IssuedAt         int64  `json:"iat"`
-	Issuer           string `json:"iss"`
-	Audience         string `json:"aud"`
-	ArgumentsSHA256  string `json:"arguments_sha256"`
-	ExpiresAt        int64  `json:"exp"`
+	RequestID           string   `json:"request_id"`
+	SessionID           string   `json:"session_id"`
+	InteractionID       string   `json:"interaction_id"`
+	DecisionID          string   `json:"decision_id"`
+	RootInteractionID   string   `json:"root_interaction_id,omitempty"`
+	ParentInteractionID string   `json:"parent_interaction_id,omitempty"`
+	InitiatorAgentID    string   `json:"initiator_agent_id"`
+	TargetAgentID       string   `json:"target_agent_id"`
+	ToolName            string   `json:"tool_name"`
+	TaskID              string   `json:"task_id"`
+	TokenID             string   `json:"jti"`
+	IssuedAt            int64    `json:"iat"`
+	Issuer              string   `json:"iss"`
+	Audience            string   `json:"aud"`
+	ArgumentsSHA256     string   `json:"arguments_sha256"`
+	AllowedTools        []string `json:"allowed_tools"`
+	AllowedCapabilities []string `json:"allowed_capabilities"`
+	AllowRedelegation   bool     `json:"allow_redelegation"`
+	RootTaskID          string   `json:"root_task_id,omitempty"`
+	ParentTaskID        string   `json:"parent_task_id,omitempty"`
+	DelegationDepth     int      `json:"delegation_depth"`
+	Deadline            int64    `json:"deadline,omitempty"`
+	BudgetTokenCount    int64    `json:"budget_token_count"`
+	BudgetPaymentAmount float64  `json:"budget_payment_amount"`
+	BudgetCurrency      string   `json:"budget_currency,omitempty"`
+	ExpiresAt           int64    `json:"exp"`
 }
 
 // HMACIssuer issues and validates HMAC-SHA256 tokens.

@@ -12,10 +12,12 @@ import (
 
 // LifecycleOutboxItem is a lifecycle audit notification awaiting delivery.
 type LifecycleOutboxItem struct {
-	ID       int64
-	Task     models.Task
-	Event    string
-	Attempts int
+	ID         int64
+	EventID    string
+	Task       models.Task
+	Event      string
+	Attempts   int
+	ClaimToken string
 }
 
 // LifecycleOutboxStore persists and acknowledges lifecycle audit deliveries.
@@ -25,8 +27,8 @@ type LifecycleOutboxStore interface {
 	// concurrent instances sharing the same database cannot deliver the same
 	// notification twice.
 	ClaimDue(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) ([]LifecycleOutboxItem, error)
-	MarkDelivered(ctx context.Context, id int64, deliveredAt time.Time) error
-	MarkFailed(ctx context.Context, id int64, nextAttemptAt time.Time, lastError string) error
+	MarkDelivered(ctx context.Context, id int64, claimToken string, deliveredAt time.Time) error
+	MarkFailed(ctx context.Context, id int64, claimToken string, nextAttemptAt time.Time, lastError string) error
 }
 
 type lifecycleOutboxStore struct {
@@ -36,14 +38,14 @@ type lifecycleOutboxStore struct {
 
 // LifecycleAuditor delivers one lifecycle notification to the audit service.
 type LifecycleAuditor interface {
-	RecordLifecycle(context.Context, models.Task, string) error
+	RecordLifecycle(context.Context, models.Task, string, string) error
 }
 
 // LifecycleOutboxDispatcher retries durable lifecycle notifications until delivery.
 type LifecycleOutboxDispatcher struct {
-	store        LifecycleOutboxStore
-	auditor      LifecycleAuditor
-	pollInterval time.Duration
+	store         LifecycleOutboxStore
+	auditor       LifecycleAuditor
+	pollInterval  time.Duration
 	leaseDuration time.Duration
 }
 
@@ -53,9 +55,9 @@ func NewLifecycleOutboxDispatcher(outbox LifecycleOutboxStore, auditor Lifecycle
 		pollInterval = time.Second
 	}
 	return &LifecycleOutboxDispatcher{
-		store:        outbox,
-		auditor:      auditor,
-		pollInterval: pollInterval,
+		store:         outbox,
+		auditor:       auditor,
+		pollInterval:  pollInterval,
 		leaseDuration: 30 * time.Second,
 	}
 }
@@ -82,14 +84,14 @@ func (d *LifecycleOutboxDispatcher) RunOnce(ctx context.Context, now time.Time) 
 		return err
 	}
 	for _, item := range items {
-		if err := d.auditor.RecordLifecycle(ctx, item.Task, item.Event); err != nil {
+		if err := d.auditor.RecordLifecycle(ctx, item.Task, item.Event, item.EventID); err != nil {
 			nextAttempt := now.Add(retryDelay(item.Attempts + 1))
-			if markErr := d.store.MarkFailed(ctx, item.ID, nextAttempt, err.Error()); markErr != nil {
+			if markErr := d.store.MarkFailed(ctx, item.ID, item.ClaimToken, nextAttempt, err.Error()); markErr != nil {
 				return markErr
 			}
 			continue
 		}
-		if err := d.store.MarkDelivered(ctx, item.ID, now); err != nil {
+		if err := d.store.MarkDelivered(ctx, item.ID, item.ClaimToken, now); err != nil {
 			return err
 		}
 	}
@@ -132,9 +134,10 @@ func (s *lifecycleOutboxStore) ClaimDue(ctx context.Context, now time.Time, leas
 		leaseDuration = 30 * time.Second
 	}
 	claimExpiresAt := now.Add(leaseDuration).UnixNano()
+	claimToken := fmt.Sprintf("%s:%d", s.owner, now.UnixNano())
 	rows, err := s.db.QueryContext(ctx, `
 		UPDATE lifecycle_outbox
-		SET claimed_by = ?, claim_expires_at = ?
+		SET claimed_by = ?, claim_token = ?, claim_expires_at = ?
 		WHERE outbox_id IN (
 			SELECT outbox_id FROM lifecycle_outbox
 			WHERE delivered_at IS NULL
@@ -143,8 +146,8 @@ func (s *lifecycleOutboxStore) ClaimDue(ctx context.Context, now time.Time, leas
 			ORDER BY outbox_id ASC
 			LIMIT ?
 		)
-		RETURNING outbox_id, payload_json, event, attempts
-	`, s.owner, claimExpiresAt, now.Format(time.RFC3339Nano), now.UnixNano(), limit)
+		RETURNING outbox_id, payload_json, event, attempts, claim_token
+	`, s.owner, claimToken, claimExpiresAt, now.Format(time.RFC3339Nano), now.UnixNano(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("claim due lifecycle outbox: %w", err)
 	}
@@ -153,12 +156,13 @@ func (s *lifecycleOutboxStore) ClaimDue(ctx context.Context, now time.Time, leas
 	for rows.Next() {
 		var item LifecycleOutboxItem
 		var payload string
-		if err := rows.Scan(&item.ID, &payload, &item.Event, &item.Attempts); err != nil {
+		if err := rows.Scan(&item.ID, &payload, &item.Event, &item.Attempts, &item.ClaimToken); err != nil {
 			return nil, fmt.Errorf("scan lifecycle outbox: %w", err)
 		}
 		if err := json.Unmarshal([]byte(payload), &item.Task); err != nil {
 			return nil, fmt.Errorf("decode lifecycle outbox payload: %w", err)
 		}
+		item.EventID = fmt.Sprintf("lifecycle:%s:%s", item.Task.TaskID, item.Event)
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -167,24 +171,30 @@ func (s *lifecycleOutboxStore) ClaimDue(ctx context.Context, now time.Time, leas
 	return items, nil
 }
 
-func (s *lifecycleOutboxStore) MarkDelivered(ctx context.Context, id int64, deliveredAt time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE lifecycle_outbox SET delivered_at = ?, attempts = attempts + 1, last_error = NULL, claimed_by = '', claim_expires_at = 0
-		WHERE outbox_id = ? AND claimed_by = ? AND delivered_at IS NULL
-	`, deliveredAt.Format(time.RFC3339Nano), id, s.owner)
+func (s *lifecycleOutboxStore) MarkDelivered(ctx context.Context, id int64, claimToken string, deliveredAt time.Time) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE lifecycle_outbox SET delivered_at = ?, attempts = attempts + 1, last_error = NULL, claimed_by = '', claim_token = '', claim_expires_at = 0
+		WHERE outbox_id = ? AND claimed_by = ? AND claim_token = ? AND delivered_at IS NULL
+	`, deliveredAt.Format(time.RFC3339Nano), id, s.owner, claimToken)
 	if err != nil {
 		return fmt.Errorf("mark lifecycle outbox delivered: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrDispatchClaimLost
 	}
 	return nil
 }
 
-func (s *lifecycleOutboxStore) MarkFailed(ctx context.Context, id int64, nextAttemptAt time.Time, lastError string) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE lifecycle_outbox SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, claimed_by = '', claim_expires_at = 0
-		WHERE outbox_id = ? AND claimed_by = ? AND delivered_at IS NULL
-	`, nextAttemptAt.Format(time.RFC3339Nano), lastError, id, s.owner)
+func (s *lifecycleOutboxStore) MarkFailed(ctx context.Context, id int64, claimToken string, nextAttemptAt time.Time, lastError string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE lifecycle_outbox SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, claimed_by = '', claim_token = '', claim_expires_at = 0
+		WHERE outbox_id = ? AND claimed_by = ? AND claim_token = ? AND delivered_at IS NULL
+	`, nextAttemptAt.Format(time.RFC3339Nano), lastError, id, s.owner, claimToken)
 	if err != nil {
 		return fmt.Errorf("mark lifecycle outbox failed: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrDispatchClaimLost
 	}
 	return nil
 }

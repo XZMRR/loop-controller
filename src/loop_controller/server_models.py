@@ -20,6 +20,12 @@ class GovernToolRequest(BaseModel):
     task_context: str = Field(default="", description="任务上下文")
     session_id: str | None = Field(default=None, description="可选 Session ID")
     task_id: str | None = Field(default=None, description="可选 Task ID")
+    allowed_tools: list[str] | None = Field(default=None, description="委托 token 允许的工具")
+    allowed_capabilities: list[str] | None = Field(
+        default=None, description="委托 token 允许的能力"
+    )
+    allow_redelegation: bool = Field(default=False, description="是否允许再次委托")
+    deadline: datetime | None = Field(default=None, description="任务执行截止时间")
 
 
 class ResumeApprovalRequest(BaseModel):

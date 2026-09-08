@@ -12,18 +12,23 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 const maxResponseBytes = 1 << 20
 
 // Request contains the persisted execution scope of a delegated task.
 type Request struct {
-	TaskID           string
-	SessionID        string
-	InitiatorAgentID string
-	TargetAgentID    string
-	ToolName         string
-	Arguments        json.RawMessage
+	TaskID              string
+	SessionID           string
+	InitiatorAgentID    string
+	TargetAgentID       string
+	ToolName            string
+	Arguments           json.RawMessage
+	AllowedTools        []string
+	AllowedCapabilities []string
+	AllowRedelegation   bool
+	Deadline            *time.Time
 }
 
 // Result is the terminal outcome returned by a target executor.
@@ -47,8 +52,9 @@ type TargetExecutor interface {
 
 // HTTPExecutor dispatches execution through the Python tool-governance HTTP API.
 type HTTPExecutor struct {
-	BaseURL string
-	Client  *http.Client
+	BaseURL     string
+	BearerToken string
+	Client      *http.Client
 }
 
 type httpHandle struct {
@@ -69,6 +75,9 @@ func (h *httpHandle) Cancel() bool {
 
 // Start begins an HTTP tool call without tying its lifetime to the start request.
 func (e *HTTPExecutor) Start(parent context.Context, req Request) (Handle, error) {
+	if req.Deadline != nil && !req.Deadline.After(time.Now().UTC()) {
+		return nil, fmt.Errorf("task deadline has expired")
+	}
 	base, err := url.Parse(strings.TrimRight(e.BaseURL, "/"))
 	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
 		return nil, fmt.Errorf("invalid HTTP executor base URL")
@@ -80,19 +89,30 @@ func (e *HTTPExecutor) Start(parent context.Context, req Request) (Handle, error
 		return nil, fmt.Errorf("decode execution arguments: %w", err)
 	}
 	body, err := json.Marshal(map[string]any{
-		"agent_id":     req.TargetAgentID,
-		"user_id":      req.InitiatorAgentID,
-		"tool_name":    req.ToolName,
-		"arguments":    arguments,
-		"session_id":   req.SessionID,
-		"task_id":      req.TaskID,
-		"task_context": "delegated task " + req.TaskID,
+		"agent_id":             req.TargetAgentID,
+		"user_id":              req.InitiatorAgentID,
+		"tool_name":            req.ToolName,
+		"arguments":            arguments,
+		"session_id":           req.SessionID,
+		"task_id":              req.TaskID,
+		"task_context":         "delegated task " + req.TaskID,
+		"allowed_tools":        req.AllowedTools,
+		"allowed_capabilities": req.AllowedCapabilities,
+		"allow_redelegation":   req.AllowRedelegation,
+		"deadline":             req.Deadline,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal execution request: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	baseCtx := context.WithoutCancel(parent)
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if req.Deadline != nil {
+		ctx, cancel = context.WithDeadline(baseCtx, *req.Deadline)
+	} else {
+		ctx, cancel = context.WithCancel(baseCtx)
+	}
 	handle := &httpHandle{cancel: cancel, done: make(chan Result, 1), stopped: make(chan struct{})}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base.String(), bytes.NewReader(body))
 	if err != nil {
@@ -100,6 +120,9 @@ func (e *HTTPExecutor) Start(parent context.Context, req Request) (Handle, error
 		return nil, fmt.Errorf("create execution request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if e.BearerToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+e.BearerToken)
+	}
 	go e.run(ctx, httpReq, handle)
 	return handle, nil
 }
@@ -122,6 +145,9 @@ func (e *HTTPExecutor) run(ctx context.Context, req *http.Request, handle *httpH
 			// 已经写出则无法确认远端是否已开始执行，交由调用方判定 outcome_unknown。
 			if !wroteRequest {
 				handle.cancelConfirmed = true
+				handle.done <- Result{Status: "failed", ErrorCode: "execution_deadline_exceeded"}
+			} else {
+				handle.done <- Result{Status: "failed", ErrorCode: "execution_deadline_exceeded", MayBeSent: true}
 			}
 			return
 		}

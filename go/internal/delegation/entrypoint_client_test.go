@@ -53,8 +53,8 @@ func (f entrypointRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, e
 
 func TestHTTPEntrypointClientDispatchErrorTracksWhetherRequestWasSent(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		wrote      bool
+		name      string
+		wrote     bool
 		mayBeSent bool
 	}{
 		{name: "connection failure", wrote: false, mayBeSent: false},

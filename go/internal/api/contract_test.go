@@ -17,7 +17,7 @@ func loadFixture(t *testing.T) map[string]json.RawMessage {
 		t.Fatalf("getwd: %v", err)
 	}
 	// go/internal/api -> project root -> contract
-	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.45.0.json")
+	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.48.0.json")
 	data, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
@@ -34,13 +34,13 @@ func TestCheckProtocolVersion(t *testing.T) {
 		version string
 		wantErr bool
 	}{
-		{"0.45.0", false},
-		{"0.45.1", false},
-		{"0.45.99", false},
+		{"0.48.0", false},
+		{"0.48.1", false},
+		{"0.48.99", false},
 		{"", true},
-		{"0.45", true},
-		{"0.45.0.0", true},
-		{"v0.45.0", true},
+		{"0.46", true},
+		{"0.48.0.0", true},
+		{"v0.48.0", true},
 		{"0.44.1", true},
 		{"0.44.0", true},
 		{"not-a-version", true},
@@ -223,6 +223,21 @@ func TestContractFixture_DecodeDelegation(t *testing.T) {
 		t.Errorf("arguments is not valid JSON: %s", req.Arguments)
 	}
 
+	var approval models.DelegationApproval
+	if err := json.Unmarshal(fixture["delegation_approval"], &approval); err != nil {
+		t.Fatalf("unmarshal delegation_approval: %v", err)
+	}
+	if approval.ApprovalID != "approval-001" || len(approval.EffectiveArgs) != 0 {
+		t.Fatalf("approval public contract leaked arguments or mismatched: %+v", approval)
+	}
+	assertCanonicalRoundTrip(t, fixture["delegation_approval"], approval)
+
+	var action models.ApprovalActionRequest
+	if err := json.Unmarshal(fixture["approval_action_request"], &action); err != nil {
+		t.Fatalf("unmarshal approval_action_request: %v", err)
+	}
+	assertCanonicalRoundTrip(t, fixture["approval_action_request"], action)
+
 	var resp models.DelegationResponse
 	if err := json.Unmarshal(fixture["delegation_response"], &resp); err != nil {
 		t.Fatalf("unmarshal delegation_response: %v", err)
@@ -233,4 +248,5 @@ func TestContractFixture_DecodeDelegation(t *testing.T) {
 	if resp.TargetEntrypoint.Type != "http" {
 		t.Errorf("target_entrypoint.type = %q, want http", resp.TargetEntrypoint.Type)
 	}
+	assertCanonicalRoundTrip(t, fixture["delegation_response"], resp)
 }

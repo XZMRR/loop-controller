@@ -90,7 +90,7 @@ type retryingLifecycleAuditor struct {
 	tasks []models.Task
 }
 
-func (a *retryingLifecycleAuditor) RecordLifecycle(_ context.Context, task models.Task, _ string) error {
+func (a *retryingLifecycleAuditor) RecordLifecycle(_ context.Context, task models.Task, _, _ string) error {
 	a.calls++
 	a.tasks = append(a.tasks, task)
 	if a.calls == 1 {
@@ -205,7 +205,7 @@ func TestLifecycleOutboxClaimIsExclusiveAcrossInstances(t *testing.T) {
 		t.Fatalf("instance B double-claimed %d items, want 0: %+v", len(claimedB), claimedB)
 	}
 
-	if err := storeA.MarkDelivered(context.Background(), claimedA[0].ID, now.Add(time.Second)); err != nil {
+	if err := storeA.MarkDelivered(context.Background(), claimedA[0].ID, claimedA[0].ClaimToken, now.Add(time.Second)); err != nil {
 		t.Fatalf("mark delivered: %v", err)
 	}
 	claimedB, err = storeB.ClaimDue(context.Background(), now.Add(2*time.Second), time.Minute, 10)
@@ -573,6 +573,85 @@ func seedRunningTask(t *testing.T, ts TaskStore, taskID string) {
 	}
 	if _, _, err := ts.UpdateStatus(context.Background(), taskID, "accepted", "running", nil, ""); err != nil {
 		t.Fatalf("run task: %v", err)
+	}
+}
+
+func TestChildBudgetReservationConcurrentAndSettlement(t *testing.T) {
+	db := openTestDB(t)
+	ts := db.TaskStore()
+	now := time.Now().UTC()
+	parent := models.Task{TaskID: "budget-parent", SessionID: "s", InitiatorAgentID: "a", TargetAgentID: "b", Status: "running", Budget: models.DelegationBudget{TokenCount: 100, PaymentAmount: 10, Currency: "USD"}, CreatedAt: now, UpdatedAt: now}
+	if err := ts.Create(context.Background(), parent); err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan string, 3)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			child := models.Task{TaskID: fmt.Sprintf("budget-child-%d", i), ParentTaskID: parent.TaskID, SessionID: "s", InitiatorAgentID: "b", TargetAgentID: "c", Status: "pending", Budget: models.DelegationBudget{TokenCount: 60, PaymentAmount: 6, Currency: "USD"}, CreatedAt: now, UpdatedAt: now}
+			if _, err := ts.CreateChildWithBudget(context.Background(), child); err == nil {
+				results <- child.TaskID
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	var created []string
+	for id := range results {
+		created = append(created, id)
+	}
+	if len(created) != 1 {
+		t.Fatalf("created children = %d, want 1", len(created))
+	}
+	reserved, _ := ts.Get(context.Background(), parent.TaskID)
+	if reserved.ReservedBudget.TokenCount != 60 || reserved.ConsumedBudget.TokenCount != 0 {
+		t.Fatalf("unexpected reserved parent budget: %+v", reserved)
+	}
+	if _, _, err := ts.UpdateStatusWithConsumption(context.Background(), created[0], "pending", "failed", nil, "dispatch_failed", models.DelegationBudget{}); err != nil {
+		t.Fatalf("refund failed child: %v", err)
+	}
+	refunded, _ := ts.Get(context.Background(), parent.TaskID)
+	if refunded.ReservedBudget.TokenCount != 0 || refunded.ConsumedBudget.TokenCount != 0 {
+		t.Fatalf("failed child was not refunded: %+v", refunded)
+	}
+}
+
+func TestChildBudgetExplicitConsumptionAndOutcomeUnknown(t *testing.T) {
+	db := openTestDB(t)
+	ts := db.TaskStore()
+	now := time.Now().UTC()
+	parent := models.Task{TaskID: "settle-parent", SessionID: "s", InitiatorAgentID: "a", TargetAgentID: "b", Status: "running", Budget: models.DelegationBudget{TokenCount: 100, PaymentAmount: 10, Currency: "USD"}, CreatedAt: now, UpdatedAt: now}
+	if err := ts.Create(context.Background(), parent); err != nil {
+		t.Fatal(err)
+	}
+	child := models.Task{TaskID: "settle-child", ParentTaskID: parent.TaskID, SessionID: "s", InitiatorAgentID: "b", TargetAgentID: "c", Status: "pending", Budget: models.DelegationBudget{TokenCount: 60, PaymentAmount: 6, Currency: "USD"}, CreatedAt: now, UpdatedAt: now}
+	if _, err := ts.CreateChildWithBudget(context.Background(), child); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ts.UpdateStatus(context.Background(), child.TaskID, "pending", "outcome_unknown", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	unknown, _ := ts.Get(context.Background(), parent.TaskID)
+	if unknown.ReservedBudget.TokenCount != 60 || unknown.ConsumedBudget.TokenCount != 0 {
+		t.Fatalf("outcome_unknown changed parent budget: %+v", unknown)
+	}
+	consumed := models.DelegationBudget{TokenCount: 25, PaymentAmount: 2.5, Currency: "USD"}
+	if _, _, err := ts.UpdateStatusWithConsumption(context.Background(), child.TaskID, "outcome_unknown", "completed", nil, "", consumed); err != nil {
+		t.Fatal(err)
+	}
+	settled, _ := ts.Get(context.Background(), parent.TaskID)
+	if settled.ReservedBudget.TokenCount != 0 || settled.ReservedBudget.PaymentAmount != 0 || settled.ConsumedBudget.TokenCount != 25 || settled.ConsumedBudget.PaymentAmount != 2.5 {
+		t.Fatalf("explicit consumption not settled: %+v", settled)
+	}
+	if _, _, err := ts.UpdateStatusWithConsumption(context.Background(), child.TaskID, "outcome_unknown", "completed", nil, "", consumed); err != ErrStatusConflict {
+		t.Fatalf("duplicate settlement error = %v, want conflict", err)
+	}
+	afterDuplicate, _ := ts.Get(context.Background(), parent.TaskID)
+	if afterDuplicate.ConsumedBudget.TokenCount != 25 || afterDuplicate.ReservedBudget.TokenCount != 0 {
+		t.Fatalf("duplicate settlement changed parent budget: %+v", afterDuplicate)
 	}
 }
 

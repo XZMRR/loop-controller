@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const CurrentProtocolVersion = "0.45.0"
+const CurrentProtocolVersion = "0.48.0"
 
 // AgentCard describes an agent that can participate in governed interactions.
 type AgentCard struct {
@@ -27,24 +27,43 @@ type AgentEntrypoint struct {
 	URL  string `json:"url" yaml:"url"`
 }
 
+// DelegationBudget represents a quantity in a task's budget currency. On Task,
+// Budget is the assigned envelope, ReservedBudget is currently held by active
+// children, and ConsumedBudget is actual settled consumption (never an estimate).
+type DelegationBudget struct {
+	TokenCount    int64   `json:"token_count"`
+	PaymentAmount float64 `json:"payment_amount"`
+	Currency      string  `json:"currency,omitempty"`
+}
+
 // Task represents an interaction context between two agents.
 type Task struct {
-	ProtocolVersion     string          `json:"protocol_version"`
-	TaskID              string          `json:"task_id"`
-	SessionID           string          `json:"session_id"`
-	InteractionID       string          `json:"interaction_id,omitempty"`
-	DecisionID          string          `json:"decision_id,omitempty"`
-	RootInteractionID   string          `json:"root_interaction_id,omitempty"`
-	ParentInteractionID string          `json:"parent_interaction_id,omitempty"`
-	InitiatorAgentID    string          `json:"initiator_agent_id"`
-	TargetAgentID       string          `json:"target_agent_id"`
-	Status              string          `json:"status"`
-	CreatedAt           time.Time       `json:"created_at"`
-	UpdatedAt           time.Time       `json:"updated_at"`
-	CompletedAt         *time.Time      `json:"completed_at,omitempty"`
-	Outcome             json.RawMessage `json:"outcome,omitempty"`
-	ErrorCode           string          `json:"error_code,omitempty"`
-	DelegationToken     string          `json:"-"`
+	ProtocolVersion     string           `json:"protocol_version"`
+	TaskID              string           `json:"task_id"`
+	SessionID           string           `json:"session_id"`
+	InteractionID       string           `json:"interaction_id,omitempty"`
+	DecisionID          string           `json:"decision_id,omitempty"`
+	RootInteractionID   string           `json:"root_interaction_id,omitempty"`
+	ParentInteractionID string           `json:"parent_interaction_id,omitempty"`
+	RootTaskID          string           `json:"root_task_id,omitempty"`
+	ParentTaskID        string           `json:"parent_task_id,omitempty"`
+	DelegationDepth     int              `json:"delegation_depth,omitempty"`
+	Deadline            *time.Time       `json:"deadline,omitempty"`
+	Budget              DelegationBudget `json:"budget,omitempty"`
+	ReservedBudget      DelegationBudget `json:"reserved_budget,omitempty"`
+	ConsumedBudget      DelegationBudget `json:"consumed_budget,omitempty"`
+	AllowedTools        []string         `json:"allowed_tools,omitempty"`
+	AllowedCapabilities []string         `json:"allowed_capabilities,omitempty"`
+	AllowRedelegation   bool             `json:"allow_redelegation"`
+	InitiatorAgentID    string           `json:"initiator_agent_id"`
+	TargetAgentID       string           `json:"target_agent_id"`
+	Status              string           `json:"status"`
+	CreatedAt           time.Time        `json:"created_at"`
+	UpdatedAt           time.Time        `json:"updated_at"`
+	CompletedAt         *time.Time       `json:"completed_at,omitempty"`
+	Outcome             json.RawMessage  `json:"outcome,omitempty"`
+	ErrorCode           string           `json:"error_code,omitempty"`
+	DelegationToken     string           `json:"-"`
 }
 
 // IsTerminal reports whether the task has reached an immutable final state.
@@ -141,18 +160,28 @@ func (p *Part) UnmarshalJSON(data []byte) error {
 // EntrypointTaskRequest is received by the target agent entrypoint to start a
 // delegated task.
 type EntrypointTaskRequest struct {
-	ProtocolVersion     string          `json:"protocol_version"`
-	InteractionID       string          `json:"interaction_id,omitempty"`
-	DecisionID          string          `json:"decision_id,omitempty"`
-	RootInteractionID   string          `json:"root_interaction_id,omitempty"`
-	ParentInteractionID string          `json:"parent_interaction_id,omitempty"`
-	TaskID              string          `json:"task_id"`
-	SessionID           string          `json:"session_id"`
-	InitiatorAgentID    string          `json:"initiator_agent_id"`
-	TargetAgentID       string          `json:"target_agent_id"`
-	ToolName            string          `json:"tool_name"`
-	Arguments           json.RawMessage `json:"arguments"`
-	DelegationToken     string          `json:"delegation_token"`
+	ProtocolVersion     string           `json:"protocol_version"`
+	DeliveryID          string           `json:"delivery_id,omitempty"`
+	RequestID           string           `json:"request_id"`
+	InteractionID       string           `json:"interaction_id,omitempty"`
+	DecisionID          string           `json:"decision_id,omitempty"`
+	RootInteractionID   string           `json:"root_interaction_id,omitempty"`
+	ParentInteractionID string           `json:"parent_interaction_id,omitempty"`
+	RootTaskID          string           `json:"root_task_id,omitempty"`
+	ParentTaskID        string           `json:"parent_task_id,omitempty"`
+	DelegationDepth     int              `json:"delegation_depth,omitempty"`
+	Deadline            *time.Time       `json:"deadline,omitempty"`
+	Budget              DelegationBudget `json:"budget"`
+	TaskID              string           `json:"task_id"`
+	SessionID           string           `json:"session_id"`
+	InitiatorAgentID    string           `json:"initiator_agent_id"`
+	TargetAgentID       string           `json:"target_agent_id"`
+	ToolName            string           `json:"tool_name"`
+	Arguments           json.RawMessage  `json:"arguments"`
+	DelegationToken     string           `json:"delegation_token"`
+	AllowedTools        []string         `json:"allowed_tools"`
+	AllowedCapabilities []string         `json:"allowed_capabilities"`
+	AllowRedelegation   bool             `json:"allow_redelegation"`
 }
 
 // CancelTaskRequest requests cancellation using the negotiated protocol version.
@@ -164,38 +193,89 @@ type CancelTaskRequest struct {
 // EntrypointResultRequest is received by the target agent entrypoint to report
 // the final outcome of a delegated task.
 type EntrypointResultRequest struct {
-	ProtocolVersion string          `json:"protocol_version"`
-	Status          string          `json:"status"`
-	Outcome         json.RawMessage `json:"outcome,omitempty"`
-	ErrorCode       string          `json:"error_code,omitempty"`
+	ProtocolVersion string           `json:"protocol_version"`
+	Status          string           `json:"status"`
+	Outcome         json.RawMessage  `json:"outcome,omitempty"`
+	ErrorCode       string           `json:"error_code,omitempty"`
+	ConsumedBudget  DelegationBudget `json:"consumed_budget"`
 }
 
 // DelegationRequest asks the A2A kernel to forward a structured tool request
 // to another agent after interaction governance authorization.
 type DelegationRequest struct {
-	RequestID           string          `json:"request_id"`
-	InitiatorAgentID    string          `json:"initiator_agent_id"`
-	TargetAgentID       string          `json:"target_agent_id"`
-	ToolName            string          `json:"tool_name"`
-	Arguments           json.RawMessage `json:"arguments"`
-	SessionID           string          `json:"session_id"`
-	TaskID              string          `json:"task_id"`
-	RootInteractionID   string          `json:"root_interaction_id,omitempty"`
-	ParentInteractionID string          `json:"parent_interaction_id,omitempty"`
-	RiskLevel           string          `json:"risk_level"`
-	ProtocolVersion     string          `json:"protocol_version"`
+	RequestID               string           `json:"request_id"`
+	InitiatorAgentID        string           `json:"initiator_agent_id"`
+	TargetAgentID           string           `json:"target_agent_id"`
+	ToolName                string           `json:"tool_name"`
+	Arguments               json.RawMessage  `json:"arguments"`
+	SessionID               string           `json:"session_id"`
+	TaskID                  string           `json:"task_id"`
+	RootInteractionID       string           `json:"root_interaction_id,omitempty"`
+	ParentInteractionID     string           `json:"parent_interaction_id,omitempty"`
+	RootTaskID              string           `json:"root_task_id,omitempty"`
+	ParentTaskID            string           `json:"parent_task_id,omitempty"`
+	DelegationDepth         int              `json:"delegation_depth,omitempty"`
+	Deadline                *time.Time       `json:"deadline,omitempty"`
+	Budget                  DelegationBudget `json:"budget"`
+	RiskLevel               string           `json:"risk_level"`
+	ProtocolVersion         string           `json:"protocol_version"`
+	AllowedTools            []string         `json:"allowed_tools"`
+	AllowedCapabilities     []string         `json:"allowed_capabilities"`
+	AllowRedelegation       bool             `json:"allow_redelegation"`
+	ParentAllowRedelegation bool             `json:"-"`
 }
 
 // DelegationResponse is returned by the Go kernel.
 type DelegationResponse struct {
 	Allowed          bool            `json:"allowed"`
+	Verdict          string          `json:"verdict"`
+	ApprovalID       string          `json:"approval_id,omitempty"`
 	InteractionID    string          `json:"interaction_id,omitempty"`
 	DecisionID       string          `json:"decision_id,omitempty"`
 	TaskID           string          `json:"task_id"`
 	TargetEntrypoint AgentEntrypoint `json:"target_entrypoint,omitempty"`
 	DelegationToken  string          `json:"delegation_token,omitempty"`
+	OriginalArgs     json.RawMessage `json:"original_args,omitempty"`
+	ModifiedArgs     json.RawMessage `json:"modified_args,omitempty"`
+	EffectiveArgs    json.RawMessage `json:"effective_args,omitempty"`
 	Reason           string          `json:"reason"`
 	ProtocolVersion  string          `json:"protocol_version,omitempty"`
+}
+
+// DelegationApproval is the durable authorization fact for a delegation awaiting approval.
+type DelegationApproval struct {
+	ProtocolVersion     string           `json:"protocol_version"`
+	ApprovalID          string           `json:"approval_id"`
+	RequestID           string           `json:"request_id"`
+	DecisionID          string           `json:"decision_id"`
+	RequestHash         string           `json:"request_hash"`
+	InitiatorAgentID    string           `json:"initiator_agent_id"`
+	TargetAgentID       string           `json:"target_agent_id"`
+	SessionID           string           `json:"session_id"`
+	RootTaskID          string           `json:"root_task_id,omitempty"`
+	ParentTaskID        string           `json:"parent_task_id,omitempty"`
+	DelegationDepth     int              `json:"delegation_depth"`
+	EffectiveArgs       json.RawMessage  `json:"-"`
+	AllowedTools        []string         `json:"allowed_tools"`
+	AllowedCapabilities []string         `json:"allowed_capabilities"`
+	AllowRedelegation   bool             `json:"allow_redelegation"`
+	Budget              DelegationBudget `json:"budget"`
+	TaskDeadline        *time.Time       `json:"task_deadline,omitempty"`
+	ExpiresAt           time.Time        `json:"expires_at"`
+	Status              string           `json:"status"`
+	ApproverID          string           `json:"approver_id,omitempty"`
+	Reason              string           `json:"reason,omitempty"`
+	CreatedAt           time.Time        `json:"created_at"`
+	UpdatedAt           time.Time        `json:"updated_at"`
+	DecidedAt           *time.Time       `json:"decided_at,omitempty"`
+	TaskID              string           `json:"task_id,omitempty"`
+	Version             int64            `json:"version"`
+}
+
+// ApprovalActionRequest carries an idempotency key and optional decision reason.
+type ApprovalActionRequest struct {
+	RequestID string `json:"request_id"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // SendMessageResponse indicates whether a message was accepted for routing.

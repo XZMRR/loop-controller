@@ -1,0 +1,91 @@
+/a2a/v1/delegation-approvals/{approval_id}:
+  get:
+    operationId: getDelegationApproval
+    summary: Get a delegation approval owned by the authenticated initiator
+    tags: [Delegation Approvals]
+    parameters:
+      - in: path
+        name: approval_id
+        required: true
+        schema: {type: string}
+    responses:
+      '200':
+        description: Approval state
+        content:
+          application/json:
+            schema: {$ref: '../schemas/delegation-approval.yaml'}
+      '401': {description: Authentication required}
+      '403': {description: Approval access denied}
+      '404': {description: Approval not found}
+/a2a/v1/delegation-approvals/{approval_id}/approve:
+  post:
+    operationId: approveDelegation
+    summary: Approve and resume a delegation
+    tags: [Delegation Approvals]
+    parameters:
+      - in: path
+        name: approval_id
+        required: true
+        schema: {type: string}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '../schemas/approval-action-request.yaml'}
+    responses:
+      '200':
+        description: Approval state after resume attempt
+        content:
+          application/json:
+            schema: {$ref: '../schemas/delegation-approval.yaml'}
+      '401': {description: Approval authentication required}
+      '403': {description: Approver is not independent}
+      '409': {description: Approval transition conflict}
+/a2a/v1/delegation-approvals/{approval_id}/reject:
+  post:
+    operationId: rejectDelegation
+    summary: Reject a delegation
+    tags: [Delegation Approvals]
+    parameters:
+      - in: path
+        name: approval_id
+        required: true
+        schema: {type: string}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '../schemas/approval-action-request.yaml'}
+    responses:
+      '200':
+        description: Rejected approval
+        content:
+          application/json:
+            schema: {$ref: '../schemas/delegation-approval.yaml'}
+      '401': {description: Approval authentication required}
+      '403': {description: Approver is not independent}
+      '409': {description: Approval transition conflict}
+/a2a/v1/delegation-approvals/{approval_id}/cancel:
+  post:
+    operationId: cancelDelegationApproval
+    summary: Cancel an approval owned by the authenticated initiator
+    tags: [Delegation Approvals]
+    parameters:
+      - in: path
+        name: approval_id
+        required: true
+        schema: {type: string}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '../schemas/approval-action-request.yaml'}
+    responses:
+      '200':
+        description: Cancelled approval
+        content:
+          application/json:
+            schema: {$ref: '../schemas/delegation-approval.yaml'}
+      '401': {description: Authentication required}
+      '403': {description: Approval access denied}
+      '409': {description: Approval transition conflict}

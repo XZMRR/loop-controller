@@ -47,4 +47,52 @@ properties:
     description: Successful result or failure summary as a JSON value; may be absent.
   error_code:
     type: string
+  root_task_id:
+    type: string
+  parent_task_id:
+    type: string
+  delegation_depth:
+    type: integer
+    minimum: 0
+  root_interaction_id:
+    type: string
+  parent_interaction_id:
+    type: string
+  deadline:
+    type: string
+    format: date-time
+  allowed_tools:
+    type: array
+    items:
+      type: string
+  allowed_capabilities:
+    type: array
+    items:
+      type: string
+  allow_redelegation:
+    type: boolean
+  budget:
+    description: Maximum budget envelope assigned to this task; it is not actual consumption.
+    type: object
+    required: [token_count, payment_amount]
+    properties:
+      token_count: {type: integer, minimum: 0}
+      payment_amount: {type: number, minimum: 0}
+      currency: {type: string}
+  reserved_budget:
+    description: Portion of this task's envelope currently reserved by non-settled child tasks.
+    type: object
+    required: [token_count, payment_amount]
+    properties:
+      token_count: {type: integer, minimum: 0}
+      payment_amount: {type: number, minimum: 0}
+      currency: {type: string}
+  consumed_budget:
+    description: Actual measured consumption settled from child tasks; never the assigned envelope or an estimate.
+    type: object
+    required: [token_count, payment_amount]
+    properties:
+      token_count: {type: integer, minimum: 0}
+      payment_amount: {type: number, minimum: 0}
+      currency: {type: string}
 description: Represents a delegated task and its current lifecycle state.

@@ -158,6 +158,7 @@ class LoopController:
                 error_code="delegation_unavailable",
             )
 
+        delegation_context = proposal.delegation_context or {}
         resp = await bridge.request_delegation(
             DelegationRequest(
                 request_id=proposal.call_id,
@@ -168,6 +169,12 @@ class LoopController:
                 session_id=task.session_id,
                 task_id="",
                 risk_level=proposal.risk_level,
+                allowed_tools=[proposal.tool_name],
+                allowed_capabilities=list(delegation_context.get("allowed_capabilities", [])),
+                allow_redelegation=bool(delegation_context.get("allow_redelegation", False)),
+                parent_task_id=str(delegation_context.get("parent_task_id") or ""),
+                budget=dict(delegation_context.get("budget") or {}),
+                deadline=delegation_context.get("deadline"),
             )
         )
         if not resp.allowed:

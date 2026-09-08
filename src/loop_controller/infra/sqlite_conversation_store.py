@@ -1,4 +1,4 @@
-"""基于 SQLite 的对话上下文存储（v0.45.0）。"""
+"""基于 SQLite 的对话上下文存储（v0.48.0）。"""
 
 from __future__ import annotations
 

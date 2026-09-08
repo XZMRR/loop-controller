@@ -1,4 +1,4 @@
-"""SqliteAlertStore 持久化测试（v0.45.0）。"""
+"""SqliteAlertStore 持久化测试（v0.48.0）。"""
 
 from __future__ import annotations
 

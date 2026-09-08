@@ -37,7 +37,7 @@ func registerExecutorAtURL(t *testing.T, server *httptest.Server, entrypointURL 
 		AgentID:      "executor",
 		Name:         "Executor",
 		Entrypoint:   models.AgentEntrypoint{Type: "http", URL: entrypointURL},
-		Capabilities: []string{"delegate_execution"},
+		Capabilities: []string{"delegate_execution", "echo_capability"},
 	}
 	body, _ := json.Marshal(card)
 	resp, err := http.Post(server.URL+"/a2a/v1/agents", "application/json", bytes.NewReader(body))
@@ -53,13 +53,15 @@ func registerExecutorAtURL(t *testing.T, server *httptest.Server, entrypointURL 
 func createDelegation(t *testing.T, server *httptest.Server) (models.Task, string) {
 	t.Helper()
 	req := models.DelegationRequest{
-		RequestID:        "req-entrypoint-1",
-		InitiatorAgentID: "planner",
-		TargetAgentID:    "executor",
-		ToolName:         "echo",
-		Arguments:        json.RawMessage(`{"x":"hello"}`),
-		SessionID:        "session-entrypoint-1",
-		ProtocolVersion:  currentProtocolVersion,
+		RequestID:           "req-entrypoint-1",
+		InitiatorAgentID:    "planner",
+		TargetAgentID:       "executor",
+		ToolName:            "echo",
+		Arguments:           json.RawMessage(`{"x":"hello"}`),
+		SessionID:           "session-entrypoint-1",
+		ProtocolVersion:     currentProtocolVersion,
+		AllowedTools:        []string{"echo"},
+		AllowedCapabilities: []string{"echo_capability"},
 	}
 	body, _ := json.Marshal(req)
 	resp, err := http.Post(server.URL+"/a2a/v1/delegations", "application/json", bytes.NewReader(body))
@@ -122,15 +124,61 @@ func getEntrypoint(t *testing.T, url, delegationToken string) *http.Response {
 func entrypointRequest(t *testing.T, server *httptest.Server, task models.Task, token string) models.EntrypointTaskRequest {
 	t.Helper()
 	return models.EntrypointTaskRequest{
-		ProtocolVersion:  currentProtocolVersion,
-		TaskID:           task.TaskID,
-		SessionID:        task.SessionID,
-		InitiatorAgentID: task.InitiatorAgentID,
-		TargetAgentID:    task.TargetAgentID,
-		ToolName:         "echo",
-		Arguments:        json.RawMessage(`{"x":"hello"}`),
-		DelegationToken:  token,
+		ProtocolVersion:     currentProtocolVersion,
+		RequestID:           "req-entrypoint-1",
+		InteractionID:       task.InteractionID,
+		DecisionID:          task.DecisionID,
+		RootInteractionID:   task.RootInteractionID,
+		ParentInteractionID: task.ParentInteractionID,
+		RootTaskID:          task.RootTaskID,
+		ParentTaskID:        task.ParentTaskID,
+		DelegationDepth:     task.DelegationDepth,
+		Deadline:            task.Deadline,
+		Budget:              task.Budget,
+		TaskID:              task.TaskID,
+		SessionID:           task.SessionID,
+		InitiatorAgentID:    task.InitiatorAgentID,
+		TargetAgentID:       task.TargetAgentID,
+		ToolName:            "echo",
+		Arguments:           json.RawMessage(`{"x":"hello"}`),
+		DelegationToken:     token,
+		AllowedTools:        []string{"echo"},
+		AllowedCapabilities: []string{"echo_capability"},
 	}
+}
+
+func issueEntrypointToken(t *testing.T, srv *Server, req models.EntrypointTaskRequest) string {
+	t.Helper()
+	claims := token.DelegationClaims{
+		RequestID:           req.RequestID,
+		SessionID:           req.SessionID,
+		InteractionID:       req.InteractionID,
+		DecisionID:          req.DecisionID,
+		RootInteractionID:   req.RootInteractionID,
+		ParentInteractionID: req.ParentInteractionID,
+		InitiatorAgentID:    req.InitiatorAgentID,
+		TargetAgentID:       req.TargetAgentID,
+		ToolName:            req.ToolName,
+		TaskID:              req.TaskID,
+		ArgumentsSHA256:     token.HashArguments(req.Arguments),
+		AllowedTools:        req.AllowedTools,
+		AllowedCapabilities: req.AllowedCapabilities,
+		AllowRedelegation:   req.AllowRedelegation,
+		RootTaskID:          req.RootTaskID,
+		ParentTaskID:        req.ParentTaskID,
+		DelegationDepth:     req.DelegationDepth,
+		BudgetTokenCount:    req.Budget.TokenCount,
+		BudgetPaymentAmount: req.Budget.PaymentAmount,
+		BudgetCurrency:      req.Budget.Currency,
+	}
+	if req.Deadline != nil {
+		claims.Deadline = req.Deadline.Unix()
+	}
+	value, err := srv.issuer.Issue(claims, time.Hour)
+	if err != nil {
+		t.Fatalf("issue entrypoint token: %v", err)
+	}
+	return value
 }
 
 func TestEntrypointCreateTaskAndPublishEvent(t *testing.T) {
@@ -176,17 +224,20 @@ func TestEntrypointCreateNewLocalTaskCommitsCreatedEvent(t *testing.T) {
 	taskID := "task-remote-only"
 	tokenString, err := srv.issuer.Issue(token.DelegationClaims{
 		RequestID:        "req-remote-only",
+		SessionID:        "session-remote-only",
 		InitiatorAgentID: "planner",
 		TargetAgentID:    "executor",
 		ToolName:         "echo",
 		TaskID:           taskID,
 		ArgumentsSHA256:  token.HashArguments(arguments),
+		AllowedTools:     []string{"echo"},
 	}, time.Hour)
 	if err != nil {
 		t.Fatalf("issue delegation token: %v", err)
 	}
 	req := models.EntrypointTaskRequest{
 		ProtocolVersion:  currentProtocolVersion,
+		RequestID:        "req-remote-only",
 		TaskID:           taskID,
 		SessionID:        "session-remote-only",
 		InitiatorAgentID: "planner",
@@ -194,6 +245,7 @@ func TestEntrypointCreateNewLocalTaskCommitsCreatedEvent(t *testing.T) {
 		ToolName:         "echo",
 		Arguments:        arguments,
 		DelegationToken:  tokenString,
+		AllowedTools:     []string{"echo"},
 	}
 	body, _ := json.Marshal(req)
 	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks", body, tokenString)
@@ -270,6 +322,76 @@ func TestEntrypointCreateRejectsArgumentsNotBoundToToken(t *testing.T) {
 	}
 	if got.Code != "token_scope_mismatch" {
 		t.Fatalf("code = %q, want token_scope_mismatch", got.Code)
+	}
+}
+
+func TestEntrypointCreateRejectsTokenInteractionContextMismatch(t *testing.T) {
+	_, server := newTestServerWithMockR2(t, true)
+	registerExecutor(t, server)
+	task, token := createDelegation(t, server)
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*models.EntrypointTaskRequest)
+	}{
+		{name: "request", mutate: func(req *models.EntrypointTaskRequest) { req.RequestID = "other-request" }},
+		{name: "session", mutate: func(req *models.EntrypointTaskRequest) { req.SessionID = "other-session" }},
+		{name: "interaction", mutate: func(req *models.EntrypointTaskRequest) { req.InteractionID = "other-interaction" }},
+		{name: "decision", mutate: func(req *models.EntrypointTaskRequest) { req.DecisionID = "other-decision" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := entrypointRequest(t, server, task, token)
+			tc.mutate(&req)
+			body, _ := json.Marshal(req)
+			resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks", body, token)
+			if err != nil {
+				t.Fatalf("entrypoint create: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestEntrypointCreateRejectsExistingTaskContextMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*models.EntrypointTaskRequest)
+	}{
+		{name: "scope", mutate: func(req *models.EntrypointTaskRequest) { req.AllowedCapabilities = []string{"delegate_execution"} }},
+		{name: "budget", mutate: func(req *models.EntrypointTaskRequest) { req.Budget.TokenCount++ }},
+		{name: "deadline", mutate: func(req *models.EntrypointTaskRequest) {
+			deadline := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+			req.Deadline = &deadline
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, server := newTestServerWithMockR2(t, true)
+			registerExecutor(t, server)
+			task, originalToken := createDelegation(t, server)
+			req := entrypointRequest(t, server, task, originalToken)
+			tc.mutate(&req)
+			tokenString := issueEntrypointToken(t, srv, req)
+			req.DelegationToken = tokenString
+			body, _ := json.Marshal(req)
+			resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks", body, tokenString)
+			if err != nil {
+				t.Fatalf("entrypoint create: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d", resp.StatusCode)
+			}
+			var got models.ErrorResponse
+			if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+				t.Fatalf("decode error: %v", err)
+			}
+			if got.Code != "entrypoint_task_mismatch" {
+				t.Fatalf("code = %q, want entrypoint_task_mismatch", got.Code)
+			}
+		})
 	}
 }
 
@@ -391,6 +513,57 @@ func TestEntrypointStartExecutesHTTPAndAutomaticallyRecordsResult(t *testing.T) 
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("task did not complete automatically")
+}
+
+func TestEntrypointCreateCanAutomaticallyAccept(t *testing.T) {
+	srv, server := newTestServerWithMockR2(t, true)
+	srv.SetTargetTaskAutomation(true, false)
+	registerExecutor(t, server)
+	task, token := createDelegation(t, server)
+	body, _ := json.Marshal(entrypointRequest(t, server, task, token))
+	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks", body, token)
+	if err != nil {
+		t.Fatalf("entrypoint create: %v", err)
+	}
+	defer resp.Body.Close()
+	var got models.Task
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	if resp.StatusCode != http.StatusCreated || got.Status != "accepted" {
+		t.Fatalf("status=%d task status=%q", resp.StatusCode, got.Status)
+	}
+}
+
+func TestEntrypointCreateCanAutomaticallyAcceptAndStart(t *testing.T) {
+	release := make(chan struct{})
+	executorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "allow", "result": "ok"})
+	}))
+	defer executorServer.Close()
+
+	srv, server := newTestServerWithMockR2(t, true)
+	srv.SetTargetExecutor(&execution.HTTPExecutor{BaseURL: executorServer.URL, Client: executorServer.Client()})
+	srv.SetTargetTaskAutomation(false, true)
+	registerExecutor(t, server)
+	task, token := createDelegation(t, server)
+	body, _ := json.Marshal(entrypointRequest(t, server, task, token))
+	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks", body, token)
+	if err != nil {
+		t.Fatalf("entrypoint create: %v", err)
+	}
+	var got models.Task
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		resp.Body.Close()
+		t.Fatalf("decode task: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || got.Status != "running" {
+		close(release)
+		t.Fatalf("status=%d task status=%q", resp.StatusCode, got.Status)
+	}
+	close(release)
 }
 
 func TestEntrypointStartRequiresAccepted(t *testing.T) {
@@ -778,9 +951,9 @@ func TestDelegationIdempotencyReturnsOriginalResponse(t *testing.T) {
 func TestDelegationIdempotencyEquivalentJSONReturnsOriginalResponse(t *testing.T) {
 	_, server := newTestServerWithMockR2(t, true)
 	registerExecutor(t, server)
-	first := []byte(`{"request_id":"req-idempotency-equivalent","initiator_agent_id":"planner","target_agent_id":"executor","tool_name":"echo","arguments":{"x":"hello","nested":{"a":1,"b":2}},"session_id":"","task_id":"","risk_level":"","protocol_version":"0.45.0"}`)
+	first := []byte(`{"request_id":"req-idempotency-equivalent","initiator_agent_id":"planner","target_agent_id":"executor","tool_name":"echo","arguments":{"x":"hello","nested":{"a":1,"b":2}},"session_id":"","task_id":"","risk_level":"","protocol_version":"0.48.0"}`)
 	second := []byte(`{
-		"protocol_version":"0.45.0", "risk_level":"", "task_id":"", "session_id":"",
+		"protocol_version":"0.48.0", "risk_level":"", "task_id":"", "session_id":"",
 		"arguments":{"nested":{"b":2,"a":1},"x":"hello"}, "tool_name":"echo",
 		"target_agent_id":"executor", "initiator_agent_id":"planner", "request_id":"req-idempotency-equivalent"
 	}`)
