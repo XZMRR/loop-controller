@@ -127,8 +127,18 @@
           class="mt-4"
           type="warning"
           :closable="false"
-          title="该委托需要审批：请联系升级对象确认后重新发起。"
-        />
+        >
+          <template #title>
+            <span v-if="delegationResult.approval">
+              该委托需要审批：已提交审批单（审批人 {{ delegationResult.approval.approver_id }}），
+              批准后将自动派发。
+              <router-link to="/approvals" style="color: inherit; text-decoration: underline">
+                前往审批台处理
+              </router-link>
+            </span>
+            <span v-else>该委托需要审批：请联系升级对象确认后重新发起。</span>
+          </template>
+        </el-alert>
       </template>
     </el-card>
 

@@ -238,6 +238,7 @@ type DelegationResponse struct {
 	OriginalArgs     json.RawMessage `json:"original_args,omitempty"`
 	ModifiedArgs     json.RawMessage `json:"modified_args,omitempty"`
 	EffectiveArgs    json.RawMessage `json:"effective_args,omitempty"`
+	EscalationTarget string          `json:"escalation_target,omitempty"`
 	Reason           string          `json:"reason"`
 	ProtocolVersion  string          `json:"protocol_version,omitempty"`
 }

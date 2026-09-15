@@ -507,11 +507,14 @@ const maxDelegationDepth = 8
 
 func (d *Delegator) deriveLineage(req models.DelegationRequest, interactionID string) (models.Task, models.DelegationRequest, error) {
 	if req.ParentTaskID == "" {
-		if req.RootTaskID != "" || req.DelegationDepth != 0 || req.RootInteractionID != "" || req.ParentInteractionID != "" {
+		if req.RootTaskID != "" || req.DelegationDepth != 0 || req.RootInteractionID != "" {
 			return models.Task{}, req, errors.New("delegation lineage must be derived from parent_task_id")
 		}
+		// ParentInteractionID is informational metadata only (it grants no
+		// privilege without a validated parent task) and is forwarded to the
+		// interaction authorizer, so root delegations may carry it.
 		req.RootInteractionID = interactionID
-		return models.Task{RootInteractionID: interactionID, Deadline: req.Deadline}, req, nil
+		return models.Task{RootInteractionID: interactionID, ParentInteractionID: req.ParentInteractionID, Deadline: req.Deadline}, req, nil
 	}
 
 	parent, err := d.tasks.Get(req.ParentTaskID)

@@ -18,7 +18,13 @@ from starlette.testclient import TestClient
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
 from loop_controller.identity import ConfigIdentityProvider
-from loop_controller.models import Agent, ApprovalRequest, AuditEvent, GovernanceResult
+from loop_controller.models import (
+    Agent,
+    ApprovalRecord,
+    ApprovalRequest,
+    AuditEvent,
+    GovernanceResult,
+)
 from loop_controller.server import build_app
 
 
@@ -91,7 +97,7 @@ class _MockApprovalStore:
         self._pending.append(request)
 
     def get_pending(self) -> list[_MockApprovalRequest]:
-        return list(self._pending)
+        return [req for req in self._pending if req.decision_id not in self._records]
 
     def get_request_by_id(self, request_id: str) -> _MockApprovalRequest | None:
         return next((req for req in self._pending if req.request_id == request_id), None)
@@ -125,6 +131,9 @@ class _MockApprovalManager:
 
     def __init__(self, store: _MockApprovalStore | None = None):
         self._store = store or _MockApprovalStore()
+
+    async def submit(self, request: Any) -> None:
+        self._store.submit_request(request)
 
     def get_request_by_id(self, request_id: str) -> Any | None:
         return self._store.get_request_by_id(request_id)
@@ -1969,6 +1978,191 @@ def test_admin_a2a_delegation_allow_dispatches(monkeypatch: pytest.MonkeyPatch) 
     # 交互审计已写入
     reasons = [e.reason for e in controller._runtime.audit_store._events]
     assert "allow" in reasons
+
+
+def test_admin_a2a_delegation_require_approval_creates_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    _FakeInteractionEngine.verdict = "require_approval"
+    _FakeInteractionEngine.allowed = False
+    client, controller = _build_admin_client()
+
+    resp = client.post(
+        "/v1/admin/a2a/delegations",
+        headers={"X-API-Key": "test-key"},
+        json=_delegation_payload(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verdict"] == "require_approval"
+    assert body["allowed"] is False
+    assert body["dispatch"]["attempted"] is False
+    # 响应携带审批单信息
+    assert body["approval"]["request_id"] == "a2a-req-interaction-1"
+    assert body["approval"]["approver_id"] == "zhang_manager"
+    # 审批单已挂入审批台，携带委托快照
+    store = controller._runtime.approval_manager._store
+    pending = [r for r in store.get_pending() if r.call_id == "a2a-delegation:interaction-1"]
+    assert len(pending) == 1
+    assert pending[0].approver_id == "zhang_manager"
+    assert pending[0].tool_arguments["target_agent_id"] == "writer_001"
+    assert pending[0].tool_arguments["arguments"] == {"to": "manager@company.com"}
+
+
+def test_admin_approval_of_delegation_dispatches() -> None:
+    client, controller = _build_client(
+        api_key="secret",
+        identity_provider=_admin_identity_provider(),
+    )
+    store = controller._runtime.approval_manager._store
+    store._pending.append(
+        ApprovalRequest(
+            request_id="a2a-req-ix-9",
+            decision_id="d-9",
+            call_id="a2a-delegation:ix-9",
+            task_id="ix-9",
+            agent_id="researcher_001",
+            tool_name="send_email",
+            arguments_masked={},
+            tool_arguments={
+                "source_agent_id": "researcher_001",
+                "target_agent_id": "writer_001",
+                "tool_name": "send_email",
+                "arguments": {"to": "a@b.com"},
+                "risk_level": "medium",
+                "session_id": "s-1",
+                "task_id": "",
+                "allow_redelegation": False,
+            },
+            reason="A2A 委托需审批",
+            requester_id="alice",
+            approver_id="zhang_manager",
+        )
+    )
+    bridge = _FakeDelegationBridge(accept=True)
+    controller._runtime.go_kernel_bridge = bridge
+
+    resp = client.post(
+        "/v1/admin/approvals/d-9/approve",
+        json={"approver": "zhang_manager", "comment": "ok"},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["verdict"] == "approve"
+    # 批准后自动派发，并返回派发结果
+    assert data["dispatch"]["attempted"] is True
+    assert data["dispatch"]["accepted"] is True
+    assert data["dispatch"]["task_id"] == "task-42"
+    assert len(bridge.requests) == 1
+    assert bridge.requests[0].parent_interaction_id == "ix-9"
+    assert bridge.requests[0].initiator_agent_id == "researcher_001"
+
+
+def test_delegation_authorize_flip_matches_approved_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """已批准的委托审批单可翻转 authorize 为 allow；参数被篡改时不得翻转。"""
+
+    class _FakeAuthorizeEndpoint:
+        last_proposal = None
+        last_decision = None
+        last_rejection_event = None
+
+        def __init__(self, engine: Any) -> None:
+            pass
+
+        async def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "verdict": "require_approval",
+                "allowed": False,
+                "reason": "delegation requires owner approval",
+                "protocol_version": "0.48.0",
+            }
+
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionAuthorizeEndpoint", _FakeAuthorizeEndpoint
+    )
+    provider = ConfigIdentityProvider(
+        agents={
+            "researcher_001": Agent(
+                agent_id="researcher_001",
+                name="Researcher",
+                profile_id="default",
+                owner_id="alice",
+            ),
+        },
+        users={"alice": "Alice"},
+        allowed_tokens=[{"token": "agent-token", "agent_id": "researcher_001", "user_id": "alice"}],
+    )
+    client, controller = _build_client(api_key="secret", identity_provider=provider)
+    store = controller._runtime.approval_manager._store
+    store.submit_request(
+        ApprovalRequest(
+            request_id="a2a-req-ix-9",
+            decision_id="d-9",
+            call_id="a2a-delegation:ix-9",
+            task_id="ix-9",
+            agent_id="researcher_001",
+            tool_name="send_email",
+            arguments_masked={},
+            tool_arguments={
+                "source_agent_id": "researcher_001",
+                "target_agent_id": "writer_001",
+                "tool_name": "send_email",
+                "arguments": {"to": "a@b.com"},
+                "risk_level": "medium",
+                "session_id": "s-1",
+                "task_id": "",
+                "allow_redelegation": False,
+            },
+            reason="A2A 委托需审批",
+            requester_id="alice",
+            approver_id="zhang_manager",
+        )
+    )
+    store.record_response(
+        ApprovalRecord(
+            request_id="a2a-req-ix-9",
+            decision_id="d-9",
+            verdict="approve",
+            approver_id="zhang_manager",
+            comment="ok",
+        )
+    )
+    headers = {"Authorization": "Bearer agent-token"}
+    base = {
+        "source_agent_id": "researcher_001",
+        "target_agent_id": "writer_001",
+        "tool_name": "send_email",
+        "session_id": "s-1",
+        "parent_interaction_id": "ix-9",
+    }
+
+    ok = client.post(
+        "/interaction/v1/delegations/authorize",
+        headers=headers,
+        json={**base, "arguments": {"to": "a@b.com"}},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["verdict"] == "allow"
+    assert ok.json()["allowed"] is True
+
+    tampered = client.post(
+        "/interaction/v1/delegations/authorize",
+        headers=headers,
+        json={**base, "arguments": {"to": "attacker@x.com"}},
+    )
+    assert tampered.status_code == 200
+    assert tampered.json()["verdict"] == "require_approval"
+
+    wrong_target = client.post(
+        "/interaction/v1/delegations/authorize",
+        headers=headers,
+        json={**base, "target_agent_id": "other_agent", "arguments": {"to": "a@b.com"}},
+    )
+    assert wrong_target.json()["verdict"] == "require_approval"
 
 
 def test_admin_a2a_delegation_deny_skips_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:

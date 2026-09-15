@@ -310,6 +310,14 @@ class JsonlApprovalStore:
             except DurableIOError as exc:
                 raise ApprovalStoreError(f"无法写入审批存储 {self._path}: {exc}") from exc
 
+    @property
+    def requests(self) -> dict[str, ApprovalRequest]:
+        return dict(self._requests)
+
+    @property
+    def responses(self) -> dict[str, ApprovalRecord]:
+        return dict(self._responses)
+
     def get_pending(self) -> list[ApprovalRequest]:
         self.refresh()
         return [r for decision_id, r in self._requests.items() if decision_id not in self._responses]

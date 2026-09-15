@@ -179,6 +179,18 @@ frontend/
 - **完整链路验证**：发起委托 → task pending → 管理端 cancel → 任务 `cancelled`；SSE 流依次收到 `task_created`(pending) 与 `task_cancelled`(cancelled) 两帧。
 - **验证**：`tests/test_server.py` 86 测试全绿（新增 cancel 200/502/503 与 stream SSE 内容/503）；前端构建通过。
 
+#### 进度记录（2026-09-15，第九轮：require_approval 委托挂接审批台）
+
+- **闭环设计**：管理端委托判定为 `require_approval` 时，handler 自动构造审批单提交审批台（`call_id=a2a-delegation:{interaction_id}`，`tool_arguments` 保存委托快照明文供批准后重建）；`POST /v1/admin/approvals/{id}/approve` 批准此类审批单后自动重建 `DelegationRequest` 派发到 Go 内核，响应附 `dispatch` 字段；内核回调 `/interaction/v1/delegations/authorize` 二次评估仍为 require_approval 时，Python 按 call_id 查审批记录，已批准则翻转为 allow。
+- **防篡改**：翻转除 call_id 外还校验委托快照与 authorize 请求一致（目标 Agent、工具名、参数），防止复用已批准 interaction 放行被篡改的委托（新增专项测试覆盖一致/篡改/错目标三种情形）。
+- **联调修复的三个跨层问题**：
+  1. Go `deriveLineage` 原拒绝无 `parent_task_id` 的 `parent_interaction_id`；该字段为纯信息元数据（无父任务时不授予任何特权），已放行根委托携带并透传 authorize（新增 `TestRootDelegationCarriesParentInteractionID`）。
+  2. Go `DelegationResponse` 缺 `escalation_target` 字段，authorize 的 require_approval 响应被 `DisallowUnknownFields` 拒绝（400 delegation_failed）；已补字段。
+  3. `JsonlApprovalStore` 缺 `requests`/`responses` 只读视图（第二轮只落在了内存实现上），导致翻转查询永远为空；已补齐。
+- **派发语义**：批准后重建的 `DelegationRequest` 必须留空 `task_id`（快照中的 task_id 是 Python 侧语义），否则内核以 "delegation task not found" 拒绝。
+- **E2E 验证**：发起委托（analyze_sales require_approval）→ 审批单进审批台 → 批准 → 自动派发 `accepted=true` 返回内核 task_id → 任务查询可见（parent_interaction_id 正确回链，allowed_tools=[analyze_sales]，status=pending）。
+- **验证**：`tests/test_server.py` 89 全绿 + `test_delegation_authorizer.py` 10 全绿；Go `internal/delegation` 测试全绿；前端构建通过。联调用 `config/interaction_profiles.yaml`、`config/go_kernel.yaml` 本地改动已还原，未提交。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

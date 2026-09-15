@@ -299,6 +299,59 @@ func TestRequestAllowed(t *testing.T) {
 	}
 }
 
+func TestRootDelegationCarriesParentInteractionID(t *testing.T) {
+	reg := registry.New()
+	reg.Register(models.AgentCard{
+		AgentID:      "executor",
+		Name:         "Executor",
+		Entrypoint:   models.AgentEntrypoint{Type: "http", URL: "http://executor:8080"},
+		Capabilities: []string{"delegate_execution"},
+	})
+	db := openTestDB(t)
+	tasks := task.New(db.TaskStore())
+	issuer := token.NewHMACIssuer([]byte("secret"))
+	pub := stream.NewPublisher(db.EventStore())
+	authorizer := &recordingAuthorizer{decision: models.DelegationResponse{Allowed: true}}
+	d := New(reg, tasks, issuer, pub, time.Hour).WithR2Authorizer(authorizer)
+
+	resp, err := d.Request(context.Background(), models.DelegationRequest{
+		RequestID:           "req-parent-info",
+		InitiatorAgentID:    "planner",
+		TargetAgentID:       "executor",
+		ToolName:            "query_sales",
+		ParentInteractionID: "ix-approved-1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.Allowed {
+		t.Fatalf("expected allowed, got %v", resp)
+	}
+	if authorizer.lastReq.ParentInteractionID != "ix-approved-1" {
+		t.Errorf("parent_interaction_id not forwarded to authorizer: %+v", authorizer.lastReq)
+	}
+	stored, err := tasks.Get(resp.TaskID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if stored.ParentInteractionID != "ix-approved-1" {
+		t.Errorf("parent_interaction_id not persisted on task: %+v", stored)
+	}
+	if stored.RootInteractionID != "req-parent-info" {
+		t.Errorf("unexpected root_interaction_id: %s", stored.RootInteractionID)
+	}
+}
+
+type recordingAuthorizer struct {
+	decision models.DelegationResponse
+	lastReq  models.DelegationRequest
+}
+
+func (r *recordingAuthorizer) Authorize(_ context.Context, req models.DelegationRequest) (models.DelegationResponse, error) {
+	r.lastReq = req
+	return r.decision, nil
+}
+
 type failingIssuer struct{}
 
 func (failingIssuer) Issue(token.DelegationClaims, time.Duration) (string, error) {

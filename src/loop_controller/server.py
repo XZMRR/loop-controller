@@ -68,7 +68,7 @@ from loop_controller.metrics import (
 from loop_controller.metrics import (
     set_trace_id as metrics_set_trace_id,
 )
-from loop_controller.models import ActionProposal, AuditEvent, Task
+from loop_controller.models import ActionProposal, ApprovalRequest, AuditEvent, Task
 from loop_controller.server_models import (
     AdminAgentDetail,
     AdminAgentItem,
@@ -86,6 +86,7 @@ from loop_controller.server_models import (
     AdminDelegationDispatch,
     AdminDelegationRequest,
     AdminDelegationResponse,
+    AdminDelegationApproval,
     AuditQueryResponse,
     GovernResponse,
     GovernToolRequest,
@@ -502,7 +503,51 @@ class ToolGovernServer:
             await self._controller._runtime.audit_store.append_async(
                 endpoint.last_rejection_event
             )
+
+        # 委托类 require_approval：若同一 interaction 的审批单已被批准，则放行
+        if response.get("verdict") == "require_approval" and self._delegation_approved(
+            payload
+        ):
+            response = {
+                **response,
+                "verdict": "allow",
+                "allowed": True,
+                "reason": "approved via delegation approval record",
+            }
         return JSONResponse(response)
+
+    def _delegation_approved(self, payload: dict[str, Any]) -> bool:
+        """查询 call_id=a2a-delegation:{interaction_id} 的审批单是否已被批准。
+
+        除 call_id 外还校验委托快照与本次 authorize 请求一致（目标 Agent、
+        工具名、参数），防止复用已批准的 interaction 放行被篡改的委托。
+        """
+        parent_interaction_id = payload.get("parent_interaction_id")
+        if not parent_interaction_id:
+            return False
+        try:
+            store = self._controller._runtime.approval_manager._store
+            store.refresh()
+            call_id = f"a2a-delegation:{parent_interaction_id}"
+            for request in store.get_pending():
+                if request.call_id == call_id:
+                    return False  # 审批单存在但尚未审批
+            for request in getattr(store, "requests", {}).values():
+                if request.call_id != call_id:
+                    continue
+                if store.get_record(request.decision_id) is None:
+                    continue
+                snapshot = request.tool_arguments or {}
+                if snapshot.get("target_agent_id") != payload.get("target_agent_id"):
+                    return False
+                if snapshot.get("tool_name") != payload.get("tool_name"):
+                    return False
+                if snapshot.get("arguments") != payload.get("arguments"):
+                    return False
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("check delegation approval failed: %s", exc)
+        return False
 
     async def _handle_interaction_lifecycle(self, request: Request) -> JSONResponse:
         """接收 Go Kernel 的 Interaction/Task 生命周期审计通知。"""
@@ -1154,13 +1199,61 @@ class ToolGovernServer:
             return JSONResponse({"error": str(exc)}, status_code=500)
         if req is not None:
             self._watcher.notify(req.request_id)
+
+        # 委托类审批单：批准后自动派发（Go 内核 authorize 会经审批记录放行）
+        dispatch_payload: dict[str, Any] | None = None
+        if verdict == "approve" and req is not None and str(req.call_id).startswith(
+            "a2a-delegation:"
+        ):
+            dispatch_payload = await self._dispatch_approved_delegation(req)
         await self._audit_admin_operation(
             request,
             f"approval_{verdict}",
             target=f"decision:{decision_id}",
-            metadata={"approver_id": approver_id, "comment": comment},
+            metadata={
+                "approver_id": approver_id,
+                "comment": comment,
+                "delegation_dispatch": dispatch_payload,
+            },
         )
-        return JSONResponse({"decision_id": decision_id, "verdict": verdict})
+        response: dict[str, Any] = {"decision_id": decision_id, "verdict": verdict}
+        if dispatch_payload is not None:
+            response["dispatch"] = dispatch_payload
+        return JSONResponse(response)
+
+    async def _dispatch_approved_delegation(self, req: ApprovalRequest) -> dict[str, Any]:
+        """按审批单中保存的委托快照重建 DelegationRequest 并派发。"""
+        payload = req.tool_arguments or {}
+        bridge, _gk = self._go_kernel_view()
+        if bridge is None:
+            return {"attempted": False, "accepted": False, "reason": "go kernel disabled"}
+        interaction_id = str(req.call_id).removeprefix("a2a-delegation:")
+        try:
+            delegation = await bridge.request_delegation(
+                DelegationRequest(
+                    request_id=req.decision_id,
+                    initiator_agent_id=str(payload.get("source_agent_id") or ""),
+                    target_agent_id=str(payload.get("target_agent_id") or ""),
+                    tool_name=str(payload.get("tool_name") or ""),
+                    arguments=payload.get("arguments") or {},
+                    session_id=str(payload.get("session_id") or ""),
+                    # 快照中的 task_id 是 Python 侧语义，内核任务必须由内核实建，
+                    # 携带不存在的 task_id 会被内核以 "delegation task not found" 拒绝。
+                    task_id=None,
+                    risk_level=str(payload.get("risk_level") or "low"),
+                    allow_redelegation=bool(payload.get("allow_redelegation")),
+                    parent_interaction_id=interaction_id,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dispatch approved delegation failed: %s", exc)
+            return {"attempted": True, "accepted": False, "reason": str(exc)}
+        return {
+            "attempted": True,
+            "accepted": delegation.allowed,
+            "task_id": delegation.task_id or "",
+            "reason": "" if delegation.allowed else delegation.reason,
+        }
 
     async def _handle_admin_approvals_approve(self, request: Request) -> JSONResponse:
         return await self._handle_admin_approval(request, verdict="approve")
@@ -1509,6 +1602,13 @@ class ToolGovernServer:
         if audit_store is not None:
             await audit_store.append_async(engine.build_audit_event(proposal, decision))
 
+        # require_approval：自动生成审批单挂入审批台，批准后自动派发
+        approval = None
+        if decision.verdict == "require_approval":
+            approval = await self._submit_delegation_approval(
+                body, decision, proposal, self._admin_actor_id(request)
+            )
+
         dispatch = AdminDelegationDispatch()
         if decision.allowed:
             bridge, _gk = self._go_kernel_view()
@@ -1528,6 +1628,7 @@ class ToolGovernServer:
                         task_id=body.task_id,
                         risk_level=body.risk_level,
                         allow_redelegation=body.allow_redelegation,
+                        parent_interaction_id=decision.interaction_id,
                     )
                 )
                 dispatch = AdminDelegationDispatch(
@@ -1547,7 +1648,69 @@ class ToolGovernServer:
                 target_entrypoint=decision.target_entrypoint,
                 modified_args=decision.modified_args,
                 dispatch=dispatch,
+                approval=approval,
             ).model_dump(mode="json")
+        )
+
+    async def _submit_delegation_approval(
+        self,
+        body: Any,
+        decision: Any,
+        proposal: Any,
+        actor_id: str,
+    ) -> AdminDelegationApproval | None:
+        """把 require_approval 的委托转换为审批单提交到审批台。
+
+        审批单以 ``call_id=a2a-delegation:{interaction_id}`` 标记，批准后由
+        审批接口自动派发；审批人缺失（策略未指定升级对象）时不提交。
+        """
+        approver_id = (getattr(decision, "escalation_target", "") or "").strip()
+        if not approver_id:
+            logger.warning(
+                "delegation require_approval without escalation target: %s",
+                getattr(decision, "decision_id", ""),
+            )
+            return None
+        runtime = self._controller._runtime
+        try:
+            masked = runtime.masker.mask(proposal.arguments, "approval_request")
+        except Exception:  # noqa: BLE001
+            masked = proposal.arguments
+        request = ApprovalRequest(
+            request_id=f"a2a-req-{decision.interaction_id}",
+            decision_id=decision.decision_id,
+            call_id=f"a2a-delegation:{decision.interaction_id}",
+            task_id=proposal.task_id or decision.interaction_id,
+            agent_id=proposal.source_agent_id,
+            tool_name=proposal.tool_name,
+            arguments_masked=masked,
+            tool_arguments={
+                "source_agent_id": body.source_agent_id,
+                "target_agent_id": body.target_agent_id,
+                "tool_name": body.tool_name,
+                "arguments": proposal.arguments,
+                "risk_level": body.risk_level,
+                "session_id": body.session_id,
+                "task_id": body.task_id,
+                "allow_redelegation": body.allow_redelegation,
+            },
+            original_decision=None,
+            reason=(
+                f"A2A 委托需审批：{body.source_agent_id} → {body.target_agent_id}"
+                f" / {body.tool_name}（{decision.reason}）"
+            ),
+            requester_id=actor_id,
+            approver_id=approver_id,
+        )
+        try:
+            await runtime.approval_manager.submit(request)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("submit delegation approval failed: %s", exc)
+            return None
+        return AdminDelegationApproval(
+            request_id=request.request_id,
+            decision_id=decision.decision_id,
+            approver_id=approver_id,
         )
 
     async def _handle_admin_session_login(self, request: Request) -> JSONResponse:

@@ -237,6 +237,14 @@ class AdminDelegationDispatch(BaseModel):
     reason: str = ""
 
 
+class AdminDelegationApproval(BaseModel):
+    """require_approval 时自动生成的审批单信息。"""
+
+    request_id: str = ""
+    decision_id: str = ""
+    approver_id: str = ""
+
+
 class AdminDelegationResponse(BaseModel):
     """POST /v1/admin/a2a/delegations 响应体。"""
 
@@ -249,6 +257,7 @@ class AdminDelegationResponse(BaseModel):
     target_entrypoint: dict[str, Any] | None = None
     modified_args: dict[str, Any] | None = None
     dispatch: AdminDelegationDispatch = Field(default_factory=AdminDelegationDispatch)
+    approval: AdminDelegationApproval | None = None
 
 
 class AdminGovernEvaluateRequest(BaseModel):

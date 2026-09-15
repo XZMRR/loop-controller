@@ -149,6 +149,7 @@ class DelegationRequest:
         allowed_capabilities: list[str] | None = None,
         allow_redelegation: bool = False,
         parent_task_id: str = "",
+        parent_interaction_id: str = "",
         budget: dict[str, Any] | None = None,
         deadline: str | None = None,
         protocol_version: str = CURRENT_PROTOCOL_VERSION,
@@ -165,6 +166,7 @@ class DelegationRequest:
         self.allowed_capabilities = list(allowed_capabilities or [])
         self.allow_redelegation = allow_redelegation
         self.parent_task_id = parent_task_id
+        self.parent_interaction_id = parent_interaction_id
         self.budget = dict(budget or {})
         self.deadline = deadline
         self.protocol_version = protocol_version
@@ -183,6 +185,7 @@ class DelegationRequest:
             "allowed_capabilities": self.allowed_capabilities,
             "allow_redelegation": self.allow_redelegation,
             "parent_task_id": self.parent_task_id,
+            "parent_interaction_id": self.parent_interaction_id,
             "budget": self.budget,
             "deadline": self.deadline,
             "protocol_version": self.protocol_version,

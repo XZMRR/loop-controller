@@ -332,6 +332,11 @@ export interface AdminDelegationResult {
     task_id: string
     reason: string
   }
+  approval?: {
+    request_id: string
+    decision_id: string
+    approver_id: string
+  } | null
 }
 
 export async function createAdminDelegation(payload: {
