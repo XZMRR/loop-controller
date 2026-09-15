@@ -1,40 +1,56 @@
-# v0.23.0 本地函数注册表示例。
-# 实际函数需要可通过 PYTHONPATH 导入；下面的 module 仅作占位，请按真实项目修改。
+# 本地函数工具注册（v0.23.0）
+# analyze_sales 为 A2A 委托闭环 E2E 使用的模拟分析函数。
 tools:
-  calculate_checksum:
-    module: my_company.local_tools
-    function: calculate_file_sha256
-    description: 计算本地文件 SHA-256 校验和
+  analyze_sales:
+    module: tests.integration.local_tools
+    function: analyze_sales
+    description: 模拟销售数据分析（E2E 委托闭环）
     input_schema:
       type: object
       properties:
-        path:
-          type: string
-      required: [path]
-    cost_per_call: 100
-    default_risk: medium
+        region: {type: string}
+        period: {type: string}
+      required: [region, period]
+      additionalProperties: true
+    cost_per_call: 0
+    default_risk: low
     sandbox:
       timeout_seconds: 10
       max_output_bytes: 65536
-      allowed_paths: ["/data/input/**", "/data/output/**"]
+      allowed_paths: []
       env_whitelist: []
-
-  transform_data:
-    module: my_company.local_tools
-    function: transform_json_data
-    description: 对 JSON 数据做内部转换
+  # trusted_local_tools 白名单要求注册（execution_policy.yaml）
+  calculate_checksum:
+    module: tests.integration.local_tools
+    function: calculate_checksum
+    description: 模拟文件校验和（trusted_local 占位）
     input_schema:
       type: object
       properties:
-        data:
-          type: object
-        operation:
-          type: string
-      required: [data, operation]
-    cost_per_call: 50
+        path: {type: string}
+      required: [path]
+      additionalProperties: true
+    cost_per_call: 0
     default_risk: low
     sandbox:
-      timeout_seconds: 30
+      timeout_seconds: 10
+      max_output_bytes: 65536
+      allowed_paths: []
+      env_whitelist: []
+  transform_data:
+    module: tests.integration.local_tools
+    function: transform_data
+    description: 模拟数据转换（trusted_local 占位）
+    input_schema:
+      type: object
+      properties:
+        data: {type: array}
+      required: [data]
+      additionalProperties: true
+    cost_per_call: 0
+    default_risk: low
+    sandbox:
+      timeout_seconds: 10
       max_output_bytes: 65536
       allowed_paths: []
       env_whitelist: []

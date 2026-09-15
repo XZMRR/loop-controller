@@ -55,6 +55,7 @@
     "allowed_capabilities": ["filesystem_read"],
     "allow_redelegation": false,
     "parent_task_id": "task-parent",
+    "parent_interaction_id": "",
     "budget": {"token_count": 1000, "payment_amount": 5, "currency": "USD"},
     "deadline": "2026-09-01T12:30:00Z",
     "protocol_version": "0.48.0"

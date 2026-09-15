@@ -205,6 +205,19 @@ frontend/
 - **前端审批中心加"内核对账"页签**（[Approvals.vue](file:///D:/Agent/loop-controller-latest-develop/frontend/src/views/Approvals.vue)）：内核状态过滤下拉、对账表格（Approval ID/目标 Agent/工具/内核状态/任务/审批台关联/审批台结论/过期时间），未启用内核时提示。
 - **验证**：`tests/test_server.py` + `test_go_kernel_bridge.py` 共 102 全绿（新增代批准 Resume、对账视图、202 解析、403 透传、control/approver token 共 6 个）；Go `internal/api` + `internal/store` 测试全绿（新增 control token initiator 过滤用例）；前端构建通过。
 
+#### 进度记录（2026-09-16，第十一轮：任务执行闭环）
+
+- **架构**：采用"内核执行"语义——审批 Consume 后内核经 outbox dispatcher 把任务投递给目标 agent entrypoint，stub 回调 accept/start，由内核 executor 调用 Python `/v1/govern/tool-call` 完成工具执行，任务终态 `completed`。
+- **Go 内核 dispatcher 接线**（[handlers.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/api/handlers.go)）：`SetEntrypointClient` 内启动 `DelegationDispatchOutboxDispatcher`（仿 `SetR2Authorizer` 模式），`dispatchCancel` 在 `Close()` 释放；Consume 写入的 outbox 记录由此投递（Claim→Dispatch→MarkDelivered/MarkFailed 指数退避）。
+- **集成测试**（api_test.go）：`TestApprovalConsumptionDispatchesViaOutboxDispatcher` 全链路验证 require_approval→approve→Consume→dispatcher 投递（URL/task_id/token/delivery_id）。
+- **Python entrypoint stub**（[entrypoint_stub.py](file:///D:/Agent/loop-controller-latest-develop/src/loop_controller/entrypoint_stub.py) + CLI `entrypoint-stub` 子命令）：接收内核投递后**先幂等回调 create**（Consume 路径建任务不写 delegation message，而内核 token 校验依赖该 message），再 accept/start；重复投递 200 幂等；回调失败 502 不标记 driven，交由 dispatcher 退避重投。10 个单元测试全绿。
+- **Python 侧执行适配**（[server.py](file:///D:/Agent/loop-controller-latest-develop/src/loop_controller/server.py)）：
+  - `_handle_govern_tool_call` 对内核 task_id 建立**影子任务**（Python 侧无对应 Task 时同 id 登记），打通 R1-R5 治理与预算链路；
+  - 修复 GovernResponse 序列化：工具返回 dict 时 `json.dumps` 为字符串（原为 pydantic 校验 500）。
+- **配置/策略补齐**（委托闭环执行前提）：`identity.yaml` 增 `dev-token-research-agent-001`（agent_id=research-agent）；`agents.yaml` 注册 research-agent（复用 `research_assistant_v1` profile，避免测试最小 profile 校验冲突）；`profiles.yaml` 增 analyze_sales；新增 `local_functions.yaml` 注册 analyze_sales/calculate_checksum/transform_data（tests.integration.local_tools 模拟实现）；`execution_policy.yaml` trusted_local 增 analyze_sales；`policies/default.rego` 增 analyze_sales allow 规则；contract fixture 补 `parent_interaction_id` 字段。
+- **E2E 全链路验证**（OPA 8181 + Python 8000 + 内核 18080 + stub 8001）：管理端委托 → require_approval → 审批单入台 → Python 审批台批准 → 自动派发内核 → Consume → outbox dispatcher → stub create/accept/start → 内核 executor → govern/tool-call（影子任务+策略 allow+本地函数执行）→ 任务 `completed`，两次复验均通过。
+- **回归**：Python `pytest` 981 passed / 8 skipped；Go `go test ./...` 全包通过。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

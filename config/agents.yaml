@@ -10,6 +10,11 @@ agents:
       subject: agent://research-assistant/prod-001
       # mTLS 场景下证书 CN/SAN 匹配模板（可选）
       # cert_subject_template: "agent-researcher-prod-{harness_id}"
+  # 外部 A2A Agent（Go 内核注册），工具经内核 executor 回调 /v1/govern/tool-call 执行。
+  - agent_id: research-agent
+    name: External Research Agent
+    profile_id: research_assistant_v1
+    owner_id: zhang_manager
 
 users:
   - user_id: alice

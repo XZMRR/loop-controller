@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -554,4 +555,133 @@ func muxFor(srv *Server) *http.ServeMux {
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 	return mux
+}
+
+type recordingEntrypointClient struct {
+	mu          sync.Mutex
+	dispatched  []models.EntrypointTaskRequest
+	entrypoints []models.AgentEntrypoint
+}
+
+func (c *recordingEntrypointClient) Dispatch(_ context.Context, ep models.AgentEntrypoint, req models.EntrypointTaskRequest) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dispatched = append(c.dispatched, req)
+	c.entrypoints = append(c.entrypoints, ep)
+	return nil
+}
+
+func (c *recordingEntrypointClient) Cancel(context.Context, models.AgentEntrypoint, string, string) (bool, error) {
+	return true, nil
+}
+
+func (c *recordingEntrypointClient) waitDispatch(t *testing.T, timeout time.Duration) (models.AgentEntrypoint, models.EntrypointTaskRequest) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		if len(c.dispatched) > 0 {
+			ep, req := c.entrypoints[0], c.dispatched[0]
+			c.mu.Unlock()
+			return ep, req
+		}
+		c.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for entrypoint dispatch")
+	return models.AgentEntrypoint{}, models.EntrypointTaskRequest{}
+}
+
+type sequenceR2Authorizer struct {
+	decisions []models.DelegationResponse
+	calls     int
+}
+
+func (a *sequenceR2Authorizer) Authorize(context.Context, models.DelegationRequest) (models.DelegationResponse, error) {
+	d := a.decisions[a.calls]
+	a.calls++
+	return d, nil
+}
+
+// TestApprovalConsumptionDispatchesViaOutboxDispatcher verifies the full loop:
+// require_approval delegation → approve → ResumeApproval consumes the approval
+// and enqueues the dispatch outbox → the dispatcher started by
+// SetEntrypointClient delivers the task to the target entrypoint.
+func TestApprovalConsumptionDispatchesViaOutboxDispatcher(t *testing.T) {
+	srv, server := newTestServer(t)
+	srv.SetApprovalAuth("approver-token", "reviewer")
+	srv.SetR2Authorizer(&sequenceR2Authorizer{decisions: []models.DelegationResponse{
+		{Allowed: false, Verdict: "require_approval", DecisionID: "approval-decision", Reason: "review"},
+		{Allowed: true, Verdict: "allow", DecisionID: "allow-decision"},
+	}})
+
+	card := models.AgentCard{
+		AgentID:      "executor",
+		Name:         "Executor",
+		Entrypoint:   models.AgentEntrypoint{Type: "http", URL: "http://executor.local"},
+		Capabilities: []string{"delegate_execution"},
+	}
+	body, _ := json.Marshal(card)
+	resp, err := http.Post(server.URL+"/a2a/v1/agents", "application/json", bytes.NewReader(body))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register agent: %v status=%d", err, statusOf(resp))
+	}
+	resp.Body.Close()
+
+	client := &recordingEntrypointClient{}
+	srv.SetEntrypointClient(client)
+
+	delegationBody := `{"protocol_version":"` + currentProtocolVersion + `","request_id":"req-approval","session_id":"s-1","initiator_agent_id":"planner","target_agent_id":"executor","tool_name":"echo","arguments":{"x":1},"allowed_tools":["echo"],"budget":{}}`
+	resp, err = http.Post(server.URL+"/a2a/v1/delegations", "application/json", strings.NewReader(delegationBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("delegation status=%d", resp.StatusCode)
+	}
+	var delegationResp models.DelegationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&delegationResp); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if delegationResp.ApprovalID == "" {
+		t.Fatal("expected approval id in require_approval response")
+	}
+
+	approveBody := `{"request_id":"approve-1","reason":"ok"}`
+	approveReq, _ := http.NewRequest(http.MethodPost, server.URL+"/a2a/v1/delegation-approvals/"+delegationResp.ApprovalID+"/approve", strings.NewReader(approveBody))
+	approveReq.Header.Set("Authorization", "Bearer approver-token")
+	resp, err = http.DefaultClient.Do(approveReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("approve status=%d", resp.StatusCode)
+	}
+	var consumed models.DelegationApproval
+	if err := json.NewDecoder(resp.Body).Decode(&consumed); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if consumed.Status != "consumed" || consumed.TaskID == "" {
+		t.Fatalf("expected consumed approval with task, got %+v", consumed)
+	}
+
+	ep, req := client.waitDispatch(t, 5*time.Second)
+	if ep.URL != "http://executor.local" {
+		t.Fatalf("dispatched entrypoint = %q", ep.URL)
+	}
+	if req.TaskID != consumed.TaskID {
+		t.Fatalf("dispatched task = %q, want %q", req.TaskID, consumed.TaskID)
+	}
+	if req.DelegationToken == "" || req.DeliveryID == "" {
+		t.Fatalf("dispatch missing token/delivery: %+v", req)
+	}
+}
+
+func statusOf(resp *http.Response) int {
+	if resp == nil {
+		return 0
+	}
+	return resp.StatusCode
 }

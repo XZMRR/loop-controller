@@ -45,3 +45,7 @@ profiles:
         allowed_args:
           to: ["*@company.com"]
         max_calls_per_task: 1
+      # A2A 委托闭环：外部研究 Agent 经内核 executor 执行的分析工具
+      analyze_sales:
+        allowed: true
+        max_calls_per_task: 10

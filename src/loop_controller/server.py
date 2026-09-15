@@ -639,6 +639,25 @@ class ToolGovernServer:
                 status_code=409,
             )
 
+        # Go 内核 executor 以内核 task_id 回调；Python 侧无对应 Task 时建立影子
+        # 任务（同一 task_id），使 R1-R5 治理与预算链路可复用内核任务标识。
+        runtime = self._controller._runtime
+        get_task = getattr(runtime, "get_task", None)
+        if body.task_id and callable(get_task) and get_task(body.task_id) is None:
+            shadow_session = runtime.session_manager.get_or_create_session(
+                user_id=user_id,
+                agent_id=agent_id,
+            )
+            runtime.task_store.save(
+                Task(
+                    task_id=body.task_id,
+                    session_id=shadow_session.session_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    description=body.task_context or f"delegated task {body.task_id}",
+                )
+            )
+
         logger.info(
             "tool_call request agent=%s user=%s tool=%s",
             agent_id,
@@ -659,7 +678,15 @@ class ToolGovernServer:
 
         response = GovernResponse(
             status=result.status,
-            result=result.content if result.content is not None else result.reason or result.status,
+            result=(
+                result.content
+                if isinstance(result.content, str)
+                else (
+                    json.dumps(result.content, ensure_ascii=False)
+                    if result.content is not None
+                    else result.reason or result.status
+                )
+            ),
             request_id=result.request_id if result.status == "require_approval" else None,
             error_code=result.error_code,
         )

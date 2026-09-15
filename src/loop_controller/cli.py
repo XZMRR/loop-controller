@@ -147,6 +147,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SSE 模式要求客户端 mTLS 的 CA 证书路径",
     )
 
+    entrypoint_stub = subparsers.add_parser(
+        "entrypoint-stub",
+        help="启动 target agent entrypoint stub（接收内核任务投递并回调 accept/start）",
+    )
+    entrypoint_stub.add_argument("--host", default="127.0.0.1", help="监听 host（默认 127.0.0.1）")
+    entrypoint_stub.add_argument("--port", type=int, default=8001, help="监听端口（默认 8001）")
+    entrypoint_stub.add_argument("--kernel-url", required=True, help="Go A2A 内核 base URL")
+    entrypoint_stub.add_argument(
+        "--no-auto-accept",
+        action="store_true",
+        help="收到任务后不回调内核 accept",
+    )
+    entrypoint_stub.add_argument(
+        "--no-auto-start",
+        action="store_true",
+        help="收到任务后不回调内核 start（隐含 --no-auto-accept）",
+    )
+
     server = subparsers.add_parser("server", help="启动 HTTP 治理服务（v0.17.0）")
     server.add_argument("--host", default="127.0.0.1", help="监听 host（默认 127.0.0.1）")
     server.add_argument("--port", type=int, default=8080, help="监听端口（默认 8080）")
@@ -333,6 +351,28 @@ def _cmd_proxy(
     return 0
 
 
+def _cmd_entrypoint_stub(args: argparse.Namespace) -> int:
+    """启动 target agent entrypoint stub。"""
+    try:
+        import uvicorn
+
+        from loop_controller.entrypoint_stub import create_app
+    except ImportError:
+        print(
+            "错误：启动 entrypoint-stub 需要安装 server 依赖：uv pip install 'loop-controller[server]'",
+            file=sys.stderr,
+        )
+        return 1
+
+    app = create_app(
+        args.kernel_url,
+        auto_accept=not args.no_auto_accept,
+        auto_start=not args.no_auto_start,
+    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return 0
+
+
 def _cmd_server(config_dir: str, args: argparse.Namespace) -> int:
     """启动 HTTP 治理服务。"""
     try:
@@ -393,6 +433,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "server":
         return _cmd_server(config_dir, args)
+
+    if args.command == "entrypoint-stub":
+        return _cmd_entrypoint_stub(args)
 
     config = ConfigLoader().load(config_dir)
 

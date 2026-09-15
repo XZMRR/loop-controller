@@ -73,6 +73,13 @@ decision := {"verdict": "allow", "reason": "local function hang_forever allowed"
     not session_risk_above_threshold
 }
 
+# ---- analyze_sales：A2A 委托闭环目标 agent 的分析工具 ----
+decision := {"verdict": "allow", "reason": "analyze_sales allowed for delegated research agent", "policy_hits": ["analyze_sales_allow"]} if {
+    input.tool_name == "analyze_sales"
+    input.risk_level != "critical"
+    not session_risk_above_threshold
+}
+
 # ---- web_search ----
 decision := {"verdict": "allow", "reason": "web search allowed", "policy_hits": ["web_search_allow"]} if {
     input.tool_name == "web_search"

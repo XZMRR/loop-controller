@@ -21,5 +21,6 @@ execution:
     - send_email
     - calculate_checksum
     - transform_data
+    - analyze_sales
   # 单个工具的执行策略覆盖
   tools: {}

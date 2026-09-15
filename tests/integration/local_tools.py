@@ -24,6 +24,21 @@ def send_email(to: str, subject: str, body: str) -> dict[str, str]:
     return {"status": "sent", "to": to, "subject": subject}
 
 
+def analyze_sales(region: str, period: str) -> dict[str, str]:
+    """模拟销售分析，返回分析摘要。"""
+    return {"status": "analyzed", "region": region, "period": period}
+
+
+def calculate_checksum(path: str) -> dict[str, str]:
+    """模拟计算文件校验和（E2E 占位实现）。"""
+    return {"status": "ok", "path": path, "checksum": "0" * 64}
+
+
+def transform_data(data: list) -> dict[str, object]:
+    """模拟数据转换（E2E 占位实现）。"""
+    return {"status": "ok", "count": len(data)}
+
+
 def raise_error(message: str) -> str:
     """故意抛出异常，用于测试执行失败时的错误透传。"""
     raise RuntimeError(message)

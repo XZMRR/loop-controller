@@ -47,6 +47,7 @@ type Server struct {
 	executionsMu       sync.Mutex
 	executions         map[string]execution.Handle
 	outboxCancel       context.CancelFunc
+	dispatchCancel     context.CancelFunc
 	recoveryCancel     context.CancelFunc
 	controlToken       string
 	controlInitiatorID string
@@ -171,10 +172,20 @@ func (s *Server) SetR2Authorizer(a delegation.R2Authorizer) {
 	}
 }
 
-// SetEntrypointClient enables delivery of authorized tasks to target Agents.
+// SetEntrypointClient enables delivery of authorized tasks to target Agents
+// and starts the durable dispatch outbox dispatcher so tasks created by
+// approval consumption are delivered even across process restarts.
 func (s *Server) SetEntrypointClient(client delegation.EntrypointClient) {
 	s.entrypointClient = client
 	s.delegation.WithEntrypointClient(client)
+	if s.dispatchCancel != nil {
+		s.dispatchCancel()
+		s.dispatchCancel = nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.dispatchCancel = cancel
+	dispatcher := store.NewDelegationDispatchOutboxDispatcher(s.db.DelegationDispatchOutboxStore(), client, time.Second)
+	go dispatcher.Run(ctx)
 }
 
 // SetTargetExecutor configures execution of accepted target-side tasks.
@@ -204,6 +215,10 @@ func (s *Server) Close() error {
 	if s.outboxCancel != nil {
 		s.outboxCancel()
 		s.outboxCancel = nil
+	}
+	if s.dispatchCancel != nil {
+		s.dispatchCancel()
+		s.dispatchCancel = nil
 	}
 	if s.db != nil {
 		return s.db.Close()

@@ -8,6 +8,11 @@ identity:
       - token: dev-token-researcher-001
         agent_id: researcher_001
         user_id: alice
+      # Go 内核 executor 以目标 agent 身份调用 /v1/govern/tool-call，
+      # user_id 携带委托发起方；开发环境为外部 agent 研究线配置专用 token。
+      - token: dev-token-research-agent-001
+        agent_id: research-agent
+        user_id: researcher_001
 
   # 生产环境示例：JWT
   # jwt:
