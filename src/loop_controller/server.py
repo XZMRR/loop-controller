@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -31,7 +32,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
 
@@ -1434,6 +1435,42 @@ class ToolGovernServer:
             return JSONResponse({"error": "task not found"}, status_code=404)
         return JSONResponse(task)
 
+    async def _handle_admin_a2a_task_cancel(self, request: Request) -> JSONResponse:
+        """POST /v1/admin/a2a/tasks/{task_id}/cancel：管理端取消委托任务。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        bridge, _gk = self._go_kernel_view()
+        if bridge is None:
+            return JSONResponse({"error": "go kernel disabled"}, status_code=503)
+        reason = ""
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                reason = str(body.get("reason") or "")
+        except Exception:
+            reason = ""
+        task = await bridge.cancel_task(request.path_params["task_id"], reason=reason)
+        if task is None:
+            return JSONResponse(
+                {"error": "cancel failed or task not found"}, status_code=502
+            )
+        return JSONResponse(task)
+
+    async def _handle_admin_a2a_task_stream(self, request: Request) -> StreamingResponse:
+        """GET /v1/admin/a2a/tasks/{task_id}/stream：SSE 转发任务状态流。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)  # type: ignore[return-value]
+        bridge, _gk = self._go_kernel_view()
+        if bridge is None:
+            return JSONResponse({"error": "go kernel disabled"}, status_code=503)  # type: ignore[return-value]
+        task_id = request.path_params["task_id"]
+
+        async def events() -> AsyncIterator[str]:
+            async for event in bridge.stream_task(task_id):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
     async def _handle_admin_a2a_delegation(self, request: Request) -> JSONResponse:
         """POST /v1/admin/a2a/delegations：管理端发起委托（与 Agent 自发委托同治理路径）。"""
         if not self._check_api_key(request):
@@ -1862,6 +1899,16 @@ def build_app(
             Route(
                 "/v1/admin/a2a/tasks/{task_id}",
                 server._handle_admin_a2a_task_query,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/admin/a2a/tasks/{task_id}/cancel",
+                server._handle_admin_a2a_task_cancel,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/admin/a2a/tasks/{task_id}/stream",
+                server._handle_admin_a2a_task_stream,
                 methods=["GET"],
             ),
             Route(

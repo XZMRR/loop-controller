@@ -1767,6 +1767,17 @@ class _FakeGoKernelBridge:
             return None
         return {"task_id": task_id, "status": "completed"}
 
+    async def cancel_task(
+        self, task_id: str, reason: str = "", delegation_token: str = ""
+    ) -> dict[str, Any] | None:
+        if not self.reachable:
+            return None
+        return {"task_id": task_id, "status": "canceled", "cancel_reason": reason}
+
+    async def stream_task(self, task_id: str, timeout: float = 30.0):
+        yield {"task_id": task_id, "status": "running"}
+        yield {"task_id": task_id, "status": "completed"}
+
 
 def test_admin_a2a_status_without_bridge() -> None:
     client, _controller = _build_admin_client()  # mock runtime 无 go_kernel_bridge
@@ -1813,6 +1824,47 @@ def test_admin_a2a_task_query() -> None:
     # 无 bridge 时 fail-closed
     client2, _controller2 = _build_admin_client()
     resp = client2.get("/v1/admin/a2a/tasks/t-1", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 503
+
+
+def test_admin_a2a_task_cancel() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=True)
+    resp = client.post(
+        "/v1/admin/a2a/tasks/t-1/cancel",
+        headers={"X-API-Key": "test-key"},
+        json={"reason": "operator cancel"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "canceled"
+    assert body["cancel_reason"] == "operator cancel"
+
+    # 不可达时 502；无 bridge 时 503
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=False)
+    resp = client.post(
+        "/v1/admin/a2a/tasks/t-1/cancel", headers={"X-API-Key": "test-key"}
+    )
+    assert resp.status_code == 502
+    client2, _controller2 = _build_admin_client()
+    resp = client2.post(
+        "/v1/admin/a2a/tasks/t-1/cancel", headers={"X-API-Key": "test-key"}
+    )
+    assert resp.status_code == 503
+
+
+def test_admin_a2a_task_stream() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=True)
+    resp = client.get("/v1/admin/a2a/tasks/t-1/stream", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert '"status": "running"' in resp.text
+    assert '"status": "completed"' in resp.text
+
+    # 无 bridge 时 fail-closed
+    client2, _controller2 = _build_admin_client()
+    resp = client2.get("/v1/admin/a2a/tasks/t-1/stream", headers={"X-API-Key": "test-key"})
     assert resp.status_code == 503
 
 

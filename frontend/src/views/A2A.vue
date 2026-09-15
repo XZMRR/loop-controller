@@ -134,7 +134,10 @@
 
     <el-card class="mt-4" shadow="hover">
       <template #header>
-        <span>任务查询</span>
+        <div class="card-header">
+          <span>任务查询</span>
+          <el-tag v-if="streaming" type="primary" effect="dark">流式订阅中</el-tag>
+        </div>
       </template>
       <el-form inline @submit.prevent="queryTask">
         <el-form-item>
@@ -147,6 +150,27 @@
         </el-form-item>
       </el-form>
       <template v-if="task">
+        <div class="task-actions">
+          <el-tag :type="taskStatusTagType(task.status)" effect="dark">{{ task.status }}</el-tag>
+          <el-button
+            v-if="!isTerminalStatus(task.status)"
+            type="danger"
+            size="small"
+            :loading="canceling"
+            @click="cancelTask"
+          >
+            取消任务
+          </el-button>
+          <el-button
+            v-if="!streaming"
+            size="small"
+            :disabled="isTerminalStatus(task.status)"
+            @click="startStream"
+          >
+            订阅状态流
+          </el-button>
+          <el-button v-else size="small" @click="stopStream">停止订阅</el-button>
+        </div>
         <pre class="task-result">{{ JSON.stringify(task, null, 2) }}</pre>
       </template>
       <el-empty v-else-if="taskQueried" description="任务不存在或内核不可达" />
@@ -155,12 +179,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, reactive, onMounted } from 'vue'
+import { ref, computed, reactive, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   getA2AStatus,
   getA2AAgents,
   getA2ATask,
+  cancelA2ATask,
+  streamA2ATask,
   createAdminDelegation,
   type A2AStatus,
   type A2AAgent,
@@ -175,6 +201,23 @@ const taskId = ref('')
 const task = ref<Record<string, any> | null>(null)
 const taskQueried = ref(false)
 const querying = ref(false)
+const canceling = ref(false)
+const streaming = ref(false)
+let stopStreamFn: (() => void) | null = null
+
+const TERMINAL_STATUSES = ['completed', 'failed', 'canceled', 'cancelled', 'rejected']
+
+function isTerminalStatus(status: unknown) {
+  return TERMINAL_STATUSES.includes(String(status ?? ''))
+}
+
+function taskStatusTagType(status: unknown) {
+  const s = String(status ?? '')
+  if (s === 'completed') return 'success'
+  if (s === 'failed' || s === 'rejected') return 'danger'
+  if (s === 'canceled' || s === 'cancelled') return 'info'
+  return 'primary'
+}
 
 const delegation = reactive({
   source_agent_id: '',
@@ -247,6 +290,7 @@ async function submitDelegation() {
 async function queryTask() {
   querying.value = true
   taskQueried.value = false
+  stopStream()
   task.value = null
   try {
     task.value = await getA2ATask(taskId.value.trim())
@@ -257,6 +301,50 @@ async function queryTask() {
     querying.value = false
   }
 }
+
+async function cancelTask() {
+  canceling.value = true
+  try {
+    const updated = await cancelA2ATask(taskId.value.trim(), 'operator cancel from admin console')
+    task.value = updated
+    ElMessage.success(`任务已取消：${updated.status}`)
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.error || error.message || '取消任务失败')
+  } finally {
+    canceling.value = false
+  }
+}
+
+function startStream() {
+  const id = taskId.value.trim()
+  if (!id) return
+  stopStreamFn = streamA2ATask(
+    id,
+    (event) => {
+      // 内核事件即任务快照：就地更新并展示
+      task.value = event
+      taskQueried.value = true
+      if (isTerminalStatus(event?.status)) {
+        streaming.value = false
+        stopStreamFn = null
+      }
+    },
+    (error) => {
+      streaming.value = false
+      stopStreamFn = null
+      ElMessage.error(`状态流中断：${error.message}`)
+    },
+  )
+  streaming.value = true
+}
+
+function stopStream() {
+  stopStreamFn?.()
+  stopStreamFn = null
+  streaming.value = false
+}
+
+onBeforeUnmount(stopStream)
 
 onMounted(loadData)
 </script>
@@ -278,5 +366,12 @@ onMounted(loadData)
   padding: 12px;
   font-size: 12px;
   overflow: auto;
+}
+
+.task-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
 }
 </style>

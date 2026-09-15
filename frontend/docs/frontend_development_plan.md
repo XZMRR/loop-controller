@@ -167,6 +167,18 @@ frontend/
 - **完整链路验证通过**：Session 登录 → `POST /v1/admin/a2a/delegations`（researcher_001 → research-agent / analyze_sales）→ IIGE 治理 allow（profile → capability → 深度 → trust → OPA interaction 策略）→ Go 内核二次 authorize（200）→ 任务创建 accepted=true 返回 task_id → `GET /v1/admin/a2a/tasks/{task_id}` 查到 pending 任务（research-agent :8001 无真实执行端，development 模式不实际派发，符合预期）。全程审计落盘。
 - **验证**：`test_server.py` + `test_delegation_authorizer.py` 共 94 测试全绿。
 
+#### 进度记录（2026-09-15，第八轮：任务生命周期闭环——取消与 SSE 流式）
+
+- **后端新增两个管理接口**（[server.py](file:///D:/Agent/loop-controller-latest-develop/src/loop_controller/server.py)）：
+  - `POST /v1/admin/a2a/tasks/{task_id}/cancel`：透传 `bridge.cancel_task`，内核不可达/拒绝返回 502，无 bridge 503（fail-closed）；
+  - `GET /v1/admin/a2a/tasks/{task_id}/stream`：`StreamingResponse` SSE 转发 `bridge.stream_task`。
+- **前端**（[python.ts](file:///D:/Agent/loop-controller-latest-develop/frontend/src/api/python.ts)、[A2A.vue](file:///D:/Agent/loop-controller-latest-develop/frontend/src/views/A2A.vue)）：
+  - `cancelA2ATask` + `streamA2ATask`（fetch + ReadableStream 实现 SSE，因 EventSource 无法带 Authorization 头；自动解包内核事件信封取 `payload` 任务快照，收到终态自动断开）；
+  - 任务查询卡：状态 tag、非终态任务的"取消任务"按钮、"订阅状态流/停止订阅"按钮、订阅中标识；组件卸载自动断开流。
+- **联调发现的语义细节**：Go 内核终态拼写为 `cancelled`（双 l），前端终态集合已兼容两种拼写。
+- **完整链路验证**：发起委托 → task pending → 管理端 cancel → 任务 `cancelled`；SSE 流依次收到 `task_created`(pending) 与 `task_cancelled`(cancelled) 两帧。
+- **验证**：`tests/test_server.py` 86 测试全绿（新增 cancel 200/502/503 与 stream SSE 内容/503）；前端构建通过。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

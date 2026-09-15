@@ -252,6 +252,71 @@ export async function getA2ATask(taskId: string): Promise<Record<string, any>> {
   return data
 }
 
+export async function cancelA2ATask(taskId: string, reason = ''): Promise<Record<string, any>> {
+  const { data } = await pythonClient.post(`/v1/admin/a2a/tasks/${taskId}/cancel`, { reason })
+  return data
+}
+
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'canceled', 'cancelled', 'rejected'])
+
+/**
+ * 订阅任务 SSE 状态流；返回停止函数。收到终态事件自动停止并回调。
+ * 使用 fetch 而非 EventSource 以便携带 Authorization 头。
+ */
+export function streamA2ATask(
+  taskId: string,
+  onEvent: (event: Record<string, any>) => void,
+  onError?: (error: Error) => void,
+): () => void {
+  const abort = new AbortController()
+  const run = async () => {
+    try {
+      const headers: Record<string, string> = {}
+      const sessionToken = localStorage.getItem('lc_session_token')
+      const sessionExpires = localStorage.getItem('lc_session_expires')
+      const sessionValid =
+        !!sessionToken &&
+        (!sessionExpires || new Date(sessionExpires).getTime() > Date.now())
+      const apiKey = localStorage.getItem('lc_api_key')
+      if (sessionValid && sessionToken) headers.Authorization = `Bearer ${sessionToken}`
+      else if (apiKey) headers['X-API-Key'] = apiKey
+      const resp = await fetch(`/api/python/v1/admin/a2a/tasks/${taskId}/stream`, {
+        headers,
+        signal: abort.signal,
+      })
+      if (!resp.ok || !resp.body) throw new Error(`stream failed: HTTP ${resp.status}`)
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const frames = buffer.split('\n\n')
+        buffer = frames.pop() ?? ''
+        for (const frame of frames) {
+          const line = frame.split('\n').find((l) => l.startsWith('data: '))
+          if (!line) continue
+          try {
+            const raw = JSON.parse(line.slice(6))
+            // Go 内核事件为信封结构：任务快照在 payload 字段中
+            const event = raw?.payload && raw?.event_type ? raw.payload : raw
+            onEvent(event)
+            if (TERMINAL_STATUSES.has(String(event?.status ?? ''))) abort.abort()
+          } catch {
+            // 忽略无法解析的帧
+          }
+        }
+      }
+    } catch (error: any) {
+      if (!abort.signal.aborted) onError?.(error instanceof Error ? error : new Error(String(error)))
+    }
+  }
+  void run()
+  return () => abort.abort()
+}
+
 export interface AdminDelegationResult {
   verdict: string
   allowed: boolean
