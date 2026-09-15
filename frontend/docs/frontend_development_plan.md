@@ -84,6 +84,39 @@ frontend/
 
 ## 4. 功能阶段规划
 
+### 长线开发顺序与决策记录（2026-09-15）
+
+当前已确认进入长线开发阶段，不再只做静态展示或单次演示。
+
+#### 已确认的推进顺序
+
+1. **管理配置闭环**
+   - Agent / Profile / Identity / Entrypoints 的在线查看、编辑、保存、reload、审计。
+   - 目标：先把“配置能不能长期维护”做扎实，形成管理平台底座。
+2. **审批与审计闭环**
+   - 待审批、审批历史、审批详情、审批筛选、审计分页筛选、SSE/实时刷新、审计追踪。
+   - 目标：把治理运营链路做成可追踪、可复盘、可演示。
+3. **A2A 接入**
+   - Agent Card、Task、Message、Delegation、跨 Agent 协同。
+   - 目标：在前面两个底座稳定后，再接入多 Agent 协作。
+
+#### 已确认的技术决策
+
+- **演示主线**：先围绕“企业研究助手”做完整流程，原因是现有 `researcher_001`、`web_search`、`send_email`、OPA Profile 与审批链路最适合先跑通真实故事。
+- **多 Agent 底座要求**：虽然第一阶段先用单一 Agent 演示，但数据模型、API 契约、页面结构、筛选方式和权限设计都必须按“多 Agent、多 Profile、多 Owner、多租户可扩展”预留。
+- **鉴权策略**：短期继续保留 Admin API Key 用于联调；同时逐步补最小后端 Session 登录，为长期运行做准备。
+- **存储策略**：现阶段继续使用 JSONL / 文件存储，但所有新接口按分页、筛选、稳定契约设计，避免未来切 SQLite / 数据库时返工。
+- **配置生效策略**：Profile 优先支持“保存后统一 reload”；Identity / Entrypoints 先明确区分“可热更新字段”和“需要重启字段”。
+- **安全原则**：Identity、Secret、Token 等信息默认脱敏，不回显明文；管理操作必须写审计；前端 YAML fallback 逐步收紧。
+
+#### 长线开发为什么这样排
+
+- 先做管理配置闭环，是因为没有稳定的 Agent / Profile / Identity 维护能力，审批、审计、A2A 都只会停留在演示层。
+- 再做审批与审计闭环，是因为这是治理系统最重要的可运营能力，也是管理层最容易理解和验收的部分。
+- 最后接 A2A，是因为 A2A 依赖前面稳定的身份、配置、审计和审批语义，过早接入会放大接口返工成本。
+
+---
+
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）
 
 目标：不依赖后端新增接口，前端可独立运行并展示核心能力。
@@ -153,14 +186,53 @@ frontend/
 
 ### 6.2 需要后端配合
 
-- [ ] 后端补齐 `GET /v1/admin/agents`
-- [ ] 后端补齐 `GET /v1/admin/profiles`
-- [ ] 后端补齐 `GET /v1/admin/identity`（脱敏）
-- [ ] 后端补齐 `GET /v1/admin/entrypoints`
-- [ ] 后端补齐 `POST /v1/admin/govern/evaluate`（只读调试）
+- [x] 后端补齐 `GET /v1/admin/agents`
+- [x] 后端补齐 `GET /v1/admin/profiles`
+- [x] 后端补齐 `GET /v1/admin/identity`（脱敏）
+- [x] 后端补齐 `GET /v1/admin/entrypoints`
+- [x] 后端补齐 `POST /v1/admin/govern/evaluate`（只读调试）
 - [ ] 后端实现配置热重载 `POST /v1/admin/reload`
 - [ ] 后端扩展审批历史查询 `GET /v1/admin/approvals`
 - [ ] 后端修复 Go Kernel control token 桥接
+
+### 6.3 长线开发底座任务（当前主路线）
+
+#### 管理配置闭环
+
+- [ ] 审计查询支持 `agent_id` / `tool_name` 等稳定筛选契约
+- [ ] 登录地址策略收口：联调模式固定代理，生产模式反向代理
+- [ ] Agent 列表升级为多 Agent 可扩展数据结构
+- [ ] 新增 `GET /v1/admin/users` 或合并用户视图数据源
+- [ ] 新增 Agent 详情接口与页面
+- [ ] 新增 Profile 工具策略保存接口
+- [ ] 新增统一配置 reload 接口
+- [ ] Identity / Entrypoints 在线编辑与“需重启字段”提示
+- [ ] 管理操作统一写审计并支持追踪
+- [ ] 逐步收紧前端 YAML fallback，敏感配置禁止回退到明文文件
+
+#### 审批与审计闭环
+
+- [ ] 审批历史接口按分页和筛选设计
+- [ ] 审批详情抽屉或详情页
+- [ ] 审批实时刷新（SSE 或短期 ticket 方案）
+- [ ] 审计接口分页、筛选、时间范围
+- [ ] 从审批到审计的完整链路追踪视图
+
+#### A2A 接入
+
+- [ ] 建立真实 `frontend/src/api/a2a.ts`
+- [ ] Agent Card / Task / Message / Delegation 页面
+- [ ] Python -> Go Kernel control token 桥接
+- [ ] 多 Agent 协作演示链路
+
+### 6.4 当前优先实施顺序
+
+1. 修复审计 `agent_id` / `tool_name` 筛选契约。
+2. 收口登录地址驱动与联调代理策略。
+3. 增加审批历史接口与页面基础能力。
+4. 开始做 Agent 详情与多 Agent 兼容结构。
+5. 开始做 Profile 工具策略在线编辑与统一 reload。
+6. 接入 A2A 前，先稳定身份、审计和配置底座。
 
 ---
 

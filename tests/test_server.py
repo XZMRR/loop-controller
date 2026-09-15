@@ -24,12 +24,25 @@ from loop_controller.server import build_app
 class _MockAuditEvent:
     """极简审计事件 mock。"""
 
-    def __init__(self, session_id: str | None, task_id: str | None):
+    def __init__(
+        self,
+        session_id: str | None,
+        task_id: str | None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+    ):
         self.session_id = session_id
         self.task_id = task_id
+        self.agent_id = agent_id
+        self.tool_name = tool_name
 
-    def model_dump(self) -> dict[str, Any]:
-        return {"session_id": self.session_id, "task_id": self.task_id}
+    def model_dump(self, mode: str | None = None) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "agent_id": self.agent_id,
+            "tool_name": self.tool_name,
+        }
 
 
 class _MockAuditStore:
@@ -73,6 +86,9 @@ class _MockApprovalStore:
         self._pending = pending or []
         self._records: dict[str, Any] = {}
 
+    def submit_request(self, request: Any) -> None:
+        self._pending.append(request)
+
     def get_pending(self) -> list[_MockApprovalRequest]:
         return list(self._pending)
 
@@ -90,6 +106,14 @@ class _MockApprovalStore:
 
     def add_record(self, decision_id: str, record: Any) -> None:
         self._records[decision_id] = record
+
+    @property
+    def requests(self) -> dict[str, Any]:
+        return {req.decision_id: req for req in self._pending}
+
+    @property
+    def responses(self) -> dict[str, Any]:
+        return dict(self._records)
 
     def refresh(self) -> None:
         pass
@@ -565,6 +589,53 @@ def test_metrics_endpoint() -> None:
     assert "loop_controller_requests_total" in resp.text
 
 
+def test_admin_approvals_history_filters_and_pagination() -> None:
+    client, controller = _build_client(
+        api_key="secret",
+        identity_provider=_admin_identity_provider(),
+    )
+    from loop_controller.models import ApprovalRecord
+
+    store = controller._runtime.approval_manager._store
+    request = _pending_approval_request()
+    store.submit_request(request)
+    store.record_response(
+        ApprovalRecord(
+            request_id=request.request_id,
+            decision_id=request.decision_id,
+            verdict="approve",
+            approver_id="zhang_manager",
+            comment="ok",
+        )
+    )
+
+    resp = client.get(
+        "/v1/admin/approvals",
+        params={"status": "approve", "tool_name": "send_email", "limit": 10},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["approvals"]) == 1
+    assert data["approvals"][0]["status"] == "approve"
+    assert data["approvals"][0]["agent_id"] == "researcher_001"
+    assert data["approvals"][0]["tool_name"] == "send_email"
+    assert data["approvals"][0]["approver_id"] == "zhang_manager"
+    assert data["total"] == 1
+    assert data["limit"] == 10
+    assert data["offset"] == 0
+
+
+def test_admin_approvals_rejects_invalid_status() -> None:
+    client, _controller = _build_client(api_key="secret")
+    resp = client.get(
+        "/v1/admin/approvals",
+        params={"status": "weird"},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 400
+
+
 def test_admin_pending_approvals() -> None:
     client, controller = _build_client(api_key="secret")
     store = controller._runtime.approval_manager._store
@@ -583,6 +654,26 @@ def test_admin_pending_approvals() -> None:
     assert len(data["approvals"]) == 1
     assert data["approvals"][0]["request_id"] == "req-1"
     assert data["approvals"][0]["tool_name"] == "send_email"
+
+
+def test_admin_audit_query_by_agent_and_tool() -> None:
+    client, controller = _build_client(api_key="secret")
+    controller._runtime.audit_store = _MockAuditStore(
+        [
+            _MockAuditEvent(session_id="s-1", task_id="t-1", agent_id="a-1", tool_name="send_email"),
+            _MockAuditEvent(session_id="s-2", task_id="t-2", agent_id="a-2", tool_name="web_search"),
+        ]
+    )
+    resp = client.get(
+        "/v1/admin/audit",
+        params={"agent_id": "a-1", "tool_name": "send_email", "limit": 10},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["events"]) == 1
+    assert data["events"][0]["agent_id"] == "a-1"
+    assert data["events"][0]["tool_name"] == "send_email"
 
 
 def test_admin_audit_query() -> None:

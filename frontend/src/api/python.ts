@@ -74,6 +74,32 @@ export async function getHealth(): Promise<HealthStatus> {
   return data
 }
 
+export interface ApprovalHistoryItem {
+  request_id: string
+  decision_id: string
+  agent_id: string
+  tool_name: string
+  requester_id: string
+  approver_id: string
+  reason: string
+  status: string
+  created_at?: string | null
+  decided_at?: string | null
+}
+
+export async function getApprovalHistory(params: {
+  status?: string
+  agent_id?: string
+  tool_name?: string
+  requester_id?: string
+  approver_id?: string
+  limit?: number
+  offset?: number
+}): Promise<{ approvals: ApprovalHistoryItem[]; total: number; limit: number; offset: number }> {
+  const { data } = await pythonClient.get('/v1/admin/approvals', { params })
+  return data
+}
+
 export async function getPendingApprovals(): Promise<PendingApproval[]> {
   const { data } = await pythonClient.get('/v1/admin/approvals/pending')
   return data.approvals || []

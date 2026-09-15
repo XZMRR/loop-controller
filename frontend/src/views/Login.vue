@@ -9,12 +9,12 @@
         </div>
       </template>
       <el-form :model="form" label-position="top" @submit.prevent="handleLogin">
-        <el-form-item label="Python Runtime 地址">
-          <el-input v-model="form.baseUrl" placeholder="http://127.0.0.1:8000" />
-        </el-form-item>
-        <el-form-item label="Go A2A Kernel 地址">
-          <el-input v-model="form.a2aUrl" placeholder="http://127.0.0.1:8080" />
-        </el-form-item>
+        <el-alert
+          title="当前为联调模式：后端地址由开发代理固定，生产环境建议由网关统一代理。"
+          type="info"
+          :closable="false"
+          style="margin-bottom: 16px"
+        />
         <el-form-item label="Admin API Key">
           <el-input
             v-model="form.apiKey"
@@ -43,8 +43,6 @@ const auth = useAuthStore()
 const loading = ref(false)
 
 const form = reactive({
-  baseUrl: auth.baseUrl || 'http://127.0.0.1:8000',
-  a2aUrl: auth.a2aUrl || 'http://127.0.0.1:8080',
   apiKey: auth.apiKey || '',
 })
 
@@ -57,8 +55,8 @@ async function handleLogin() {
   try {
     auth.login({
       apiKey: form.apiKey.trim(),
-      baseUrl: form.baseUrl.trim(),
-      a2aUrl: form.a2aUrl.trim(),
+      baseUrl: '/api/python',
+      a2aUrl: '/api/a2a',
     })
     await getHealth()
     ElMessage.success('连接成功')

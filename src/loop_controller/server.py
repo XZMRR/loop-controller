@@ -46,7 +46,7 @@ from loop_controller.identity import (
     KillSwitchConfig,
     RevocationType,
 )
-from loop_controller.infra.approval_store import ApprovalStoreError
+from loop_controller.infra.approval_store import ApprovalStoreError, list_approval_history
 from loop_controller.interaction.engine import (
     InteractionAuthorizeEndpoint,
     InteractionGovernanceEngine,
@@ -66,6 +66,7 @@ from loop_controller.models import ActionProposal, AuditEvent, Task
 from loop_controller.server_models import (
     AdminAgentItem,
     AdminAgentsResponse,
+    AdminApprovalsResponse,
     AdminGovernEvaluateRequest,
     AdminGovernEvaluateResponse,
     AdminProfilesResponse,
@@ -1019,6 +1020,57 @@ class ToolGovernServer:
         )
         return JSONResponse(summary)
 
+    async def _handle_admin_approvals(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/approvals：审批历史（兼容 JSONL，按未来分页契约返回）。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        status = request.query_params.get("status")
+        valid_status = {None, "all", "pending", "approve", "deny"}
+        if status not in valid_status:
+            return JSONResponse(
+                {"error": "invalid_parameter", "message": "invalid approval status"},
+                status_code=400,
+            )
+        try:
+            limit = int(request.query_params.get("limit", "100"))
+            offset = int(request.query_params.get("offset", "0"))
+        except ValueError:
+            return JSONResponse(
+                {"error": "invalid_parameter", "message": "limit/offset must be integers"},
+                status_code=400,
+            )
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
+        store = self._controller._runtime.approval_manager._store
+        requests = getattr(store, "requests", {})
+        responses = getattr(store, "responses", {})
+        pending = [request for decision_id, request in requests.items() if decision_id not in responses]
+        completed = [
+            (request, responses[decision_id])
+            for decision_id, request in requests.items()
+            if decision_id in responses
+        ]
+        items = list_approval_history(
+            pending,
+            completed,
+            status=status,
+            agent_id=request.query_params.get("agent_id"),
+            tool_name=request.query_params.get("tool_name"),
+            requester_id=request.query_params.get("requester_id"),
+            approver_id=request.query_params.get("approver_id"),
+            limit=limit,
+            offset=offset,
+        )
+        return JSONResponse(
+            AdminApprovalsResponse(
+                approvals=items,
+                total=len(items),
+                limit=limit,
+                offset=offset,
+            ).model_dump(mode="json")
+        )
+
     async def _handle_admin_approval(self, request: Request, *, verdict: str) -> JSONResponse:
         if not self._check_api_key(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -1089,6 +1141,8 @@ class ToolGovernServer:
 
         session_id = request.query_params.get("session_id")
         task_id = request.query_params.get("task_id")
+        agent_id = request.query_params.get("agent_id")
+        tool_name = request.query_params.get("tool_name")
         interaction_id = request.query_params.get("interaction_id")
         source_agent_id = request.query_params.get("source_agent_id")
         target_agent_id = request.query_params.get("target_agent_id")
@@ -1129,6 +1183,10 @@ class ToolGovernServer:
                 if session_id and payload.get("session_id") != session_id:
                     continue
                 if task_id and payload.get("task_id") != task_id:
+                    continue
+                if agent_id and payload.get("agent_id") != agent_id:
+                    continue
+                if tool_name and payload.get("tool_name") != tool_name:
                     continue
                 events.append(payload)
                 if len(events) >= limit:
@@ -1414,6 +1472,7 @@ def build_app(
                 server._handle_admin_pending_approvals,
                 methods=["GET"],
             ),
+            Route("/v1/admin/approvals", server._handle_admin_approvals, methods=["GET"]),
             Route(
                 "/v1/admin/harness/backends", server._handle_admin_harness_backends, methods=["GET"]
             ),

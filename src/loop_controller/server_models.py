@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from loop_controller.identity import KillSwitchConfig, RevocationEntry, RevocationType
+from loop_controller.models import ApprovalHistoryItem
 
 
 class GovernToolRequest(BaseModel):
@@ -88,6 +89,15 @@ class PendingApprovalsResponse(BaseModel):
     """GET /v1/admin/approvals/pending 响应体。"""
 
     approvals: list[PendingApprovalItem] = Field(default_factory=list, description="待审批请求列表")
+
+
+class AdminApprovalsResponse(BaseModel):
+    """GET /v1/admin/approvals 审批历史响应体。"""
+
+    approvals: list[ApprovalHistoryItem] = Field(default_factory=list)
+    total: int = Field(default=0, description="未分页前的总条数")
+    limit: int = Field(default=100)
+    offset: int = Field(default=0)
 
 
 class RevokeRequest(BaseModel):
