@@ -70,7 +70,7 @@ async function loadData() {
     healthStatus.value = healthData.status
     pendingCount.value = pending.length
     agentCount.value = agents.agents?.length || 0
-    killSwitchActive.value = revocation.kill_switch?.active || false
+    killSwitchActive.value = revocation.kill_switch?.enabled || false
   } catch (error: any) {
     ElMessage.error(error.message || '加载仪表盘失败')
   }

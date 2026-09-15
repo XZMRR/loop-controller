@@ -1125,7 +1125,7 @@ class ToolGovernServer:
         else:
             events = []
             async for event in audit_store.iter_events():
-                payload = event.model_dump()
+                payload = event.model_dump(mode="json")
                 if session_id and payload.get("session_id") != session_id:
                     continue
                 if task_id and payload.get("task_id") != task_id:

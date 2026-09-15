@@ -63,7 +63,7 @@ export interface RevocationEntry {
 export interface RevocationListResponse {
   revocations: RevocationEntry[]
   kill_switch: {
-    active: boolean
+    enabled: boolean
     reason?: string
     activated_at?: string
   }
@@ -120,8 +120,8 @@ export async function getRevocationList(): Promise<RevocationListResponse> {
   return data
 }
 
-export async function setKillSwitch(active: boolean, reason: string): Promise<void> {
-  await pythonClient.post('/admin/kill-switch', { active, reason })
+export async function setKillSwitch(enabled: boolean, reason: string): Promise<void> {
+  await pythonClient.post('/admin/kill-switch', { enabled, reason })
 }
 
 export async function getHarnessBackends(): Promise<Array<Record<string, any>>> {

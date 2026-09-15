@@ -97,7 +97,7 @@ async function loadData() {
     ])
     entrypoints.value = ep
     identity.value = id
-    killSwitchActive.value = revocation.kill_switch?.active || false
+    killSwitchActive.value = revocation.kill_switch?.enabled || false
   } catch (error: any) {
     ElMessage.error(error.message || '加载配置失败')
   }
