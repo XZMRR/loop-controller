@@ -471,3 +471,26 @@ Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` �
 5. `POST /v1/admin/govern/evaluate`（只读调试）
 
 这样前端就可以完全脱离直接读取 YAML 文件，统一走后端 API。
+
+### 实现状态（已完成）
+
+以上 5 个接口已在 `src/loop_controller/server.py` 实现并注册路由，请求/响应模型见
+`src/loop_controller/server_models.py`（`AdminAgentItem` / `AdminAgentsResponse` /
+`AdminProfilesResponse` / `AdminGovernEvaluateRequest` / `AdminGovernEvaluateResponse`），
+测试覆盖见 `tests/test_server.py` 末尾的管理接口测试段。
+
+实现要点：
+
+- **鉴权**：与既有 `/v1/admin/*` 一致，强制 `X-API-Key` / `Authorization: Bearer` 校验。
+- **Agent 列表**：数据源为 `runtime.config.agents`，结合 `RevocationList` 计算 `revoked`
+  字段（过期吊销条目不计入）。
+- **Profile 列表**：数据源为 `runtime.profiles`，`CapabilityProfile` 原样序列化。
+- **Identity / Entrypoints**：直接返回内存配置，经 `_mask_sensitive` 递归脱敏——键名命中
+  `secret|token|password|private|credential|api_key`（忽略大小写）的字符串值替换为
+  `******`（如 `static.allowed_tokens` 中的 token 字段）。
+- **Govern 只读调试**：绕过 `LoopController.evaluate`（避免提交审批请求），直接调用
+  `Checkpoint.evaluate`。已知可控副作用：防重放记录 call_id、按随机 task_id 预留预算
+  （下次启动由 `recover_stale_reservations` 回收）、deny 时更新随机 session 风险状态
+  （不累积）。所有合成 ID 带 `dryrun-` 前缀便于审计识别。
+- **前端接入**：`frontend/src/api/config.ts` 的 4 个 loader 已改为 API 优先、YAML 回退，
+  视图层无需感知数据来源。

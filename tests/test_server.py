@@ -1293,3 +1293,227 @@ def test_invalid_query_param_returns_400() -> None:
     resp = client.get("/v1/wait-for-approval?request_id=r1&max_wait=abc")
     assert resp.status_code == 400
     assert resp.json()["error"] == "invalid_parameter"
+
+
+# ---------------------------------------------------------------------------
+# 管理控制台最小可行接口（/v1/admin/agents|profiles|identity|entrypoints|govern/evaluate）
+# ---------------------------------------------------------------------------
+
+from datetime import UTC, datetime, timedelta  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from loop_controller.classifier import RuleBasedClassifier  # noqa: E402
+from loop_controller.identity import (  # noqa: E402
+    AgentIdentity,
+    RevocationEntry,
+    RevocationList,
+    RevocationType,
+)
+from loop_controller.identity.revocation import RevocationMatch  # noqa: E402
+from loop_controller.models import (  # noqa: E402
+    CapabilityProfile,
+    Decision,
+    ToolPermission,
+)
+
+
+def _admin_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        agents={
+            "researcher_001": Agent(
+                agent_id="researcher_001",
+                name="Research Assistant",
+                profile_id="research_v1",
+                owner_id="zhang_manager",
+            ),
+            "writer_001": Agent(
+                agent_id="writer_001",
+                name="Writer",
+                profile_id="writer_v1",
+                owner_id="li_manager",
+            ),
+        },
+        users={"zhang_manager": "张经理", "li_manager": "李经理"},
+        identity_config={
+            "provider": "static",
+            "static": {"allowed_tokens": ["tok-secret-1", "tok-secret-2"]},
+        },
+        entrypoints_config={
+            "entrypoints": {"http": {"require_auth": True, "api_key": "super-secret-key"}},
+        },
+    )
+
+
+def _admin_profiles() -> dict[str, CapabilityProfile]:
+    return {
+        "research_v1": CapabilityProfile(
+            profile_id="research_v1",
+            version="abc123",
+            description="研究助手",
+            tools={
+                "send_email": ToolPermission(
+                    tool_name="send_email", allowed=True, require_approval=True
+                )
+            },
+        )
+    }
+
+
+class _AdminMockCheckpoint:
+    """提供吊销检查与判定结果的 Checkpoint mock。"""
+
+    def __init__(self, revoked: bool = False) -> None:
+        self._policy_engine = _MockPolicyEngine("http://127.0.0.1:1")
+        self._revoked = revoked
+        self.evaluated: list[str] = []
+
+    def check_revocation(
+        self, identity: AgentIdentity, tool_name: str, arguments: dict
+    ) -> RevocationMatch:
+        if self._revoked:
+            return RevocationMatch(
+                revoked=True, reason="agent revoked", type=RevocationType.AGENT, id=identity.agent_id
+            )
+        return RevocationMatch(revoked=False)
+
+    async def evaluate(self, task: Any, agent: Any, proposal: Any, **kwargs: Any) -> Decision:
+        self.evaluated.append(proposal.call_id)
+        return Decision(
+            decision_id="d-dryrun",
+            call_id=proposal.call_id,
+            task_id=task.task_id,
+            verdict="allow",
+            reason="allowed by policy",
+            policy_hits=["default_allow"],
+            policy_version="pv1",
+            profile_version="abc123",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+
+
+class _AdminMockRuntime:
+    def __init__(self, revoked: bool = False, with_revocation: bool = True) -> None:
+        self.approval_manager = _MockApprovalManager()
+        self.audit_store = _MockAuditStore()
+        self.checkpoint = _AdminMockCheckpoint(revoked=revoked)
+        self.harness_executor = None
+        self.config = _admin_config()
+        self.profiles = _admin_profiles()
+        self.classifier = RuleBasedClassifier()
+        self.http_tool_names: set[str] = set()
+        revocations = RevocationList()
+        if with_revocation:
+            revocations.add(
+                RevocationEntry(type=RevocationType.AGENT, id="writer_001", reason="测试吊销")
+            )
+        self.revocation_list = revocations
+
+
+class _AdminMockController(_MockController):
+    def __init__(self, revoked: bool = False) -> None:
+        super().__init__()
+        self._runtime = _AdminMockRuntime(revoked=revoked)
+
+
+def _build_admin_client(
+    api_key: str | None = "test-key", revoked: bool = False
+) -> tuple[TestClient, _AdminMockController]:
+    controller = _AdminMockController(revoked=revoked)
+    app = build_app(controller, api_key=api_key, configure_logs=False)
+    return TestClient(app), controller
+
+
+def test_admin_agents_lists_config_with_revocation() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/agents", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    agents = {a["agent_id"]: a for a in resp.json()["agents"]}
+    assert agents["researcher_001"]["name"] == "Research Assistant"
+    assert agents["researcher_001"]["owner_name"] == "张经理"
+    assert agents["researcher_001"]["revoked"] is False
+    assert agents["writer_001"]["revoked"] is True
+
+
+def test_admin_agents_requires_api_key() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/agents")
+    assert resp.status_code == 401
+
+
+def test_admin_profiles_returns_serialized_profiles() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/profiles", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    profiles = {p["profile_id"]: p for p in resp.json()["profiles"]}
+    profile = profiles["research_v1"]
+    assert profile["tools"]["send_email"]["allowed"] is True
+    assert profile["tools"]["send_email"]["require_approval"] is True
+
+
+def test_admin_identity_masks_sensitive_values() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/identity", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["provider"] == "static"
+    tokens = data["config"]["static"]["allowed_tokens"]
+    assert tokens == ["******", "******"]
+    assert "tok-secret-1" not in resp.text
+
+
+def test_admin_entrypoints_masks_api_key() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/entrypoints", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    entrypoints = resp.json()["entrypoints"]
+    assert entrypoints["http"]["require_auth"] is True
+    assert entrypoints["http"]["api_key"] == "******"
+    assert "super-secret-key" not in resp.text
+
+
+def test_admin_govern_evaluate_returns_decision_without_execution() -> None:
+    client, controller = _build_admin_client()
+    resp = client.post(
+        "/v1/admin/govern/evaluate",
+        headers={"X-API-Key": "test-key"},
+        json={
+            "agent_id": "researcher_001",
+            "user_id": "alice",
+            "tool_name": "send_email",
+            "arguments": {"to": "zhang@company.com"},
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["verdict"] == "allow"
+    assert data["dry_run"] is True
+    assert data["risk_level"] == "high"  # RuleBasedClassifier: send_email -> high
+    # 未触发真实执行
+    assert controller.tool_calls == []
+    # 合成 call_id 带 dryrun- 前缀
+    assert controller._runtime.checkpoint.evaluated[0].startswith("dryrun-")
+
+
+def test_admin_govern_evaluate_blocked_by_revocation() -> None:
+    client, controller = _build_admin_client(revoked=True)
+    resp = client.post(
+        "/v1/admin/govern/evaluate",
+        headers={"X-API-Key": "test-key"},
+        json={"agent_id": "researcher_001", "user_id": "alice", "tool_name": "send_email"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["verdict"] == "blocked"
+    assert data["reason"] == "agent revoked"
+    # 被吊销时不进入 R2 判定
+    assert controller._runtime.checkpoint.evaluated == []
+
+
+def test_admin_govern_evaluate_unknown_agent_returns_404() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.post(
+        "/v1/admin/govern/evaluate",
+        headers={"X-API-Key": "test-key"},
+        json={"agent_id": "ghost", "user_id": "alice", "tool_name": "send_email"},
+    )
+    assert resp.status_code == 404

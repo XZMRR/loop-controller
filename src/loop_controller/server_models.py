@@ -110,3 +110,55 @@ class AuditQueryResponse(BaseModel):
     """GET /v1/admin/audit 响应体。"""
 
     events: list[dict] = Field(default_factory=list, description="审计事件列表")
+
+
+# ---------------------------------------------------------------------------
+# 管理控制台最小可行接口（GET /v1/admin/agents|profiles + POST govern/evaluate）
+# ---------------------------------------------------------------------------
+
+
+class AdminAgentItem(BaseModel):
+    """GET /v1/admin/agents 列表项。"""
+
+    agent_id: str = Field(..., description="Agent 身份标识")
+    name: str = Field(..., description="显示名称")
+    profile_id: str = Field(..., description="绑定的 CapabilityProfile")
+    owner_id: str = Field(..., description="所属用户/部门 ID")
+    owner_name: str | None = Field(default=None, description="所属用户显示名")
+    tenant_id: str | None = Field(default=None, description="租户 ID")
+    revoked: bool = Field(default=False, description="是否已被吊销")
+
+
+class AdminAgentsResponse(BaseModel):
+    """GET /v1/admin/agents 响应体。"""
+
+    agents: list[AdminAgentItem] = Field(default_factory=list)
+
+
+class AdminProfilesResponse(BaseModel):
+    """GET /v1/admin/profiles 响应体（CapabilityProfile 原样序列化）。"""
+
+    profiles: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AdminGovernEvaluateRequest(BaseModel):
+    """POST /v1/admin/govern/evaluate 请求体（只读判定调试）。"""
+
+    agent_id: str = Field(..., description="Agent 身份标识")
+    user_id: str = Field(..., description="用户身份标识")
+    tool_name: str = Field(..., description="Loop Controller 内部 canonical_name")
+    arguments: dict[str, Any] = Field(default_factory=dict, description="工具参数")
+    task_context: str = Field(default="", description="任务上下文")
+
+
+class AdminGovernEvaluateResponse(BaseModel):
+    """POST /v1/admin/govern/evaluate 响应体。"""
+
+    verdict: str = Field(..., description="allow / deny / modify / require_approval / blocked")
+    reason: str = Field(default="", description="判定原因")
+    policy_hits: list[str] = Field(default_factory=list, description="命中的策略规则")
+    risk_level: str | None = Field(default=None, description="R1 分类的风险等级")
+    risk_tags: list[str] = Field(default_factory=list, description="R1 分类的风险标签")
+    policy_version: str = Field(default="", description="判定时生效的策略版本")
+    profile_version: str = Field(default="", description="判定时生效的 Profile 版本")
+    dry_run: bool = Field(default=True, description="标识该判定未真实执行")

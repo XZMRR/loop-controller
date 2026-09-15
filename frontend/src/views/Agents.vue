@@ -10,8 +10,10 @@
         <el-table-column prop="profile_id" label="Profile" width="180" />
         <el-table-column prop="owner_id" label="Owner" />
         <el-table-column label="状态" width="120">
-          <template #default>
-            <el-tag type="success">正常</el-tag>
+          <template #default="{ row }">
+            <el-tag :type="row.revoked ? 'danger' : 'success'">
+              {{ row.revoked ? '已吊销' : '正常' }}
+            </el-tag>
           </template>
         </el-table-column>
       </el-table>

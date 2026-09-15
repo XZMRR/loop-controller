@@ -26,15 +26,18 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from loop_controller.approval_service import ApprovalServiceError, build_approval_record
 from loop_controller.approval_watcher import ApprovalWatcher
+from loop_controller.checkpoint import CheckpointError
 from loop_controller.controller import LoopController
 from loop_controller.identity import (
     AgentIdentity,
@@ -59,8 +62,13 @@ from loop_controller.metrics import (
 from loop_controller.metrics import (
     set_trace_id as metrics_set_trace_id,
 )
-from loop_controller.models import AuditEvent
+from loop_controller.models import ActionProposal, AuditEvent, Task
 from loop_controller.server_models import (
+    AdminAgentItem,
+    AdminAgentsResponse,
+    AdminGovernEvaluateRequest,
+    AdminGovernEvaluateResponse,
+    AdminProfilesResponse,
     AuditQueryResponse,
     GovernResponse,
     GovernToolRequest,
@@ -105,6 +113,26 @@ def _extract_identity_provider(controller: LoopController) -> IdentityProvider |
     if checkpoint is None:
         return None
     return getattr(checkpoint, "_identity", None)
+
+
+# 配置脱敏：键名命中敏感词时，字符串值/字符串列表项替换为掩码。
+_SENSITIVE_KEY_PATTERN = re.compile(
+    r"(secret|token|password|private|credential|api_key)", re.IGNORECASE
+)
+_MASK = "******"
+
+
+def _mask_sensitive(value: Any, key: str = "") -> Any:
+    """递归脱敏配置字典；命中敏感键名的字符串值替换为 ``******``。"""
+    if isinstance(value, dict):
+        return {k: _mask_sensitive(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        if _SENSITIVE_KEY_PATTERN.search(key):
+            return [_MASK if isinstance(item, str) else _mask_sensitive(item) for item in value]
+        return [_mask_sensitive(item) for item in value]
+    if isinstance(value, str) and value and _SENSITIVE_KEY_PATTERN.search(key):
+        return _MASK
+    return value
 
 
 class MetricsMiddleware(BaseHTTPMiddleware):
@@ -1108,6 +1136,158 @@ class ToolGovernServer:
             events.reverse()
         return JSONResponse(AuditQueryResponse(events=events).model_dump())
 
+    def _revoked_ids(self, entry_type: RevocationType) -> set[str]:
+        """当前生效（未过期）的吊销条目 ID 集合。"""
+        revocations = getattr(self._controller._runtime, "revocation_list", None)
+        if revocations is None:
+            return set()
+        now = datetime.now(UTC)
+        return {
+            entry.id
+            for entry in revocations.entries
+            if entry.type == entry_type and (entry.expires_at is None or entry.expires_at > now)
+        }
+
+    async def _handle_admin_agents(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/agents：列出已配置 Agent 及其吊销状态。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        config = getattr(self._controller._runtime, "config", None)
+        if config is None:
+            return JSONResponse({"error": "config unavailable"}, status_code=503)
+        revoked_ids = self._revoked_ids(RevocationType.AGENT)
+        items = [
+            AdminAgentItem(
+                agent_id=agent.agent_id,
+                name=agent.name,
+                profile_id=agent.profile_id,
+                owner_id=agent.owner_id,
+                owner_name=config.users.get(agent.owner_id),
+                tenant_id=agent.tenant_id,
+                revoked=agent.agent_id in revoked_ids,
+            )
+            for agent in config.agents.values()
+        ]
+        return JSONResponse(AdminAgentsResponse(agents=items).model_dump(mode="json"))
+
+    async def _handle_admin_profiles(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/profiles：列出已加载的 CapabilityProfile。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        profiles = self._controller._runtime.profiles
+        return JSONResponse(
+            AdminProfilesResponse(
+                profiles=[p.model_dump(mode="json") for p in profiles.values()]
+            ).model_dump(mode="json")
+        )
+
+    async def _handle_admin_identity_config(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/identity：返回脱敏后的 Identity Provider 配置。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        config = getattr(self._controller._runtime, "config", None)
+        if config is None:
+            return JSONResponse({"error": "config unavailable"}, status_code=503)
+        identity_config = config.identity_config
+        return JSONResponse(
+            {
+                "provider": identity_config.get("provider", "static"),
+                "config": _mask_sensitive(identity_config),
+            }
+        )
+
+    async def _handle_admin_entrypoints(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/entrypoints：返回脱敏后的入口认证配置（含顶层 entrypoints 键）。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        config = getattr(self._controller._runtime, "config", None)
+        entrypoints = config.entrypoints_config if config is not None else self._entrypoints_config
+        return JSONResponse(_mask_sensitive(entrypoints))
+
+    async def _handle_admin_govern_evaluate(self, request: Request) -> JSONResponse:
+        """POST /v1/admin/govern/evaluate：只读判定调试（不执行、不提交审批）。
+
+        为复用真实判定链路，本接口直接调用 ``Checkpoint.evaluate``，存在
+        可控副作用：防重放记录 call_id、按随机 task_id 预留预算（可回收）、
+        deny 时更新随机 session 的风险状态（不累积）。合成 ID 统一带
+        ``dryrun-`` 前缀，便于审计识别与清理。
+        """
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        runtime = self._controller._runtime
+        config = getattr(runtime, "config", None)
+        if config is None:
+            return JSONResponse({"error": "config unavailable"}, status_code=503)
+        try:
+            body = AdminGovernEvaluateRequest(**await request.json())
+        except Exception as exc:
+            logger.warning("invalid govern evaluate request: %s", exc)
+            return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+
+        agent = config.agents.get(body.agent_id)
+        if agent is None:
+            return JSONResponse({"error": f"unknown agent: {body.agent_id}"}, status_code=404)
+        profile = runtime.profiles.get(agent.profile_id)
+        if profile is None:
+            return JSONResponse({"error": f"unknown profile: {agent.profile_id}"}, status_code=404)
+
+        task = Task(
+            task_id=f"dryrun-{uuid.uuid4().hex[:12]}",
+            session_id=f"dryrun-{uuid.uuid4().hex[:12]}",
+            user_id=body.user_id,
+            agent_id=body.agent_id,
+            description=body.task_context or "admin dry-run evaluate",
+        )
+        proposal = ActionProposal(
+            task_id=task.task_id,
+            call_id=f"dryrun-{uuid.uuid4().hex}",
+            agent_id=body.agent_id,
+            tool_name=body.tool_name,
+            arguments=body.arguments,
+            task_context=body.task_context,
+        )
+
+        # 吊销前置拦截（与 LoopController.evaluate 一致）
+        identity = AgentIdentity(
+            agent_id=agent.agent_id,
+            user_id=body.user_id,
+            profile_id=agent.profile_id,
+        )
+        match = runtime.checkpoint.check_revocation(identity, body.tool_name, body.arguments)
+        if match.revoked:
+            return JSONResponse(
+                AdminGovernEvaluateResponse(
+                    verdict="blocked", reason=match.reason or "revoked"
+                ).model_dump(mode="json")
+            )
+
+        # R1 轻量分类（与 LoopController._evaluate_proposal 一致）
+        signal = runtime.classifier.classify(task, agent, proposal, profile)
+        if body.tool_name in runtime.http_tool_names:
+            signal = LoopController._bump_risk_signal(signal)
+        proposal = proposal.model_copy(
+            update={"risk_level": signal.risk_level, "risk_tags": signal.tags}
+        )
+
+        try:
+            decision = await runtime.checkpoint.evaluate(task, agent, proposal)
+        except CheckpointError as exc:
+            return JSONResponse(
+                AdminGovernEvaluateResponse(verdict="deny", reason=str(exc)).model_dump(mode="json")
+            )
+
+        return JSONResponse(
+            AdminGovernEvaluateResponse(
+                verdict=decision.verdict,
+                reason=decision.reason,
+                policy_hits=decision.policy_hits,
+                risk_level=signal.risk_level,
+                risk_tags=signal.tags,
+                policy_version=decision.policy_version,
+                profile_version=decision.profile_version,
+            ).model_dump(mode="json")
+        )
+
     def _refresh_pending_approvals(self) -> None:
         try:
             store = self._controller._runtime.approval_manager._store
@@ -1279,6 +1459,15 @@ def build_app(
             Route("/admin/revocation-list", server._handle_admin_revocation_list, methods=["GET"]),
             Route("/admin/kill-switch", server._handle_admin_kill_switch, methods=["POST"]),
             Route("/v1/admin/audit", server._handle_admin_audit, methods=["GET"]),
+            Route("/v1/admin/agents", server._handle_admin_agents, methods=["GET"]),
+            Route("/v1/admin/profiles", server._handle_admin_profiles, methods=["GET"]),
+            Route("/v1/admin/identity", server._handle_admin_identity_config, methods=["GET"]),
+            Route("/v1/admin/entrypoints", server._handle_admin_entrypoints, methods=["GET"]),
+            Route(
+                "/v1/admin/govern/evaluate",
+                server._handle_admin_govern_evaluate,
+                methods=["POST"],
+            ),
         ],
     )
 

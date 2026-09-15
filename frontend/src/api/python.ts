@@ -128,3 +128,62 @@ export async function getHarnessBackends(): Promise<Array<Record<string, any>>> 
   const { data } = await pythonClient.get('/v1/admin/harness/backends')
   return data.backends || []
 }
+
+export interface AdminAgent {
+  agent_id: string
+  name: string
+  profile_id: string
+  owner_id: string
+  owner_name?: string | null
+  tenant_id?: string | null
+  revoked: boolean
+}
+
+export async function getAdminAgents(): Promise<AdminAgent[]> {
+  const { data } = await pythonClient.get('/v1/admin/agents')
+  return data.agents || []
+}
+
+export async function getAdminProfiles(): Promise<Array<Record<string, any>>> {
+  const { data } = await pythonClient.get('/v1/admin/profiles')
+  return data.profiles || []
+}
+
+export interface AdminIdentityConfig {
+  provider: string
+  config: Record<string, any>
+}
+
+export async function getAdminIdentity(): Promise<AdminIdentityConfig> {
+  const { data } = await pythonClient.get('/v1/admin/identity')
+  return data
+}
+
+export async function getAdminEntrypoints(): Promise<Record<string, any>> {
+  const { data } = await pythonClient.get('/v1/admin/entrypoints')
+  return data
+}
+
+export interface GovernEvaluateRequest {
+  agent_id: string
+  user_id: string
+  tool_name: string
+  arguments?: Record<string, any>
+  task_context?: string
+}
+
+export interface GovernEvaluateResponse {
+  verdict: string
+  reason: string
+  policy_hits: string[]
+  risk_level?: string | null
+  risk_tags: string[]
+  policy_version: string
+  profile_version: string
+  dry_run: boolean
+}
+
+export async function evaluateGovern(body: GovernEvaluateRequest): Promise<GovernEvaluateResponse> {
+  const { data } = await pythonClient.post('/v1/admin/govern/evaluate', body)
+  return data
+}
