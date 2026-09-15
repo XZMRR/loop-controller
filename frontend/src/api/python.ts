@@ -125,6 +125,45 @@ export function createApprovalSSE(requestId: string): EventSource {
   return new EventSource(`/api/python/v1/wait-for-approval/sse?request_id=${requestId}&max_wait=300`)
 }
 
+// ---------------------------------------------------------------------------
+// 内核委托审批对账
+// ---------------------------------------------------------------------------
+
+export interface KernelApprovalItem {
+  approval_id: string
+  request_id: string
+  decision_id: string
+  initiator_agent_id: string
+  target_agent_id: string
+  session_id?: string
+  status: string
+  approver_id?: string
+  reason?: string
+  allowed_tools?: string[]
+  task_id?: string
+  expires_at: string
+  created_at: string
+  updated_at: string
+  decided_at?: string
+}
+
+export interface KernelApprovalReconciliationItem {
+  kernel: KernelApprovalItem
+  console_decision_id: string
+  console_verdict: string
+  reconciled: boolean
+}
+
+export async function getKernelApprovals(status?: string): Promise<{
+  enabled: boolean
+  approvals: KernelApprovalReconciliationItem[]
+}> {
+  const { data } = await pythonClient.get('/v1/admin/a2a/kernel-approvals', {
+    params: status ? { status } : {},
+  })
+  return data
+}
+
 export async function getAuditEvents(params: {
   session_id?: string
   task_id?: string

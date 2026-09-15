@@ -453,6 +453,74 @@ func TestDelegationApprovalAPIAuthTransitionsAndReplay(t *testing.T) {
 	}
 }
 
+func TestDelegationApprovalListScopesToControlInitiator(t *testing.T) {
+	srv, server := newTestServer(t)
+	srv.SetControlAuth("initiator-token", "planner")
+	now := time.Now().UTC()
+	seed := func(id, initiator, status string) {
+		a := models.DelegationApproval{ApprovalID: id, RequestID: "req-" + id, DecisionID: "decision-" + id, RequestHash: "hash-" + id, InitiatorAgentID: initiator, TargetAgentID: "executor", EffectiveArgs: json.RawMessage(`{}`), ExpiresAt: now.Add(time.Hour), Status: status, CreatedAt: now, UpdatedAt: now, Version: 1}
+		if _, _, err := srv.db.DelegationApprovalStore().Create(context.Background(), a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("approval-own-pending", "planner", "pending")
+	seed("approval-own-consumed", "planner", "consumed")
+	seed("approval-other", "other-agent", "pending")
+
+	get := func(path, bearer string) *http.Response {
+		req, _ := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	resp := get("/a2a/v1/delegation-approvals", "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated list = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = get("/a2a/v1/delegation-approvals", "initiator-token")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authorized list = %d", resp.StatusCode)
+	}
+	var body struct {
+		Approvals []models.DelegationApproval `json:"approvals"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Approvals) != 2 {
+		t.Fatalf("expected 2 scoped approvals, got %d", len(body.Approvals))
+	}
+	for _, approval := range body.Approvals {
+		if approval.InitiatorAgentID != "planner" {
+			t.Errorf("approval leaked from another initiator: %s", approval.ApprovalID)
+		}
+	}
+
+	resp = get("/a2a/v1/delegation-approvals?status=pending", "initiator-token")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status-filtered list = %d", resp.StatusCode)
+	}
+	body = struct {
+		Approvals []models.DelegationApproval `json:"approvals"`
+	}{}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Approvals) != 1 || body.Approvals[0].ApprovalID != "approval-own-pending" {
+		t.Fatalf("status filter mismatch: %+v", body.Approvals)
+	}
+}
+
 func TestDelegationApprovalCancelConsumedDelegatesToTask(t *testing.T) {
 	srv, server := newTestServer(t)
 	srv.SetControlAuth("initiator-token", "planner")

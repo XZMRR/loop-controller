@@ -1248,12 +1248,89 @@ class ToolGovernServer:
         except Exception as exc:  # noqa: BLE001
             logger.warning("dispatch approved delegation failed: %s", exc)
             return {"attempted": True, "accepted": False, "reason": str(exc)}
+        if delegation.allowed:
+            return {
+                "attempted": True,
+                "accepted": True,
+                "task_id": delegation.task_id or "",
+                "reason": "",
+            }
+        # 内核侧仍要求审批（authorize 翻转未生效等）：Python 审批单已批准，
+        # 代为完成内核批准 + ResumeApproval（幂等，request_id=审批单 decision_id）。
+        if delegation.verdict == "require_approval" and delegation.approval_id:
+            consumed = await bridge.approve_delegation(
+                delegation.approval_id,
+                request_id=req.decision_id,
+                reason="approved via console approval record",
+            )
+            if consumed is not None and consumed.status == "consumed" and consumed.task_id:
+                return {
+                    "attempted": True,
+                    "accepted": True,
+                    "task_id": consumed.task_id,
+                    "reason": "",
+                    "kernel_approval_id": delegation.approval_id,
+                    "kernel_verdict": "require_approval",
+                }
+            return {
+                "attempted": True,
+                "accepted": False,
+                "reason": "kernel approval resume failed",
+                "kernel_approval_id": delegation.approval_id,
+                "kernel_verdict": "require_approval",
+            }
         return {
             "attempted": True,
-            "accepted": delegation.allowed,
-            "task_id": delegation.task_id or "",
-            "reason": "" if delegation.allowed else delegation.reason,
+            "accepted": False,
+            "task_id": "",
+            "reason": delegation.reason,
         }
+
+    async def _handle_admin_kernel_approvals(self, request: Request) -> JSONResponse:
+        """内核委托审批对账视图：枚举内核审批单并与审批台记录关联。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        bridge, _gk = self._go_kernel_view()
+        if bridge is None:
+            return JSONResponse({"enabled": False, "approvals": []})
+        status = request.query_params.get("status", "")
+        kernel_approvals = await bridge.list_delegation_approvals(status=status)
+        # 关联审批台记录：派发时 request_id=审批单 decision_id，即内核 approval.request_id
+        console_by_request_id = self._console_approvals_by_request_id()
+        items = []
+        for approval in kernel_approvals:
+            console = console_by_request_id.get(str(approval.get("request_id") or ""))
+            items.append(
+                {
+                    "kernel": approval,
+                    "console_decision_id": console.get("decision_id") if console else "",
+                    "console_verdict": console.get("verdict") if console else "",
+                    "reconciled": bool(console),
+                }
+            )
+        return JSONResponse({"enabled": True, "approvals": items})
+
+    def _console_approvals_by_request_id(self) -> dict[str, dict[str, Any]]:
+        """返回 {request_id(decision_id): {decision_id, verdict}} 供对账关联。"""
+        try:
+            store = self._controller._runtime.approval_manager._store
+            store.refresh()
+            result: dict[str, dict[str, Any]] = {}
+            responses = getattr(store, "responses", {})
+            for request in store.get_pending():
+                result[request.decision_id] = {
+                    "decision_id": request.decision_id,
+                    "verdict": "pending",
+                }
+            for decision_id, record in responses.items():
+                result[str(decision_id)] = {
+                    "decision_id": str(decision_id),
+                    "verdict": str(getattr(record, "verdict", "")),
+                }
+            return result
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("collect console approvals for reconciliation failed: %s", exc)
+            return {}
 
     async def _handle_admin_approvals_approve(self, request: Request) -> JSONResponse:
         return await self._handle_admin_approval(request, verdict="approve")
@@ -2059,6 +2136,11 @@ def build_app(
             ),
             Route("/v1/admin/a2a/status", server._handle_admin_a2a_status, methods=["GET"]),
             Route("/v1/admin/a2a/agents", server._handle_admin_a2a_agents, methods=["GET"]),
+            Route(
+                "/v1/admin/a2a/kernel-approvals",
+                server._handle_admin_kernel_approvals,
+                methods=["GET"],
+            ),
             Route(
                 "/v1/admin/a2a/tasks/{task_id}",
                 server._handle_admin_a2a_task_query,

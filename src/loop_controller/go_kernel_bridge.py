@@ -297,6 +297,7 @@ class DelegationResponse:
         return cls(
             allowed=data.get("allowed", False),
             verdict=data.get("verdict", ""),
+            approval_id=data.get("approval_id", ""),
             decision_id=data.get("decision_id", ""),
             task_id=data.get("task_id", ""),
             target_entrypoint=AgentEntrypoint.from_dict(ep) if ep else None,
@@ -349,11 +350,23 @@ class GoKernelBridge:
         *,
         timeout: float = 5.0,
         client: httpx.AsyncClient | None = None,
+        token: str = "",
+        approval_token: str = "",
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._client = client
         self._owned_client = client is None
+        # control token：委托/任务/审批枚举等控制面调用
+        self._token = token.strip()
+        # approver token：内核审批单的批准/拒绝（独立审批人凭证）
+        self._approval_token = approval_token.strip()
+
+    def _headers(self, token: str | None = None) -> dict[str, str]:
+        bearer = self._token if token is None else token
+        if not bearer:
+            return {}
+        return {"Authorization": f"Bearer {bearer}"}
 
     async def _client_context(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -408,11 +421,34 @@ class GoKernelBridge:
             return False
 
     async def request_delegation(self, req: DelegationRequest) -> DelegationResponse:
-        """请求委托执行；Go 内核不可用时返回 allowed=False。"""
+        """请求委托执行；Go 内核不可用时返回 allowed=False。
+
+        202 Accepted 表示内核进入原生 require_approval 流程，响应体中的
+        ``approval_id`` 会原样保留，供调用方对账/代审批。
+        """
         url = f"{self._base_url}/a2a/v1/delegations"
         try:
             client = await self._client_context()
-            response = await client.post(url, json=req.to_dict())
+            response = await client.post(url, json=req.to_dict(), headers=self._headers())
+            if response.status_code == 202:
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise ValueError("invalid Go kernel delegation response")
+                check_protocol_version(str(data.get("protocol_version", "")))
+                result = DelegationResponse.from_dict(data)
+                if not result.verdict:
+                    result.verdict = "require_approval"
+                return result
+            if response.status_code in (400, 403):
+                reason = "go_kernel_rejected"
+                try:
+                    body = response.json()
+                    if isinstance(body, dict) and body.get("reason"):
+                        reason = str(body["reason"])
+                except ValueError:
+                    pass
+                logger.warning("Go kernel delegation rejected: %s %s", response.status_code, reason)
+                return DelegationResponse(allowed=False, reason=reason)
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict):
@@ -432,12 +468,97 @@ class GoKernelBridge:
                 reason="go_kernel_unreachable",
             )
 
+    # ------------------------------------------------------------------
+    # 内核原生委托审批（对账/代审批）
+    # ------------------------------------------------------------------
+
+    async def list_delegation_approvals(
+        self, *, status: str = "", limit: int = 0
+    ) -> list[dict[str, Any]]:
+        """枚举内核委托审批单（control token，结果按 control initiator 过滤）。"""
+        url = f"{self._base_url}/a2a/v1/delegation-approvals"
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        if limit > 0:
+            params["limit"] = limit
+        try:
+            client = await self._client_context()
+            response = await client.get(url, params=params, headers=self._headers())
+            response.raise_for_status()
+            data = response.json()
+            approvals = data.get("approvals") if isinstance(data, dict) else None
+            if not isinstance(approvals, list):
+                return []
+            return [item for item in approvals if isinstance(item, dict)]
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+            logger.warning("Go kernel list delegation approvals failed: %s", exc)
+            return []
+
+    async def get_delegation_approval(
+        self, approval_id: str
+    ) -> DelegationApproval | None:
+        """查询单个内核委托审批单；不存在或不可达时返回 None。"""
+        url = f"{self._base_url}/a2a/v1/delegation-approvals/{approval_id}"
+        try:
+            client = await self._client_context()
+            response = await client.get(url, headers=self._headers())
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                return None
+            return DelegationApproval.from_dict(data)
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError, TypeError) as exc:
+            logger.warning("Go kernel get delegation approval failed: %s", exc)
+            return None
+
+    async def approve_delegation(
+        self, approval_id: str, *, request_id: str, reason: str = ""
+    ) -> DelegationApproval | None:
+        """批准内核委托审批单并触发 ResumeApproval；返回 consume 后的审批单。
+
+        成功时审批单状态为 ``consumed`` 且 ``task_id`` 已回填；失败返回 None。
+        """
+        return await self._transition_delegation_approval(
+            approval_id, "approve", request_id=request_id, reason=reason
+        )
+
+    async def reject_delegation(
+        self, approval_id: str, *, request_id: str, reason: str = ""
+    ) -> DelegationApproval | None:
+        """拒绝内核委托审批单；返回更新后的审批单，失败返回 None。"""
+        return await self._transition_delegation_approval(
+            approval_id, "reject", request_id=request_id, reason=reason
+        )
+
+    async def _transition_delegation_approval(
+        self, approval_id: str, action: str, *, request_id: str, reason: str
+    ) -> DelegationApproval | None:
+        url = f"{self._base_url}/a2a/v1/delegation-approvals/{approval_id}/{action}"
+        try:
+            client = await self._client_context()
+            response = await client.post(
+                url,
+                json=ApprovalActionRequest(request_id, reason).to_dict(),
+                headers=self._headers(self._approval_token),
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                return None
+            return DelegationApproval.from_dict(data)
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError, TypeError) as exc:
+            logger.warning("Go kernel %s delegation approval failed: %s", action, exc)
+            return None
+
     async def route_message(self, msg: A2AMessage) -> bool:
         """向目标 Agent 路由一条消息。"""
         url = f"{self._base_url}/a2a/v1/messages"
         try:
             client = await self._client_context()
-            response = await client.post(url, json=msg.to_dict())
+            response = await client.post(url, json=msg.to_dict(), headers=self._headers())
             if response.status_code != 200:
                 return False
             data = response.json()
@@ -451,7 +572,7 @@ class GoKernelBridge:
         url = f"{self._base_url}/a2a/v1/agents/{agent_id}"
         try:
             client = await self._client_context()
-            response = await client.get(url)
+            response = await client.get(url, headers=self._headers())
             if response.status_code == 404:
                 return None
             response.raise_for_status()
@@ -490,7 +611,10 @@ class GoKernelBridge:
     ) -> dict[str, Any] | None:
         """请求取消委托任务；内核不可达或拒绝时返回 None。"""
         url = f"{self._base_url}/a2a/v1/tasks/{task_id}/cancel"
-        headers = {"Authorization": f"Bearer {delegation_token}"} if delegation_token else None
+        if delegation_token:
+            headers = {"Authorization": f"Bearer {delegation_token}"}
+        else:
+            headers = self._headers()
         try:
             client = await self._client_context()
             response = await client.post(
@@ -515,7 +639,9 @@ class GoKernelBridge:
         url = f"{self._base_url}/a2a/v1/tasks/{task_id}/stream"
         try:
             client = await self._client_context()
-            async with client.stream("GET", url, timeout=timeout) as response:
+            async with client.stream(
+                "GET", url, timeout=timeout, headers=self._headers()
+            ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):

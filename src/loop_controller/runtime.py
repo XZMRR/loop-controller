@@ -414,7 +414,14 @@ def _build_go_kernel_bridge(config: AppConfig) -> GoKernelBridge | None:
         return None
     base_url = gk.get("base_url", "http://127.0.0.1:8080")
     timeout = float(gk.get("timeout", 5.0))
-    return GoKernelBridge(base_url=base_url, timeout=timeout)
+    token = str(gk.get("token", "") or "")
+    approval_token = str(gk.get("approval_token", "") or "")
+    return GoKernelBridge(
+        base_url=base_url,
+        timeout=timeout,
+        token=token,
+        approval_token=approval_token,
+    )
 
 
 def build_runtime(

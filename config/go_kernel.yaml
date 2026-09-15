@@ -4,6 +4,10 @@ go_kernel:
   enabled: false
   base_url: "http://127.0.0.1:8080"
   timeout: 5.0
+  # control token（对应内核 -control-token，绑定 initiator，用于委托/任务/审批枚举）
+  token: ""
+  # approver token（对应内核 -approval-token，独立审批人凭证，用于代批准/拒绝内核审批单）
+  approval_token: ""
   development: false
   dispatch_entrypoints: true
   discovery:

@@ -191,6 +191,20 @@ frontend/
 - **E2E 验证**：发起委托（analyze_sales require_approval）→ 审批单进审批台 → 批准 → 自动派发 `accepted=true` 返回内核 task_id → 任务查询可见（parent_interaction_id 正确回链，allowed_tools=[analyze_sales]，status=pending）。
 - **验证**：`tests/test_server.py` 89 全绿 + `test_delegation_authorizer.py` 10 全绿；Go `internal/delegation` 测试全绿；前端构建通过。联调用 `config/interaction_profiles.yaml`、`config/go_kernel.yaml` 本地改动已还原，未提交。
 
+#### 进度记录（2026-09-16，第十轮：审批状态对账）
+
+- **架构**：Python 审批台为唯一人工审批入口，Go 内核原生审批（DelegationApproval）为执行事实源。内核审批单经 LIST 端点枚举，与审批台记录按 `kernel.request_id == console.decision_id` 关联（Python 派发时 `DelegationRequest.request_id` 即审批单 decision_id）。
+- **Go 内核新增 LIST 端点**（对账最大缺口，此前内核审批单完全无法枚举）：
+  - store：`ApprovalFilter{Status, InitiatorAgentID, Limit}` + `List()`（动态 WHERE、默认 limit 100 上限 500、按 created_at DESC）；
+  - api：`GET /a2a/v1/delegation-approvals`，配 control-token 认证，配置了 control token 时结果强制按 control initiator 过滤，支持 `?status=`/`?limit=` 查询参数。
+- **Python bridge 修复与扩展**（[go_kernel_bridge.py](file:///D:/Agent/loop-controller-latest-develop/src/loop_controller/go_kernel_bridge.py)）：
+  - 修复 202 误判 bug：`request_delegation` 原 `raise_for_status()` 把内核原生 require_approval（202）当错误吞掉且丢失 approval_id；现解析 `require_approval` verdict 并保留 approval_id，403/400 透传内核 reason；
+  - 新增 `list_delegation_approvals` / `get_delegation_approval` / `approve_delegation` / `reject_delegation`（approve/reject 用 approver token）；control token 注入全部既有方法（`token`/`approval_token` 经 `config/go_kernel.yaml` 与 `runtime.py` 传入）。
+- **批准派发自动代批准**：`_dispatch_approved_delegation` 在 Python 批准派发时若内核仍返回 require_approval，自动以审批人身份代批准内核审批单（`request_id=req.decision_id` 幂等）触发 `ResumeApproval`（重建 DelegationRequest + 二次 authorize + 防扩大校验 + Consume 建任务）；consumed 审批单返回 `task_id` 回填派发结果，附 `kernel_approval_id`/`kernel_verdict`。
+- **管理端对账接口**：`GET /v1/admin/a2a/kernel-approvals?status=`，每项返回内核审批单 + 审批台关联 decision_id/verdict + `reconciled` 标记（pending 与 history 两路按 decision_id 关联）。
+- **前端审批中心加"内核对账"页签**（[Approvals.vue](file:///D:/Agent/loop-controller-latest-develop/frontend/src/views/Approvals.vue)）：内核状态过滤下拉、对账表格（Approval ID/目标 Agent/工具/内核状态/任务/审批台关联/审批台结论/过期时间），未启用内核时提示。
+- **验证**：`tests/test_server.py` + `test_go_kernel_bridge.py` 共 102 全绿（新增代批准 Resume、对账视图、202 解析、403 透传、control/approver token 共 6 个）；Go `internal/api` + `internal/store` 测试全绿（新增 control token initiator 过滤用例）；前端构建通过。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

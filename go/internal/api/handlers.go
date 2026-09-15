@@ -229,6 +229,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /a2a/v1/tasks/{id}/stream", s.withControlAuth(false, s.handleTaskStream))
 	mux.HandleFunc("POST /a2a/v1/messages", s.handleSendMessage)
 	mux.HandleFunc("POST /a2a/v1/delegations", s.withControlAuth(true, s.handleDelegation))
+	mux.HandleFunc("GET /a2a/v1/delegation-approvals", s.withApprovalListAuth(s.handleListDelegationApprovals))
 	mux.HandleFunc("GET /a2a/v1/delegation-approvals/{id}", s.withInitiatorApprovalAuth(s.handleGetDelegationApproval))
 	mux.HandleFunc("POST /a2a/v1/delegation-approvals/{id}/approve", s.withApproverAuth(s.handleApproveDelegation))
 	mux.HandleFunc("POST /a2a/v1/delegation-approvals/{id}/reject", s.withApproverAuth(s.handleRejectDelegation))

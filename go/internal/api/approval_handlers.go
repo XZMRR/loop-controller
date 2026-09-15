@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,10 +27,47 @@ func (s *Server) SetApprovalAuth(bearerToken, principal string) {
 }
 
 func (s *Server) registerApprovalRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /a2a/v1/delegation-approvals", s.withApprovalListAuth(s.handleListDelegationApprovals))
 	mux.HandleFunc("GET /a2a/v1/delegation-approvals/{id}", s.withInitiatorApprovalAuth(s.handleGetDelegationApproval))
 	mux.HandleFunc("POST /a2a/v1/delegation-approvals/{id}/approve", s.withApproverAuth(s.handleApproveDelegation))
 	mux.HandleFunc("POST /a2a/v1/delegation-approvals/{id}/reject", s.withApproverAuth(s.handleRejectDelegation))
 	mux.HandleFunc("POST /a2a/v1/delegation-approvals/{id}/cancel", s.withInitiatorApprovalAuth(s.handleCancelDelegation))
+}
+
+// withApprovalListAuth 约束枚举端点：配置 control token 时，调用方必须持有
+// control token，且结果仅限该 token 绑定的 initiator；未配置时放行（开发模式）。
+func (s *Server) withApprovalListAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.controlToken == "" || s.controlInitiatorID == "" {
+			next(w, r)
+			return
+		}
+		tokenString, err := bearerToken(r.Header.Get("Authorization"))
+		if err != nil || subtle.ConstantTimeCompare([]byte(tokenString), []byte(s.controlToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, "invalid_control_token", "valid Bearer control token is required")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) handleListDelegationApprovals(w http.ResponseWriter, r *http.Request) {
+	_, _ = s.db.DelegationApprovalStore().ExpireDue(r.Context(), nowUTC(), 100)
+	filter := store.ApprovalFilter{
+		Status:           strings.TrimSpace(r.URL.Query().Get("status")),
+		InitiatorAgentID: s.controlInitiatorID,
+	}
+	if limitParam := strings.TrimSpace(r.URL.Query().Get("limit")); limitParam != "" {
+		if limit, err := strconv.Atoi(limitParam); err == nil {
+			filter.Limit = limit
+		}
+	}
+	approvals, err := s.db.DelegationApprovalStore().List(r.Context(), filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "approval_list_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"approvals": approvals})
 }
 
 func (s *Server) approvalConfig() approvalAuthConfig {

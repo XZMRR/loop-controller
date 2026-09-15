@@ -1923,9 +1923,12 @@ class _FakeInteractionEngine:
 
 
 class _FakeDelegationBridge:
-    def __init__(self, accept: bool = True) -> None:
+    def __init__(self, accept: bool = True, approval_id: str = "") -> None:
         self.accept = accept
+        self.approval_id = approval_id
         self.requests: list[Any] = []
+        self.approved: list[dict[str, Any]] = []
+        self.kernel_approvals: list[dict[str, Any]] = []
 
     async def ping(self) -> bool:
         return True
@@ -1934,12 +1937,39 @@ class _FakeDelegationBridge:
         self.requests.append(req)
 
         class _Resp:
-            def __init__(self, accept: bool) -> None:
+            def __init__(self, accept: bool, approval_id: str) -> None:
                 self.allowed = accept
+                self.verdict = "" if accept else (
+                    "require_approval" if approval_id else ""
+                )
+                self.approval_id = approval_id
                 self.task_id = "task-42" if accept else ""
                 self.reason = "" if accept else "go_kernel_rejected"
 
-        return _Resp(self.accept)
+        return _Resp(self.accept, self.approval_id)
+
+    async def approve_delegation(
+        self, approval_id: str, *, request_id: str, reason: str = ""
+    ) -> Any:
+        self.approved.append(
+            {"approval_id": approval_id, "request_id": request_id, "reason": reason}
+        )
+
+        class _Approval:
+            def __init__(self) -> None:
+                self.status = "consumed"
+                self.task_id = "task-resumed-1"
+
+        return _Approval()
+
+    async def list_delegation_approvals(
+        self, *, status: str = "", limit: int = 0
+    ) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in self.kernel_approvals
+            if not status or item.get("status") == status
+        ]
 
 
 def _delegation_payload() -> dict[str, Any]:
@@ -2163,6 +2193,132 @@ def test_delegation_authorize_flip_matches_approved_snapshot(monkeypatch: pytest
         json={**base, "target_agent_id": "other_agent", "arguments": {"to": "a@b.com"}},
     )
     assert wrong_target.json()["verdict"] == "require_approval"
+
+
+def test_admin_approval_dispatches_via_kernel_approval_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """内核 authorize 翻转未生效时，派发自动代批准内核审批单并 Resume 出任务。"""
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    _FakeInteractionEngine.verdict = "require_approval"
+    _FakeInteractionEngine.allowed = False
+    client, controller = _build_client(
+        api_key="secret", identity_provider=_admin_identity_provider()
+    )
+    bridge = _FakeDelegationBridge(accept=False, approval_id="approval-k1")
+    controller._runtime.go_kernel_bridge = bridge
+
+    store = controller._runtime.approval_manager._store
+    store.submit_request(
+        ApprovalRequest(
+            request_id="a2a-req-ix-10",
+            decision_id="d-10",
+            call_id="a2a-delegation:ix-10",
+            task_id="ix-10",
+            agent_id="researcher_001",
+            tool_name="send_email",
+            arguments_masked={},
+            tool_arguments=_delegation_payload(),
+            reason="A2A 委托需审批",
+            requester_id="alice",
+            approver_id="zhang_manager",
+        )
+    )
+    resp = client.post(
+        "/v1/admin/approvals/d-10/approve",
+        headers={"X-API-Key": "secret"},
+        json={"approver": "zhang_manager", "comment": "ok"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["dispatch"]["accepted"] is True
+    assert data["dispatch"]["task_id"] == "task-resumed-1"
+    assert data["dispatch"]["kernel_approval_id"] == "approval-k1"
+    assert bridge.approved == [
+        {
+            "approval_id": "approval-k1",
+            "request_id": "d-10",
+            "reason": "approved via console approval record",
+        }
+    ]
+
+
+def test_admin_kernel_approvals_reconciliation() -> None:
+    """内核审批对账视图：枚举内核审批单并关联审批台记录。"""
+    client, controller = _build_admin_client()
+    bridge = _FakeDelegationBridge()
+    controller._runtime.go_kernel_bridge = bridge
+    bridge.kernel_approvals = [
+        {
+            "approval_id": "approval-k1",
+            "request_id": "d-10",
+            "decision_id": "kernel-dec-1",
+            "request_hash": "h",
+            "initiator_agent_id": "researcher_001",
+            "target_agent_id": "writer_001",
+            "status": "consumed",
+            "expires_at": "2026-09-15T16:00:00Z",
+            "created_at": "2026-09-15T15:00:00Z",
+            "updated_at": "2026-09-15T15:05:00Z",
+            "task_id": "task-resumed-1",
+        },
+        {
+            "approval_id": "approval-k2",
+            "request_id": "req-external-1",
+            "decision_id": "kernel-dec-2",
+            "request_hash": "h2",
+            "initiator_agent_id": "researcher_001",
+            "target_agent_id": "writer_001",
+            "status": "pending",
+            "expires_at": "2026-09-15T16:00:00Z",
+            "created_at": "2026-09-15T15:00:00Z",
+            "updated_at": "2026-09-15T15:00:00Z",
+        },
+    ]
+    store = controller._runtime.approval_manager._store
+    store.submit_request(
+        ApprovalRequest(
+            request_id="a2a-req-ix-10",
+            decision_id="d-10",
+            call_id="a2a-delegation:ix-10",
+            task_id="ix-10",
+            agent_id="researcher_001",
+            tool_name="send_email",
+            arguments_masked={},
+            tool_arguments=_delegation_payload(),
+            reason="A2A 委托需审批",
+            requester_id="alice",
+            approver_id="zhang_manager",
+        )
+    )
+    store.record_response(
+        ApprovalRecord(
+            request_id="a2a-req-ix-10",
+            decision_id="d-10",
+            verdict="approve",
+            approver_id="zhang_manager",
+            comment="ok",
+        )
+    )
+
+    headers = {"X-API-Key": "test-key"}
+    resp = client.get("/v1/admin/a2a/kernel-approvals", headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["enabled"] is True
+    assert len(data["approvals"]) == 2
+    by_id = {item["kernel"]["approval_id"]: item for item in data["approvals"]}
+    assert by_id["approval-k1"]["reconciled"] is True
+    assert by_id["approval-k1"]["console_decision_id"] == "d-10"
+    assert by_id["approval-k1"]["console_verdict"] == "approve"
+    assert by_id["approval-k2"]["reconciled"] is False
+
+    filtered = client.get(
+        "/v1/admin/a2a/kernel-approvals?status=pending", headers=headers
+    )
+    assert len(filtered.json()["approvals"]) == 1
 
 
 def test_admin_a2a_delegation_deny_skips_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -238,6 +238,122 @@ async def test_cancel_task_returns_none_when_kernel_rejects() -> None:
 
 
 @pytest.mark.asyncio
+async def test_request_delegation_keeps_require_approval_approval_id() -> None:
+    """202 Accepted 应解析为 require_approval 并保留 approval_id（对账/代审批入口）。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/a2a/v1/delegations"
+        return httpx.Response(
+            202,
+            json={
+                "allowed": False,
+                "verdict": "require_approval",
+                "approval_id": "approval-abc",
+                "interaction_id": "ix-1",
+                "decision_id": "decision-1",
+                "reason": "delegation requires owner approval",
+                "protocol_version": CURRENT_PROTOCOL_VERSION,
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bridge = GoKernelBridge(base_url="http://kernel", client=client)
+        resp = await bridge.request_delegation(
+            DelegationRequest(
+                request_id="req-1",
+                initiator_agent_id="planner",
+                target_agent_id="executor",
+                tool_name="query_sales",
+            )
+        )
+
+    assert resp.allowed is False
+    assert resp.verdict == "require_approval"
+    assert resp.approval_id == "approval-abc"
+    assert "go_kernel_rejected" not in resp.reason
+
+
+@pytest.mark.asyncio
+async def test_request_delegation_surfaces_kernel_deny_reason() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"code": "denied", "reason": "delegation requires owner approval"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bridge = GoKernelBridge(base_url="http://kernel", client=client)
+        resp = await bridge.request_delegation(
+            DelegationRequest(
+                request_id="req-2",
+                initiator_agent_id="planner",
+                target_agent_id="executor",
+                tool_name="query_sales",
+            )
+        )
+
+    assert resp.allowed is False
+    assert resp.reason == "delegation requires owner approval"
+
+
+@pytest.mark.asyncio
+async def test_list_delegation_approvals_uses_control_token() -> None:
+    captured: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers.get("Authorization", "")
+        assert request.url.path == "/a2a/v1/delegation-approvals"
+        assert request.url.params["status"] == "pending"
+        return httpx.Response(200, json={"approvals": [{"approval_id": "a1", "status": "pending"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bridge = GoKernelBridge(
+            base_url="http://kernel", client=client, token="control-token"
+        )
+        approvals = await bridge.list_delegation_approvals(status="pending")
+
+    assert captured["auth"] == "Bearer control-token"
+    assert approvals == [{"approval_id": "a1", "status": "pending"}]
+
+
+@pytest.mark.asyncio
+async def test_approve_delegation_posts_with_approver_token() -> None:
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers.get("Authorization", "")
+        captured["body"] = json.loads(request.content)
+        assert request.url.path == "/a2a/v1/delegation-approvals/approval-1/approve"
+        return httpx.Response(
+            200,
+            json={
+                "approval_id": "approval-1",
+                "request_id": "req-1",
+                "decision_id": "decision-1",
+                "request_hash": "h",
+                "initiator_agent_id": "planner",
+                "target_agent_id": "executor",
+                "status": "consumed",
+                "task_id": "task-9",
+                "expires_at": "2026-09-15T16:00:00Z",
+                "created_at": "2026-09-15T15:00:00Z",
+                "updated_at": "2026-09-15T15:05:00Z",
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bridge = GoKernelBridge(
+            base_url="http://kernel", client=client, approval_token="approver-token"
+        )
+        consumed = await bridge.approve_delegation(
+            "approval-1", request_id="req-1", reason="ok"
+        )
+
+    assert captured["auth"] == "Bearer approver-token"
+    assert captured["body"] == {"request_id": "req-1", "reason": "ok"}
+    assert consumed is not None
+    assert consumed.status == "consumed"
+    assert consumed.task_id == "task-9"
+
+
+@pytest.mark.asyncio
 async def test_query_task(bridge: GoKernelBridge) -> None:
     card = AgentCard(
         agent_id="executor-agent",

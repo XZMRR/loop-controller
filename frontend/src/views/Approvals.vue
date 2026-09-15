@@ -8,6 +8,7 @@
             <el-radio-group v-model="activeTab" style="margin-right: 12px">
               <el-radio-button value="pending">待审批</el-radio-button>
               <el-radio-button value="history">历史</el-radio-button>
+              <el-radio-button value="kernel">内核对账</el-radio-button>
             </el-radio-group>
             <el-button type="primary" :icon="Refresh" @click="handleRefresh" :loading="loading">
               刷新
@@ -81,6 +82,62 @@
           />
         </div>
       </template>
+
+      <template v-if="activeTab === 'kernel'">
+        <el-alert
+          v-if="!kernelEnabled"
+          type="info"
+          :closable="false"
+          title="Go 内核未启用，暂无内核审批单可对账"
+          style="margin-bottom: 16px"
+        />
+        <template v-else>
+          <el-form inline style="margin-bottom: 16px">
+            <el-form-item label="内核状态">
+              <el-select v-model="kernelStatus" placeholder="全部" clearable style="width: 140px" @change="loadKernelApprovals">
+                <el-option label="待审批" value="pending" />
+                <el-option label="已批准" value="approved" />
+                <el-option label="已消费" value="consumed" />
+                <el-option label="已拒绝" value="rejected" />
+                <el-option label="已过期" value="expired" />
+                <el-option label="已取消" value="cancelled" />
+              </el-select>
+            </el-form-item>
+          </el-form>
+          <el-table :data="kernelApprovals" v-loading="kernelLoading" stripe>
+            <el-table-column prop="kernel.approval_id" label="内核 Approval ID" width="220" show-overflow-tooltip />
+            <el-table-column prop="kernel.target_agent_id" label="目标 Agent" width="140" />
+            <el-table-column label="工具" width="150">
+              <template #default="{ row }">
+                {{ (row.kernel.allowed_tools || [])[0] || '-' }}
+              </template>
+            </el-table-column>
+            <el-table-column label="内核状态" width="110">
+              <template #default="{ row }">
+                <el-tag :type="kernelStatusTagType(row.kernel.status)">{{ kernelStatusLabel(row.kernel.status) }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="任务" width="200" show-overflow-tooltip>
+              <template #default="{ row }">
+                {{ row.kernel.task_id || '-' }}
+              </template>
+            </el-table-column>
+            <el-table-column label="审批台关联" width="130">
+              <template #default="{ row }">
+                <el-tag v-if="row.reconciled" type="success">已关联</el-tag>
+                <el-tag v-else type="warning">未关联</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="审批台结论" width="110">
+              <template #default="{ row }">
+                {{ row.console_verdict ? statusLabel(row.console_verdict) : '-' }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="kernel.expires_at" label="过期时间" width="180" />
+          </el-table>
+          <el-empty v-if="!kernelLoading && kernelApprovals.length === 0" description="暂无内核对账记录" />
+        </template>
+      </template>
     </el-card>
 
     <el-dialog v-model="dialogVisible" :title="dialogTitle" width="500px">
@@ -116,10 +173,11 @@ import {
   getApprovalHistory,
   approveDecision,
   denyDecision,
+  getKernelApprovals,
 } from '@/api/python'
-import type { PendingApproval, ApprovalHistoryItem } from '@/api/python'
+import type { PendingApproval, ApprovalHistoryItem, KernelApprovalReconciliationItem } from '@/api/python'
 
-const activeTab = ref<'pending' | 'history'>('pending')
+const activeTab = ref<'pending' | 'history' | 'kernel'>('pending')
 const approvals = ref<PendingApproval[]>([])
 const history = ref<ApprovalHistoryItem[]>([])
 const historyTotal = ref(0)
@@ -137,6 +195,10 @@ const submitting = ref(false)
 const currentRow = ref<PendingApproval | null>(null)
 const currentAction = ref<'approve' | 'deny'>('approve')
 const form = ref({ approver: '', comment: '' })
+const kernelEnabled = ref(false)
+const kernelApprovals = ref<KernelApprovalReconciliationItem[]>([])
+const kernelStatus = ref('')
+const kernelLoading = ref(false)
 
 const dialogTitle = computed(() => (currentAction.value === 'approve' ? '通过审批' : '拒绝审批'))
 
@@ -187,8 +249,47 @@ async function loadHistory() {
 function handleRefresh() {
   if (activeTab.value === 'pending') {
     loadApprovals()
-  } else {
+  } else if (activeTab.value === 'history') {
     loadHistory()
+  } else {
+    loadKernelApprovals()
+  }
+}
+
+function kernelStatusLabel(status: string) {
+  const map: Record<string, string> = {
+    pending: '待审批',
+    approved: '已批准',
+    consumed: '已消费',
+    rejected: '已拒绝',
+    expired: '已过期',
+    cancelled: '已取消',
+  }
+  return map[status] || status
+}
+
+function kernelStatusTagType(status: string) {
+  const map: Record<string, string> = {
+    pending: 'warning',
+    approved: 'primary',
+    consumed: 'success',
+    rejected: 'danger',
+    expired: 'info',
+    cancelled: 'info',
+  }
+  return map[status] || 'info'
+}
+
+async function loadKernelApprovals() {
+  kernelLoading.value = true
+  try {
+    const data = await getKernelApprovals(kernelStatus.value || undefined)
+    kernelEnabled.value = data.enabled
+    kernelApprovals.value = data.approvals
+  } catch (error: any) {
+    ElMessage.error(error.message || '加载内核对账失败')
+  } finally {
+    kernelLoading.value = false
   }
 }
 
@@ -237,6 +338,7 @@ async function submitAction() {
 onMounted(() => {
   loadApprovals()
   loadHistory()
+  loadKernelApprovals()
 })
 </script>
 

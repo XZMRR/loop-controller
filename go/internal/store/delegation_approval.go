@@ -17,9 +17,17 @@ var (
 	ErrApprovalExpired  = errors.New("delegation approval expired")
 )
 
+// ApprovalFilter 约束 List 查询；零值字段不参与过滤。
+type ApprovalFilter struct {
+	Status           string
+	InitiatorAgentID string
+	Limit            int
+}
+
 type DelegationApprovalStore interface {
 	Create(context.Context, models.DelegationApproval) (models.DelegationApproval, bool, error)
 	Get(context.Context, string) (models.DelegationApproval, error)
+	List(context.Context, ApprovalFilter) ([]models.DelegationApproval, error)
 	Transition(context.Context, string, int64, string, string, string, string, string) (models.DelegationApproval, error)
 	Consume(context.Context, string, int64, models.Task, models.AgentEntrypoint, models.EntrypointTaskRequest) (models.DelegationApproval, error)
 	ExpireDue(context.Context, time.Time, int) (int64, error)
@@ -67,6 +75,40 @@ func (s *delegationApprovalStore) Get(ctx context.Context, id string) (models.De
 
 func (s *delegationApprovalStore) getByRequestID(ctx context.Context, id string) (models.DelegationApproval, error) {
 	return queryApproval(ctx, s.db.QueryRowContext(ctx, `SELECT `+approvalColumns+` FROM delegation_approvals WHERE request_id=?`, id))
+}
+
+func (s *delegationApprovalStore) List(ctx context.Context, filter ApprovalFilter) ([]models.DelegationApproval, error) {
+	query := `SELECT ` + approvalColumns + ` FROM delegation_approvals WHERE 1=1`
+	var args []any
+	if filter.Status != "" {
+		query += ` AND status=?`
+		args = append(args, filter.Status)
+	}
+	if filter.InitiatorAgentID != "" {
+		query += ` AND initiator_agent_id=?`
+		args = append(args, filter.InitiatorAgentID)
+	}
+	limit := filter.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query += ` ORDER BY created_at DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var approvals []models.DelegationApproval
+	for rows.Next() {
+		approval, err := queryApproval(ctx, rows)
+		if err != nil {
+			return nil, err
+		}
+		approvals = append(approvals, approval)
+	}
+	return approvals, rows.Err()
 }
 
 const approvalColumns = `approval_id,request_id,decision_id,request_hash,initiator_agent_id,target_agent_id,session_id,
