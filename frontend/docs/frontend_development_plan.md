@@ -154,6 +154,19 @@ frontend/
 - **前端**：A2A 治理页新增“发起委托”卡片——发起/目标 Agent 下拉、能力名、风险等级、参数 JSON；结果区展示判定（allow/modify/require_approval/deny）、原因、Decision/Interaction ID、升级对象与派发信息；require_approval 给出人工跟进提示。
 - **验证**：后端 84 个 server 测试全绿（新增 4 个：allow 派发、deny 跳过派发、未知 Agent 400、无内核时派发标记跳过）；前端构建通过。
 
+#### 进度记录（2026-09-15，第七轮：Go 内核启动与完整链路验证）
+
+- **环境就绪**：下载 OPA 1.19.0 至 `tools/opa.exe`（本机 8181 已有 OPA 实例运行且加载 `policies/interaction/default.rego`，直接复用）；Go 模块经 `GOPROXY=https://goproxy.cn,direct` 绕过被墙的 proxy.golang.org 完成编译。
+- **Go 内核启动命令**：`go run ./cmd/kernel -addr :8080 -development -discovery-file ..\config\a2a_agents.yaml -interaction-url http://127.0.0.1:8000 -interaction-token dev-token-researcher-001`。
+  - `-discovery-file` 静态注册 `loop-controller-local` 与 `research-agent` 两张 Card；
+  - `-interaction-token` 必须用 `config/identity.yaml` 静态 token 表中的 Agent 凭证（`dev-token-researcher-001`），authorize 端点要求有效 AgentIdentity 且 `source_agent_id` 与身份匹配（401/403 的根因均是凭证不匹配）。
+- **Python 服务启动**：`lc server --port 8000` 需 `LOOP_CONTROLLER_API_KEY` 与 `LOOP_CONTROLLER_AUDIT_HMAC_KEY`；启动时自动向 Go 内核注册本地 Card（201）。注意 `data/audit.jsonl` 若含旧 HMAC key 签名的记录会导致 Store 阻断，需备份重建（已备份为 `*.bak-20260915-194620`）。
+- **联调中修正的两个语义问题**：
+  1. 管理端委托 handler 预先拒绝"不在本地 config.agents 的 target"——但 A2A 委托的 target 常是仅注册在 Go 内核的外部 Agent；已移除该预检，交由治理引擎通过 Agent Card 查询兜底（测试同步改为"unknown target 委托给引擎"）。
+  2. Go 内核语义：请求带 `task_id` 时该任务必须已存在于内核（pending），否则 `delegation task not found` 403；新委托应留空 `task_id`，由内核创建并返回。
+- **完整链路验证通过**：Session 登录 → `POST /v1/admin/a2a/delegations`（researcher_001 → research-agent / analyze_sales）→ IIGE 治理 allow（profile → capability → 深度 → trust → OPA interaction 策略）→ Go 内核二次 authorize（200）→ 任务创建 accepted=true 返回 task_id → `GET /v1/admin/a2a/tasks/{task_id}` 查到 pending 任务（research-agent :8001 无真实执行端，development 模式不实际派发，符合预期）。全程审计落盘。
+- **验证**：`test_server.py` + `test_delegation_authorizer.py` 共 94 测试全绿。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

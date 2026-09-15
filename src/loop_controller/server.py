@@ -1448,8 +1448,8 @@ class ToolGovernServer:
             return JSONResponse({"error": "config unavailable"}, status_code=503)
         if body.source_agent_id not in config.agents:
             return JSONResponse({"error": "unknown source agent"}, status_code=400)
-        if body.target_agent_id not in config.agents:
-            return JSONResponse({"error": "unknown target agent"}, status_code=400)
+        # target 可以是外部 Agent（仅注册在 Go 内核）；其合法性由治理引擎
+        # 通过 Agent Card 查询与信任校验兜底。
 
         proposal = InteractionProposal(
             interaction_id=uuid.uuid4().hex,

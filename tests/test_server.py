@@ -1942,9 +1942,11 @@ def test_admin_a2a_delegation_deny_skips_dispatch(monkeypatch: pytest.MonkeyPatc
     assert bridge.requests == []
 
 
-def test_admin_a2a_delegation_unknown_agent_returns_400(
+def test_admin_a2a_delegation_unknown_target_delegated_to_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # target 可以是外部 Agent（仅注册在 Go 内核），不由 handler 预先拒绝，
+    # 而是交给治理引擎通过 Agent Card 查询兜底（假引擎默认 deny）。
     monkeypatch.setattr(
         "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
     )
@@ -1956,7 +1958,9 @@ def test_admin_a2a_delegation_unknown_agent_returns_400(
         headers={"X-API-Key": "test-key"},
         json=payload,
     )
-    assert resp.status_code == 400
+    assert resp.status_code == 200
+    assert resp.json()["verdict"] == "deny"
+    assert resp.json()["dispatch"]["attempted"] is False
 
 
 def test_admin_a2a_delegation_allow_without_kernel_notes_skip(
