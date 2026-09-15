@@ -176,6 +176,20 @@ class AdminProfileUpdateResponse(BaseModel):
     reloaded: bool = Field(default=True, description="运行时是否已同步刷新")
 
 
+class AdminSessionLoginRequest(BaseModel):
+    """POST /v1/admin/session/login 请求体。"""
+
+    api_key: str = Field(..., description="Admin API Key，验证通过后换取 Session Token")
+
+
+class AdminSessionLoginResponse(BaseModel):
+    """POST /v1/admin/session/login 响应体。"""
+
+    token: str
+    token_type: str = "bearer"
+    expires_at: datetime
+
+
 class AdminGovernEvaluateRequest(BaseModel):
     """POST /v1/admin/govern/evaluate 请求体（只读判定调试）。"""
 

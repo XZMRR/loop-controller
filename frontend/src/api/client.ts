@@ -19,7 +19,9 @@ export const a2aClient = axios.create({
 
 pythonClient.interceptors.request.use((config) => {
   const auth = useAuthStore()
-  if (auth.apiKey) {
+  if (auth.sessionValid && auth.sessionToken) {
+    config.headers['Authorization'] = `Bearer ${auth.sessionToken}`
+  } else if (auth.apiKey) {
     config.headers['X-API-Key'] = auth.apiKey
   }
   return config

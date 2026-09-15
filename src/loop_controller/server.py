@@ -47,6 +47,7 @@ from loop_controller.identity import (
     RevocationType,
 )
 from loop_controller.infra.approval_store import ApprovalStoreError, list_approval_history
+from loop_controller.infra.admin_session import AdminSessionStore
 from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.infra.profile_config import ProfileConfigError, update_profile_tools
 from loop_controller.interaction.engine import (
@@ -75,6 +76,8 @@ from loop_controller.server_models import (
     AdminProfilesResponse,
     AdminProfileToolsUpdateRequest,
     AdminProfileUpdateResponse,
+    AdminSessionLoginRequest,
+    AdminSessionLoginResponse,
     AuditQueryResponse,
     GovernResponse,
     GovernToolRequest,
@@ -259,6 +262,7 @@ class ToolGovernServer:
         start_time: float | None = None,
         identity_provider: IdentityProvider | None = None,
         entrypoints_config: dict[str, Any] | None = None,
+        session_store: AdminSessionStore | None = None,
     ) -> None:
         self._controller = controller
         self._api_key = api_key
@@ -266,6 +270,7 @@ class ToolGovernServer:
         self._start_time = start_time or time.time()
         self._identity_provider = identity_provider or _extract_identity_provider(controller)
         self._entrypoints_config = entrypoints_config or {}
+        self._session_store = session_store or AdminSessionStore()
 
     def _http_require_auth(self) -> bool:
         """读取 entrypoints.http.require_auth；缺省 false 保持向后兼容。"""
@@ -274,7 +279,7 @@ class ToolGovernServer:
         return bool(http_cfg.get("require_auth", False))
 
     def _check_api_key(self, request: Request) -> bool:
-        """管理员端点的全局 API key 强制校验。"""
+        """管理员端点的全局 API key 强制校验；Bearer Session Token 作为替代凭据。"""
         if not self._api_key:
             return False
         header = request.headers.get("x-api-key") or ""
@@ -286,19 +291,24 @@ class ToolGovernServer:
             if candidate and len(candidate) == len(self._api_key):
                 if hmac.compare_digest(candidate, self._api_key):
                     return True
-        return False
+        # Session 登录签发的 Bearer Token（长期运行：前端不长期持有明文 API Key）
+        return self._session_store.validate(token)
+
+    def _bearer_token(self, request: Request) -> str:
+        auth = request.headers.get("authorization") or ""
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return ""
 
     def _admin_actor_id(self, request: Request) -> str:
-        """从请求中提取管理员 API key 的匿名标识；未认证时返回 unauthenticated。"""
+        """从请求中提取管理员身份匿名标识；未认证时返回 unauthenticated。"""
         if not self._api_key:
             return "unauthenticated"
         header = request.headers.get("x-api-key") or ""
-        auth = request.headers.get("authorization") or ""
-        if auth.lower().startswith("bearer "):
-            token = auth[7:].strip()
-        else:
-            token = ""
-        key = header or token
+        bearer = self._bearer_token(request)
+        if not header and bearer and self._session_store.validate(bearer):
+            return f"session:{hashlib.sha256(bearer.encode()).hexdigest()[:12]}"
+        key = header or bearer
         if not key:
             return "unauthenticated"
         return f"api-key:{hashlib.sha256(key.encode()).hexdigest()[:12]}"
@@ -1337,6 +1347,40 @@ class ToolGovernServer:
             ).model_dump(mode="json")
         )
 
+    async def _handle_admin_session_login(self, request: Request) -> JSONResponse:
+        """POST /v1/admin/session/login：验证 Admin API Key，签发 Session Token。"""
+        try:
+            body = AdminSessionLoginRequest(**await request.json())
+        except Exception as exc:
+            return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+        if not self._api_key or not hmac.compare_digest(body.api_key, self._api_key):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session = self._session_store.create()
+        await self._audit_admin_operation(
+            request,
+            "session_login",
+            target="admin_session",
+            metadata={"expires_at": datetime.fromtimestamp(session.expires_at, UTC)},
+        )
+        return JSONResponse(
+            AdminSessionLoginResponse(
+                token=session.token,
+                expires_at=datetime.fromtimestamp(session.expires_at, UTC),
+            ).model_dump(mode="json")
+        )
+
+    async def _handle_admin_session_logout(self, request: Request) -> JSONResponse:
+        """POST /v1/admin/session/logout：吊销当前 Bearer Session Token。"""
+        token = self._bearer_token(request)
+        revoked = self._session_store.revoke(token) if token else False
+        await self._audit_admin_operation(
+            request,
+            "session_logout",
+            target="admin_session",
+            metadata={"revoked": revoked},
+        )
+        return JSONResponse({"revoked": revoked})
+
     async def _handle_admin_identity_config(self, request: Request) -> JSONResponse:
         """GET /v1/admin/identity：返回脱敏后的 Identity Provider 配置。"""
         if not self._check_api_key(request):
@@ -1480,6 +1524,7 @@ def build_app(
     configure_logs: bool = True,
     identity_provider: IdentityProvider | None = None,
     entrypoints_config: dict[str, Any] | None = None,
+    session_store: AdminSessionStore | None = None,
 ) -> Starlette:
     """从 LoopController 构造 Starlette ASGI 应用。"""
     if configure_logs:
@@ -1492,6 +1537,7 @@ def build_app(
         watcher=watcher,
         identity_provider=identity_provider,
         entrypoints_config=entrypoints_config,
+        session_store=session_store,
     )
 
     @asynccontextmanager
@@ -1632,6 +1678,16 @@ def build_app(
                 "/v1/admin/profiles/{profile_id}/tools",
                 server._handle_admin_profile_tools_update,
                 methods=["PUT"],
+            ),
+            Route(
+                "/v1/admin/session/login",
+                server._handle_admin_session_login,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/admin/session/logout",
+                server._handle_admin_session_logout,
+                methods=["POST"],
             ),
             Route("/v1/admin/identity", server._handle_admin_identity_config, methods=["GET"]),
             Route("/v1/admin/entrypoints", server._handle_admin_entrypoints, methods=["GET"]),

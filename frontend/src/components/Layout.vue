@@ -66,11 +66,18 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { logoutAdminSession } from '@/api/python'
 
 const router = useRouter()
 const auth = useAuthStore()
 
-function handleLogout() {
+async function handleLogout() {
+  // 后端在线时吊销 Session Token；失败也不阻塞本地登出
+  try {
+    await logoutAdminSession()
+  } catch {
+    // 忽略：后端不可达或已是 API Key 模式
+  }
   auth.logout()
   router.push('/login')
 }

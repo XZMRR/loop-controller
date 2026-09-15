@@ -36,7 +36,7 @@ import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
-import { getHealth } from '@/api/python'
+import { getHealth, loginAdminSession } from '@/api/python'
 
 const router = useRouter()
 const auth = useAuthStore()
@@ -52,12 +52,20 @@ async function handleLogin() {
     return
   }
   loading.value = true
+  const apiKey = form.apiKey.trim()
   try {
     auth.login({
-      apiKey: form.apiKey.trim(),
+      apiKey,
       baseUrl: '/api/python',
       a2aUrl: '/api/a2a',
     })
+    // 优先换取 Session Token（后端在线时）；旧后端无该端点则降级为 API Key 直连
+    try {
+      const session = await loginAdminSession(apiKey)
+      auth.setSession(session.token, session.expires_at)
+    } catch {
+      // 404/网络错误：保持 API Key 模式
+    }
     await getHealth()
     ElMessage.success('连接成功')
     router.push('/')

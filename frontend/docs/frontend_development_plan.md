@@ -130,6 +130,14 @@ frontend/
 - **前端**：工具策略页升级为在线编辑（每 Profile“编辑”对话框：允许/需审批开关、调用上限、参数黑白名单 JSON 编辑器、增删工具），保存即热更新；“从磁盘重载”按钮对应统一 reload；数据加载优先在线 API，失败回退静态 YAML。
 - **验证**：后端 72 个 server 测试全绿（新增 5 个：写回+热更新+审计、未知 Profile 400、非法权限 400 且不落盘、磁盘直改后 reload 同步、无 config_dir 503）；全量 869 通过（3 个 go_kernel 集成测试错误为既有环境问题，与本轮改动无关，已 stash 基线复核）；前端构建通过。
 
+#### 进度记录（2026-09-15，第四轮：身份、审计、配置底座收口）
+
+- **最小后端 Session 登录落地**（对应已确认决策“短期保留 API Key 联调，同时补最小 Session 登录”）：新增 `POST /v1/admin/session/login`（验证 API Key 后签发 8 小时随机 token）与 `POST /v1/admin/session/logout`（吊销当前 token）；`_check_api_key` 接受 `Authorization: Bearer <session-token>` 作为 API Key 的替代凭据，审计 actor 区分 `api-key:` 与 `session:` 前缀。存储为进程内存（重启全失效，接口预留持久化替换空间），登录/登出均写审计。
+- **前端登录改造**：登录时优先换取 Session Token（旧后端无该端点自动降级 API Key 直连）；axios 拦截器优先携带 Bearer Session Token；退出时先调用后端吊销再清理本地状态。
+- **审计底座现状**：管理侧所有变更操作（吊销、Kill Switch、审批决策、Profile 编辑/重载、Session 登录/登出）均落审计，actor 可区分来源。
+- **配置底座现状**：Profile 在线编辑 + 统一 reload + profiles.yaml 热更新已闭环；Identity/Entrypoints 仍为只读脱敏展示（热更新字段拆分未做，属长期项）。
+- **验证**：后端 76 个 server 测试全绿（新增 4 个 session 用例）；前端构建通过。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

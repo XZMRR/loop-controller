@@ -206,6 +206,22 @@ export async function reloadProfiles(): Promise<Array<Record<string, any>>> {
   return data.profiles || []
 }
 
+export interface AdminSession {
+  token: string
+  token_type: string
+  expires_at: string
+}
+
+export async function loginAdminSession(apiKey: string): Promise<AdminSession> {
+  const { data } = await pythonClient.post('/v1/admin/session/login', { api_key: apiKey })
+  return data
+}
+
+export async function logoutAdminSession(): Promise<boolean> {
+  const { data } = await pythonClient.post('/v1/admin/session/logout')
+  return data.revoked === true
+}
+
 export interface AdminIdentityConfig {
   provider: string
   config: Record<string, any>

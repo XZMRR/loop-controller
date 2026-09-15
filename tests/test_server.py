@@ -1701,6 +1701,53 @@ def test_admin_profile_tools_update_requires_config_dir() -> None:
     assert resp.status_code == 503
 
 
+def test_admin_session_login_issues_bearer_token() -> None:
+    client, controller = _build_admin_client()
+    resp = client.post("/v1/admin/session/login", json={"api_key": "test-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["token"]
+    assert body["token_type"] == "bearer"
+
+    # Bearer Session Token 可访问管理端点
+    resp = client.get(
+        "/v1/admin/agents", headers={"Authorization": f"Bearer {body['token']}"}
+    )
+    assert resp.status_code == 200
+
+    reasons = [e.reason for e in controller._runtime.audit_store._events]
+    assert "session_login" in reasons
+
+
+def test_admin_session_login_wrong_key_returns_401() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.post("/v1/admin/session/login", json={"api_key": "wrong-key"})
+    assert resp.status_code == 401
+
+
+def test_admin_session_logout_revokes_token() -> None:
+    client, controller = _build_admin_client()
+    token = client.post("/v1/admin/session/login", json={"api_key": "test-key"}).json()["token"]
+    resp = client.post(
+        "/v1/admin/session/logout", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["revoked"] is True
+    # 吊销后立即失效
+    resp = client.get("/v1/admin/agents", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 401
+    reasons = [e.reason for e in controller._runtime.audit_store._events]
+    assert "session_logout" in reasons
+
+
+def test_admin_session_unknown_token_returns_401() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get(
+        "/v1/admin/agents", headers={"Authorization": "Bearer not-a-real-token"}
+    )
+    assert resp.status_code == 401
+
+
 def test_admin_identity_masks_sensitive_values() -> None:
     client, _controller = _build_admin_client()
     resp = client.get("/v1/admin/identity", headers={"X-API-Key": "test-key"})
