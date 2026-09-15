@@ -158,6 +158,24 @@ class AdminProfilesResponse(BaseModel):
     profiles: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class AdminProfileToolsUpdateRequest(BaseModel):
+    """PUT /v1/admin/profiles/{profile_id}/tools 请求体。
+
+    ``tools`` 为完整替换语义：写入后即该 Profile 的全部工具权限。
+    每个值对应 ``ToolPermission`` 字段（allowed / require_approval /
+    allowed_args / denied_args / max_calls_per_task），不允许额外字段。
+    """
+
+    tools: dict[str, dict[str, Any]] = Field(..., description="工具权限映射（整体替换）")
+
+
+class AdminProfileUpdateResponse(BaseModel):
+    """PUT /v1/admin/profiles/{profile_id}/tools 响应体（写回并热更新后的 Profile）。"""
+
+    profile: dict[str, Any] = Field(default_factory=dict)
+    reloaded: bool = Field(default=True, description="运行时是否已同步刷新")
+
+
 class AdminGovernEvaluateRequest(BaseModel):
     """POST /v1/admin/govern/evaluate 请求体（只读判定调试）。"""
 

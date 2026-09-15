@@ -47,6 +47,8 @@ from loop_controller.identity import (
     RevocationType,
 )
 from loop_controller.infra.approval_store import ApprovalStoreError, list_approval_history
+from loop_controller.infra.config_loader import ConfigLoader
+from loop_controller.infra.profile_config import ProfileConfigError, update_profile_tools
 from loop_controller.interaction.engine import (
     InteractionAuthorizeEndpoint,
     InteractionGovernanceEngine,
@@ -71,6 +73,8 @@ from loop_controller.server_models import (
     AdminGovernEvaluateRequest,
     AdminGovernEvaluateResponse,
     AdminProfilesResponse,
+    AdminProfileToolsUpdateRequest,
+    AdminProfileUpdateResponse,
     AuditQueryResponse,
     GovernResponse,
     GovernToolRequest,
@@ -1265,6 +1269,74 @@ class ToolGovernServer:
             ).model_dump(mode="json")
         )
 
+    async def _reload_runtime_profiles(self) -> bool:
+        """从磁盘重载 profiles.yaml 并原地刷新共享映射；返回是否成功。"""
+        runtime = self._controller._runtime
+        config_dir = getattr(runtime, "config_dir", None)
+        if config_dir is None:
+            return False
+        try:
+            new_profiles = ConfigLoader().reload_profiles(config_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("profiles.yaml 重载失败：%s", exc)
+            return False
+        runtime.profiles.clear()
+        runtime.profiles.update(new_profiles)
+        return True
+
+    async def _handle_admin_profile_tools_update(self, request: Request) -> JSONResponse:
+        """PUT /v1/admin/profiles/{profile_id}/tools：在线编辑工具策略并写回 + 热更新。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        runtime = self._controller._runtime
+        config_dir = getattr(runtime, "config_dir", None)
+        if config_dir is None:
+            return JSONResponse({"error": "config dir unavailable"}, status_code=503)
+        profile_id = request.path_params["profile_id"]
+        try:
+            body = AdminProfileToolsUpdateRequest(**await request.json())
+        except Exception as exc:
+            return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+        try:
+            profile = update_profile_tools(config_dir, profile_id, body.tools)
+        except ProfileConfigError as exc:
+            return JSONResponse(
+                {"error": "invalid_profile", "message": str(exc)}, status_code=400
+            )
+        reloaded = await self._reload_runtime_profiles()
+        await self._audit_admin_operation(
+            request,
+            "update_profile_tools",
+            target=f"profile:{profile_id}",
+            metadata={"tool_count": len(body.tools), "reloaded": reloaded},
+        )
+        return JSONResponse(
+            AdminProfileUpdateResponse(
+                profile=profile.model_dump(mode="json"),
+                reloaded=reloaded,
+            ).model_dump(mode="json")
+        )
+
+    async def _handle_admin_profiles_reload(self, request: Request) -> JSONResponse:
+        """POST /v1/admin/profiles/reload：放弃内存修改，从磁盘统一重载全部 Profile。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        reloaded = await self._reload_runtime_profiles()
+        if not reloaded:
+            return JSONResponse({"error": "reload failed"}, status_code=500)
+        await self._audit_admin_operation(
+            request,
+            "reload_profiles",
+            target="profiles",
+            metadata={"count": len(self._controller._runtime.profiles)},
+        )
+        profiles = self._controller._runtime.profiles
+        return JSONResponse(
+            AdminProfilesResponse(
+                profiles=[p.model_dump(mode="json") for p in profiles.values()]
+            ).model_dump(mode="json")
+        )
+
     async def _handle_admin_identity_config(self, request: Request) -> JSONResponse:
         """GET /v1/admin/identity：返回脱敏后的 Identity Provider 配置。"""
         if not self._check_api_key(request):
@@ -1551,6 +1623,16 @@ def build_app(
                 methods=["GET"],
             ),
             Route("/v1/admin/profiles", server._handle_admin_profiles, methods=["GET"]),
+            Route(
+                "/v1/admin/profiles/reload",
+                server._handle_admin_profiles_reload,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/admin/profiles/{profile_id}/tools",
+                server._handle_admin_profile_tools_update,
+                methods=["PUT"],
+            ),
             Route("/v1/admin/identity", server._handle_admin_identity_config, methods=["GET"]),
             Route("/v1/admin/entrypoints", server._handle_admin_entrypoints, methods=["GET"]),
             Route(

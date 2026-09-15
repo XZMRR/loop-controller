@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 pytest.importorskip("starlette")
 
@@ -1573,6 +1574,131 @@ def test_admin_profiles_returns_serialized_profiles() -> None:
     profile = profiles["research_v1"]
     assert profile["tools"]["send_email"]["allowed"] is True
     assert profile["tools"]["send_email"]["require_approval"] is True
+
+
+def _write_profiles_yaml(config_dir: Path, tools: dict[str, Any]) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "profiles.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "profiles": [
+                    {
+                        "profile_id": "research_v1",
+                        "description": "研究助手",
+                        "tools": tools,
+                    }
+                ]
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _build_profile_edit_client(tmp_path: Path) -> tuple[TestClient, Any]:
+    client, controller = _build_admin_client()
+    _write_profiles_yaml(
+        tmp_path,
+        {
+            "send_email": {
+                "allowed": True,
+                "require_approval": True,
+                "allowed_args": {"to": ["*@company.com"]},
+                "max_calls_per_task": 1,
+            },
+            "web_search": {"allowed": True, "max_calls_per_task": 10},
+        },
+    )
+    controller._runtime.config_dir = str(tmp_path)
+    return client, controller
+
+
+def test_admin_profile_tools_update_writes_reloads_and_audits(tmp_path: Path) -> None:
+    client, controller = _build_profile_edit_client(tmp_path)
+    resp = client.put(
+        "/v1/admin/profiles/research_v1/tools",
+        headers={"X-API-Key": "test-key"},
+        json={
+            "tools": {
+                "send_email": {
+                    "allowed": True,
+                    "require_approval": False,
+                    "allowed_args": {"to": ["*@company.com", "*@partner.com"]},
+                },
+                "web_search": {"allowed": True, "max_calls_per_task": 5},
+            }
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["reloaded"] is True
+    send_email = body["profile"]["tools"]["send_email"]
+    assert send_email["require_approval"] is False
+    assert send_email["allowed_args"]["to"] == ["*@company.com", "*@partner.com"]
+
+    # 运行时映射已原地刷新（对象替换为磁盘重载版本）
+    runtime_perm = controller._runtime.profiles["research_v1"].tools["send_email"]
+    assert runtime_perm.require_approval is False
+
+    # 文件确实写回（加载-修改-全量写回，注释不保留）
+    on_disk = yaml.safe_load((tmp_path / "profiles.yaml").read_text(encoding="utf-8"))
+    disk_tools = on_disk["profiles"][0]["tools"]
+    assert disk_tools["send_email"]["allowed_args"]["to"] == ["*@company.com", "*@partner.com"]
+    assert "require_approval" not in disk_tools["send_email"]
+
+    # 审计已记录管理操作
+    actions = [e.reason for e in controller._runtime.audit_store._events]
+    assert "update_profile_tools" in actions
+
+
+def test_admin_profile_tools_update_unknown_profile_returns_400(tmp_path: Path) -> None:
+    client, _controller = _build_profile_edit_client(tmp_path)
+    resp = client.put(
+        "/v1/admin/profiles/ghost/tools",
+        headers={"X-API-Key": "test-key"},
+        json={"tools": {"web_search": {"allowed": True}}},
+    )
+    assert resp.status_code == 400
+
+
+def test_admin_profile_tools_update_invalid_permission_returns_400(tmp_path: Path) -> None:
+    client, controller = _build_profile_edit_client(tmp_path)
+    resp = client.put(
+        "/v1/admin/profiles/research_v1/tools",
+        headers={"X-API-Key": "test-key"},
+        json={"tools": {"web_search": {"allowed": True, "max_calls_per_task": "abc"}}},
+    )
+    assert resp.status_code == 400
+    # 校验失败不写文件：磁盘内容保持初始状态
+    on_disk = yaml.safe_load((tmp_path / "profiles.yaml").read_text(encoding="utf-8"))
+    assert on_disk["profiles"][0]["tools"]["web_search"]["max_calls_per_task"] == 10
+
+
+def test_admin_profiles_reload_syncs_from_disk(tmp_path: Path) -> None:
+    client, controller = _build_profile_edit_client(tmp_path)
+    # 绕过 API 直接改文件（模拟手工编辑），再触发统一 reload
+    _write_profiles_yaml(
+        tmp_path,
+        {"send_email": {"allowed": False}},
+    )
+    resp = client.post("/v1/admin/profiles/reload", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    profiles = {p["profile_id"]: p for p in resp.json()["profiles"]}
+    assert profiles["research_v1"]["tools"]["send_email"]["allowed"] is False
+    assert controller._runtime.profiles["research_v1"].tools["send_email"].allowed is False
+    actions = [e.reason for e in controller._runtime.audit_store._events]
+    assert "reload_profiles" in actions
+
+
+def test_admin_profile_tools_update_requires_config_dir() -> None:
+    client, _controller = _build_admin_client()  # mock runtime 无 config_dir
+    resp = client.put(
+        "/v1/admin/profiles/research_v1/tools",
+        headers={"X-API-Key": "test-key"},
+        json={"tools": {"web_search": {"allowed": True}}},
+    )
+    assert resp.status_code == 503
 
 
 def test_admin_identity_masks_sensitive_values() -> None:

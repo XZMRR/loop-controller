@@ -125,6 +125,7 @@ class Runtime:
     go_kernel_bridge: GoKernelBridge | None = None  # v0.36.0 A2A 交互治理桥接
     local_agent_config: dict[str, Any] = field(default_factory=dict)
     config: AppConfig | None = None
+    config_dir: str | None = None  # v0.37.0 Profile 在线编辑/重载定位 profiles.yaml
 
     def require_execution_ready(self) -> None:
         if self.persistence_status.status not in {"healthy", "tail_repaired"}:
@@ -709,4 +710,5 @@ def build_runtime(
             config.go_kernel_config.get("go_kernel", {}).get("local_agent", {})
         ),
         config=config,
+        config_dir=str(config_dir),
     )

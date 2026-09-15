@@ -35,6 +35,7 @@ class HotReloader:
         revocation_list: RevocationList | None = None,
         harness_executor: HarnessExecutor | None = None,
         harness_tool_names: set[str] | None = None,
+        profiles: dict[str, Any] | None = None,
         poll_interval_seconds: float = 30.0,
         enabled: bool = True,
     ) -> None:
@@ -48,6 +49,8 @@ class HotReloader:
         self._harness_executor = harness_executor
         # 与 Runtime 共享的可变集合；热更新 Harness 工具后同步刷新。
         self._harness_tool_names = harness_tool_names
+        # 与 Runtime 共享的 Profile 映射；profiles.yaml 变化后原地刷新。
+        self._profiles = profiles
         self._poll_interval = poll_interval_seconds
         self._enabled = enabled
         self._task: asyncio.Task[Any] | None = None
@@ -131,6 +134,9 @@ class HotReloader:
         revocation_yaml = self._config_dir / "revocation.yaml"
         if revocation_yaml.exists():
             paths.append(revocation_yaml)
+        profiles_yaml = self._config_dir / "profiles.yaml"
+        if profiles_yaml.exists():
+            paths.append(profiles_yaml)
         # 监控 secret 后端 base_path 下的所有 .json 文件；优先使用 backend 声明的路径。
         secrets_dir = self._secrets_dir()
         if secrets_dir is not None and secrets_dir.exists():
@@ -185,3 +191,12 @@ class HotReloader:
                 logger.info("吊销列表热更新完成")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("吊销列表热更新失败，保留旧配置：%s", exc)
+
+        if self._profiles is not None:
+            try:
+                new_profiles = self._loader.reload_profiles(self._config_dir)
+                self._profiles.clear()
+                self._profiles.update(new_profiles)
+                logger.info("Profile 热更新完成，共 %d 个", len(new_profiles))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Profile 热更新失败，保留旧配置：%s", exc)

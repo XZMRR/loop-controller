@@ -122,6 +122,14 @@ frontend/
 - **Agent 详情接口落地（多 Agent 底座）**：新增 `GET /v1/admin/agents/{agent_id}`，返回 `AdminAgentDetail`（在列表字段基础上扩展 `description`、`metadata`），404/401/503 语义完整；前端 Agent 管理页新增“详情”操作列与 Drawer 详情视图，接口不可用时回退列表行数据。后端 67 测试全绿，前端构建通过。
 - **实现注意**：审批历史查询不改 `ApprovalStore` Protocol，只给 `JSONLApprovalStore` 具体类加只读 `requests`/`responses` 视图属性，server 端 `getattr` 防御，避免对所有 store 实现造成兼容压力；verdict 序列化用 `getattr(record.verdict, "value", record.verdict)` 兼容枚举与字符串。
 
+#### 进度记录（2026-09-15，第三轮：Profile 工具策略在线编辑与统一 reload）
+
+- **后端新增接口**：`PUT /v1/admin/profiles/{profile_id}/tools`（工具权限整体替换：先经 `ToolPermission` 模型校验，再原子写回 `profiles.yaml`，随后从磁盘重载并原地刷新运行时共享映射，全程写审计）；`POST /v1/admin/profiles/reload`（放弃内存修改，从磁盘统一重载全部 Profile）。
+- **统一 reload 底座**：`HotReloader` 纳入 `profiles.yaml` 监视，文件被手工编辑后按轮询周期自动热更新；`Runtime` 新增 `config_dir` 字段供管理接口定位配置文件；`ConfigLoader.reload_profiles()` 与既有 http/harness/revocation 重载方法同构。
+- **写回实现**：新增 `infra/profile_config.py`，采用“加载-修改-全量写回 + 紧凑序列化（省略默认值）”，已知取舍是首次写回后文件注释与排版不保留（PyYAML 限制），已在页面提示。
+- **前端**：工具策略页升级为在线编辑（每 Profile“编辑”对话框：允许/需审批开关、调用上限、参数黑白名单 JSON 编辑器、增删工具），保存即热更新；“从磁盘重载”按钮对应统一 reload；数据加载优先在线 API，失败回退静态 YAML。
+- **验证**：后端 72 个 server 测试全绿（新增 5 个：写回+热更新+审计、未知 Profile 400、非法权限 400 且不落盘、磁盘直改后 reload 同步、无 config_dir 503）；全量 869 通过（3 个 go_kernel 集成测试错误为既有环境问题，与本轮改动无关，已 stash 基线复核）；前端构建通过。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

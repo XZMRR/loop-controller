@@ -185,6 +185,27 @@ export async function getAdminProfiles(): Promise<Array<Record<string, any>>> {
   return data.profiles || []
 }
 
+export interface ToolPermissionInput {
+  allowed: boolean
+  require_approval?: boolean
+  allowed_args?: Record<string, string[]>
+  denied_args?: Record<string, string[]>
+  max_calls_per_task?: number | null
+}
+
+export async function updateProfileTools(
+  profileId: string,
+  tools: Record<string, ToolPermissionInput>,
+): Promise<{ profile: Record<string, any>; reloaded: boolean }> {
+  const { data } = await pythonClient.put(`/v1/admin/profiles/${profileId}/tools`, { tools })
+  return data
+}
+
+export async function reloadProfiles(): Promise<Array<Record<string, any>>> {
+  const { data } = await pythonClient.post('/v1/admin/profiles/reload')
+  return data.profiles || []
+}
+
 export interface AdminIdentityConfig {
   provider: string
   config: Record<string, any>
