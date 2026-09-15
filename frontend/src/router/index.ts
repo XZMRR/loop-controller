@@ -40,6 +40,12 @@ const router = createRouter({
           meta: { title: '工具策略' },
         },
         {
+          path: 'debug',
+          name: 'Debug',
+          component: () => import('@/views/Debug.vue'),
+          meta: { title: '判定调试' },
+        },
+        {
           path: 'audit',
           name: 'Audit',
           component: () => import('@/views/Audit.vue'),

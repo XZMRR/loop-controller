@@ -29,6 +29,10 @@
           <el-icon><Tools /></el-icon>
           <span>工具策略</span>
         </el-menu-item>
+        <el-menu-item index="/debug">
+          <el-icon><Aim /></el-icon>
+          <span>判定调试</span>
+        </el-menu-item>
         <el-menu-item index="/audit">
           <el-icon><DocumentCopy /></el-icon>
           <span>审计查询</span>
