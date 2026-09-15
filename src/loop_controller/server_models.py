@@ -190,6 +190,27 @@ class AdminSessionLoginResponse(BaseModel):
     expires_at: datetime
 
 
+class AdminA2AStatusResponse(BaseModel):
+    """GET /v1/admin/a2a/status 响应体（Go 内核连接状态）。"""
+
+    enabled: bool = Field(default=False, description="go_kernel.yaml 是否启用")
+    reachable: bool = Field(default=False, description="Go 内核 HTTP 可达")
+    base_url: str = Field(default="", description="Go 内核地址")
+    local_agent: dict[str, Any] = Field(default_factory=dict, description="本地 Agent Card 配置")
+
+
+class AdminA2AAgentItem(BaseModel):
+    """GET /v1/admin/a2a/agents 列表项（配置 Agent 与内核注册态合并视图）。"""
+
+    agent_id: str
+    name: str
+    profile_id: str
+    owner_name: str | None = None
+    registered: bool | None = Field(
+        default=None, description="内核是否已注册；None 表示内核不可达，状态未知"
+    )
+
+
 class AdminGovernEvaluateRequest(BaseModel):
     """POST /v1/admin/govern/evaluate 请求体（只读判定调试）。"""
 

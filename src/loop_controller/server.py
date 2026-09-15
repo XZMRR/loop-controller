@@ -78,6 +78,8 @@ from loop_controller.server_models import (
     AdminProfileUpdateResponse,
     AdminSessionLoginRequest,
     AdminSessionLoginResponse,
+    AdminA2AAgentItem,
+    AdminA2AStatusResponse,
     AuditQueryResponse,
     GovernResponse,
     GovernToolRequest,
@@ -1347,6 +1349,76 @@ class ToolGovernServer:
             ).model_dump(mode="json")
         )
 
+    def _go_kernel_view(self) -> tuple[Any, dict[str, Any]]:
+        """提取 (GoKernelBridge|None, go_kernel 配置段)。"""
+        runtime = self._controller._runtime
+        bridge = getattr(runtime, "go_kernel_bridge", None)
+        gk: dict[str, Any] = {}
+        config = getattr(runtime, "config", None)
+        if config is not None:
+            raw = getattr(config, "go_kernel_config", None) or {}
+            gk = raw.get("go_kernel", {}) or {}
+        return bridge, gk
+
+    async def _handle_admin_a2a_status(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/a2a/status：Go 内核连接状态。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        bridge, gk = self._go_kernel_view()
+        reachable = await bridge.ping() if bridge is not None else False
+        return JSONResponse(
+            AdminA2AStatusResponse(
+                enabled=bool(gk.get("enabled", False)),
+                reachable=reachable,
+                base_url=str(gk.get("base_url", "")),
+                local_agent=dict(gk.get("local_agent", {}) or {}),
+            ).model_dump(mode="json")
+        )
+
+    async def _handle_admin_a2a_agents(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/a2a/agents：配置 Agent 与内核注册态合并视图。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        runtime = self._controller._runtime
+        config = getattr(runtime, "config", None)
+        if config is None:
+            return JSONResponse({"error": "config unavailable"}, status_code=503)
+        bridge, _gk = self._go_kernel_view()
+        registered_ids: set[str] | None = None
+        if bridge is not None and await bridge.ping():
+            cards = await bridge.list_agents()
+            registered_ids = {str(card.get("agent_id", "")) for card in cards}
+        items = [
+            AdminA2AAgentItem(
+                agent_id=agent.agent_id,
+                name=agent.name,
+                profile_id=agent.profile_id,
+                owner_name=config.users.get(agent.owner_id),
+                registered=(
+                    agent.agent_id in registered_ids if registered_ids is not None else None
+                ),
+            )
+            for agent in config.agents.values()
+        ]
+        return JSONResponse(
+            {
+                "agents": [item.model_dump(mode="json") for item in items],
+                "kernel_reachable": registered_ids is not None,
+            }
+        )
+
+    async def _handle_admin_a2a_task_query(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/a2a/tasks/{task_id}：经 Go 内核查询任务状态。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        bridge, _gk = self._go_kernel_view()
+        if bridge is None:
+            return JSONResponse({"error": "go kernel disabled"}, status_code=503)
+        task = await bridge.query_task(request.path_params["task_id"])
+        if task is None:
+            return JSONResponse({"error": "task not found"}, status_code=404)
+        return JSONResponse(task)
+
     async def _handle_admin_session_login(self, request: Request) -> JSONResponse:
         """POST /v1/admin/session/login：验证 Admin API Key，签发 Session Token。"""
         try:
@@ -1688,6 +1760,13 @@ def build_app(
                 "/v1/admin/session/logout",
                 server._handle_admin_session_logout,
                 methods=["POST"],
+            ),
+            Route("/v1/admin/a2a/status", server._handle_admin_a2a_status, methods=["GET"]),
+            Route("/v1/admin/a2a/agents", server._handle_admin_a2a_agents, methods=["GET"]),
+            Route(
+                "/v1/admin/a2a/tasks/{task_id}",
+                server._handle_admin_a2a_task_query,
+                methods=["GET"],
             ),
             Route("/v1/admin/identity", server._handle_admin_identity_config, methods=["GET"]),
             Route("/v1/admin/entrypoints", server._handle_admin_entrypoints, methods=["GET"]),

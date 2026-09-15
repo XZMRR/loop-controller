@@ -1748,6 +1748,74 @@ def test_admin_session_unknown_token_returns_401() -> None:
     assert resp.status_code == 401
 
 
+class _FakeGoKernelBridge:
+    """模拟 GoKernelBridge：reachable 控制 ping/list，tasks 模拟任务存储。"""
+
+    def __init__(self, reachable: bool = True) -> None:
+        self.reachable = reachable
+
+    async def ping(self) -> bool:
+        return self.reachable
+
+    async def list_agents(self) -> list[dict[str, Any]]:
+        if not self.reachable:
+            return []
+        return [{"agent_id": "researcher_001"}, {"agent_id": "loop-controller-local"}]
+
+    async def query_task(self, task_id: str) -> dict[str, Any] | None:
+        if not self.reachable:
+            return None
+        return {"task_id": task_id, "status": "completed"}
+
+
+def test_admin_a2a_status_without_bridge() -> None:
+    client, _controller = _build_admin_client()  # mock runtime 无 go_kernel_bridge
+    resp = client.get("/v1/admin/a2a/status", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enabled"] is False
+    assert body["reachable"] is False
+
+
+def test_admin_a2a_status_and_agents_with_bridge() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=True)
+    resp = client.get("/v1/admin/a2a/status", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    assert resp.json()["reachable"] is True
+
+    resp = client.get("/v1/admin/a2a/agents", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["kernel_reachable"] is True
+    agents = {a["agent_id"]: a for a in body["agents"]}
+    assert agents["researcher_001"]["registered"] is True
+    assert agents["writer_001"]["registered"] is False
+
+
+def test_admin_a2a_agents_kernel_unreachable() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=False)
+    resp = client.get("/v1/admin/a2a/agents", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["kernel_reachable"] is False
+    assert all(a["registered"] is None for a in body["agents"])
+
+
+def test_admin_a2a_task_query() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=True)
+    resp = client.get("/v1/admin/a2a/tasks/t-1", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"
+
+    # 无 bridge 时 fail-closed
+    client2, _controller2 = _build_admin_client()
+    resp = client2.get("/v1/admin/a2a/tasks/t-1", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 503
+
+
 def test_admin_identity_masks_sensitive_values() -> None:
     client, _controller = _build_admin_client()
     resp = client.get("/v1/admin/identity", headers={"X-API-Key": "test-key"})

@@ -362,6 +362,37 @@ class GoKernelBridge:
             await self._client.aclose()
             self._client = None
 
+    async def ping(self) -> bool:
+        """探测 Go 内核可达性（GET /a2a/v1/agents 期望 200）。"""
+        url = f"{self._base_url}/a2a/v1/agents"
+        try:
+            client = await self._client_context()
+            response = await client.get(url)
+            return response.status_code == 200
+        except httpx.RequestError as exc:
+            logger.warning("Go kernel ping unreachable: %s", exc)
+            return False
+
+    async def list_agents(self) -> list[dict[str, Any]]:
+        """列出已注册 Agent Card；不可达或响应非法时返回空列表。"""
+        url = f"{self._base_url}/a2a/v1/agents"
+        try:
+            client = await self._client_context()
+            response = await client.get(url)
+            response.raise_for_status()
+            result = response.json()
+            if isinstance(result, list):
+                return [item for item in result if isinstance(item, dict)]
+            if isinstance(result, dict):
+                agents = result.get("agents")
+                if isinstance(agents, list):
+                    return [item for item in agents if isinstance(item, dict)]
+            logger.warning("Go kernel list_agents returned unexpected payload")
+            return []
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            logger.warning("Go kernel list_agents unreachable: %s", exc)
+            return []
+
     async def register_agent(self, card: AgentCard) -> bool:
         """向 Go 内核注册 Agent Card。"""
         url = f"{self._base_url}/a2a/v1/agents"

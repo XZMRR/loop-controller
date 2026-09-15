@@ -138,6 +138,16 @@ frontend/
 - **配置底座现状**：Profile 在线编辑 + 统一 reload + profiles.yaml 热更新已闭环；Identity/Entrypoints 仍为只读脱敏展示（热更新字段拆分未做，属长期项）。
 - **验证**：后端 76 个 server 测试全绿（新增 4 个 session 用例）；前端构建通过。
 
+#### 进度记录（2026-09-15，第五轮：路由守卫收口 + A2A 接入第一步）
+
+- **路由级权限守卫**：路由守卫此前已存在（未登录跳 `/login`、已登录访问登录页跳首页），本轮补齐缺口——axios 响应拦截器统一处理 401：清理本地凭据、3 秒防抖提示并跳回登录页；登录页自身的 401 不触发跳转，避免循环。
+- **A2A 接入第一步（治理视角，不依赖 Go 内核在线）**：
+  - `GoKernelBridge` 新增 `ping()`（GET /a2a/v1/agents 探测可达性）与 `list_agents()`（兼容列表/包装两种响应）。
+  - 新增管理接口：`GET /v1/admin/a2a/status`（启用/可达/地址/本地 Agent Card 配置）、`GET /v1/admin/a2a/agents`（配置 Agent 与内核注册态合并视图，内核不可达时 registered=null 语义明确）、`GET /v1/admin/a2a/tasks/{task_id}`（任务状态查询；内核未启用 fail-closed 返回 503）。
+  - 前端 A2A 治理页从占位升级为三张卡：内核状态（含未启用/不可达引导提示）、Agent 注册状态表、任务查询。
+  - 为后续预留：Delegation / route_message / cancel_task 的 bridge 方法已存在，下一步可做管理端发起委托与任务取消。
+- **验证**：后端 80 个 server 测试全绿（新增 4 个 A2A 用例）；前端构建通过。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

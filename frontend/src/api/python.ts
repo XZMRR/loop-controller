@@ -222,6 +222,36 @@ export async function logoutAdminSession(): Promise<boolean> {
   return data.revoked === true
 }
 
+export interface A2AStatus {
+  enabled: boolean
+  reachable: boolean
+  base_url: string
+  local_agent: Record<string, any>
+}
+
+export async function getA2AStatus(): Promise<A2AStatus> {
+  const { data } = await pythonClient.get('/v1/admin/a2a/status')
+  return data
+}
+
+export interface A2AAgent {
+  agent_id: string
+  name: string
+  profile_id: string
+  owner_name?: string | null
+  registered?: boolean | null
+}
+
+export async function getA2AAgents(): Promise<{ agents: A2AAgent[]; kernel_reachable: boolean }> {
+  const { data } = await pythonClient.get('/v1/admin/a2a/agents')
+  return data
+}
+
+export async function getA2ATask(taskId: string): Promise<Record<string, any>> {
+  const { data } = await pythonClient.get(`/v1/admin/a2a/tasks/${taskId}`)
+  return data
+}
+
 export interface AdminIdentityConfig {
   provider: string
   config: Record<string, any>
