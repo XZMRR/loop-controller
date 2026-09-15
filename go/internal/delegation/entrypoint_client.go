@@ -10,7 +10,9 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"time"
 
+	"github.com/loop-controller/go/internal/entrypointpolicy"
 	"github.com/loop-controller/go/internal/models"
 )
 
@@ -18,8 +20,12 @@ const maxEntrypointResponseBytes = 1 << 20
 
 // DispatchError records whether an entrypoint request may have reached the target.
 type DispatchError struct {
-	Err       error
-	MayBeSent bool
+	Err          error
+	FailureClass models.FailureClass
+	MayBeSent    bool
+	Disposition  models.DispatchDisposition
+	StatusCode   int
+	RetryAfter   time.Duration
 }
 
 func (e *DispatchError) Error() string { return e.Err.Error() }
@@ -34,6 +40,7 @@ type EntrypointClient interface {
 // HTTPEntrypointClient dispatches tasks to HTTP Agent entrypoints.
 type HTTPEntrypointClient struct {
 	Client *http.Client
+	Policy entrypointpolicy.Policy
 }
 
 // Dispatch sends a delegated task to the target's standard entrypoint route.
@@ -55,23 +62,46 @@ func (c *HTTPEntrypointClient) Dispatch(ctx context.Context, entrypoint models.A
 	if req.DeliveryID != "" {
 		httpReq.Header.Set("Idempotency-Key", req.DeliveryID)
 	}
-	client := c.Client
-	if client == nil {
-		client = http.DefaultClient
+	if req.AssignmentID != "" {
+		httpReq.Header.Set("X-LC-Assignment-ID", req.AssignmentID)
+		httpReq.Header.Set("X-LC-Delivery-ID", req.DeliveryID)
+		httpReq.Header.Set("X-LC-Assignment-Attempt", fmt.Sprint(req.AssignmentAttempt))
+		httpReq.Header.Set("X-LC-Assignment-Fence", fmt.Sprint(req.AssignmentFence))
+	}
+	approved, err := c.Policy.Validate(ctx, base.String())
+	if err != nil && c.Policy.Development && c.Client != nil {
+		if checked, checkErr := c.Policy.Check(base.String()); checkErr == nil {
+			approved = entrypointpolicy.Approved{URL: checked}
+			err = nil
+		}
+	}
+	if err != nil {
+		return &DispatchError{Err: err, FailureClass: models.FailureClassSecurityViolation, Disposition: models.DispatchDispositionConfirmedNotSent}
+	}
+	client, err := c.Policy.Client(c.Client, approved)
+	if err != nil {
+		return &DispatchError{Err: err, FailureClass: models.FailureClassSecurityViolation, Disposition: models.DispatchDispositionConfirmedNotSent}
 	}
 	wroteRequest := false
 	trace := &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest = true }}
 	resp, err := client.Do(httpReq.WithContext(httptrace.WithClientTrace(httpReq.Context(), trace)))
 	if err != nil {
-		return &DispatchError{Err: fmt.Errorf("dispatch entrypoint request: %w", err), MayBeSent: wroteRequest}
+		failure := models.FailureClassPreDispatchTransient
+		if wroteRequest {
+			failure = models.FailureClassSentUnacknowledged
+		}
+		disposition := models.DispatchDispositionConfirmedNotSent
+		if wroteRequest {
+			disposition = models.DispatchDispositionSentUnacknowledged
+		}
+		return &DispatchError{Err: fmt.Errorf("dispatch entrypoint request: %w", err), FailureClass: failure, MayBeSent: wroteRequest, Disposition: disposition}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		limited, _ := io.ReadAll(io.LimitReader(resp.Body, maxEntrypointResponseBytes))
-		return &DispatchError{
-			Err:       fmt.Errorf("entrypoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(limited))),
-			MayBeSent: false,
-		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxEntrypointResponseBytes))
+		failure := models.FailureClassRemoteRejected
+		retryAfter, _ := time.ParseDuration(strings.TrimSpace(resp.Header.Get("Retry-After")) + "s")
+		return &DispatchError{Err: fmt.Errorf("entrypoint returned status %d", resp.StatusCode), FailureClass: failure, MayBeSent: true, Disposition: models.DispatchDispositionSentUnacknowledged, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
 	}
 	return nil
 }
@@ -94,9 +124,19 @@ func (c *HTTPEntrypointClient) Cancel(ctx context.Context, entrypoint models.Age
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+delegationToken)
-	client := c.Client
-	if client == nil {
-		client = http.DefaultClient
+	approved, err := c.Policy.Validate(ctx, base.String())
+	if err != nil && c.Policy.Development && c.Client != nil {
+		if checked, checkErr := c.Policy.Check(base.String()); checkErr == nil {
+			approved = entrypointpolicy.Approved{URL: checked}
+			err = nil
+		}
+	}
+	if err != nil {
+		return false, err
+	}
+	client, err := c.Policy.Client(c.Client, approved)
+	if err != nil {
+		return false, err
 	}
 	resp, err := client.Do(httpReq)
 	if err != nil {

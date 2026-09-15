@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/loop-controller/go/internal/models"
@@ -25,32 +26,44 @@ type DelegationApprovalStore interface {
 	ExpireDue(context.Context, time.Time, int) (int64, error)
 }
 
-type delegationApprovalStore struct{ db *sql.DB }
+type delegationApprovalStore struct {
+	db                      *sql.DB
+	notificationsEnabled    *atomic.Bool
+	notificationDestination *atomic.Value
+}
 
 func (db *DB) DelegationApprovalStore() DelegationApprovalStore {
-	return &delegationApprovalStore{db: db.DB}
+	return &delegationApprovalStore{db: db.DB, notificationsEnabled: &db.approvalNotifications, notificationDestination: &db.notificationDestination}
 }
 
 func (s *delegationApprovalStore) Create(ctx context.Context, a models.DelegationApproval) (models.DelegationApproval, bool, error) {
 	tools, _ := json.Marshal(a.AllowedTools)
 	caps, _ := json.Marshal(a.AllowedCapabilities)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO delegation_approvals (
-		approval_id,request_id,decision_id,request_hash,initiator_agent_id,target_agent_id,session_id,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return models.DelegationApproval{}, false, err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `INSERT INTO delegation_approvals (
+		approval_id,request_id,decision_id,request_hash,initiator_agent_id,target_agent_id,session_id,tenant_id,target_workload_id,target_instance_id,
 		root_task_id,parent_task_id,delegation_depth,effective_args_json,allowed_tools_json,allowed_capabilities_json,
 		allow_redelegation,budget_token_count,budget_payment_amount,budget_currency,task_deadline,expires_at,status,
 		approver_id,reason,created_at,updated_at,decided_at,task_id,version)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		a.ApprovalID, a.RequestID, a.DecisionID, a.RequestHash, a.InitiatorAgentID, a.TargetAgentID, a.SessionID,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ApprovalID, a.RequestID, a.DecisionID, a.RequestHash, a.InitiatorAgentID, a.TargetAgentID, a.SessionID, a.TenantID, a.TargetWorkloadID, a.TargetInstanceID,
 		a.RootTaskID, a.ParentTaskID, a.DelegationDepth, string(a.EffectiveArgs), string(tools), string(caps), boolInt(a.AllowRedelegation),
 		a.Budget.TokenCount, a.Budget.PaymentAmount, a.Budget.Currency, formatOptionalTime(a.TaskDeadline), a.ExpiresAt.UTC().Format(time.RFC3339Nano),
 		a.Status, a.ApproverID, a.Reason, a.CreatedAt.UTC().Format(time.RFC3339Nano), a.UpdatedAt.UTC().Format(time.RFC3339Nano), formatOptionalTime(a.DecidedAt), a.TaskID, a.Version)
 	if err == nil {
-		if auditErr := insertApprovalAuditOutbox(ctx, s.db, a, "created", a.CreatedAt); auditErr != nil {
-			_, _ = s.db.ExecContext(ctx, `DELETE FROM delegation_approvals WHERE approval_id=?`, a.ApprovalID)
-			return models.DelegationApproval{}, false, auditErr
+		if err := s.enqueueApprovalEvents(ctx, tx, a, "created", a.CreatedAt); err != nil {
+			return models.DelegationApproval{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return models.DelegationApproval{}, false, err
 		}
 		return a, true, nil
 	}
+	_ = tx.Rollback()
 	existing, getErr := s.getByRequestID(ctx, a.RequestID)
 	if getErr != nil {
 		return models.DelegationApproval{}, false, fmt.Errorf("create delegation approval: %w", err)
@@ -69,7 +82,7 @@ func (s *delegationApprovalStore) getByRequestID(ctx context.Context, id string)
 	return queryApproval(ctx, s.db.QueryRowContext(ctx, `SELECT `+approvalColumns+` FROM delegation_approvals WHERE request_id=?`, id))
 }
 
-const approvalColumns = `approval_id,request_id,decision_id,request_hash,initiator_agent_id,target_agent_id,session_id,
+const approvalColumns = `approval_id,request_id,decision_id,request_hash,initiator_agent_id,target_agent_id,session_id,tenant_id,target_workload_id,target_instance_id,
 root_task_id,parent_task_id,delegation_depth,effective_args_json,allowed_tools_json,allowed_capabilities_json,
 allow_redelegation,budget_token_count,budget_payment_amount,budget_currency,task_deadline,expires_at,status,
 approver_id,reason,created_at,updated_at,decided_at,task_id,version`
@@ -83,7 +96,7 @@ func queryApproval(_ context.Context, row rowScanner) (models.DelegationApproval
 	var deadline, decided sql.NullString
 	var expires, created, updated string
 	err := row.Scan(&a.ApprovalID, &a.RequestID, &a.DecisionID, &a.RequestHash,
-		&a.InitiatorAgentID, &a.TargetAgentID, &a.SessionID, &a.RootTaskID, &a.ParentTaskID, &a.DelegationDepth,
+		&a.InitiatorAgentID, &a.TargetAgentID, &a.SessionID, &a.TenantID, &a.TargetWorkloadID, &a.TargetInstanceID, &a.RootTaskID, &a.ParentTaskID, &a.DelegationDepth,
 		&args, &tools, &caps, &redelegate, &a.Budget.TokenCount, &a.Budget.PaymentAmount, &a.Budget.Currency,
 		&deadline, &expires, &a.Status, &a.ApproverID, &a.Reason, &created, &updated, &decided, &a.TaskID, &a.Version)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -116,46 +129,50 @@ func queryApproval(_ context.Context, row rowScanner) (models.DelegationApproval
 }
 
 func (s *delegationApprovalStore) Transition(ctx context.Context, id string, version int64, from, to, principal, reason, actionKey string) (models.DelegationApproval, error) {
-	a, err := s.Get(ctx, id)
-	if err != nil {
-		return a, err
-	}
 	if actionKey == "" {
-		return a, ErrApprovalConflict
+		return models.DelegationApproval{}, ErrApprovalConflict
 	}
 	now := time.Now().UTC()
-	if (a.Status == "pending" || a.Status == "approved") && !a.ExpiresAt.After(now) {
-		_, _ = s.db.ExecContext(ctx, `UPDATE delegation_approvals SET status='expired',updated_at=?,decided_at=?,version=version+1 WHERE approval_id=? AND version=? AND status IN ('pending','approved')`, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id, a.Version)
-		return s.Get(ctx, id)
-	}
-	actionHash := from + "\x00" + to + "\x00" + principal + "\x00" + reason
-	decided := any(now.Format(time.RFC3339Nano))
-	if to == "approved" {
-		decided = nil
-	}
-	res, err := s.db.ExecContext(ctx, `UPDATE delegation_approvals SET status=?,approver_id=?,reason=?,updated_at=?,decided_at=?,version=version+1,action_request_id=?,action_hash=? WHERE approval_id=? AND version=? AND status=?`,
-		to, principal, reason, now.Format(time.RFC3339Nano), decided, actionKey, actionHash, id, version, from)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return models.DelegationApproval{}, err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		current, getErr := s.Get(ctx, id)
-		if getErr != nil {
-			return current, getErr
-		}
-		var storedKey, storedHash string
-		_ = s.db.QueryRowContext(ctx, `SELECT action_request_id,action_hash FROM delegation_approvals WHERE approval_id=?`, id).Scan(&storedKey, &storedHash)
-		if actionKey != "" && storedKey == actionKey && storedHash == actionHash {
-			return current, nil
-		}
-		return current, ErrApprovalConflict
+	defer tx.Rollback()
+	a, err := queryApproval(ctx, tx.QueryRowContext(ctx, `SELECT `+approvalColumns+` FROM delegation_approvals WHERE approval_id=?`, id))
+	if err != nil {
+		return a, err
 	}
-	updated, err := s.Get(ctx, id)
+	actualTo, actualPrincipal, actualReason, actualActionKey := to, principal, reason, actionKey
+	if (a.Status == "pending" || a.Status == "approved") && !a.ExpiresAt.After(now) {
+		actualTo, actualPrincipal, actualReason, actualActionKey = "expired", "go-kernel", "approval expired", "expire:"+id
+		from, version = a.Status, a.Version
+	}
+	actionHash := from + "\x00" + actualTo + "\x00" + actualPrincipal + "\x00" + actualReason
+	decided := any(now.Format(time.RFC3339Nano))
+	if actualTo == "approved" {
+		decided = nil
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE delegation_approvals SET status=?,approver_id=?,reason=?,updated_at=?,decided_at=?,version=version+1,action_request_id=?,action_hash=? WHERE approval_id=? AND version=? AND status=?`,
+		actualTo, actualPrincipal, actualReason, now.Format(time.RFC3339Nano), decided, actualActionKey, actionHash, id, version, from)
+	if err != nil {
+		return models.DelegationApproval{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		var storedKey, storedHash string
+		_ = tx.QueryRowContext(ctx, `SELECT action_request_id,action_hash FROM delegation_approvals WHERE approval_id=?`, id).Scan(&storedKey, &storedHash)
+		if storedKey == actionKey && storedHash == actionHash {
+			return a, nil
+		}
+		return a, ErrApprovalConflict
+	}
+	updated, err := queryApproval(ctx, tx.QueryRowContext(ctx, `SELECT `+approvalColumns+` FROM delegation_approvals WHERE approval_id=?`, id))
 	if err != nil {
 		return updated, err
 	}
-	if err := insertApprovalAuditOutbox(ctx, s.db, updated, to, now); err != nil {
+	if err := s.enqueueApprovalEvents(ctx, tx, updated, actualTo, now); err != nil {
+		return models.DelegationApproval{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return models.DelegationApproval{}, err
 	}
 	return updated, nil
@@ -182,6 +199,25 @@ func (s *delegationApprovalStore) Consume(ctx context.Context, id string, versio
 		return a, ErrApprovalConflict
 	}
 	if !a.ExpiresAt.After(now) || (task.Deadline != nil && !task.Deadline.After(now)) {
+		res, updateErr := tx.ExecContext(ctx, `UPDATE delegation_approvals SET status='expired',approver_id='go-kernel',reason='approval expired',updated_at=?,decided_at=?,version=version+1,action_request_id=?,action_hash=? WHERE approval_id=? AND version=? AND status='approved'`, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), "expire:"+id, "approved\x00expired\x00go-kernel\x00approval expired", id, version)
+		if updateErr != nil {
+			return a, updateErr
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return a, ErrApprovalConflict
+		}
+		a.Status = "expired"
+		a.ApproverID = "go-kernel"
+		a.Reason = "approval expired"
+		a.UpdatedAt = now
+		a.DecidedAt = &now
+		a.Version++
+		if err := s.enqueueApprovalEvents(ctx, tx, a, "expired", now); err != nil {
+			return a, err
+		}
+		if err := tx.Commit(); err != nil {
+			return a, err
+		}
 		return a, ErrApprovalExpired
 	}
 	if task.ParentTaskID != "" {
@@ -200,17 +236,26 @@ func (s *delegationApprovalStore) Consume(ctx context.Context, id string, versio
 	if err != nil {
 		return a, err
 	}
-	eventID := "ev-approval-" + id
-	if _, err := tx.ExecContext(ctx, `INSERT INTO events(event_id,task_id,event_type,payload_json,published_at,published) VALUES(?,?,?,?,?,0)`, eventID, task.TaskID, "task_created", string(payload), now.Format(time.RFC3339Nano)); err != nil {
+	event := models.TaskEvent{EventID: "ev-approval-" + id, TaskID: task.TaskID, EventType: "task_created", Payload: payload, PublishedAt: now}
+	if err := appendEvent(ctx, tx, &event); err != nil {
 		return a, err
 	}
-	entrypointJSON, _ := json.Marshal(entrypoint)
+	entrypointJSON, err := json.Marshal(entrypoint)
+	if err != nil {
+		return a, err
+	}
+	assignmentID := "outbound-assignment-" + task.TaskID
+	deliveryID := "delegation-dispatch-" + task.TaskID
+	dispatch.TaskID = task.TaskID
+	dispatch.DeliveryID = deliveryID
 	dispatchJSON, err := json.Marshal(dispatch)
 	if err != nil {
 		return a, err
 	}
-	deliveryID := "delegation-dispatch:" + id
-	if _, err := tx.ExecContext(ctx, `INSERT INTO delegation_dispatch_outbox(delivery_id,approval_id,task_id,entrypoint_json,payload_json,next_attempt_at) VALUES(?,?,?,?,?,?)`, deliveryID, id, task.TaskID, string(entrypointJSON), string(dispatchJSON), now.Format(time.RFC3339Nano)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_assignments(assignment_id,assignment_kind,tenant_id,task_id,agent_id,state,revision,attempt,execution_fence,lease_owner,claim_token,lease_expires_at,deadline,delivery_id,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,'queued',1,0,0,'','',0,?,?,?,?,?)`, assignmentID, models.AssignmentKindOutboundDelegation, task.TenantID, task.TaskID, task.TargetAgentID, timeText(task.Deadline), deliveryID, deliveryID, formatTime(now), formatTime(now)); err != nil {
+		return a, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO delegation_dispatch_outbox(delivery_id,approval_id,task_id,assignment_id,entrypoint_json,payload_json,next_attempt_at) VALUES(?,?,?,?,?,?,?)`, deliveryID, id, task.TaskID, assignmentID, string(entrypointJSON), string(dispatchJSON), formatTime(now)); err != nil {
 		return a, err
 	}
 	if err := insertLifecycleOutbox(ctx, tx, task, "approval_consumed", now); err != nil {
@@ -220,7 +265,7 @@ func (s *delegationApprovalStore) Consume(ctx context.Context, id string, versio
 	auditApproval.Status = "consumed"
 	auditApproval.TaskID = task.TaskID
 	auditApproval.EffectiveArgs = nil
-	if err := insertApprovalAuditOutbox(ctx, tx, auditApproval, "consumed", now); err != nil {
+	if err := s.enqueueApprovalEvents(ctx, tx, auditApproval, "consumed", now); err != nil {
 		return a, err
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE delegation_approvals SET status='consumed',task_id=?,updated_at=?,decided_at=?,version=version+1 WHERE approval_id=? AND version=? AND status='approved'`, task.TaskID, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id, version)
@@ -269,6 +314,17 @@ func (s *delegationApprovalStore) ExpireDue(ctx context.Context, now time.Time, 
 		}
 	}
 	return expired, nil
+}
+
+func (s *delegationApprovalStore) enqueueApprovalEvents(ctx context.Context, tx *sql.Tx, approval models.DelegationApproval, event string, at time.Time) error {
+	if err := insertApprovalAuditOutbox(ctx, tx, approval, event, at); err != nil {
+		return err
+	}
+	if s.notificationsEnabled != nil && s.notificationsEnabled.Load() {
+		destination, _ := s.notificationDestination.Load().(string)
+		return insertApprovalNotificationOutbox(ctx, tx, approval, event, at, destination)
+	}
+	return nil
 }
 
 func boolInt(v bool) int {

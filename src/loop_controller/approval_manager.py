@@ -52,22 +52,7 @@ class AsyncApprovalManager:
     def list_recent(self, limit: int = 100) -> list[dict[str, Any]]:
         """v0.32.0：返回最近的审批请求摘要（按提交时间倒序）。"""
         self._store.refresh()
-        requests = getattr(self._store, "_requests", {})
-        records = getattr(self._store, "_records", {})
-        items: list[dict[str, Any]] = []
-        for decision_id, request in requests.items():
-            record = records.get(decision_id)
-            items.append(
-                {
-                    "decision_id": decision_id,
-                    "request_id": request.request_id,
-                    "tool_name": request.tool_name,
-                    "status": record.verdict if record is not None else "pending",
-                    "created_at": request.created_at.isoformat(),
-                }
-            )
-        items.sort(key=lambda d: d["created_at"], reverse=True)
-        return items[:limit]
+        return self._store.list_recent(limit)
 
     async def cancel_request(self, request_id: str) -> ApprovalRecord | None:
         """因超时等原因取消待审批请求；若已有审批结果则返回该结果。"""

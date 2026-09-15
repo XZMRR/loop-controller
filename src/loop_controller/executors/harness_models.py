@@ -167,6 +167,8 @@ class HTTPBackendConfig(BaseModel):
     tls: HarnessTLSConfig = Field(default_factory=HarnessTLSConfig)
     health: HarnessHealthConfig = Field(default_factory=HarnessHealthConfig)
     allow_insecure_http: bool = False
+    authenticated_workload_id: str | None = None
+    execution_profile: str = "default"
     api_key_env: str | None = None
 
     @model_validator(mode="after")

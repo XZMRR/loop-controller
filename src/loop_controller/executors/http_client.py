@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -74,6 +75,7 @@ class HTTPClient:
         body: dict[str, Any] | str | None = None,
         *,
         url_checker: Any | None = None,
+        protect_sensitive_headers: bool = False,
     ) -> tuple[int, dict[str, str], str, float]:
         """发送 HTTP 请求并返回响应摘要。
 
@@ -137,9 +139,29 @@ class HTTPClient:
                 location = response.headers.get("location")
                 if not location:
                     break
-                current_url = str(response.url.join(location))
+                redirect_url = str(response.url.join(location))
                 if url_checker is not None:
-                    url_checker(current_url)
+                    url_checker(redirect_url)
+                if protect_sensitive_headers:
+                    previous = urlparse(current_url)
+                    redirected = urlparse(redirect_url)
+                    if (previous.scheme, previous.hostname, previous.port) != (
+                        redirected.scheme,
+                        redirected.hostname,
+                        redirected.port,
+                    ):
+                        sensitive = {
+                            "authorization",
+                            "proxy-authorization",
+                            "cookie",
+                            "x-api-key",
+                        }
+                        request_headers = {
+                            name: value
+                            for name, value in request_headers.items()
+                            if name.lower() not in sensitive
+                        }
+                current_url = redirect_url
                 if response.status_code == 303:
                     method = "GET"
                     content = None

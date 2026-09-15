@@ -53,6 +53,7 @@ class AuditStore(Protocol):
     def query_by_trace(self, trace_id: str) -> list[AuditEvent]: ...
     def query_by_session(self, session_id: str) -> list[AuditEvent]: ...  # v0.12.0
     def query_by_task(self, task_id: str) -> list[AuditEvent]: ...  # v0.12.0
+    def query_by_correlation(self, correlation_id: str, limit: int = 100) -> list[AuditEvent]: ...
     def query_interactions(
         self,
         *,
@@ -187,7 +188,8 @@ class JsonlAuditStore:
 
     def _prepare_event(self, event: AuditEvent) -> tuple[AuditEvent, str]:
         self._seq += 1
-        to_write = event.model_copy(
+        sanitized = AuditEvent.model_validate(event.model_dump(mode="python"))
+        to_write = sanitized.model_copy(
             update={
                 "seq": self._seq,
                 "prev_hash": self._prev_hash,
@@ -914,8 +916,64 @@ class JsonlAuditStore:
         return self._query_by_field("session_id", session_id)
 
     def query_by_task(self, task_id: str) -> list[AuditEvent]:
-        """按 task_id 全文件扫描并返回 AuditEvent 列表（v0.12.0）。"""
-        return self._query_by_field("task_id", task_id)
+        """按 task_id 查询；旧日志以 trace_id 作为 task_id。"""
+        if self._audit_index is not None and not self._audit_index.degraded:
+            try:
+                return self._audit_index.query_by_task(task_id)
+            except AuditIndexError as exc:
+                logger.warning("审计索引查询失败，回退 JSONL 扫描: %s", exc)
+        return self._scan_correlations(task_id, 1_000_000, fields=("task_id", "trace_id"))
+
+    def query_by_correlation(self, correlation_id: str, limit: int = 100) -> list[AuditEvent]:
+        """沿主要 correlation 字段的关联闭包返回有序完整链。"""
+        if self._audit_index is not None and not self._audit_index.degraded:
+            try:
+                return self._audit_index.query_by_correlation(correlation_id, limit)
+            except AuditIndexError as exc:
+                logger.warning("审计索引查询失败，回退 JSONL 扫描: %s", exc)
+        fields = ("request_id", "interaction_id", "decision_id", "task_id", "call_id", "delegation_jti", "receipt_id")
+        events = self._scan_correlations(None, 1_000_000, fields=fields)
+        identifiers = {correlation_id}
+        selected: list[AuditEvent] = []
+        selected_ids: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for event in events:
+                values = {value for field in fields if (value := getattr(event, field, None))}
+                if event.event_id not in selected_ids and values & identifiers:
+                    selected.append(event)
+                    selected_ids.add(event.event_id)
+                    before = len(identifiers)
+                    identifiers.update(values)
+                    changed = changed or len(identifiers) != before
+        selected.sort(key=lambda event: event.seq)
+        return selected[:limit]
+
+    def _scan_correlations(self, value: str | None, limit: int, *, fields: tuple[str, ...]) -> list[AuditEvent]:
+        results: list[AuditEvent] = []
+        if not self._path.exists():
+            return results
+        with self._path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                    event = AuditEvent.model_validate(record.get("event") or record)
+                except (json.JSONDecodeError, ValidationError):
+                    continue
+                if value is None or any(
+                    getattr(event, field, None) == value for field in fields
+                ):
+                    results.append(event)
+                    if len(results) >= limit:
+                        break
+        return results
+
+    @property
+    def index_status(self):
+        if self._audit_index is None:
+            return None
+        return self._audit_index.status()
 
     def query_interactions(
         self,

@@ -36,6 +36,36 @@ def test_chain_initially_passes(tmp_path) -> None:
     assert store._seq == 2
 
 
+def test_correlation_fallback_and_sensitive_canary(tmp_path) -> None:
+    path = tmp_path / "audit.jsonl"
+    store = JsonlAuditStore(path)
+    event = _make_event().model_copy(
+        update={
+            "request_id": "corr",
+            "decision_id": "corr",
+            "metadata": {
+                "authorization": "Bearer canary-token",
+                "private_key": "-----BEGIN PRIVATE KEY-----canary",
+                "safe": "ok",
+            },
+        }
+    )
+    store.append(event)
+    payload = path.read_text(encoding="utf-8")
+    assert "canary-token" not in payload
+    assert "BEGIN PRIVATE KEY" not in payload
+    assert len(store.query_by_correlation("corr")) == 1
+    assert store.query_by_task("t1")[0].task_id == "t1"
+
+
+def test_correlation_fallback_expands_transitive_closure(tmp_path) -> None:
+    store = JsonlAuditStore(tmp_path / "audit.jsonl")
+    store.append(_make_event().model_copy(update={"event_id": "e1", "request_id": "r", "decision_id": "d"}))
+    store.append(_make_event().model_copy(update={"event_id": "e2", "decision_id": "d", "call_id": "c"}))
+    store.append(_make_event().model_copy(update={"event_id": "e3", "call_id": "c", "receipt_id": "receipt"}))
+    assert [event.event_id for event in store.query_by_correlation("receipt")] == ["e1", "e2", "e3"]
+
+
 def test_duplicate_lifecycle_event_id_is_idempotent(tmp_path) -> None:
     path = tmp_path / "audit.jsonl"
     store = JsonlAuditStore(path)

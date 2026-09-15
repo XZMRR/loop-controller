@@ -9,10 +9,11 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 if TYPE_CHECKING:
     from loop_controller.controller import LoopController
@@ -26,6 +27,7 @@ Verdict = Literal["allow", "deny", "modify", "require_approval"]
 ActionKind = Literal["tool_call", "delegation"]
 AuditDecision = Literal["allow", "deny", "modify", "require_approval", "blocked"]
 ToolResultStatus = Literal["success", "error", "blocked"]
+ExecutionTerminalStatusValue = Literal["success", "error", "timeout", "cancelled"]
 ActorType = Literal["agent", "user", "r0_delegate", "system", "checkpoint"]
 AuditAction = Literal[
     "task_start",
@@ -274,8 +276,10 @@ class ToolResult(BaseModel):
     tool_name: str  # canonical_name
     status: ToolResultStatus
     content: Any
+    terminal_status: ExecutionTerminalStatusValue | None = None
     error_code: str | None = None
     elapsed_ms: int = 0
+    execution_receipt: Any | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)  # v0.25.0 Harness 透传元数据
 
 
@@ -369,6 +373,7 @@ class ApprovalRequest(BaseModel):
     reason: str  # R2 给出的升级理由
     requester_id: str  # 任务发起者 user_id
     approver_id: str  # 被指派的审批人
+    tenant_id: str | None = None  # v0.52.0 数据域：Task.tenant_id 透传，审批双轨锚定依据
     created_at: datetime = Field(default_factory=_utc_now)
 
 
@@ -382,6 +387,8 @@ class ApprovalRecord(BaseModel):
     verdict: ApprovalVerdict
     approver_id: str
     comment: str
+    principal: str | None = None
+    action_summary: str | None = None
     decided_at: datetime = Field(default_factory=_utc_now)
 
 
@@ -390,12 +397,32 @@ class ApprovalRecord(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AuditEvent(BaseModel):
-    """R3 审计最小日志单元。
+_AUDIT_SENSITIVE_KEYS = re.compile(
+    r"(^|_)(authorization|password|passwd|secret|api_key|access_token|refresh_token|"
+    r"delegation_token|private_key|credential_value)($|_)",
+    re.IGNORECASE,
+)
+_AUDIT_SENSITIVE_TEXT = re.compile(
+    r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+|-----BEGIN [^-]*PRIVATE KEY-----"
+)
 
-    ``seq`` / ``prev_hash`` 由 AuditStore 分配（哈希链）；``args_hash`` 与
-    ``args_mask`` 记录脱敏后的参数，原始参数永不落盘。
-    """
+
+def _sanitize_audit_value(value: Any, key: str = "") -> Any:
+    if _AUDIT_SENSITIVE_KEYS.search(key):
+        return "***"
+    if isinstance(value, dict):
+        return {str(k): _sanitize_audit_value(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_audit_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_audit_value(item) for item in value)
+    if isinstance(value, str):
+        return _AUDIT_SENSITIVE_TEXT.sub("***", value)
+    return value
+
+
+class AuditEvent(BaseModel):
+    """R3 审计最小日志单元，兼容旧字段并集中净化敏感值。"""
 
     model_config = ConfigDict(frozen=True)
 
@@ -406,6 +433,25 @@ class AuditEvent(BaseModel):
     trace_id: str  # == Task.task_id
     session_id: str  # == Task.session_id
     call_id: str | None = None  # 动作级 ID；task_start/task_end 为空
+    request_id: str | None = None
+    interaction_id: str | None = None
+    decision_id: str | None = None
+    task_id: str | None = None
+    delegation_jti: str | None = None
+    tenant_id: str | None = None
+    workload_id: str | None = None
+    authenticated_instance_id: str | None = None
+    process_instance_id: str | None = None
+    delegated_agent_id: str | None = None
+    delegated_user_id: str | None = None
+    executor: str | None = None
+    backend: str | None = None
+    receipt_id: str | None = None
+    receipt_type: str | None = None
+    receipt_status: str | None = None
+    result_sha256: str | None = None
+    credential_ref_digest: str | None = None
+    resolved_credential_version: str | None = None
     timestamp: datetime = Field(default_factory=_utc_now)
     actor_type: ActorType
     actor_id: str
@@ -420,6 +466,28 @@ class AuditEvent(BaseModel):
     policy_version: str | None = None
     profile_version: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)  # 分类器 suggestion、审批 comment 等
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sanitize_and_backfill(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        cleaned = _sanitize_audit_value(dict(data))
+        metadata = cleaned.get("metadata")
+        if isinstance(metadata, dict):
+            for field in (
+                "request_id", "interaction_id", "decision_id", "task_id",
+                "delegation_jti", "tenant_id", "workload_id",
+                "authenticated_instance_id", "process_instance_id",
+                "delegated_agent_id", "delegated_user_id", "executor", "backend",
+                "receipt_id", "receipt_type", "receipt_status", "result_sha256",
+                "credential_ref_digest", "resolved_credential_version",
+            ):
+                if cleaned.get(field) is None and metadata.get(field) is not None:
+                    cleaned[field] = metadata[field]
+        if cleaned.get("task_id") is None and cleaned.get("trace_id"):
+            cleaned["task_id"] = cleaned["trace_id"]
+        return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +602,9 @@ class GovernanceResult(BaseModel):
     request_id: str | None = None  # require_approval 时有
     reason: str = ""
     content: Any = None  # allow 后执行的结果内容
+    terminal_status: ExecutionTerminalStatusValue | None = None
     error_code: str | None = None
+    execution_receipt: Any | None = None
 
     # 内部保留：用于审批后自动重试；不参与序列化/深拷贝
     _controller: Any = PrivateAttr(default=None)

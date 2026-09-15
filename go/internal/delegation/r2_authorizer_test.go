@@ -36,8 +36,8 @@ func TestHTTPR2Authorizer_RecordLifecycleCarriesCorrelationFields(t *testing.T) 
 			t.Errorf("%s = %v, want %q", field, got, want)
 		}
 	}
-	if _, ok := payload["delegation_token"]; ok {
-		t.Fatal("lifecycle payload must not contain delegation token")
+	if payload["delegation_token"] != task.DelegationToken {
+		t.Fatal("lifecycle payload must carry the delegation token")
 	}
 }
 
@@ -70,6 +70,9 @@ func TestHTTPR2Authorizer_Allowed(t *testing.T) {
 		if payload["source_agent_id"] != "agent-a" {
 			t.Errorf("source_agent_id = %v", payload["source_agent_id"])
 		}
+		if payload["tenant_id"] != "tenant-a" {
+			t.Errorf("tenant_id = %v", payload["tenant_id"])
+		}
 		if _, exists := payload["arguments_json"]; exists {
 			t.Error("arguments_json must not be sent")
 		}
@@ -94,6 +97,7 @@ func TestHTTPR2Authorizer_Allowed(t *testing.T) {
 		ToolName:         "echo",
 		Arguments:        json.RawMessage(`{"text":"你好"}`),
 		ProtocolVersion:  interactionProtocolVersion,
+		TenantID:         "tenant-a",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

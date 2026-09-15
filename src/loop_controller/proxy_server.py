@@ -20,13 +20,15 @@ v0.7.0 变更：
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import ssl
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -35,6 +37,9 @@ from mcp import types  # type: ignore[import-untyped]
 from mcp.server import Server  # type: ignore[import-untyped]
 from mcp.server.sse import SseServerTransport  # type: ignore[import-untyped]
 from mcp.server.stdio import stdio_server  # type: ignore[import-untyped]
+from mcp.server.streamable_http_manager import (  # type: ignore[import-untyped]
+    StreamableHTTPSessionManager,
+)
 from starlette.applications import Starlette  # type: ignore[import-untyped]
 from starlette.middleware import Middleware  # type: ignore[import-untyped]
 from starlette.middleware.base import BaseHTTPMiddleware  # type: ignore[import-untyped]
@@ -44,6 +49,19 @@ from starlette.routing import Mount, Route  # type: ignore[import-untyped]
 
 from loop_controller.checkpoint import CheckpointError, DecisionAlreadyConsumed
 from loop_controller.controller import LoopController
+from loop_controller.execution_security import TLSWorkloadIdentityResolver
+from loop_controller.executors.base import (
+    ExecutionContext,
+    ExecutionReceiptType,
+    ExecutionTerminalStatus,
+    issue_execution_receipt,
+)
+from loop_controller.executors.mcp_executor import (
+    PROTECTED_MCP_CAPABILITIES,
+    PROTECTED_MCP_META_KEY,
+    ProtectedMCPEnvelope,
+    ProtectedMCPReceipt,
+)
 from loop_controller.identity import AgentIdentity, IdentityCredential, IdentityProvider
 from loop_controller.models import (
     ActionProposal,
@@ -136,6 +154,10 @@ class ProxyIdentity:
 
 DEFAULT_MAX_MCP_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
 DEFAULT_MAX_SSE_CONNECTIONS = 100
+_protected_envelope: ContextVar[ProtectedMCPEnvelope | None] = ContextVar(
+    "protected_mcp_envelope", default=None
+)
+_protected_workload: ContextVar[Any | None] = ContextVar("protected_mcp_workload", default=None)
 
 
 class _MCPBodySizeMiddleware(BaseHTTPMiddleware):
@@ -246,6 +268,7 @@ class LoopControllerProxyServer:
         identity_key: str | None = None,
         client_ca_cert: str | None = None,
         entrypoints_config: dict[str, Any] | None = None,
+        proxy_workload_id: str | None = None,
     ) -> None:
         self._runtime = runtime
         self._identity = identity
@@ -254,6 +277,7 @@ class LoopControllerProxyServer:
         self._identity_key = identity_key
         self._client_ca_cert = client_ca_cert
         self._entrypoints_config = entrypoints_config or {}
+        self._proxy_workload_id = proxy_workload_id
         self._server: Server[Any] | None = None
         self._agent = runtime.checkpoint._identity.get_agent(identity.agent_id)
         if self._agent is None:
@@ -336,7 +360,9 @@ class LoopControllerProxyServer:
         await self._run_stdio_async()
 
     def run_sse(self, host: str = "127.0.0.1", port: int = 8080) -> None:
-        """以 SSE 传输启动 MCP Proxy。"""
+        """以 SSE 传输启动 MCP Proxy（仅 compatibility）。"""
+        if self._runtime.execution_security_policy.strict:
+            raise ValueError("strict mode forbids legacy SSE MCP transport")
         app = self._build_starlette_app()
         kwargs: dict[str, Any] = {"host": host, "port": port, "log_level": "warning"}
         if self._identity_cert and self._identity_key:
@@ -346,6 +372,51 @@ class LoopControllerProxyServer:
                 kwargs["ssl_ca_certs"] = self._client_ca_cert
                 kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
         uvicorn.run(app, **kwargs)
+
+    def run_streamable_http(self, host: str = "127.0.0.1", port: int = 8080) -> None:
+        """启动 strict Streamable HTTP；网络入口必须由 TLS 层强制客户端证书。"""
+        if not all((self._identity_cert, self._identity_key, self._client_ca_cert)):
+            raise ValueError("streamable HTTP requires server cert/key and client CA")
+        app = self._build_streamable_http_app()
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            log_level="warning",
+            ssl_keyfile=self._identity_key,
+            ssl_certfile=self._identity_cert,
+            ssl_ca_certs=self._client_ca_cert,
+            ssl_cert_reqs=ssl.CERT_REQUIRED,
+        )
+
+    def _build_streamable_http_app(self) -> Starlette:
+        server = self._build_server()
+        manager = StreamableHTTPSessionManager(server, json_response=True)
+        resolver = TLSWorkloadIdentityResolver(
+            self._runtime.execution_security_policy.workload_registry
+        )
+
+        @contextlib.asynccontextmanager
+        async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+            async with manager.run():
+                yield
+
+        async def protected_asgi(scope: Any, receive: Any, send: Any) -> None:
+            if scope.get("scheme") != "https":
+                await Response("HTTPS required", status_code=400)(scope, receive, send)
+                return
+            request = Request(scope, receive=receive, send=send)
+            workload = resolver(request)
+            if workload is None:
+                await Response("unauthorized", status_code=401)(scope, receive, send)
+                return
+            token = _protected_workload.set(workload)
+            try:
+                await manager.handle_request(scope, receive, send)
+            finally:
+                _protected_workload.reset(token)
+
+        return Starlette(routes=[Mount("/mcp", app=protected_asgi)], lifespan=lifespan)
 
     # -- Server 构建 --------------------------------------------------------
 
@@ -363,6 +434,63 @@ class LoopControllerProxyServer:
         ) -> types.CallToolResult:
             return await self._handle_call_tool_impl(name, arguments or {})
 
+        generated_handler = server.request_handlers[types.CallToolRequest]
+
+        async def protected_handler(request: types.CallToolRequest) -> Any:
+            raw = request.params.meta.model_dump(exclude_none=True) if request.params.meta else {}
+            envelope_raw = raw.get(PROTECTED_MCP_META_KEY)
+            envelope = (
+                ProtectedMCPEnvelope.model_validate(envelope_raw)
+                if isinstance(envelope_raw, dict)
+                else None
+            )
+            token = _protected_envelope.set(envelope)
+            try:
+                server_result = await generated_handler(request)
+                result = server_result.root
+                if envelope is not None and isinstance(result, types.CallToolResult):
+                    subject = envelope.delegated_subject
+                    context = ExecutionContext(
+                        call_id=subject.call_id,
+                        task_id=subject.task_id,
+                        agent_id=subject.agent_id,
+                        user_id=subject.user_id or "",
+                        tenant_id=subject.tenant_id,
+                        request_id=subject.request_id,
+                        interaction_id=envelope.interaction_id,
+                        decision_id=subject.decision_id,
+                        delegation_jti=subject.delegation_jti,
+                        delegated_subject=subject,
+                    )
+                    content = [item.model_dump(mode="json") for item in result.content]
+                    terminal = (
+                        ExecutionTerminalStatus.ERROR
+                        if result.isError
+                        else ExecutionTerminalStatus.SUCCESS
+                    )
+                    if not self._proxy_workload_id:
+                        raise ValueError("proxy workload identity is not configured")
+                    receipt = ProtectedMCPReceipt(
+                        supported_capabilities=PROTECTED_MCP_CAPABILITIES,
+                        proxy_attestation=issue_execution_receipt(
+                            receipt_type=ExecutionReceiptType.PROXY_ATTESTATION,
+                            context=context,
+                            attester_workload_id=self._proxy_workload_id,
+                            executor="mcp",
+                            backend="loop-controller-proxy",
+                            status=terminal,
+                            result=content,
+                        ),
+                    )
+                    result.meta = {
+                        **(result.meta or {}),
+                        PROTECTED_MCP_META_KEY: receipt.model_dump(mode="json"),
+                    }
+                return server_result
+            finally:
+                _protected_envelope.reset(token)
+
+        server.request_handlers[types.CallToolRequest] = protected_handler
         self._server = server
         return server
 
@@ -698,7 +826,26 @@ class LoopControllerProxyServer:
         arguments: dict[str, Any],
     ) -> types.CallToolResult:
         """把 MCP tool call 映射为 ActionProposal，经 Checkpoint 治理后转发。"""
-        identity = self._resolve_identity()
+        envelope = _protected_envelope.get()
+        workload = _protected_workload.get()
+        if self._runtime.execution_security_policy.strict is True:
+            if envelope is None or workload is None:
+                return self._error_result("protected MCP metadata or mTLS identity missing")
+            subject = envelope.delegated_subject
+            if not self._runtime.execution_security_policy.workload_registry.authorize(
+                workload,
+                agent_id=subject.agent_id,
+                tenant_id=subject.tenant_id,
+            ):
+                return self._error_result("delegated subject outside workload scope")
+            missing = envelope.required_capabilities - PROTECTED_MCP_CAPABILITIES
+            if missing:
+                return self._error_result(
+                    f"unsupported protected MCP capabilities: {sorted(missing)}"
+                )
+            identity = ProxyIdentity(agent_id=subject.agent_id, user_id=subject.user_id or "")
+        else:
+            identity = self._resolve_identity()
         agent = self._runtime.checkpoint._identity.get_agent(identity.agent_id)
         if agent is None:
             return self._error_result(f"unknown agent_id: {identity.agent_id}")

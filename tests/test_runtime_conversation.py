@@ -108,6 +108,7 @@ def _build_controller(audit_path: Path) -> LoopController:
         risk_manager=risk_manager,
         decision_store=InMemoryDecisionStore(),
         budget_ledger=InMemoryBudgetLedger(),
+        allow_degraded=True,
         tool_costs={"web_search": BudgetCost(token_count=1)},
         masker=Masker(
             MaskingRules(

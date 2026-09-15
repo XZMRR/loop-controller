@@ -1,0 +1,62 @@
+# Static strict conformance template only; not a directly runnable production manifest.
+# Replace image tags and Secret names, then validate real CNI/NetworkPolicy enforcement,
+# Secret isolation, workload identity, mTLS, resource controls and external DeploymentProof.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: agent}}
+  template:
+    metadata: {labels: {app: agent}}
+    spec:
+      serviceAccountName: agent
+      automountServiceAccountToken: false
+      securityContext: {seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: agent
+          image: loop-controller-agent:release
+          env: [{name: LOOP_CONTROLLER_URL, value: http://loop-controller:8080}]
+          securityContext: {runAsNonRoot: true, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 500m, memory: 256Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trusted-executor
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: trusted-executor}}
+  template:
+    metadata: {labels: {app: trusted-executor}}
+    spec:
+      serviceAccountName: trusted-executor
+      automountServiceAccountToken: false
+      securityContext: {seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: trusted-executor
+          image: loop-controller-executor:release
+          securityContext: {runAsNonRoot: true, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: "1", memory: 512Mi}}
+          volumeMounts: [{name: tool-credential, mountPath: /run/secrets, readOnly: true}]
+      volumes: [{name: tool-credential, secret: {secretName: tool-credential}}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-governance-ingress}
+spec:
+  podSelector: {matchLabels: {app: trusted-executor}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: loop-controller}}}]
+      ports: [{protocol: TCP, port: 8443}]

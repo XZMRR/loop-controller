@@ -3,8 +3,8 @@
 审批入口：
 
     lc approvals list --config-dir config/
-    lc approvals approve <decision_id> --approver <id> [--comment <text>]
-    lc approvals deny <decision_id> --approver <id> [--comment <text>]
+    lc approvals approve <decision_id> [--comment <text>]
+    lc approvals deny <decision_id> [--comment <text>]
 
 审计分析入口（v0.12.0）：
 
@@ -24,7 +24,7 @@ HTTP 服务入口（v0.17.0）：
 
     lc server [--host 127.0.0.1] [--port 8080] [--opa-url http://127.0.0.1:8181]
 
-CLI 直接读写 ``JsonlApprovalStore``，不经过 Runtime，确保审批人与执行进程解耦。
+CLI 与 Runtime 通过同一配置路径选择审批事实源，但 CLI 不启动 Runtime。
 """
 
 from __future__ import annotations
@@ -37,13 +37,21 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-from loop_controller.approval_service import ApprovalServiceError, build_approval_record
+from loop_controller.approval_service import (
+    ApprovalAuthenticationError,
+    ApprovalAuthorizationError,
+    ApprovalServiceError,
+    build_approval_record,
+    resolve_approver_principal,
+)
 from loop_controller.audit_analyzer import RuleBasedAuditAnalyzer
 from loop_controller.infra.alert_store import JsonlAlertStore
 from loop_controller.infra.approval_crypto import ApprovalCrypto
 from loop_controller.infra.approval_store import (
+    ApprovalStore,
     ApprovalStoreError,
-    JsonlApprovalStore,
+    approval_notification_destination,
+    build_approval_store,
     migrate_approval_store,
 )
 from loop_controller.infra.audit_store import JsonlAuditStore
@@ -80,12 +88,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     approve_cmd = app_sub.add_parser("approve", help="批准一个请求")
     approve_cmd.add_argument("decision_id", help="需要审批的 decision_id")
-    approve_cmd.add_argument("--approver", required=True, help="审批人 ID")
     approve_cmd.add_argument("--comment", default="", help="审批意见")
 
     deny_cmd = app_sub.add_parser("deny", help="拒绝一个请求")
     deny_cmd.add_argument("decision_id", help="需要审批的 decision_id")
-    deny_cmd.add_argument("--approver", required=True, help="审批人 ID")
     deny_cmd.add_argument("--comment", default="", help="审批意见")
 
     migrate_cmd = app_sub.add_parser(
@@ -180,7 +186,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _cmd_list(store: JsonlApprovalStore, args: argparse.Namespace) -> int:
+def _cmd_list(store: ApprovalStore, args: argparse.Namespace) -> int:
     now = datetime.now(UTC)
     pending = store.get_pending()
     if not pending:
@@ -213,7 +219,7 @@ def _cmd_list(store: JsonlApprovalStore, args: argparse.Namespace) -> int:
 
 
 def _cmd_approve_or_deny(
-    store: JsonlApprovalStore,
+    store: ApprovalStore,
     config: AppConfig,
     args: argparse.Namespace,
     verdict: str,
@@ -223,15 +229,24 @@ def _cmd_approve_or_deny(
     existing_record = store.get_record(decision_id)
 
     try:
+        principal = resolve_approver_principal(
+            os.environ.get("LOOP_CONTROLLER_APPROVER_TOKEN"),
+            config.entrypoints_config.get("approval_auth") or {},
+        )
+    except (ApprovalAuthenticationError, ApprovalAuthorizationError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+
+    try:
         record = build_approval_record(
             request,
             existing_record,
-            args.approver,
+            principal,
             verdict,
             args.comment,
             approver_exists=lambda user_id: user_id in config.users,
         )
-    except ApprovalServiceError as exc:
+    except (ApprovalAuthorizationError, ApprovalServiceError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
 
@@ -404,9 +419,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
-    store = JsonlApprovalStore(
+    store = build_approval_store(
         config.approval_store_path,
         crypto=ApprovalCrypto.from_env_or_none(),
+        notification_destination=approval_notification_destination(
+            config.approval.webhook.enabled
+        ),
     )
 
     if args.approval_cmd == "list":
@@ -416,6 +434,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.approval_cmd == "deny":
         return _cmd_approve_or_deny(store, config, args, "deny")
     if args.approval_cmd == "migrate":
+        if config.approval_store_path.lower().endswith((".db", ".sqlite", ".sqlite3")):
+            print("错误：migrate 仅适用于 JSONL 审批存储", file=sys.stderr)
+            return 1
         crypto = ApprovalCrypto.from_env()
         migrate_approval_store(
             config.approval_store_path,

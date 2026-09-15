@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -160,3 +161,46 @@ def test_status_report(tmp_path: Path) -> None:
     status = index.status()
     assert status.healthy
     assert status.indexed_count == 1
+
+
+def test_old_schema_migrates_idempotently(tmp_path: Path) -> None:
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("""CREATE TABLE audit_events (
+            seq INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,
+            timestamp REAL NOT NULL, trace_id TEXT, session_id TEXT,
+            action TEXT, json_payload TEXT NOT NULL, created_at TEXT NOT NULL)""")
+    AuditIndex(path).init_schema()
+    AuditIndex(path).init_schema()
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(audit_events)")}
+    assert {"request_id", "decision_id", "task_id", "delegation_jti", "receipt_id"} <= columns
+
+
+def test_correlation_query_has_order_and_no_duplicates(tmp_path: Path) -> None:
+    index = AuditIndex(tmp_path / "audit.index.db")
+    shared = "corr-1"
+    index.append(_make_event(1).model_copy(update={"request_id": shared, "call_id": shared}))
+    index.append(_make_event(2).model_copy(update={"receipt_id": shared}))
+    assert [event.seq for event in index.query_by_correlation(shared)] == [1, 2]
+
+
+def test_correlation_query_expands_transitive_closure(tmp_path: Path) -> None:
+    index = AuditIndex(tmp_path / "audit.index.db")
+    index.append(_make_event(1).model_copy(update={"request_id": "request", "decision_id": "decision"}))
+    index.append(_make_event(2).model_copy(update={"decision_id": "decision", "call_id": "call"}))
+    index.append(_make_event(3).model_copy(update={"call_id": "call", "receipt_id": "receipt"}))
+    assert [event.seq for event in index.query_by_correlation("receipt")] == [1, 2, 3]
+
+
+def test_rebuild_twice_and_metadata_backfill(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    event = _make_event(1, trace_id="legacy-task").model_copy(
+        update={"metadata": {"request_id": "legacy-request", "decision_id": "legacy-decision"}}
+    )
+    path.write_text(json.dumps(event.model_dump(mode="json", exclude_none=True)) + "\n", encoding="utf-8")
+    index = AuditIndex(tmp_path / "audit.index.db")
+    assert index.rebuild_from_jsonl(path) == 1
+    assert index.rebuild_from_jsonl(path) == 1
+    assert index.query_by_correlation("legacy-request")[0].task_id == "legacy-task"
+    assert index.query_by_task("legacy-task")[0].decision_id == "legacy-decision"

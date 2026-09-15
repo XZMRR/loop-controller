@@ -1,0 +1,10 @@
+execution_security:
+  mode: compatibility
+  supported_egress_types: []
+  required_security_capabilities: []
+  supported_security_capabilities: []
+  require_instance_identity: false
+  require_external_deployment_attestation: false
+  trusted_workloads: []
+  runtime_observation:
+    profile: process

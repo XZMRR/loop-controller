@@ -1,0 +1,69 @@
+{
+  "contract": "result_sha256_restricted_json_v1",
+  "accepted": [
+    {
+      "name": "object_unicode_separators",
+      "media_type": "application/json",
+      "encoding": "utf-8",
+      "wire_result": {
+        "z": true,
+        "a": {
+          "unicode": "βПривет",
+          "line": "x y z"
+        }
+      },
+      "canonical_base64": "eyJhIjp7ImxpbmUiOiJ44oCoeeKAqXoiLCJ1bmljb2RlIjoizrLQn9GA0LjQstC10YIifSwieiI6dHJ1ZX0=",
+      "sha256": "b578654a9dba9f9f3c15802c7dfbac1013180cce3c92110b3e5bb28022591b29"
+    },
+    {
+      "name": "integer_max_safe",
+      "media_type": "application/json",
+      "encoding": "utf-8",
+      "wire_result": 9007199254740991,
+      "canonical_base64": "OTAwNzE5OTI1NDc0MDk5MQ==",
+      "sha256": "f40b423c2dd95ff2b2f027e22208f438cf7242862e5e746860e697308c9add26"
+    },
+    {
+      "name": "integer_min_safe",
+      "media_type": "application/json",
+      "encoding": "utf-8",
+      "wire_result": -9007199254740991,
+      "canonical_base64": "LTkwMDcxOTkyNTQ3NDA5OTE=",
+      "sha256": "4c933a456bb8f2e9894b2d0b26480439cd72d52fb8a27cbf8fd7f323f22c7815"
+    },
+    {
+      "name": "text_unicode_separators",
+      "media_type": "text/plain",
+      "encoding": "utf-8",
+      "wire_result": "Привет line end",
+      "canonical_base64": "0J/RgNC40LLQtdGC4oCobGluZeKAqWVuZA==",
+      "sha256": "36e15ceeac4a3a091dab2d451ef28967c22318ef99c1ec070fbd231240c9a715"
+    },
+    {
+      "name": "base64_binary",
+      "media_type": "application/octet-stream",
+      "encoding": null,
+      "wire_result": "AP9wYXlsb2Fk",
+      "canonical_base64": "AP9wYXlsb2Fk",
+      "sha256": "7d4a21f2f4f6953a3bf17ba29d34134ba26c83d77c75bebfa4996cd439266daf"
+    }
+  ],
+  "rejected_json": [
+    {
+      "name": "integer_above_safe",
+      "wire_json": "9007199254740992"
+    },
+    {
+      "name": "integer_below_safe",
+      "wire_json": "-9007199254740992"
+    },
+    {
+      "name": "float_fraction",
+      "wire_json": "1.5"
+    },
+    {
+      "name": "float_exponent",
+      "wire_json": "1e3"
+    }
+  ]
+}

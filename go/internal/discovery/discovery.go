@@ -1,24 +1,29 @@
-// Package discovery loads Agent Cards from static files or remote URLs.
+// Package discovery loads source-scoped Agent snapshots from files or remote URLs.
 package discovery
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/loop-controller/go/internal/entrypointpolicy"
 	"github.com/loop-controller/go/internal/models"
+	"github.com/loop-controller/go/internal/observability"
 	"gopkg.in/yaml.v3"
 )
 
-// DiscoveryEventType indicates the kind of discovery change.
 type DiscoveryEventType string
 
 const (
@@ -27,196 +32,362 @@ const (
 	DiscoveryRemove DiscoveryEventType = "remove"
 )
 
-// DiscoveryEvent is a single change notification from a provider.
 type DiscoveryEvent struct {
 	Type DiscoveryEventType
 	Card models.AgentCard
 }
-
-// AgentDiscoveryProvider abstracts a source of Agent Cards.
 type AgentDiscoveryProvider interface {
 	Name() string
-	Discover(ctx context.Context) ([]models.AgentCard, error)
-	Watch(ctx context.Context) (<-chan DiscoveryEvent, error)
+	Discover(context.Context) ([]models.AgentCard, error)
+	Watch(context.Context) (<-chan DiscoveryEvent, error)
 }
-
-// RegistryStore is the minimal interface the discovery manager needs.
+type SourceProvider interface {
+	AgentDiscoveryProvider
+	SourceMetadata() (tenantID, sourceType, sourceID string)
+}
 type RegistryStore interface {
-	Register(card models.AgentCard) error
-	Get(agentID string) (models.AgentCard, error)
-	Delete(agentID string) error
+	Register(models.AgentCard) error
+	Get(string) (models.AgentCard, error)
+	Delete(string) error
+}
+type SnapshotRegistry interface {
+	SupportsAgentSpecs() bool
+	SyncSource(context.Context, models.DiscoverySnapshot) error
+	MarkSourceStale(context.Context, string, string, string, error) error
+	ExpireStatuses(context.Context, time.Time) (int64, error)
 }
 
-// Manager coordinates one or more discovery providers.
 type Manager struct {
 	registry  RegistryStore
 	providers []AgentDiscoveryProvider
 	mu        sync.Mutex
 	known     map[string]models.AgentCard
+	state     observability.State
+	policy    entrypointpolicy.Policy
 }
 
-// NewManager creates a discovery manager.
-func NewManager(registry RegistryStore, providers ...AgentDiscoveryProvider) *Manager {
-	return &Manager{
-		registry:  registry,
-		providers: providers,
-		known:     make(map[string]models.AgentCard),
-	}
+func NewManager(r RegistryStore, p ...AgentDiscoveryProvider) *Manager {
+	return &Manager{registry: r, providers: p, known: map[string]models.AgentCard{}, policy: entrypointpolicy.Strict()}
 }
-
-// Sync performs a one-time full sync from all providers.
-func (m *Manager) Sync(ctx context.Context) error {
+func (m *Manager) WithEntrypointPolicy(policy entrypointpolicy.Policy) *Manager {
+	m.policy = policy
+	return m
+}
+func (m *Manager) Snapshot() observability.StateSnapshot { return m.state.Snapshot() }
+func (m *Manager) Required() bool                        { return len(m.providers) > 0 }
+func (m *Manager) Close()                                { m.state.Stop() }
+func (m *Manager) Sync(ctx context.Context) (err error) {
+	m.state.Start()
+	defer func() {
+		now := time.Now().UTC()
+		if err != nil {
+			m.state.Error(now)
+			observability.Default.Add("discovery_refresh_errors_total", 1)
+		} else {
+			m.state.Success(now)
+			observability.Default.Set("discovery_last_success_unixtime", float64(now.Unix()))
+		}
+	}()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	newKnown := make(map[string]models.AgentCard)
-	for _, provider := range m.providers {
-		cards, err := provider.Discover(ctx)
-		if err != nil {
-			return fmt.Errorf("provider %s discover failed: %w", provider.Name(), err)
+	if sr, ok := m.registry.(SnapshotRegistry); ok && sr.SupportsAgentSpecs() {
+		return m.syncSnapshots(ctx, sr)
+	}
+	newKnown := map[string]models.AgentCard{}
+	for _, p := range m.providers {
+		cards, e := p.Discover(ctx)
+		if e != nil {
+			return fmt.Errorf("provider %s discover failed: %w", p.Name(), e)
 		}
-		for _, card := range cards {
-			if err := validateCard(card); err != nil {
-				return fmt.Errorf("provider %s returned invalid card: %w", provider.Name(), err)
+		for _, c := range cards {
+			if e = validateCard(c); e == nil {
+				e = m.policy.ValidateRegistration(ctx, c.Entrypoint.URL)
 			}
-			newKnown[card.AgentID] = card
+			if e != nil {
+				return fmt.Errorf("provider %s returned invalid card: %w", p.Name(), e)
+			}
+			if _, exists := newKnown[c.AgentID]; exists {
+				return fmt.Errorf("agent %s supplied by multiple sources", c.AgentID)
+			}
+			newKnown[c.AgentID] = c
 		}
 	}
-
-	// Remove cards that disappeared.
 	for id := range m.known {
 		if _, ok := newKnown[id]; !ok {
-			_ = m.registry.Delete(id)
+			if e := m.registry.Delete(id); e != nil {
+				return e
+			}
 		}
 	}
-
-	// Register or update cards.
-	for _, card := range newKnown {
-		if err := m.registry.Register(card); err != nil {
-			return fmt.Errorf("register %s failed: %w", card.AgentID, err)
+	for _, c := range newKnown {
+		if e := m.registry.Register(c); e != nil {
+			return e
 		}
 	}
 	m.known = newKnown
 	return nil
 }
-
-func validateCard(card models.AgentCard) error {
-	if card.AgentID == "" {
+func (m *Manager) syncSnapshots(ctx context.Context, r SnapshotRegistry) error {
+	owners := map[string]string{}
+	var errs []error
+	for _, p := range m.providers {
+		sp, ok := p.(SourceProvider)
+		if !ok {
+			return fmt.Errorf("provider %s has no source metadata", p.Name())
+		}
+		tenant, typ, id := sp.SourceMetadata()
+		cards, e := p.Discover(ctx)
+		if e != nil {
+			_ = r.MarkSourceStale(ctx, tenant, typ, id, e)
+			errs = append(errs, fmt.Errorf("provider %s discover failed: %w", p.Name(), e))
+			continue
+		}
+		specs := make([]models.AgentSpec, 0, len(cards))
+		for _, c := range cards {
+			if e = validateCard(c); e == nil {
+				e = m.policy.ValidateRegistration(ctx, c.Entrypoint.URL)
+			}
+			if e != nil {
+				break
+			}
+			key := tenant + "\x00" + c.AgentID
+			if owner, exists := owners[key]; exists && owner != typ+"/"+id {
+				e = fmt.Errorf("agent %s source ownership conflict", c.AgentID)
+				break
+			}
+			owners[key] = typ + "/" + id
+			specs = append(specs, cardSpec(c, tenant, typ, id))
+		}
+		if e == nil {
+			e = r.SyncSource(ctx, models.DiscoverySnapshot{TenantID: tenant, SourceType: typ, SourceID: id, Agents: specs})
+		}
+		if e != nil {
+			_ = r.MarkSourceStale(ctx, tenant, typ, id, e)
+			errs = append(errs, e)
+		}
+	}
+	_, e := r.ExpireStatuses(ctx, time.Now())
+	if e != nil {
+		errs = append(errs, e)
+	}
+	return errors.Join(errs...)
+}
+func cardSpec(c models.AgentCard, tenant, typ, id string) models.AgentSpec {
+	return models.AgentSpec{TenantID: tenant, AgentID: c.AgentID, Name: c.Name, Description: c.Description, Entrypoint: c.Entrypoint, Capabilities: c.Capabilities, TrustDomain: c.TrustDomain, SupportedProtocolVersions: []string{c.Version}, SourceType: typ, SourceID: id, Schedulable: false, Weight: 1, MaxConcurrency: 1}
+}
+func validateCard(c models.AgentCard) error {
+	if c.AgentID == "" {
 		return errors.New("agent_id is required")
 	}
-	if card.Entrypoint.URL == "" {
+	if c.Entrypoint.URL == "" {
 		return errors.New("entrypoint.url is required")
 	}
 	return nil
 }
 
-// StaticProvider loads Agent Cards from a JSON or YAML array file.
-type StaticProvider struct {
-	path string
-}
+type StaticProvider struct{ path, tenant, sourceID string }
 
-// NewStaticProvider creates a provider backed by a file.
 func NewStaticProvider(path string) *StaticProvider {
-	return &StaticProvider{path: path}
+	return &StaticProvider{path: path, tenant: "legacy", sourceID: path}
 }
-
-// Name returns the provider name.
-func (p *StaticProvider) Name() string {
-	return "static:" + p.path
+func NewStaticProviderForSource(path, tenant, sourceID string) *StaticProvider {
+	return &StaticProvider{path: path, tenant: tenant, sourceID: sourceID}
 }
-
-// Discover reads the file and parses the cards.
+func (p *StaticProvider) Name() string { return "static:" + p.path }
+func (p *StaticProvider) SourceMetadata() (string, string, string) {
+	return p.tenant, "static", p.sourceID
+}
 func (p *StaticProvider) Discover(ctx context.Context) ([]models.AgentCard, error) {
-	data, err := os.ReadFile(p.path)
-	if err != nil {
-		if os.IsNotExist(err) {
+	data, e := os.ReadFile(p.path)
+	if e != nil {
+		if os.IsNotExist(e) {
 			return nil, nil
 		}
-		return nil, err
+		return nil, e
 	}
-
-	ext := strings.ToLower(filepath.Ext(p.path))
 	var cards []models.AgentCard
-	if ext == ".yaml" || ext == ".yml" {
-		if err := yaml.Unmarshal(data, &cards); err != nil {
-			return nil, fmt.Errorf("parse yaml %s: %w", p.path, err)
-		}
-		return cards, nil
+	if ext := strings.ToLower(filepath.Ext(p.path)); ext == ".yaml" || ext == ".yml" {
+		e = yaml.Unmarshal(data, &cards)
+	} else {
+		e = json.Unmarshal(data, &cards)
 	}
-	if err := json.Unmarshal(data, &cards); err != nil {
-		return nil, fmt.Errorf("parse json %s: %w", p.path, err)
+	if e != nil {
+		return nil, e
 	}
 	return cards, nil
 }
-
-// Watch is not supported for static files.
-func (p *StaticProvider) Watch(ctx context.Context) (<-chan DiscoveryEvent, error) {
+func (p *StaticProvider) Watch(context.Context) (<-chan DiscoveryEvent, error) {
 	return nil, errors.New("static provider does not support watch")
 }
 
-// HTTPProvider fetches Agent Cards from a remote URL with caching.
+type SignatureVerifier interface {
+	Verify(ctx context.Context, body []byte, headers http.Header) error
+}
+type HTTPProviderConfig struct {
+	URL              string
+	TenantID         string
+	SourceID         string
+	CacheFor         time.Duration
+	Strict           bool
+	MaxResponseBytes int64
+	MaxAgents        int
+	AllowedHosts     []string
+	AllowedIPs       []net.IP
+	TLSConfig        *tls.Config
+	Client           *http.Client
+	RequireSignature bool
+	Verifier         SignatureVerifier
+}
 type HTTPProvider struct {
-	client   *http.Client
-	url      string
-	cacheFor time.Duration
-	mu       sync.RWMutex
-	cachedAt time.Time
-	cached   []models.AgentCard
+	client                *http.Client
+	url, tenant, sourceID string
+	cacheFor              time.Duration
+	strict                bool
+	maxBytes              int64
+	maxAgents             int
+	allowedHosts          map[string]bool
+	allowedIPs            []net.IP
+	requireSignature      bool
+	verifier              SignatureVerifier
+	mu                    sync.RWMutex
+	cachedAt              time.Time
+	cached                []models.AgentCard
 }
 
-// NewHTTPProvider creates a provider that fetches from url.
-func NewHTTPProvider(url string, cacheFor time.Duration) *HTTPProvider {
-	return &HTTPProvider{
-		client:   &http.Client{Timeout: 10 * time.Second},
-		url:      url,
-		cacheFor: cacheFor,
+func NewHTTPProvider(raw string, cache time.Duration) *HTTPProvider {
+	p, _ := NewHTTPProviderWithConfig(HTTPProviderConfig{URL: raw, CacheFor: cache, MaxResponseBytes: 1 << 20, MaxAgents: 1000, AllowedHosts: []string{"127.0.0.1", "localhost"}})
+	return p
+}
+func NewHTTPProviderWithConfig(c HTTPProviderConfig) (*HTTPProvider, error) {
+	u, e := url.Parse(c.URL)
+	if e != nil || u.Hostname() == "" {
+		return nil, errors.New("invalid provider URL")
 	}
+	if c.Strict && u.Scheme != "https" {
+		return nil, errors.New("strict HTTP provider requires HTTPS")
+	}
+	if c.RequireSignature && c.Verifier == nil {
+		return nil, errors.New("signature required but no verifier configured")
+	}
+	if c.MaxResponseBytes <= 0 {
+		c.MaxResponseBytes = 1 << 20
+	}
+	if c.MaxAgents <= 0 {
+		c.MaxAgents = 1000
+	}
+	hosts := map[string]bool{}
+	for _, h := range c.AllowedHosts {
+		hosts[strings.ToLower(h)] = true
+	}
+	client := c.Client
+	if client == nil {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		if c.TLSConfig != nil {
+			tr.TLSClientConfig = c.TLSConfig.Clone()
+		}
+		client = &http.Client{Timeout: 10 * time.Second, Transport: tr}
+	}
+	if client.CheckRedirect == nil {
+		clone := *client
+		clone.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client = &clone
+	}
+	return &HTTPProvider{client: client, url: c.URL, tenant: c.TenantID, sourceID: c.SourceID, cacheFor: c.CacheFor, strict: c.Strict, maxBytes: c.MaxResponseBytes, maxAgents: c.MaxAgents, allowedHosts: hosts, allowedIPs: c.AllowedIPs, requireSignature: c.RequireSignature, verifier: c.Verifier}, nil
 }
-
-// Name returns the provider name.
-func (p *HTTPProvider) Name() string {
-	return "http:" + p.url
+func (p *HTTPProvider) Name() string                             { return "http:" + p.url }
+func (p *HTTPProvider) SourceMetadata() (string, string, string) { return p.tenant, "http", p.sourceID }
+func (p *HTTPProvider) allowed(ctx context.Context) error {
+	u, _ := url.Parse(p.url)
+	host := strings.ToLower(u.Hostname())
+	if p.allowedHosts[host] {
+		return nil
+	}
+	ips, e := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if e != nil {
+		return e
+	}
+	for _, ip := range ips {
+		ok := false
+		for _, a := range p.allowedIPs {
+			if a.Equal(ip) {
+				ok = true
+				break
+			}
+		}
+		if ok {
+			continue
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+			return fmt.Errorf("provider address %s is not allowed", ip)
+		}
+	}
+	return nil
 }
-
-// Discover fetches cards, using the cache if still valid.
 func (p *HTTPProvider) Discover(ctx context.Context) ([]models.AgentCard, error) {
 	p.mu.RLock()
 	if time.Since(p.cachedAt) < p.cacheFor && p.cached != nil {
-		cached := p.cached
+		out := append([]models.AgentCard(nil), p.cached...)
 		p.mu.RUnlock()
-		return cached, nil
+		return out, nil
 	}
 	p.mu.RUnlock()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
-	if err != nil {
-		return nil, err
+	if e := p.allowed(ctx); e != nil {
+		return nil, e
 	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, err
+	req, e := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+	if e != nil {
+		return nil, e
+	}
+	resp, e := p.client.Do(req)
+	if e != nil {
+		return nil, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	media := strings.ToLower(strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0]))
+	if media != "application/json" {
+		return nil, fmt.Errorf("content-type must be application/json")
 	}
+	body, e := io.ReadAll(io.LimitReader(resp.Body, p.maxBytes+1))
+	if e != nil {
+		return nil, e
+	}
+	if int64(len(body)) > p.maxBytes {
+		return nil, errors.New("provider response too large")
+	}
+	if p.requireSignature {
+		if e = p.verifier.Verify(ctx, body, resp.Header); e != nil {
+			return nil, fmt.Errorf("verify signature: %w", e)
+		}
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
 	var cards []models.AgentCard
-	if err := json.Unmarshal(body, &cards); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
+	if e = dec.Decode(&cards); e != nil {
+		return nil, fmt.Errorf("parse response: %w", e)
 	}
-
+	var trailing any
+	if e = dec.Decode(&trailing); e != io.EOF {
+		return nil, errors.New("trailing JSON value")
+	}
+	if len(cards) > p.maxAgents {
+		return nil, errors.New("too many agents")
+	}
+	seen := map[string]bool{}
+	for _, c := range cards {
+		if seen[c.AgentID] {
+			return nil, fmt.Errorf("duplicate agent_id %q", c.AgentID)
+		}
+		seen[c.AgentID] = true
+	}
 	p.mu.Lock()
-	p.cached = cards
+	p.cached = append([]models.AgentCard(nil), cards...)
 	p.cachedAt = time.Now()
 	p.mu.Unlock()
 	return cards, nil
 }
-
-// Watch is not supported for simple HTTP provider.
-func (p *HTTPProvider) Watch(ctx context.Context) (<-chan DiscoveryEvent, error) {
+func (p *HTTPProvider) Watch(context.Context) (<-chan DiscoveryEvent, error) {
 	return nil, errors.New("http provider does not support watch")
 }

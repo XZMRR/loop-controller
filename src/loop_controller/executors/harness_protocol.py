@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from loop_controller.executors.base import ExecutionReceipt
+
 HARNESS_PROTOCOL_VERSION = "2"
 HARNESS_EXECUTE_PATH = "/harness/v2/execute"
 HARNESS_CANCEL_PATH = "/harness/v2/cancel"
@@ -40,6 +42,13 @@ class HarnessContext(BaseModel):
     user_id: str
     session_id: str | None = None
     tenant_id: str | None = None
+    request_id: str | None = None
+    interaction_id: str | None = None
+    decision_id: str | None = None
+    delegation_jti: str | None = None
+    workload_id: str | None = None
+    authenticated_instance_id: str | None = None
+    security_capabilities: frozenset[str] = Field(default_factory=frozenset)
 
 
 class ResourceLimits(BaseModel):
@@ -124,11 +133,12 @@ class HarnessExecuteResponse(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    status: Literal["success", "error"]
+    status: Literal["success", "error", "timeout", "cancelled"]
     content: Any | None = None
     error_code: HarnessErrorCode | None = None
     effective_sandbox: HarnessSandbox | None = None
     evidence: HarnessEvidence | None = None
+    execution_receipt: ExecutionReceipt | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

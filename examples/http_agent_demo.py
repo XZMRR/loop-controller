@@ -74,7 +74,7 @@ async def main() -> None:
         if result.get("status") == "require_approval":
             request_id = result.get("request_id")
             print("\n请在另一个终端执行审批：")
-            print("  .venv\\Scripts\\lc approvals approve <decision_id> --approver zhang_manager")
+            print("  .venv\\Scripts\\lc approvals approve <decision_id>")
             print("然后按回车继续，模拟 Agent 调用 resume-after-approval...")
             input()
 

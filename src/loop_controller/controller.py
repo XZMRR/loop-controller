@@ -84,6 +84,9 @@ def _audit_event(
         trace_id=task.task_id,
         session_id=task.session_id,
         call_id=proposal.call_id if proposal else None,
+        task_id=task.task_id,
+        decision_id=decision.decision_id if decision else None,
+        tenant_id=task.tenant_id,
         actor_type=actor_type,
         actor_id=actor_id,
         action=action,
@@ -175,6 +178,7 @@ class LoopController:
                 parent_task_id=str(delegation_context.get("parent_task_id") or ""),
                 budget=dict(delegation_context.get("budget") or {}),
                 deadline=delegation_context.get("deadline"),
+                tenant_id=task.tenant_id,
             )
         )
         if not resp.allowed:
@@ -524,7 +528,9 @@ class LoopController:
             arguments=arguments,
             decision=decision,
             content=result.content,
+            terminal_status=result.terminal_status,
             error_code=result.error_code,
+            execution_receipt=result.execution_receipt,
         )
 
     async def resume_after_approval(
@@ -695,7 +701,9 @@ class LoopController:
             arguments=request.tool_arguments,
             decision=finalized,
             content=result.content,
+            terminal_status=result.terminal_status,
             error_code=result.error_code,
+            execution_receipt=result.execution_receipt,
         )
 
     async def cancel_approval(self, request_id: str) -> None:

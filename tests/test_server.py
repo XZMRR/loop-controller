@@ -196,6 +196,7 @@ def _build_client(
     watcher: ApprovalWatcher | None = None,
     identity_provider: ConfigIdentityProvider | None = None,
     entrypoints_config: dict[str, Any] | None = None,
+    **app_kwargs: Any,
 ) -> tuple[TestClient, _MockController]:
     controller = _MockController()
     app = build_app(
@@ -205,6 +206,7 @@ def _build_client(
         configure_logs=False,
         identity_provider=identity_provider,
         entrypoints_config=entrypoints_config,
+        **app_kwargs,
     )
     return TestClient(app), controller
 
@@ -218,6 +220,8 @@ def test_health() -> None:
     assert "opa_reachable" in data
     assert "gateway_ready" in data
     assert "uptime_seconds" in data
+    assert data["execution_security"]["status"] == "not_strict"
+    assert client.get("/ready").status_code == 200
 
 
 def test_govern_tool_call() -> None:
@@ -244,6 +248,38 @@ def test_govern_tool_call() -> None:
     assert call["arguments"] == {"to": "zhang@company.com"}
     assert call["kwargs"]["task_context"] == "发送摘要"
     assert call["kwargs"]["session_id"] == "s-001"
+
+
+def test_govern_tool_call_returns_real_execution_receipt() -> None:
+    from datetime import UTC, datetime
+
+    from loop_controller.executors.base import ExecutionReceipt
+
+    client, controller = _build_client()
+    receipt = ExecutionReceipt(
+        receipt_id="receipt-1", type="controller_execution_record",
+        attester_workload_id="controller", request_id="request-1", task_id="task-1",
+        call_id="call-1", decision_id="decision-1", executor="http", backend="backend",
+        status="success", result_sha256="0" * 64, media_type="text/plain",
+        encoding="utf-8", issued_at=datetime.now(UTC),
+    )
+    controller._tool_response = controller._tool_response.model_copy(
+        update={"execution_receipt": receipt}
+    )
+    data = client.post(
+        "/v1/govern/tool-call",
+        json={"agent_id": "researcher_001", "tool_name": "send_email", "arguments": {}},
+    ).json()
+    assert data["execution_receipt"]["receipt_id"] == "receipt-1"
+
+
+def test_govern_tool_call_does_not_fabricate_execution_receipt() -> None:
+    client, _controller = _build_client()
+    data = client.post(
+        "/v1/govern/tool-call",
+        json={"agent_id": "researcher_001", "tool_name": "send_email", "arguments": {}},
+    ).json()
+    assert data["execution_receipt"] is None
 
 
 def test_govern_tool_call_enforces_delegated_allowed_tools() -> None:
@@ -413,12 +449,28 @@ def test_govern_tool_call_validation_error() -> None:
 
 
 def test_resume_after_approval() -> None:
+    from datetime import UTC, datetime
+
+    from loop_controller.executors.base import ExecutionReceipt
+
     client, controller = _build_client()
+    receipt = ExecutionReceipt(
+        receipt_id="resume-receipt-1", type="controller_execution_record",
+        attester_workload_id="controller", request_id="req-1", task_id="task-1",
+        call_id="call-1", decision_id="decision-1", executor="http", backend="backend",
+        status="timeout", result_sha256="0" * 64, media_type="text/plain",
+        encoding="utf-8", issued_at=datetime.now(UTC),
+    )
+    controller._resume_response = controller._resume_response.model_copy(
+        update={"status": "error", "terminal_status": "timeout", "execution_receipt": receipt}
+    )
     resp = client.post("/v1/govern/resume-after-approval", json={"request_id": "req-1"})
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "allow"
+    assert data["status"] == "error"
     assert data["result"] == "email resumed"
+    assert data["terminal_status"] == "timeout"
+    assert data["execution_receipt"]["receipt_id"] == "resume-receipt-1"
     assert controller.resume_calls == ["req-1"]
 
 
@@ -1093,6 +1145,22 @@ def _admin_identity_provider() -> ConfigIdentityProvider:
     )
 
 
+def _approval_auth_config() -> dict[str, Any]:
+    return {
+        "approval_auth": {
+            "allowlist": ["zhang_manager"],
+            "credentials": [
+                {"principal": "zhang_manager", "token_env": "TEST_APPROVER_TOKEN"}
+            ],
+        }
+    }
+
+
+@pytest.fixture(autouse=True)
+def _approver_token(monkeypatch):
+    monkeypatch.setenv("TEST_APPROVER_TOKEN", "approver-secret")
+
+
 def _pending_approval_request(decision_id: str = "d-1") -> ApprovalRequest:
     return ApprovalRequest(
         request_id="req-1",
@@ -1112,14 +1180,15 @@ def test_admin_approvals_approve_success() -> None:
     client, controller = _build_client(
         api_key="secret",
         identity_provider=_admin_identity_provider(),
+        entrypoints_config=_approval_auth_config(),
     )
     store = controller._runtime.approval_manager._store
     store._pending.append(_pending_approval_request())
 
     resp = client.post(
         "/v1/admin/approvals/d-1/approve",
-        json={"approver": "zhang_manager", "comment": "approved"},
-        headers={"X-API-Key": "secret"},
+        json={"approver": "ghost_user", "comment": "approved"},
+        headers={"Authorization": "Bearer approver-secret"},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -1135,20 +1204,33 @@ def test_admin_approvals_approve_success() -> None:
     admin_ops = [e for e in audit if e.action == "admin_operation"]
     assert len(admin_ops) == 1
     assert admin_ops[0].reason == "approval_approve"
+    assert admin_ops[0].actor_id == "zhang_manager"
+    assert admin_ops[0].metadata["principal"] == "zhang_manager"
+    assert admin_ops[0].metadata["request_id"] == "req-1"
+    assert admin_ops[0].metadata["decision_id"] == "d-1"
+    assert admin_ops[0].metadata["action_summary"] == "approval_approve"
+
+
+def test_admin_approvals_requires_independent_credential() -> None:
+    client, controller = _build_client(entrypoints_config=_approval_auth_config())
+    controller._runtime.approval_manager._store._pending.append(_pending_approval_request())
+    resp = client.post("/v1/admin/approvals/d-1/approve", json={"comment": "ok"})
+    assert resp.status_code == 401
 
 
 def test_admin_approvals_deny_success() -> None:
     client, controller = _build_client(
         api_key="secret",
         identity_provider=_admin_identity_provider(),
+        entrypoints_config=_approval_auth_config(),
     )
     store = controller._runtime.approval_manager._store
     store._pending.append(_pending_approval_request())
 
     resp = client.post(
         "/v1/admin/approvals/d-1/deny",
-        json={"approver": "zhang_manager", "comment": "suspicious"},
-        headers={"X-API-Key": "secret"},
+        json={"approver": "ghost_user", "comment": "suspicious"},
+        headers={"Authorization": "Bearer approver-secret"},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -1171,46 +1253,49 @@ def test_admin_approvals_deny_requires_comment() -> None:
     client, controller = _build_client(
         api_key="secret",
         identity_provider=_admin_identity_provider(),
+        entrypoints_config=_approval_auth_config(),
     )
     store = controller._runtime.approval_manager._store
     store._pending.append(_pending_approval_request())
 
     resp = client.post(
         "/v1/admin/approvals/d-1/deny",
-        json={"approver": "zhang_manager"},
-        headers={"X-API-Key": "secret"},
+        json={},
+        headers={"Authorization": "Bearer approver-secret"},
     )
     assert resp.status_code == 422
     assert "deny 必须提供审批意见" in resp.json()["error"]
 
 
-def test_admin_approvals_rejects_non_approver() -> None:
-    client, controller = _build_client(
-        api_key="secret",
-        identity_provider=_admin_identity_provider(),
+def test_admin_approvals_rejects_unauthorized_principal(monkeypatch) -> None:
+    config = _approval_auth_config()
+    config["approval_auth"]["allowlist"].append("auditor")
+    config["approval_auth"]["credentials"].append(
+        {"principal": "auditor", "token_env": "TEST_AUDITOR_TOKEN"}
     )
-    store = controller._runtime.approval_manager._store
-    store._pending.append(_pending_approval_request())
+    monkeypatch.setenv("TEST_AUDITOR_TOKEN", "auditor-secret")
+    client, controller = _build_client(entrypoints_config=config)
+    controller._runtime.approval_manager._store._pending.append(_pending_approval_request())
 
     resp = client.post(
         "/v1/admin/approvals/d-1/approve",
-        json={"approver": "ghost_user", "comment": "ok"},
-        headers={"X-API-Key": "secret"},
+        json={"approver": "zhang_manager", "comment": "ok"},
+        headers={"Authorization": "Bearer auditor-secret"},
     )
-    assert resp.status_code == 422
-    assert "ghost_user" in resp.json()["error"]
+    assert resp.status_code == 403
 
 
 def test_admin_approvals_conflict_when_already_decided() -> None:
     client, controller = _build_client(
         api_key="secret",
         identity_provider=_admin_identity_provider(),
+        entrypoints_config=_approval_auth_config(),
     )
     store = controller._runtime.approval_manager._store
     store._pending.append(_pending_approval_request())
 
-    headers = {"X-API-Key": "secret"}
-    body = {"approver": "zhang_manager", "comment": "approved"}
+    headers = {"Authorization": "Bearer approver-secret"}
+    body = {"approver": "ghost_user", "comment": "approved"}
     assert (
         client.post("/v1/admin/approvals/d-1/approve", json=body, headers=headers).status_code
         == 200

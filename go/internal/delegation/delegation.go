@@ -15,7 +15,7 @@ import (
 
 // AgentQuerier is the subset of registry.Registry used by the delegator.
 type AgentQuerier interface {
-	Get(agentID string) (models.AgentCard, error)
+	GetContext(ctx context.Context, tenant, agentID string) (models.AgentCard, error)
 }
 
 // TaskStore is the subset of task.Manager used by the delegator.
@@ -45,6 +45,10 @@ type TaskEventPublisher interface {
 }
 
 // Delegator performs delegation decisions.
+type outboundTaskPreparer interface {
+	PrepareInteractionTask(models.Task) models.Task
+}
+
 type Delegator struct {
 	registry   AgentQuerier
 	tasks      TaskStore
@@ -52,8 +56,10 @@ type Delegator struct {
 	authorizer R2Authorizer
 	publisher  TaskEventPublisher
 	dispatcher EntrypointClient
+	outbound   store.DelegationDispatchOutboxStore
 	approvals  store.DelegationApprovalStore
 	instanceID string
+	strict     bool
 	tokenTTL   time.Duration
 }
 
@@ -98,10 +104,28 @@ func (d *Delegator) WithEntrypointClient(client EntrypointClient) *Delegator {
 	return d
 }
 
+func (d *Delegator) WithOutboundQueue(outbound store.DelegationDispatchOutboxStore) *Delegator {
+	d.outbound = outbound
+	return d
+}
+
 func (d *Delegator) WithApprovalStore(approvals store.DelegationApprovalStore, instanceID string) *Delegator {
 	d.approvals = approvals
 	d.instanceID = instanceID
 	return d
+}
+
+func (d *Delegator) WithStrict(strict bool) *Delegator {
+	d.strict = strict
+	return d
+}
+
+func (d *Delegator) lookupTarget(ctx context.Context, tenantID, targetAgentID string) (models.AgentCard, error) {
+	return d.registry.GetContext(ctx, tenantID, targetAgentID)
+}
+
+func targetNotFoundResponse() models.DelegationResponse {
+	return models.DelegationResponse{Allowed: false, Reason: "target agent not found"}
 }
 
 // Cancel asks the target Agent to cancel a delegated task.
@@ -109,9 +133,17 @@ func (d *Delegator) Cancel(ctx context.Context, targetAgentID, taskID, delegatio
 	if d.dispatcher == nil {
 		return false, errors.New("entrypoint client is not configured")
 	}
-	target, err := d.registry.Get(targetAgentID)
+	tenantID := ""
+	if validator, ok := d.issuer.(tokenValidator); ok && delegationToken != "" {
+		claims, err := validator.Validate(delegationToken)
+		if err != nil || claims.TaskID != taskID || claims.TargetAgentID != targetAgentID {
+			return false, errors.New("delegation token does not match target task")
+		}
+		tenantID = claims.TenantID
+	}
+	target, err := d.lookupTarget(ctx, tenantID, targetAgentID)
 	if err != nil {
-		return false, fmt.Errorf("target agent not registered: %w", err)
+		return false, errors.New("target agent not found")
 	}
 	return d.dispatcher.Cancel(ctx, target.Entrypoint, taskID, delegationToken)
 }
@@ -138,12 +170,9 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 		return models.DelegationResponse{Allowed: false, Reason: "delegation deadline has expired"}, nil
 	}
 
-	target, err := d.registry.Get(req.TargetAgentID)
+	target, err := d.lookupTarget(ctx, req.TenantID, req.TargetAgentID)
 	if err != nil {
-		return models.DelegationResponse{
-			Allowed: false,
-			Reason:  "target agent not registered",
-		}, nil
+		return targetNotFoundResponse(), nil
 	}
 
 	if !hasCapability(target.Capabilities, "delegate_execution") {
@@ -210,6 +239,7 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 		if req.ParentTaskID == "" {
 			lineage.RootInteractionID = interactionID
 		}
+		lineage.RequestID = req.RequestID
 		lineage.SessionID = req.SessionID
 		lineage.InteractionID = interactionID
 		lineage.DecisionID = interactionResp.DecisionID
@@ -219,14 +249,24 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 		lineage.AllowedTools = allowedTools
 		lineage.AllowedCapabilities = allowedCapabilities
 		lineage.AllowRedelegation = allowRedelegation
-		var createErr error
-		task, createErr = d.tasks.CreateInteractionTask(lineage)
-		if createErr != nil {
-			return models.DelegationResponse{
-				Allowed:    false,
-				DecisionID: interactionResp.DecisionID,
-				Reason:     "delegation task persistence failed",
-			}, createErr
+		lineage.TargetWorkloadID = req.TargetWorkloadID
+		lineage.TargetInstanceID = req.TargetInstanceID
+		if d.outbound != nil {
+			preparer, ok := d.tasks.(outboundTaskPreparer)
+			if !ok {
+				return models.DelegationResponse{Allowed: false, DecisionID: interactionResp.DecisionID, Reason: "durable delegation task preparation unavailable"}, errors.New("durable delegation task preparation unavailable")
+			}
+			task = preparer.PrepareInteractionTask(lineage)
+		} else {
+			var createErr error
+			task, createErr = d.tasks.CreateInteractionTask(lineage)
+			if createErr != nil {
+				return models.DelegationResponse{
+					Allowed:    false,
+					DecisionID: interactionResp.DecisionID,
+					Reason:     "delegation task persistence failed",
+				}, createErr
+			}
 		}
 		taskID = task.TaskID
 	} else {
@@ -247,8 +287,28 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 			task.RootTaskID != lineage.RootTaskID || task.ParentTaskID != lineage.ParentTaskID || task.DelegationDepth != lineage.DelegationDepth ||
 			task.RootInteractionID != expectedRootInteractionID || task.ParentInteractionID != lineage.ParentInteractionID ||
 			!sameScope(task.AllowedTools, allowedTools) || !sameScope(task.AllowedCapabilities, allowedCapabilities) || task.AllowRedelegation != allowRedelegation ||
-			task.Budget != req.Budget || !sameDeadline(task.Deadline, lineage.Deadline) {
+			task.Budget != req.Budget || task.RequestID != req.RequestID || task.TargetWorkloadID != req.TargetWorkloadID || task.TargetInstanceID != req.TargetInstanceID || !sameDeadline(task.Deadline, lineage.Deadline) {
 			return models.DelegationResponse{Allowed: false, Reason: "existing task does not match delegation request"}, nil
+		}
+	}
+
+	if req.TaskID != "" && d.outbound != nil {
+		item, loadErr := d.outbound.LoadOutboundDelegation(ctx, "outbound-assignment-"+taskID)
+		if loadErr == nil {
+			expected := models.EntrypointTaskRequest{
+				ProtocolVersion: interactionProtocolVersion, RequestID: req.RequestID, InteractionID: interactionID, DecisionID: interactionResp.DecisionID,
+				RootInteractionID: task.RootInteractionID, ParentInteractionID: task.ParentInteractionID, RootTaskID: task.RootTaskID, ParentTaskID: task.ParentTaskID,
+				DelegationDepth: task.DelegationDepth, Deadline: task.Deadline, Budget: task.Budget, TaskID: taskID, SessionID: req.SessionID,
+				InitiatorAgentID: req.InitiatorAgentID, TargetAgentID: req.TargetAgentID, ToolName: req.ToolName, Arguments: effectiveArgs,
+				DelegationToken: item.Request.DelegationToken, DeliveryID: item.DeliveryID, AllowedTools: allowedTools, AllowedCapabilities: allowedCapabilities,
+				AllowRedelegation: allowRedelegation, TenantID: task.TenantID, TargetWorkloadID: task.TargetWorkloadID, TargetInstanceID: task.TargetInstanceID,
+			}
+			gotJSON, _ := json.Marshal(item.Request)
+			wantJSON, _ := json.Marshal(expected)
+			if item.Entrypoint != target.Entrypoint || string(gotJSON) != string(wantJSON) {
+				return models.DelegationResponse{Allowed: false, Reason: "existing task does not match delegation request"}, nil
+			}
+			return models.DelegationResponse{Allowed: true, Verdict: verdict, InteractionID: interactionID, DecisionID: interactionResp.DecisionID, TaskID: taskID, TargetEntrypoint: item.Entrypoint, DelegationToken: item.Request.DelegationToken, OriginalArgs: interactionResp.OriginalArgs, ModifiedArgs: interactionResp.ModifiedArgs}, nil
 		}
 	}
 
@@ -268,6 +328,8 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 		ParentInteractionID: task.ParentInteractionID,
 		InitiatorAgentID:    req.InitiatorAgentID,
 		TargetAgentID:       req.TargetAgentID,
+		TargetWorkloadID:    task.TargetWorkloadID,
+		TargetInstanceID:    task.TargetInstanceID,
 		ToolName:            req.ToolName,
 		TaskID:              taskID,
 		ArgumentsSHA256:     token.HashArguments(effectiveArgs),
@@ -280,6 +342,7 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 		BudgetTokenCount:    task.Budget.TokenCount,
 		BudgetPaymentAmount: task.Budget.PaymentAmount,
 		BudgetCurrency:      task.Budget.Currency,
+		TenantID:            task.TenantID,
 	}
 	if task.Deadline != nil {
 		claims.Deadline = task.Deadline.Unix()
@@ -293,17 +356,45 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 			Reason:  "delegation token issuance failed",
 		}, fmt.Errorf("delegation token issuance failed: %w", err)
 	}
-	if err := d.tasks.SetDelegationToken(taskID, tokenStr); err != nil {
-		_, _ = d.tasks.UpdateStatusFrom(taskID, task.Status, "failed")
-		return models.DelegationResponse{
-			Allowed: false,
-			TaskID:  taskID,
-			Reason:  "delegation token persistence failed",
-		}, err
+	dispatchReq := models.EntrypointTaskRequest{
+		ProtocolVersion:     interactionProtocolVersion,
+		RequestID:           req.RequestID,
+		InteractionID:       interactionID,
+		DecisionID:          interactionResp.DecisionID,
+		RootInteractionID:   task.RootInteractionID,
+		ParentInteractionID: task.ParentInteractionID,
+		RootTaskID:          task.RootTaskID,
+		ParentTaskID:        task.ParentTaskID,
+		DelegationDepth:     task.DelegationDepth,
+		Deadline:            task.Deadline,
+		Budget:              task.Budget,
+		TaskID:              taskID,
+		SessionID:           req.SessionID,
+		InitiatorAgentID:    req.InitiatorAgentID,
+		TargetAgentID:       req.TargetAgentID,
+		ToolName:            req.ToolName,
+		Arguments:           effectiveArgs,
+		DelegationToken:     tokenStr,
+		AllowedTools:        allowedTools,
+		AllowedCapabilities: allowedCapabilities,
+		AllowRedelegation:   allowRedelegation,
+		TenantID:            task.TenantID,
+		TargetWorkloadID:    task.TargetWorkloadID,
+		TargetInstanceID:    task.TargetInstanceID,
+	}
+	if d.outbound != nil {
+		if _, _, err := d.outbound.EnqueueOutboundDelegation(ctx, store.OutboundDelegationEnqueue{Task: task, Entrypoint: target.Entrypoint, Request: dispatchReq, Now: now}); err != nil {
+			return models.DelegationResponse{Allowed: false, DecisionID: interactionResp.DecisionID, TaskID: taskID, Reason: "delegation durable enqueue failed"}, err
+		}
+	} else {
+		if err := d.tasks.SetDelegationToken(taskID, tokenStr); err != nil {
+			_, _ = d.tasks.UpdateStatusFrom(taskID, task.Status, "failed")
+			return models.DelegationResponse{Allowed: false, TaskID: taskID, Reason: "delegation token persistence failed"}, err
+		}
 	}
 
-	if d.dispatcher != nil {
-		dispatchReq := models.EntrypointTaskRequest{
+	if d.outbound == nil && d.dispatcher != nil {
+		dispatchReq = models.EntrypointTaskRequest{
 			ProtocolVersion:     interactionProtocolVersion,
 			RequestID:           req.RequestID,
 			InteractionID:       interactionID,
@@ -325,6 +416,9 @@ func (d *Delegator) Request(ctx context.Context, req models.DelegationRequest) (
 			AllowedTools:        allowedTools,
 			AllowedCapabilities: allowedCapabilities,
 			AllowRedelegation:   allowRedelegation,
+			TenantID:            task.TenantID,
+			TargetWorkloadID:    task.TargetWorkloadID,
+			TargetInstanceID:    task.TargetInstanceID,
 		}
 		if err := d.dispatcher.Dispatch(ctx, target.Entrypoint, dispatchReq); err != nil {
 			var dispatchErr *DispatchError
@@ -401,7 +495,7 @@ func (d *Delegator) requireApproval(ctx context.Context, req models.DelegationRe
 	a, _, err := d.approvals.Create(ctx, models.DelegationApproval{
 		ProtocolVersion: models.CurrentProtocolVersion, ApprovalID: approvalID, RequestID: req.RequestID,
 		DecisionID: decision.DecisionID, RequestHash: token.HashArguments(encoded), InitiatorAgentID: req.InitiatorAgentID,
-		TargetAgentID: req.TargetAgentID, SessionID: req.SessionID, RootTaskID: lineage.RootTaskID,
+		TargetAgentID: req.TargetAgentID, SessionID: req.SessionID, TenantID: req.TenantID, TargetWorkloadID: req.TargetWorkloadID, TargetInstanceID: req.TargetInstanceID, RootTaskID: lineage.RootTaskID,
 		ParentTaskID: lineage.ParentTaskID, DelegationDepth: lineage.DelegationDepth, EffectiveArgs: effectiveArgs,
 		AllowedTools: allowedTools, AllowedCapabilities: allowedCapabilities, AllowRedelegation: allowRedelegation,
 		Budget: req.Budget, TaskDeadline: lineage.Deadline, ExpiresAt: now.Add(15 * time.Minute), Status: "pending",
@@ -418,14 +512,17 @@ func (d *Delegator) ResumeApproval(ctx context.Context, approvalID string) (mode
 	if err != nil || a.Status != "approved" {
 		return a, err
 	}
-	req := models.DelegationRequest{RequestID: a.RequestID, InitiatorAgentID: a.InitiatorAgentID, TargetAgentID: a.TargetAgentID, ToolName: firstTool(a.AllowedTools), Arguments: a.EffectiveArgs, SessionID: a.SessionID, ParentTaskID: a.ParentTaskID, Deadline: a.TaskDeadline, Budget: a.Budget, ProtocolVersion: models.CurrentProtocolVersion, AllowedTools: a.AllowedTools, AllowedCapabilities: a.AllowedCapabilities, AllowRedelegation: a.AllowRedelegation}
+	req := models.DelegationRequest{RequestID: a.RequestID, InitiatorAgentID: a.InitiatorAgentID, TargetAgentID: a.TargetAgentID, ToolName: firstTool(a.AllowedTools), Arguments: a.EffectiveArgs, SessionID: a.SessionID, ParentTaskID: a.ParentTaskID, Deadline: a.TaskDeadline, Budget: a.Budget, ProtocolVersion: models.CurrentProtocolVersion, AllowedTools: a.AllowedTools, AllowedCapabilities: a.AllowedCapabilities, AllowRedelegation: a.AllowRedelegation, TenantID: a.TenantID, TargetWorkloadID: a.TargetWorkloadID, TargetInstanceID: a.TargetInstanceID}
+	if d.strict && (a.TenantID == "" || a.TargetWorkloadID == "") {
+		return a, errors.New("strict approval resume requires persisted tenant and target workload bindings")
+	}
 	lineage, trusted, err := d.deriveLineage(req, req.RequestID)
 	if err != nil {
 		return a, err
 	}
-	target, err := d.registry.Get(a.TargetAgentID)
+	target, err := d.lookupTarget(ctx, a.TenantID, a.TargetAgentID)
 	if err != nil {
-		return a, err
+		return a, errors.New("target agent not found")
 	}
 	decision, err := d.authorizer.Authorize(ctx, trusted)
 	if err != nil {
@@ -463,8 +560,8 @@ func (d *Delegator) ResumeApproval(ctx context.Context, approvalID string) (mode
 	if req.ParentTaskID != "" {
 		allowRedelegation = allowRedelegation && lineage.AllowRedelegation
 	}
-	task := models.Task{ProtocolVersion: models.CurrentProtocolVersion, TaskID: taskID, SessionID: a.SessionID, InteractionID: interactionID, DecisionID: decision.DecisionID, RootInteractionID: lineage.RootInteractionID, ParentInteractionID: lineage.ParentInteractionID, RootTaskID: lineage.RootTaskID, ParentTaskID: lineage.ParentTaskID, DelegationDepth: lineage.DelegationDepth, Deadline: lineage.Deadline, Budget: a.Budget, AllowedTools: allowedTools, AllowedCapabilities: allowedCaps, AllowRedelegation: allowRedelegation, InitiatorAgentID: a.InitiatorAgentID, TargetAgentID: a.TargetAgentID, Status: "pending", CreatedAt: now, UpdatedAt: now}
-	claims := token.DelegationClaims{RequestID: a.RequestID, SessionID: task.SessionID, InteractionID: task.InteractionID, DecisionID: task.DecisionID, RootInteractionID: task.RootInteractionID, ParentInteractionID: task.ParentInteractionID, InitiatorAgentID: a.InitiatorAgentID, TargetAgentID: a.TargetAgentID, ToolName: req.ToolName, TaskID: taskID, ArgumentsSHA256: token.HashArguments(effectiveArgs), AllowedTools: allowedTools, AllowedCapabilities: allowedCaps, AllowRedelegation: task.AllowRedelegation, RootTaskID: task.RootTaskID, ParentTaskID: task.ParentTaskID, DelegationDepth: task.DelegationDepth, BudgetTokenCount: task.Budget.TokenCount, BudgetPaymentAmount: task.Budget.PaymentAmount, BudgetCurrency: task.Budget.Currency}
+	task := models.Task{ProtocolVersion: models.CurrentProtocolVersion, TaskID: taskID, SessionID: a.SessionID, InteractionID: interactionID, DecisionID: decision.DecisionID, RootInteractionID: lineage.RootInteractionID, ParentInteractionID: lineage.ParentInteractionID, RootTaskID: lineage.RootTaskID, ParentTaskID: lineage.ParentTaskID, DelegationDepth: lineage.DelegationDepth, Deadline: lineage.Deadline, Budget: a.Budget, AllowedTools: allowedTools, AllowedCapabilities: allowedCaps, AllowRedelegation: allowRedelegation, InitiatorAgentID: a.InitiatorAgentID, TargetAgentID: a.TargetAgentID, TenantID: a.TenantID, TargetWorkloadID: a.TargetWorkloadID, TargetInstanceID: a.TargetInstanceID, Status: "pending", CreatedAt: now, UpdatedAt: now}
+	claims := token.DelegationClaims{RequestID: a.RequestID, SessionID: task.SessionID, InteractionID: task.InteractionID, DecisionID: task.DecisionID, RootInteractionID: task.RootInteractionID, ParentInteractionID: task.ParentInteractionID, InitiatorAgentID: a.InitiatorAgentID, TargetAgentID: a.TargetAgentID, TargetWorkloadID: a.TargetWorkloadID, TargetInstanceID: a.TargetInstanceID, ToolName: req.ToolName, TaskID: taskID, ArgumentsSHA256: token.HashArguments(effectiveArgs), AllowedTools: allowedTools, AllowedCapabilities: allowedCaps, AllowRedelegation: task.AllowRedelegation, RootTaskID: task.RootTaskID, ParentTaskID: task.ParentTaskID, DelegationDepth: task.DelegationDepth, BudgetTokenCount: task.Budget.TokenCount, BudgetPaymentAmount: task.Budget.PaymentAmount, BudgetCurrency: task.Budget.Currency, TenantID: a.TenantID}
 	if task.Deadline != nil {
 		claims.Deadline = task.Deadline.Unix()
 	}
@@ -474,7 +571,7 @@ func (d *Delegator) ResumeApproval(ctx context.Context, approvalID string) (mode
 	}
 	task.DelegationToken = tokenStr
 	deliveryID := "delegation-dispatch:" + a.ApprovalID
-	dispatch := models.EntrypointTaskRequest{ProtocolVersion: models.CurrentProtocolVersion, DeliveryID: deliveryID, RequestID: a.RequestID, InteractionID: task.InteractionID, DecisionID: task.DecisionID, RootInteractionID: task.RootInteractionID, ParentInteractionID: task.ParentInteractionID, RootTaskID: task.RootTaskID, ParentTaskID: task.ParentTaskID, DelegationDepth: task.DelegationDepth, Deadline: task.Deadline, Budget: task.Budget, TaskID: taskID, SessionID: a.SessionID, InitiatorAgentID: a.InitiatorAgentID, TargetAgentID: a.TargetAgentID, ToolName: req.ToolName, Arguments: effectiveArgs, DelegationToken: tokenStr, AllowedTools: allowedTools, AllowedCapabilities: allowedCaps, AllowRedelegation: task.AllowRedelegation}
+	dispatch := models.EntrypointTaskRequest{ProtocolVersion: models.CurrentProtocolVersion, DeliveryID: deliveryID, RequestID: a.RequestID, InteractionID: task.InteractionID, DecisionID: task.DecisionID, RootInteractionID: task.RootInteractionID, ParentInteractionID: task.ParentInteractionID, RootTaskID: task.RootTaskID, ParentTaskID: task.ParentTaskID, DelegationDepth: task.DelegationDepth, Deadline: task.Deadline, Budget: task.Budget, TaskID: taskID, SessionID: a.SessionID, InitiatorAgentID: a.InitiatorAgentID, TargetAgentID: a.TargetAgentID, ToolName: req.ToolName, Arguments: effectiveArgs, DelegationToken: tokenStr, AllowedTools: allowedTools, AllowedCapabilities: allowedCaps, AllowRedelegation: task.AllowRedelegation, TenantID: a.TenantID, TargetWorkloadID: a.TargetWorkloadID, TargetInstanceID: a.TargetInstanceID}
 	return d.approvals.Consume(ctx, a.ApprovalID, a.Version, task, target.Entrypoint, dispatch)
 }
 
@@ -511,7 +608,7 @@ func (d *Delegator) deriveLineage(req models.DelegationRequest, interactionID st
 			return models.Task{}, req, errors.New("delegation lineage must be derived from parent_task_id")
 		}
 		req.RootInteractionID = interactionID
-		return models.Task{RootInteractionID: interactionID, Deadline: req.Deadline}, req, nil
+		return models.Task{RootInteractionID: interactionID, Deadline: req.Deadline, TenantID: req.TenantID}, req, nil
 	}
 
 	parent, err := d.tasks.Get(req.ParentTaskID)
@@ -574,6 +671,7 @@ func (d *Delegator) deriveLineage(req models.DelegationRequest, interactionID st
 	req.ParentInteractionID = parent.InteractionID
 	req.Deadline = deadline
 	req.ParentAllowRedelegation = parent.AllowRedelegation
+	req.TenantID = parent.TenantID
 	return models.Task{
 		RootTaskID:          rootTaskID,
 		ParentTaskID:        parent.TaskID,
@@ -584,6 +682,7 @@ func (d *Delegator) deriveLineage(req models.DelegationRequest, interactionID st
 		AllowedTools:        parent.AllowedTools,
 		AllowedCapabilities: parent.AllowedCapabilities,
 		AllowRedelegation:   parent.AllowRedelegation,
+		TenantID:            parent.TenantID,
 	}, req, nil
 }
 

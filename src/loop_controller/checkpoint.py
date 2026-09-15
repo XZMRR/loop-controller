@@ -4,10 +4,7 @@
 治理语义只许住在本组件：``forward`` 的校验、modify 复核不得下沉到 MCPGateway，
 也不得上浮到 R1（开发指南纪律 4）。
 
-当前状态（迭代 1/2 完成，已对齐 v1.1）：
-- 步骤 1 DecisionStore：``JsonlDecisionStore`` 持久化 + call_id 全局唯一检测（v1.1）；
-- 步骤 3 调用次数上限、步骤 4 预算（按工具 ``cost_per_call``）、步骤 5 权限组合、步骤 6 OPA 已接通；
-- 审批分支：``require_approval`` → R0-delegate async 接口（评审#4）。
+判定流水线依赖必须由生产组装路径显式注入；仅测试或嵌入场景可显式启用降级后端。
 """
 
 from __future__ import annotations
@@ -18,8 +15,17 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
-from loop_controller.authority import AuthorityManager, NoopAuthorityManager
-from loop_controller.executors.base import ExecutionContext, ExecutorRegistry
+from loop_controller.authority import AuthorityManager, _DisabledAuthorityManager
+from loop_controller.budget import InMemoryBudgetLedger as _InMemoryBudgetLedger
+from loop_controller.execution_security import current_execution_request
+from loop_controller.executors.base import (
+    DelegatedSubject,
+    ExecutionContext,
+    ExecutionReceiptType,
+    ExecutionTerminalStatus,
+    ExecutorRegistry,
+    verify_execution_receipt,
+)
 from loop_controller.executors.mcp_executor import MCPExecutor
 from loop_controller.governance_context import build_context_meta, build_governance_context
 from loop_controller.identity import AgentIdentity, IdentityProvider
@@ -77,6 +83,10 @@ class CheckpointError(Exception):
     """forward 前置校验失败（调用方语义错误 / 授权过期 / 重放），向上抛异常。"""
 
 
+class CheckpointConfigurationError(ValueError):
+    """Checkpoint 关键治理依赖缺失。"""
+
+
 # ---------------------------------------------------------------------------
 # §4.5 DecisionStore：判定存储（防重放）
 # ---------------------------------------------------------------------------
@@ -104,10 +114,7 @@ class DecisionAlreadyConsumed(CheckpointError):
 
 
 class InMemoryDecisionStore:
-    """内存版 DecisionStore（迭代 1 占位；T2.1 替换为 Jsonl 持久化版）。
-
-    接口与最终实现一致，仅不持久化（进程重启即失效）。
-    """
+    """显式测试或嵌入场景使用的非持久化 DecisionStore。"""
 
     def __init__(self) -> None:
         self._call_ids: set[str] = set()
@@ -160,8 +167,8 @@ class BudgetLedger(Protocol):
     def refund(self, task_id: str, cost: BudgetCost) -> None: ...
 
 
-class InfiniteBudgetLedger:
-    """恒通过的预算占位（迭代 1；T2.4 换 InMemoryBudgetLedger 真计数）。"""
+class _InfiniteBudgetLedger:
+    """仅供显式降级模式使用的无限预算适配器。"""
 
     def check_and_reserve(self, task_id: str, cost: BudgetCost) -> bool:
         return True
@@ -189,8 +196,8 @@ class PermissionInteractionAnalyzer(Protocol):
     ) -> PermissionRule | None: ...
 
 
-class NoopPermissionInteractionAnalyzer:
-    """恒无命中的组合规则占位（迭代 1；T2.3 换真实现）。"""
+class _DisabledPermissionInteractionAnalyzer:
+    """仅供显式降级模式使用的禁用权限组合分析适配器。"""
 
     def check(
         self,
@@ -215,9 +222,10 @@ class Checkpoint:
         gateway: MCPGateway（forward 的默认执行通道；v0.20.0 保留以兼容旧构造）。
         executor_registry: 执行器注册表（v0.20.0 新增；未提供时自动用 gateway 构造 MCPExecutor）。
         identity: 可信身份源（步骤 0 交叉校验用）。
-        decision_store: 防重放存储（默认内存占位）。
-        budget_ledger: 预算记账（默认恒通过占位）。
-        permission_analyzer: 组合规则分析（默认无命中占位）。
+        decision_store: 防重放存储；生产路径必须显式注入。
+        budget_ledger: 预算记账；生产路径必须显式注入。
+        permission_analyzer: 组合规则分析；生产路径必须显式注入。
+        allow_degraded: 是否为缺失关键依赖启用测试/嵌入降级后端。
         now: 可注入的时间源（测试用），默认 UTC now。
     """
 
@@ -241,13 +249,49 @@ class Checkpoint:
         masker=None,  # Masker（T3.2 接入 build_approval_request）
         revocation_list: RevocationList | None = None,
         audit_store: AuditStore | None = None,
+        allow_degraded: bool = False,
         now: Callable[[], datetime] | None = None,
     ) -> None:
+        dependencies = {
+            "decision_store": decision_store,
+            "budget_ledger": budget_ledger,
+            "reservation_store": reservation_store,
+            "permission_analyzer": permission_analyzer,
+            "authority_manager": authority_manager,
+        }
+        missing = tuple(name for name, backend in dependencies.items() if backend is None)
+        if missing and not allow_degraded:
+            raise CheckpointConfigurationError(
+                "Checkpoint 缺少关键治理依赖: " + ", ".join(missing)
+            )
+        degraded = tuple(
+            name
+            for name, backend in dependencies.items()
+            if backend is None
+            or (name == "decision_store" and isinstance(backend, InMemoryDecisionStore))
+            or (name == "budget_ledger" and isinstance(backend, _InMemoryBudgetLedger))
+            or (
+                name == "reservation_store"
+                and isinstance(backend, InMemoryReservationStore)
+            )
+            or isinstance(
+                backend,
+                (_DisabledPermissionInteractionAnalyzer, _DisabledAuthorityManager),
+            )
+        )
         if executor_registry is None:
             if gateway is None:
                 raise ValueError("Checkpoint 必须提供 gateway 或 executor_registry")
             executor_registry = ExecutorRegistry()
             executor_registry.set_default(MCPExecutor(gateway))
+        if degraded:
+            logger.warning(
+                "checkpoint_degraded_backends",
+                extra={
+                    "event": "checkpoint_degraded_backends",
+                    "degraded_backends": list(degraded),
+                },
+            )
         self._profiles = profiles
         self._policy_engine = policy_engine
         self._policy_store = policy_store
@@ -256,11 +300,26 @@ class Checkpoint:
         self._identity = identity
         self._session_manager = session_manager
         self._risk_manager = risk_manager or RiskStateManager()  # 默认内存实现
-        self._decision_store = decision_store or InMemoryDecisionStore()
-        self._budget_ledger = budget_ledger or InfiniteBudgetLedger()
-        self._reservation_store = reservation_store or InMemoryReservationStore()
-        self._permission_analyzer = permission_analyzer or NoopPermissionInteractionAnalyzer()
-        self._authority_manager = authority_manager or NoopAuthorityManager()
+        self._decision_store = (
+            decision_store if decision_store is not None else InMemoryDecisionStore()
+        )
+        self._budget_ledger = (
+            budget_ledger if budget_ledger is not None else _InfiniteBudgetLedger()
+        )
+        self._reservation_store = (
+            reservation_store if reservation_store is not None else InMemoryReservationStore()
+        )
+        self._permission_analyzer = (
+            permission_analyzer
+            if permission_analyzer is not None
+            else _DisabledPermissionInteractionAnalyzer()
+        )
+        self._authority_manager = (
+            authority_manager
+            if authority_manager is not None
+            else _DisabledAuthorityManager()
+        )
+        self._degraded_backends = degraded
         self._tool_costs = tool_costs or {}
         self._masker = masker
         self._revocation_list = revocation_list
@@ -268,6 +327,11 @@ class Checkpoint:
         self._now = now or _utc_now
         # per-task 已成功执行的动作历史（§6.1 步骤 5 / 偏离 D12），任务结束即弃。
         self._history: dict[str, list[ActionProposal]] = {}
+
+    @property
+    def degraded_backends(self) -> tuple[str, ...]:
+        """当前因显式降级而自动补齐的关键后端名称。"""
+        return self._degraded_backends
 
     # -- 生命周期 -----------------------------------------------------------
 
@@ -329,13 +393,14 @@ class Checkpoint:
         user_id: str,
         tenant_id: str | None,
         reason: str,
+        decision_id: str | None = None,
     ) -> None:
         """v0.36.1：写入 execution_* 阶段审计事件，避免同名 execute 重复。"""
         if self._audit_store is None:
             return
-        metadata: dict[str, Any] = {
-            "user_id": user_id,
-        }
+        metadata: dict[str, Any] = {"user_id": user_id}
+        request_context = current_execution_request.get()
+        receipt = result.execution_receipt if result is not None else None
         if result is not None:
             metadata["result_status"] = result.status
             if result.error_code:
@@ -349,6 +414,24 @@ class Checkpoint:
                 trace_id=proposal.task_id,
                 session_id=session_id or proposal.task_id,
                 call_id=proposal.call_id,
+                request_id=request_context.request_id if request_context else None,
+                interaction_id=request_context.interaction_id if request_context else None,
+                decision_id=(request_context.decision_id if request_context else decision_id),
+                task_id=proposal.task_id,
+                delegation_jti=request_context.delegation_jti if request_context else None,
+                tenant_id=tenant_id,
+                workload_id=(request_context.workload_identity.workload_id if request_context else None),
+                authenticated_instance_id=(request_context.workload_identity.authenticated_instance_id if request_context else None),
+                delegated_agent_id=proposal.agent_id if request_context else None,
+                delegated_user_id=user_id or None if request_context else None,
+                executor=receipt.executor if receipt else None,
+                backend=receipt.backend if receipt else None,
+                receipt_id=receipt.receipt_id if receipt else None,
+                receipt_type=receipt.type.value if receipt else None,
+                receipt_status=receipt.status.value if receipt else None,
+                result_sha256=receipt.result_sha256 if receipt else None,
+                credential_ref_digest=receipt.credential_ref_digest if receipt else None,
+                resolved_credential_version=receipt.resolved_credential_version if receipt else None,
                 actor_type="agent",
                 actor_id=proposal.agent_id,
                 action=action,
@@ -775,6 +858,7 @@ class Checkpoint:
             reason=decision.reason,
             requester_id=task.user_id,
             approver_id=approver_id,
+            tenant_id=task.tenant_id,
         )
 
     def finalize_after_approval(
@@ -1082,8 +1166,12 @@ class Checkpoint:
 
             # 解析执行器并确认工具可达，避免在基础设施临时不可用或策略拒绝时
             # 过早消费 decision。
+            request_context = current_execution_request.get()
+            security_mode = "strict" if request_context is not None else "compatibility"
             try:
-                executor = self._executor_registry.resolve_executor(proposal.tool_name)
+                executor = self._executor_registry.resolve_executor(
+                    proposal.tool_name, security_mode=security_mode
+                )
             except Exception:
                 self._refund_reservation(reservation)
                 raise
@@ -1130,20 +1218,44 @@ class Checkpoint:
                 user_id=user_id,
                 tenant_id=tenant_id,
                 reason="decision and authority validated before execution",
+                decision_id=decision.decision_id,
             )
 
+            execution_context = ExecutionContext(
+                call_id=proposal.call_id,
+                task_id=proposal.task_id,
+                agent_id=proposal.agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                tenant_id=tenant_id,
+                request_id=request_context.request_id if request_context else None,
+                interaction_id=request_context.interaction_id if request_context else None,
+                decision_id=request_context.decision_id if request_context else decision.decision_id,
+                delegation_jti=request_context.delegation_jti if request_context else None,
+                workload_identity=request_context.workload_identity if request_context else None,
+                delegated_subject=(
+                    DelegatedSubject(
+                        agent_id=proposal.agent_id,
+                        user_id=user_id or None,
+                        tenant_id=request_context.tenant_id,
+                        request_id=request_context.request_id,
+                        task_id=request_context.task_id,
+                        call_id=request_context.call_id,
+                        decision_id=request_context.decision_id,
+                        delegation_jti=request_context.delegation_jti,
+                    )
+                    if request_context
+                    else None
+                ),
+                security_capabilities=(
+                    request_context.security_capabilities if request_context else frozenset()
+                ),
+            )
             try:
                 result = await executor.execute(
                     tool_name=proposal.tool_name,
                     arguments=effective_args,
-                    context=ExecutionContext(
-                        call_id=proposal.call_id,
-                        task_id=proposal.task_id,
-                        agent_id=proposal.agent_id,
-                        user_id=user_id,
-                        session_id=session_id,
-                        tenant_id=tenant_id,
-                    ),
+                    context=execution_context,
                 )
             except Exception:
                 await self._audit_authority_consumption(
@@ -1164,6 +1276,56 @@ class Checkpoint:
                 )
                 self._refund_reservation(reservation)
                 raise
+            if security_mode == "strict":
+                receipt = result.execution_receipt
+                if receipt is None:
+                    result = result.model_copy(
+                        update={
+                            "status": "error",
+                            "content": "strict execution result missing receipt",
+                            "error_code": "execution_receipt_required",
+                        }
+                    )
+                else:
+                    expected_terminal = (
+                        "success" if result.status == "success" else "error"
+                    )
+                    terminal = ExecutionTerminalStatus(
+                        result.terminal_status or expected_terminal
+                    )
+                    result_status_matches = (
+                        result.status == "success"
+                        if terminal == ExecutionTerminalStatus.SUCCESS
+                        else result.status == "error"
+                    )
+                    expected_receipt_types = {
+                        "protected_http": ExecutionReceiptType.CONTROLLER_EXECUTION_RECORD,
+                        "protected_mcp_network": ExecutionReceiptType.PROXY_ATTESTATION,
+                        "remote_harness": ExecutionReceiptType.REMOTE_EXECUTION_ATTESTATION,
+                    }
+                    expected_type = expected_receipt_types.get(
+                        getattr(executor, "security_egress_type", "")
+                    )
+                    try:
+                        if not result_status_matches:
+                            raise ValueError("tool result terminal status mismatch")
+                        if expected_type is None:
+                            raise ValueError("unsupported strict receipt boundary")
+                        verify_execution_receipt(
+                            receipt,
+                            expected_type=expected_type,
+                            context=execution_context,
+                            status=terminal,
+                            result=result.content,
+                        )
+                    except ValueError:
+                        result = result.model_copy(
+                            update={
+                                "status": "error",
+                                "content": "strict execution receipt validation failed",
+                                "error_code": "execution_receipt_invalid",
+                            }
+                        )
             await self._audit_authority_consumption(
                 proposal,
                 consumed_authority,

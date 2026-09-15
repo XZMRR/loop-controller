@@ -1,0 +1,103 @@
+{
+  "protocol_version": "0.53.0",
+  "agent_card": {
+    "agent_id": "agent-b",
+    "name": "Agent B",
+    "description": "contract fixture agent with delegate_execution capability",
+    "entrypoint": {"type": "http", "url": "http://127.0.0.1:9002"},
+    "capabilities": ["delegate_execution"],
+    "trust_domain": "test.loop-controller.local",
+    "version": "0.53.0"
+  },
+  "task": {
+    "protocol_version": "0.53.0",
+    "task_id": "task-001",
+    "request_id": "req-001",
+    "session_id": "sess-001",
+    "interaction_id": "int-001",
+    "decision_id": "dec-001",
+    "root_task_id": "task-root",
+    "parent_task_id": "task-parent",
+    "delegation_depth": 2,
+    "deadline": "2026-09-01T12:30:00Z",
+    "budget": {"token_count": 1000, "payment_amount": 5, "currency": "USD"},
+    "reserved_budget": {"token_count": 200, "payment_amount": 1, "currency": "USD"},
+    "consumed_budget": {"token_count": 100, "payment_amount": 0.5, "currency": "USD"},
+    "allowed_tools": ["read_file"],
+    "allowed_capabilities": ["filesystem_read"],
+    "allow_redelegation": false,
+    "initiator_agent_id": "agent-a",
+    "target_agent_id": "agent-b",
+    "status": "pending",
+    "created_at": "2026-09-01T12:00:00Z",
+    "updated_at": "2026-09-01T12:00:01Z",
+    "tenant_id": "tenant-a",
+    "target_workload_id": "spiffe://example.test/agent-b",
+    "target_instance_id": "agent-b-01"
+  },
+  "message": {
+    "message_id": "msg-001", "task_id": "task-001", "from_agent_id": "agent-a", "to_agent_id": "agent-b", "role": "user",
+    "parts": [{"type": "text", "text": "invoke-tool"}, {"type": "data", "data": {"path": "/data/kb/doc.md", "mode": "read"}}],
+    "timestamp": "2026-09-01T12:00:00Z", "protocol_version": "0.53.0"
+  },
+  "delegation_request": {
+    "request_id": "req-001", "initiator_agent_id": "agent-a", "target_agent_id": "agent-b", "tool_name": "read_file",
+    "arguments": {"path": "/data/kb/doc.md", "options": {"encoding": "utf-8"}}, "session_id": "sess-001", "task_id": "task-001",
+    "risk_level": "high", "allowed_tools": ["read_file"], "allowed_capabilities": ["filesystem_read"], "allow_redelegation": false,
+    "parent_task_id": "task-parent", "budget": {"token_count": 1000, "payment_amount": 5, "currency": "USD"},
+    "deadline": "2026-09-01T12:30:00Z", "protocol_version": "0.53.0", "tenant_id": "tenant-a",
+    "target_workload_id": "spiffe://example.test/agent-b", "target_instance_id": "agent-b-01"
+  },
+  "delegation_response": {
+    "allowed": true, "verdict": "modify", "decision_id": "dec-001", "task_id": "task-001",
+    "target_entrypoint": {"type": "http", "url": "http://127.0.0.1:9002"}, "delegation_token": "token-001",
+    "original_args": {"region": "all"}, "modified_args": {"region": "APAC"}, "effective_args": {"region": "APAC"},
+    "reason": "IIGE authorized delegation with narrowed arguments", "protocol_version": "0.53.0"
+  },
+  "delegation_approval": {
+    "protocol_version": "0.53.0", "approval_id": "approval-001", "request_id": "req-approval-001", "decision_id": "dec-approval-001",
+    "request_hash": "sha256:0c7a7f8f", "initiator_agent_id": "agent-a", "target_agent_id": "agent-b", "session_id": "sess-001",
+    "parent_task_id": "task-parent", "delegation_depth": 2, "allowed_tools": ["read_file"], "allowed_capabilities": ["filesystem_read"],
+    "allow_redelegation": false, "budget": {"token_count": 1000, "payment_amount": 5, "currency": "USD"},
+    "task_deadline": "2026-09-01T12:30:00Z", "expires_at": "2026-09-01T12:10:00Z", "status": "pending",
+    "created_at": "2026-09-01T12:00:00Z", "updated_at": "2026-09-01T12:00:00Z", "version": 1
+  },
+  "approval_action_request": {"request_id": "approval-action-001", "reason": "reviewed"},
+  "security_capabilities": {
+    "required": ["workload_identity_v1", "delegated_subject_binding_v1", "workload_bound_delegation_token_v1", "execution_receipt_v1", "tenant_secret_no_fallback_v1"],
+    "supported": ["workload_identity_v1", "delegated_subject_binding_v1", "workload_bound_delegation_token_v1", "execution_receipt_v1", "tenant_secret_no_fallback_v1", "protected_mcp_network_v1"]
+  },
+  "workload_identity": {
+    "workload_id": "spiffe://example.test/agent-b", "service": "target-agent", "principal": "agent-b-service", "tenant_id": "tenant-a",
+    "authenticated_at": "2026-09-01T12:00:00Z", "expires_at": "2026-09-01T13:00:00Z", "auth_method": "mtls", "authenticated_instance_id": "agent-b-01"
+  },
+  "delegated_subject": {"agent_id": "agent-a", "user_id": "alice", "tenant_id": "tenant-a", "request_id": "req-001", "task_id": "task-001", "call_id": "call-001", "decision_id": "dec-001", "delegation_jti": "jti-001"},
+  "tool_credential_ref": {"name": "kb-token", "scope": "tenant", "tenant_id": "tenant-a", "key": "token", "version_mode": "pinned", "version": "7", "injection": "header", "allowed_tools": [], "tenant_allowlist": []},
+  "resolved_tool_credential_ref": {"name": "kb-token", "scope": "tenant", "tenant_id": "tenant-a", "key": "token", "version_mode": "pinned", "resolved_version": "7", "injection": "header", "allowed_tools": [], "tenant_allowlist": []},
+  "execution_receipt": {
+    "receipt_id": "receipt-001", "type": "proxy_attestation", "attester_workload_id": "spiffe://example.test/mcp-proxy", "authenticated_instance_id": "proxy-01",
+    "request_id": "req-001", "interaction_id": "int-001", "task_id": "task-001", "call_id": "call-001", "decision_id": "dec-001", "delegation_jti": "jti-001",
+    "executor": "mcp", "backend": "protected-mcp", "credential_ref_digest": "sha256-ref", "resolved_credential_version": "7", "resolved_credential_digest": null,
+    "status": "success", "result_sha256": "0123456789abcdef", "media_type": "application/json", "encoding": "utf-8", "issued_at": "2026-09-01T12:00:03Z"
+  },
+  "entrypoint_task_request": {
+    "protocol_version": "0.53.0", "delivery_id": "delivery-001", "request_id": "req-001", "interaction_id": "int-001", "decision_id": "dec-001",
+    "task_id": "task-001", "session_id": "sess-001", "initiator_agent_id": "agent-a", "target_agent_id": "agent-b", "tool_name": "read_file",
+    "arguments": {"path": "/data/kb/doc.md"}, "delegation_token": "token-001", "allowed_tools": ["read_file"], "allowed_capabilities": ["filesystem_read"],
+    "allow_redelegation": false, "budget": {"token_count": 1000, "payment_amount": 5, "currency": "USD"}, "tenant_id": "tenant-a",
+    "target_workload_id": "spiffe://example.test/agent-b", "target_instance_id": "agent-b-01"
+  },
+  "entrypoint_result_request": {"protocol_version": "0.53.0", "status": "completed", "outcome": {"ok": true}, "consumed_budget": {"token_count": 10, "payment_amount": 0, "currency": "USD"}, "execution_receipt": {"receipt_id": "receipt-001", "type": "proxy_attestation", "attester_workload_id": "spiffe://example.test/mcp-proxy", "authenticated_instance_id": "proxy-01", "request_id": "req-001", "interaction_id": "int-001", "task_id": "task-001", "call_id": "call-001", "decision_id": "dec-001", "delegation_jti": "jti-001", "executor": "mcp", "backend": "protected-mcp", "credential_ref_digest": "sha256-ref", "resolved_credential_version": "7", "resolved_credential_digest": null, "status": "success", "result_sha256": "0123456789abcdef", "media_type": "application/json", "encoding": "utf-8", "issued_at": "2026-09-01T12:00:03Z"}},
+  "govern_tool_request": {"agent_id": "agent-b", "user_id": null, "tool_name": "read_file", "request_id": "req-001", "interaction_id": "int-001", "decision_id": "dec-001", "task_id": "task-001", "call_id": "call-001", "delegation_jti": "jti-001", "delegation_token": "token-001", "tenant_id": "tenant-a", "target_workload_id": "spiffe://example.test/agent-b", "target_instance_id": "agent-b-01", "required_security_capabilities": ["workload_identity_v1", "delegated_subject_binding_v1", "workload_bound_delegation_token_v1", "execution_receipt_v1", "tenant_secret_no_fallback_v1"], "arguments": {"path": "/data/kb/doc.md"}, "task_context": "delegated task task-001", "session_id": "sess-001", "allowed_tools": ["read_file"], "allowed_capabilities": ["filesystem_read"], "allow_redelegation": false, "deadline": "2026-09-01T12:30:00Z"},
+  "govern_tool_response": {"status": "allow", "result": {"ok": true}, "request_id": null, "error_code": null, "supported_security_capabilities": ["workload_identity_v1", "delegated_subject_binding_v1", "workload_bound_delegation_token_v1", "execution_receipt_v1", "tenant_secret_no_fallback_v1"], "execution_receipt": {"receipt_id": "receipt-001", "type": "proxy_attestation", "attester_workload_id": "spiffe://example.test/mcp-proxy", "authenticated_instance_id": "proxy-01", "request_id": "req-001", "interaction_id": "int-001", "task_id": "task-001", "call_id": "call-001", "decision_id": "dec-001", "delegation_jti": "jti-001", "executor": "mcp", "backend": "protected-mcp", "credential_ref_digest": "sha256-ref", "resolved_credential_version": "7", "resolved_credential_digest": null, "status": "success", "result_sha256": "0123456789abcdef", "media_type": "application/json", "encoding": "utf-8", "issued_at": "2026-09-01T12:00:03Z"}},
+  "lifecycle_event": {"event_id": "life-001", "event": "completed", "request_id": "req-001", "interaction_id": "int-001", "decision_id": "dec-001", "task_id": "task-001", "tenant_id": "tenant-a", "target_workload_id": "spiffe://example.test/agent-b", "target_instance_id": "agent-b-01", "required_security_capabilities": ["execution_receipt_v1"]},
+  "protected_mcp_meta": {"io.loop-controller/protected-mcp-v1": {"delegated_subject": {"agent_id": "agent-a", "user_id": "alice", "tenant_id": "tenant-a", "request_id": "req-001", "task_id": "task-001", "call_id": "call-001", "decision_id": "dec-001", "delegation_jti": "jti-001"}, "interaction_id": "int-001", "required_capabilities": ["execution_receipt_v1", "protected_mcp_network_v1", "delegated_subject_binding_v1"], "credential_refs": []}},
+  "error_response": {"error": "protocol version 0.40.0 is incompatible", "code": "incompatible_protocol_version"},
+  "sse_event": {"id": "ev-001", "event": "task_created", "data": {"protocol_version": "0.53.0", "event_id": "ev-001", "task_id": "task-001", "event_type": "task_created", "payload": {"session_id": "sess-001", "initiator_agent_id": "agent-a", "target_agent_id": "agent-b"}, "published_at": "2026-09-01T12:00:02Z"}},
+  "task_event": {"protocol_version": "0.53.0", "event_id": "ev-001", "task_id": "task-001", "event_type": "task_created", "payload": {"session_id": "sess-001", "initiator_agent_id": "agent-a", "target_agent_id": "agent-b"}, "published_at": "2026-09-01T12:00:02Z"},
+  "error_cases": [
+    {"name": "missing_required_field", "category": "invalid_request", "message": {"task_id": "task-001", "parts": []}},
+    {"name": "unknown_part_type", "category": "invalid_message_parts", "message": {"message_id": "msg-invalid-part", "task_id": "task-001", "from_agent_id": "agent-a", "to_agent_id": "agent-b", "role": "user", "parts": [{"type": "binary", "data": "AA=="}], "timestamp": "2026-09-01T12:00:00Z", "protocol_version": "0.53.0"}},
+    {"name": "incompatible_version", "category": "incompatible_protocol_version", "message": {"message_id": "msg-old-version", "task_id": "task-001", "from_agent_id": "agent-a", "to_agent_id": "agent-b", "role": "user", "parts": [{"type": "text", "text": "invoke-tool"}], "timestamp": "2026-09-01T12:00:00Z", "protocol_version": "0.40.0"}}
+  ]
+}

@@ -474,6 +474,12 @@ class InteractionGovernanceEngine:
             event_id=str(uuid4()),
             trace_id=str(payload.get("task_id") or interaction_id),
             session_id=str(payload.get("session_id") or ""),
+            request_id=payload.get("request_id"),
+            interaction_id=interaction_id,
+            decision_id=payload.get("decision_id"),
+            task_id=payload.get("task_id"),
+            tenant_id=payload.get("tenant_id"),
+            delegation_jti=payload.get("delegation_jti"),
             actor_type="agent",
             actor_id=str(payload.get("source_agent_id") or "unknown"),
             action="deny",
@@ -588,6 +594,7 @@ class InteractionAuthorizeEndpoint:
             budget=payload.get("budget") or {},
             deadline=payload.get("deadline"),
             parent_allow_redelegation=bool(payload.get("parent_allow_redelegation", False)),
+            tenant_id=payload.get("tenant_id", ""),
             interaction_context=payload.get("interaction_context", ""),
         )
 

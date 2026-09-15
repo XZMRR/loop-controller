@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -48,6 +49,31 @@ func TestTaskCreateAndGet(t *testing.T) {
 	}
 	if got.Status != "pending" {
 		t.Errorf("status = %q, want pending", got.Status)
+	}
+}
+
+func TestListDescendantsScansCompleteTaskIdentity(t *testing.T) {
+	db := openTestDB(t)
+	ts := db.TaskStore()
+	now := time.Now().UTC()
+	parent := models.Task{TaskID: "desc-parent", SessionID: "session-1", InitiatorAgentID: "agent-a", TargetAgentID: "agent-b", Status: "pending", CreatedAt: now, UpdatedAt: now}
+	child := models.Task{TaskID: "desc-child", ParentTaskID: parent.TaskID, SessionID: "session-1", InitiatorAgentID: "agent-b", TargetAgentID: "agent-c", Status: "pending", TenantID: "tenant-1", RequestID: "request-1", TargetWorkloadID: "workload-1", TargetInstanceID: "instance-1", CreatedAt: now.Add(time.Second), UpdatedAt: now.Add(time.Second)}
+	for _, task := range []models.Task{parent, child} {
+		if err := ts.Create(context.Background(), task); err != nil {
+			t.Fatalf("create %s: %v", task.TaskID, err)
+		}
+	}
+
+	descendants, err := ts.ListDescendants(context.Background(), parent.TaskID)
+	if err != nil {
+		t.Fatalf("list descendants: %v", err)
+	}
+	if len(descendants) != 1 {
+		t.Fatalf("descendants = %d, want 1", len(descendants))
+	}
+	got := descendants[0]
+	if got.TenantID != child.TenantID || got.RequestID != child.RequestID || got.TargetWorkloadID != child.TargetWorkloadID || got.TargetInstanceID != child.TargetInstanceID {
+		t.Fatalf("descendant identity fields lost: %+v", got)
 	}
 }
 
@@ -470,6 +496,160 @@ func TestEventAppendAndListPending(t *testing.T) {
 	}
 }
 
+func TestEventSequencesArePerTaskAndConcurrentSafe(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	for _, taskID := range []string{"sequence-a", "sequence-b"} {
+		if err := db.TaskStore().Create(ctx, models.Task{TaskID: taskID, SessionID: "s", InitiatorAgentID: "a", TargetAgentID: "b", Status: "pending", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const count = 40
+	var wg sync.WaitGroup
+	errs := make(chan error, count*2)
+	for i := 0; i < count; i++ {
+		for _, taskID := range []string{"sequence-a", "sequence-b"} {
+			wg.Add(1)
+			go func(i int, taskID string) {
+				defer wg.Done()
+				errs <- db.EventStore().Append(ctx, models.TaskEvent{EventID: fmt.Sprintf("%s-%d", taskID, i), TaskID: taskID, EventType: "test", Payload: []byte(`{}`), PublishedAt: time.Now().UTC()})
+			}(i, taskID)
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, taskID := range []string{"sequence-a", "sequence-b"} {
+		events, err := db.EventStore().ListAfter(ctx, taskID, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != count {
+			t.Fatalf("%s events=%d, want %d", taskID, len(events), count)
+		}
+		for i, event := range events {
+			if event.Sequence != int64(i+1) || event.SchemaVersion != models.TaskEventSchemaVersion {
+				t.Fatalf("%s event %d sequence/schema=%d/%d", taskID, i, event.Sequence, event.SchemaVersion)
+			}
+		}
+	}
+}
+
+func TestEventCursorContract(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	for _, taskID := range []string{"cursor-a", "cursor-b"} {
+		if err := db.TaskStore().Create(ctx, models.Task{TaskID: taskID, SessionID: "s", InitiatorAgentID: "a", TargetAgentID: "b", Status: "pending", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1; i <= 3; i++ {
+		if err := db.EventStore().Append(ctx, models.TaskEvent{EventID: fmt.Sprintf("cursor-a-%d", i), TaskID: "cursor-a", EventType: "test", Payload: []byte(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := db.EventStore().ListAfter(ctx, "cursor-a", "")
+	if err != nil || len(events) != 3 {
+		t.Fatalf("events=%d err=%v", len(events), err)
+	}
+	if events[0].Cursor == "" || strings.Contains(events[0].Cursor, events[0].EventID) {
+		t.Fatalf("cursor is not opaque: %q", events[0].Cursor)
+	}
+	after, err := db.EventStore().ListAfter(ctx, "cursor-a", events[0].Cursor)
+	if err != nil || len(after) != 2 || after[0].Sequence != 2 {
+		t.Fatalf("valid cursor result=%+v err=%v", after, err)
+	}
+	legacy, err := db.EventStore().ListAfter(ctx, "cursor-a", events[0].EventID)
+	if err != nil || len(legacy) != 2 {
+		t.Fatalf("legacy event_id cursor result=%+v err=%v", legacy, err)
+	}
+	if _, err := db.EventStore().ListAfter(ctx, "cursor-a", "not-a-cursor"); !errors.Is(err, ErrEventCursorInvalid) {
+		t.Fatalf("invalid cursor error=%v", err)
+	}
+	if _, err := db.EventStore().ListAfter(ctx, "cursor-b", events[0].Cursor); !errors.Is(err, ErrEventCursorInvalid) {
+		t.Fatalf("cross-task cursor error=%v", err)
+	}
+	future, err := EncodeEventCursor("cursor-a", 4, models.TaskEventSchemaVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EventStore().ListAfter(ctx, "cursor-a", future); !errors.Is(err, ErrEventCursorFuture) {
+		t.Fatalf("future cursor error=%v", err)
+	}
+	if _, err := db.EventStore().Compact(ctx, "cursor-a", 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EventStore().ListAfter(ctx, "cursor-a", events[0].Cursor); !errors.Is(err, ErrEventCursorExpired) {
+		t.Fatalf("expired cursor error=%v", err)
+	}
+	if _, err := db.EventStore().ListAfter(ctx, "cursor-a", events[0].EventID); !errors.Is(err, ErrEventCursorInvalid) {
+		t.Fatalf("deleted legacy cursor error=%v", err)
+	}
+}
+
+func TestEventCompactionRetainsTerminalAuditAtomically(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	task := models.Task{TaskID: "compact-terminal", SessionID: "s", InitiatorAgentID: "a", TargetAgentID: "b", Status: "pending", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if _, err := db.TaskStore().CreateWithEvent(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.TaskStore().UpdateStatus(ctx, task.TaskID, "pending", "accepted", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.TaskStore().UpdateStatus(ctx, task.TaskID, "accepted", "running", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	outcome := json.RawMessage(`{"ok":true}`)
+	if _, _, err := db.TaskStore().UpdateStatus(ctx, task.TaskID, "running", "completed", outcome, ""); err != nil {
+		t.Fatal(err)
+	}
+	audit, err := db.EventStore().Compact(ctx, task.TaskID, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audit.TerminalStatus != "completed" || audit.TerminalSequence != 4 || audit.TerminalEventType != "task_completed" || audit.TerminalEventAt.IsZero() || len(audit.TerminalEventPayload) == 0 {
+		t.Fatalf("terminal audit=%+v", audit)
+	}
+	var lower, eventCount, auditCount int64
+	if err := db.QueryRowContext(ctx, `SELECT lower_sequence FROM event_retention WHERE task_id=?`, task.TaskID).Scan(&lower); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE task_id=?`, task.TaskID).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM terminal_event_audit WHERE task_id=?`, task.TaskID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if lower != 4 || eventCount != 1 || auditCount != 1 {
+		t.Fatalf("lower/events/audits=%d/%d/%d", lower, eventCount, auditCount)
+	}
+
+	rollbackTask := models.Task{TaskID: "compact-rollback", SessionID: "s", InitiatorAgentID: "a", TargetAgentID: "b", Status: "completed", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := db.TaskStore().Create(ctx, rollbackTask); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EventStore().Append(ctx, models.TaskEvent{EventID: "rollback-terminal", TaskID: rollbackTask.TaskID, EventType: "task_completed", Payload: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `DROP TABLE terminal_event_audit`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EventStore().Compact(ctx, rollbackTask.TaskID, 2); err == nil {
+		t.Fatal("expected audit write failure")
+	}
+	if err := db.QueryRowContext(ctx, `SELECT lower_sequence FROM event_retention WHERE task_id=?`, rollbackTask.TaskID).Scan(&lower); err != nil || lower != 1 {
+		t.Fatalf("watermark changed after rollback: %d err=%v", lower, err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE task_id=?`, rollbackTask.TaskID).Scan(&eventCount); err != nil || eventCount != 1 {
+		t.Fatalf("events changed after rollback: %d err=%v", eventCount, err)
+	}
+}
+
 func TestIdempotencyConcurrentDuplicate(t *testing.T) {
 	db := openTestDB(t)
 	is := db.IdempotencyStore()
@@ -677,9 +857,9 @@ func TestRenewExecutionLease(t *testing.T) {
 	ts := db.TaskStore()
 	seedRunningTask(t, ts, "task-lease-renew")
 
-	var before int64
-	if err := db.QueryRowContext(context.Background(), `SELECT exec_lease_expires_at FROM tasks WHERE task_id = ?`, "task-lease-renew").Scan(&before); err != nil {
-		t.Fatalf("query lease before: %v", err)
+	const before int64 = 1
+	if _, err := db.ExecContext(context.Background(), `UPDATE tasks SET exec_lease_expires_at = ? WHERE task_id = ?`, before, "task-lease-renew"); err != nil {
+		t.Fatalf("set lease before renewal: %v", err)
 	}
 	if err := ts.RenewExecutionLease(context.Background(), "task-lease-renew"); err != nil {
 		t.Fatalf("renew lease: %v", err)
@@ -690,6 +870,27 @@ func TestRenewExecutionLease(t *testing.T) {
 	}
 	if after <= before {
 		t.Errorf("exec_lease_expires_at = %d, want > %d", after, before)
+	}
+}
+
+func TestRenewExecutionLeaseReportsLostLease(t *testing.T) {
+	db := openTestDB(t)
+	ts := db.TaskStore()
+	seedRunningTask(t, ts, "task-lease-owner")
+
+	now := time.Now().UTC()
+	nonRunning := models.Task{TaskID: "task-lease-not-running", SessionID: "session-1", InitiatorAgentID: "agent-a", TargetAgentID: "agent-b", Status: "pending", CreatedAt: now, UpdatedAt: now}
+	if err := ts.Create(context.Background(), nonRunning); err != nil {
+		t.Fatalf("create non-running task: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `UPDATE tasks SET exec_owner = ? WHERE task_id = ?`, "different-owner", "task-lease-owner"); err != nil {
+		t.Fatalf("replace lease owner: %v", err)
+	}
+
+	for _, taskID := range []string{"task-lease-missing", nonRunning.TaskID, "task-lease-owner"} {
+		if err := ts.RenewExecutionLease(context.Background(), taskID); !errors.Is(err, ErrExecutionLeaseLost) {
+			t.Errorf("renew %s error = %v, want ErrExecutionLeaseLost", taskID, err)
+		}
 	}
 }
 
@@ -769,5 +970,40 @@ func TestRecoverExpiredRunningIsExclusiveAcrossInstances(t *testing.T) {
 	}
 	if total != 1 {
 		t.Fatalf("recovered total = %d, want exactly 1", total)
+	}
+}
+
+func TestExecutionQueueEventIDsUniqueAcrossStores(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storeCount  = 32
+		idsPerStore = 256
+	)
+	now := time.Unix(1_700_000_000, 123_000_000).UTC()
+	ids := make(chan string, storeCount*idsPerStore)
+	var wg sync.WaitGroup
+	for range storeCount {
+		queue := &executionQueueStore{owner: "shared-owner"}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range idsPerStore {
+				ids <- newEventID(queue.owner, "shared-task", now)
+			}
+		}()
+	}
+	wg.Wait()
+	close(ids)
+
+	seen := make(map[string]struct{}, storeCount*idsPerStore)
+	for id := range ids {
+		if _, exists := seen[id]; exists {
+			t.Fatalf("duplicate event ID: %q", id)
+		}
+		seen[id] = struct{}{}
+	}
+	if len(seen) != storeCount*idsPerStore {
+		t.Fatalf("unique event IDs = %d, want %d", len(seen), storeCount*idsPerStore)
 	}
 }

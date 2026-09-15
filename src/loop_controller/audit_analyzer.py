@@ -37,25 +37,6 @@ class AuditAnalyzer(Protocol):
     async def analyze_task(self, task_id: str) -> AuditReport: ...
 
 
-class NoopAuditAnalyzer:
-    """恒返回空报告的占位实现。"""
-
-    async def analyze_session(self, session_id: str) -> AuditReport:
-        return AuditReport(
-            report_id=uuid.uuid4().hex,
-            session_id=session_id,
-            summary="audit analyzer disabled",
-        )
-
-    async def analyze_task(self, task_id: str) -> AuditReport:
-        return AuditReport(
-            report_id=uuid.uuid4().hex,
-            session_id="",
-            task_id=task_id,
-            summary="audit analyzer disabled",
-        )
-
-
 class RuleBasedAuditAnalyzer:
     """基于声明式规则的异步审计分析器。"""
 

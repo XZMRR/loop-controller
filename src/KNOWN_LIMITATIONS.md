@@ -1,6 +1,6 @@
 # 已知局限（Known Limitations）
 
-> 本文件列出 Loop Controller v0.37.0 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
+> 本文件列出 Loop Controller v0.50.0 **明确声明的能力边界**。每一条都是设计决策的结果，不是缺陷；但使用者必须据此判断当前版本是否适用于自己的场景。**不得在对外材料中声称本版本具备下列未实现的能力。**
 
 ---
 
@@ -123,10 +123,11 @@ v0.23.1 将 `mcp` 依赖固定为 `<2.0`，因为 mcp 2.0 对服务端 API 做�
 
 ## v0.22.0 边界声明
 
-### V22-1. 仅 HTTP 工具与 Secret 支持热更新
+### V22-1. Rego 仍不支持 Python 热更新（v0.50.0 起由 Bundle 生命周期承接）
 
-v0.22.0 的热更新仅覆盖 `config/http_tools.yaml` 与 `secrets/` 下的 secret 文件。
-`config/mcp_servers.yaml`、`config/profiles.yaml`、`config/policies/*.rego` 等变更建议重启进程，避免运行时权限漂移或子进程生命周期混乱。
+v0.22.0 的 Python `HotReloader` 仅覆盖 `config/http_tools.yaml` 与 `secrets/` 下的 secret 文件。`config/mcp_servers.yaml`、`config/profiles.yaml` 等配置变更仍建议重启进程；尤其 `config/policies/*.rego` **不会由 Python `HotReloader` 重载**。
+
+v0.50.0 已实现 OPA Bundle 策略生命周期：不可变 candidate 快照、确定性 tar.gz artifact（SHA-256 revision）、CAS 发布、OPA status 全实例加载确认、隔离 shadow 模拟与策略变更审计，并提供管理 API 与 Bundle 分发端点。Rego 变更应通过 candidate → validate → publish 流程交付；OPA 实例需配置 bundle 插件从 Loop Controller 拉取。**仅当 OPA 实例未接入 Bundle 分发端点时**，Rego 变更才需要按部署流程重启或由外部 OPA 运维机制加载；不能宣称 Python 热更新已覆盖策略。
 
 ### V22-2. Secret 文件后端：明文为默认，加密后端已提供
 
@@ -139,10 +140,9 @@ v0.24.0 新增 `EncryptedFileSecretBackend`，使用 AES-256-GCM 加密落盘，
 生产部署应优先使用加密后端，并确保 secret 目录的 ACL 严格受限。
 KMS / Vault / etcd 等外部密钥/存储集成仍计划在后续版本。
 
-### V22-3. 多租户仅为命名空间预留
+### V22-3. 多租户权限与数据隔离已部分解决（v0.52.0）
 
-v0.22.0 在 `Agent` / `Task` / `ExecutionContext` / `SecretRef` 中预留 `tenant_id`，
-`SecretBroker` 按 tenant 命名空间隔离 secret，但尚未实现完整的多租户权限隔离、数据隔离、计费拆分或跨租户访问控制。
+v0.52.0 已在企业身份、RBAC、策略候选、审批与 SecretBroker 路径中落实 tenant 绑定、默认跨租户拒绝和显式跨租户 grant。该能力仍不是全栈多租户平台：Go 内核仅透传 tenant，单 Bundle 全局生效，且不提供计费或配额拆分。
 
 ### V22-4. Secret Broker 权限检查在 Windows 上跳过 POSIX 位
 
@@ -278,7 +278,7 @@ v0.26.1 支持 HMAC-SHA256 与 Ed25519，并通过审计—证据交叉校验和
 
 签名或证据后端写入失败时，原 JSONL 审计记录仍会保留，并产生 critical 告警。这避免证据后端故障导致审计事件丢失，但该事件不会自动补写到证据链；审计—证据一致性验证会将状态标记为 `degraded`，需要运维监控并处理告警。
 
-### V26-4. 多租户字段不等于完整隔离
+### V26-4. 多租户鉴权与跨租户控制已部分解决（v0.52.0）
 
 吊销与证据模型保留 `tenant_id`，本地证据按租户分文件保存，但当前版本不提供完整的租户鉴权、资源隔离和跨租户访问控制。
 
@@ -288,9 +288,9 @@ v0.26.1 支持 HMAC-SHA256 与 Ed25519，并通过审计—证据交叉校验和
 
 `append_async()` 避免阻塞事件循环，并在单个 `JsonlAuditStore` 实例内保证序号和哈希链有序；它不提供多进程、多 worker 或多节点对同一 JSONL 文件的安全并发。违反该部署前提不在完整性承诺范围内。
 
-### V261-2. gRPC 管理接口已移除
+### V261-2. HTTP 管理面的细粒度授权已部分解决（v0.52.0）
 
-v0.32.0 已移除 Python gRPC 服务与 `entrypoints.grpc` 配置；v0.36.1 继续清理相关文档与校验。管理操作统一通过 HTTP Admin API 与现有 API key 认证，不提供角色继承、细粒度管理权限或多租户管理员域。
+v0.32.0 已移除 Python gRPC 服务与 `entrypoints.grpc` 配置。v0.52.0 在 HTTP Admin API 上加入企业身份、冻结角色集、端点权限、租户域和角色绑定管理；兼容模式仍可使用 legacy API key，且不提供自定义角色继承、ABAC/ReBAC 或泛化对象 ACL。
 
 ### V261-3. 吊销时间必须显式携带时区
 
@@ -377,13 +377,17 @@ v0.35.0-v0.36.0 已实现 Go A2A 内核的最小协议（Agent Card、Task、Mes
 
 ## v0.29.0 边界声明
 
-### V29-1. 审批可见性仍为轮询/重试语义
+### V29-1. 双审批平面已有可靠 webhook，`ApprovalWatcher` 仍仅是本机唤醒（部分解决）
 
-v0.29.0 修复了跨进程审批结果不可见的问题：Runtime 在每次查询审批状态时通过 `JsonlApprovalStore.refresh()` 增量读取文件。但 Loop Controller **不主动向 Agent 推送**审批结果；Agent 必须继续按既有语义轮询 `resume_after_approval` 或等待 `wait_for_approval` 超时重试。服务内 `ApprovalWatcher.notify()` 仅用于唤醒同一进程内的等待者。
+v0.49.0 为 Go A2A 委托审批与 Python 工具审批分别建立独立持久化通知 outbox，并接入带 claim、lease、claim-token fencing、指数退避和 ACK 所有权校验的 webhook dispatcher。已提交事件采用**至少一次**投递，进程重启后可继续派发；消费者必须按稳定 delivery ID 幂等去重，不能假设恰好一次。
 
-### V29-2. 文件锁不覆盖多 worker 强一致并发
+Python `ApprovalWatcher` 继续只负责同一进程内 SSE/长轮询等待者的低延迟唤醒，不是可靠消息通道，也不提供跨进程或跨节点送达保证。webhook 禁用时不为该目的地新增通知；已入队通知暂停消费时不会被删除，恢复后继续投递。
 
-`JsonlApprovalStore._append` 使用 `portalocker` 对追加写加跨进程锁，可防止 CLI 与 Runtime 双进程写冲突。但锁粒度仅保护单条记录追加，不覆盖读-改-写、重放或跨多台机器的并发；多 worker 共享同一 `approvals.jsonl` 仍可能产生竞态。强一致多 writer 需使用外部数据库或分布式锁，归入后续版本。
+### V29-2. SQLite 是生产审批主路径，JSONL 仅保留兼容边界（部分解决）
+
+v0.49.0 将 `config/approval.yaml` 的生产默认审批事实源切换为 `./data/approvals.db`。Python Runtime 与 CLI 按同一配置选择后端，SQLite 路径（`.db/.sqlite/.sqlite3`）通过领域级事务将审批状态变更与通知 outbox enqueue 原子提交，并以终态 CAS 和幂等 ID 保护并发写入。
+
+`.jsonl` 路径仍可作为历史兼容和单进程开发模式，但不保证审批状态与通知 outbox 同事务，不适用于多 worker 生产部署；系统禁止 JSONL/SQLite 双写，也不会自动隐式迁移历史 JSONL 数据。
 
 ### V29-3. 预算清扫不自动修复所有孤儿预留
 
@@ -409,9 +413,9 @@ v0.33.0 为 HTTP REST API 与 MCP Proxy 增加了请求体大小限制、可配�
 
 v0.33.0 的 `_resolve_sse_identity` 已禁止在 `client_ca_cert` 已配置但未成功提取 mTLS 身份时 fallback 到默认身份，从而触发 401。但该机制能获取的对端证书信息受 ASGI server 与部署层 TLS termination 实现限制；如果反向代理未正确转发客户端证书（且未配置 `trust_proxy_headers`），身份提取将失败。生产部署需确保 TLS termination 发生在 Loop Controller 进程内，或仅信任已验证的代理转发。
 
-### V33-3. admin 工具白名单默认关闭
+### V33-3. HTTP Admin 已统一授权，MCP admin 白名单仍独立（v0.52.0 部分解决）
 
-`entrypoints.admin.agent_profiles` 默认为空列表，MCP Proxy 中的 kill_switch、revoke 等 admin 工具默认全部拒绝。启用后，仅当调用 agent 的 `profile_id` 在白名单中时才允许执行。HTTP Admin API 仍使用 API Key 鉴权，两套 admin 权限模型尚未统一为单一 RBAC 体系。
+v0.52.0 已将 HTTP Admin API 接入统一企业身份与 RBAC。`entrypoints.admin.agent_profiles` 仍是 MCP Proxy 中 kill_switch、revoke 等 admin 工具的独立白名单，默认空列表即全部拒绝；该白名单尚未与 RBAC 合并。
 
 ### V33-4. 错误响应脱敏不覆盖 DEBUG 模式
 
@@ -420,3 +424,85 @@ v0.33.0 的所有网络入口错误响应统一返回固定错误码与文案，
 ### V33-5. OPA fixture 端口探测依赖 psutil
 
 v0.33.0 通过 OPA 绑定 `127.0.0.1:0` 并由子进程网络连接表读取实际端口，消除了端口抢占 TOCTOU。该机制依赖 `psutil`；CI 与 dev 依赖已加入 `psutil>=7.0`。若运行集成测试的环境未安装 psutil，fixture 会回退到重试逻辑，但仍可能受端口抢占影响。
+
+---
+
+## v0.50.0 边界声明
+
+### V50-1. 策略管理粗粒度凭证已部分解决（v0.52.0）
+
+v0.52.0 已为 candidate CRUD / validate / shadow / publish / rollback / audit 接入企业身份与细粒度 RBAC，并落实双人复核；waiver 仅限 `platform_admin`，发布还受全局 `publish_scope` 二次检查。为兼容既有部署，`enforcement: disabled` 与可配置 legacy admin key 映射仍保留，启用严格治理需显式切换到 enforce。
+
+### V50-2. LC 不 fork OPA，加载确认依赖实例主动上报
+
+v0.50.0 的 Bundle 分发与 status 接收只提供端点与生命周期记账，不代为管理 OPA 进程。OPA 实例必须自行配置 bundle 插件从 `/v1/opa/bundles/current` 拉取，并开启 status 插件向 `/v1/opa/status` 上报；`loaded` 判定以 required instance 主动上报为准。未接入上报的实例不参与确认，也不会被自动发现。
+
+### V50-3. 无自动灰度与自动回滚
+
+v0.50.0 提供人工 shadow 模拟与人工 rollback（重新发布历史不可变 revision），但不做自动灰度、自动发布或基于指标的回滚决策。发布即切换 current pointer，全部 required 实例确认前旧 revision 仍是线上生效策略的事实参考，但必须由操作者显式触发回滚。
+
+### V50-4. 单 Bundle 名与固定 roots
+
+v0.50.0 一次只管理一个逻辑策略 Bundle（单一 bundle 名、固定 roots `loop_controller`），不支持多 Bundle 并行交付或按租户拆分策略包。多 Bundle 支持留到后续版本。
+
+## v0.52.0 边界声明
+
+### V52-1. Go 内核只透传、不校验 tenant
+
+Go A2A 内核在 Agent、Task、委托与审计模型中原样携带 `tenant_id`，但不验证 tenant 归属，也不执行跨租户授权；租户安全判定由 Python 统一访问控制平面承担。
+
+### V52-2. tenant 不提供计费与配额
+
+v0.52.0 将 tenant 定义为安全域，不按租户计费、拆账或实施共享配额。既有 token/payment budget 语义不等同于企业租户计量。
+
+### V52-3. 单 Bundle 对全局生效
+
+策略 candidate 可按租户归属和授权隔离，但发布仍切换单一全局 current pointer。发布除角色权限外还要求 `platform_admin` 或显式全局 `publish_scope`；不支持每租户独立线上 Bundle。
+
+### V52-4. 无 ABAC、ReBAC 与泛化对象 ACL
+
+RBAC 使用冻结角色和“端点权限 × 租户”判定，仅对策略候选等明确对象做必要的归属检查；不提供属性策略、关系图授权或可复用的对象级 ACL 框架。
+
+### V52-5. MCP admin profile 白名单未合并 RBAC
+
+HTTP Admin API 已接入统一 RBAC，但 MCP Proxy 的 `entrypoints.admin.agent_profiles` 仍独立判定且默认拒绝。两套入口必须分别配置，不能将 HTTP RBAC 授权视为 MCP admin 工具授权。
+
+## v0.53.0 边界声明
+
+### V53-1. strict 必须显式启用，compatibility 仍是默认
+
+`config/execution_security.yaml` 默认 `mode: compatibility`，因此升级版本不会自动获得 strict 保证。strict 只有在 workload identity、能力协商、tenant/target binding、Secret no-fallback、受保护出口、ExecutionReceipt 和 readiness 均满足时成立；任何维度缺失均 fail-closed，而不是回退本地、stdio、旧 SSE 或默认执行器。
+
+### V53-2. Protected MCP 网络传输已实现，完整本地 uvicorn mTLS e2e 尚未执行
+
+Protected MCP 已使用 Streamable HTTP + HTTPS/mTLS 客户端、URI SAN/证书指纹绑定、typed `_meta` 合同与 proxy attestation；stdio 和旧 SSE 仅属 compatibility。当前收口未在本机启动完整 uvicorn 双向 TLS 拓扑执行端到端验证，正式发布仍须在支持环境完成真实证书链、TLS peer 提取及失败负向门禁。
+
+### V53-3. Docker/Kubernetes 仅完成静态 conformance
+
+仓库提供 Docker Compose/Kubernetes strict 样例及机器可读静态 conformance。真实 CNI/NetworkPolicy、集群内 upstream/metadata/目标直连阻断、Secret mount、rootfs/提权/Docker socket 与资源限制负向测试依赖发布环境，普通 CI 的静态检查不能替代这些门禁。
+
+### V53-4. receipt JSON 摘要不是完整 RFC 8785
+
+ExecutionReceipt 对 JSON 使用排序键、紧凑分隔符、UTF-8、拒绝 NaN 的确定性子集；文本和二进制按原始 bytes。该实现明确不宣称完整 RFC 8785/JCS，跨语言数值和 Unicode 边界仍须以当前合同支持集验证。
+
+### V53-5. proof 与证明边界有限
+
+runtime observation 只证明进程可观察事实，deployment conformance 只证明静态清单；没有外部 attestation 时 assurance 最高为 `observed`。controller receipt 证明 LC 发起并记录执行，proxy receipt 证明 Proxy 边界处理调用，均不证明远端工具内部行为；external DeploymentProof 的签发、信任根、保留和撤销由部署方负责，正式 assurance 仍须环境门禁。
+
+## v0.54.0 边界声明
+
+### V54-1. dispatch 是 at-least-once，不保证外部副作用 exactly-once
+
+assignment/outbox、lease、attempt 与 fence 保证任务可恢复派发并拒绝旧 worker 提交，但网络中断可能发生在下游已执行而 ACK/receipt 未返回之后。下游必须按稳定 `delivery_id` 或等价 idempotency key 幂等去重，并校验当前 attempt/fence；无法判定副作用是否发生时状态保持 `outcome_unknown`，系统不会盲目 retry/failover。
+
+### V54-2. SQLite WAL 的部署范围有限
+
+可靠调度、migration 和事件状态使用 SQLite WAL，适用于单区域、小到中等规模。它不提供跨区域共识、多主复制或无限水平扩展；多 scheduler 的代码级并发/故障测试不等于真实多主数据库保证。
+
+### V54-3. DAG 与平台能力有意受限
+
+v0.54 仅提供有节点、边、深度、宽度和并行度硬上限的静态 DAG。它不是通用 workflow/BPMN 引擎，不支持循环图、Saga 或补偿事务 DSL；也不提供 federation、多集群 registry、动态 Agent 自助注册或全局公平调度。
+
+### V54-4. 支持环境生产保证仍待完成
+
+代码级 race/fault/security、migration、mTLS 和静态 conformance 可验证实现不变量，但不替代真实拓扑证据。正式发布前仍须在支持环境完成：真实双独立 OS 进程或容器的 worker/scheduler 崩溃接管；Protected MCP 完整 mTLS 拓扑；Go→Python strict；Docker/Kubernetes CNI/NetworkPolicy、Secret mount/隔离负向测试；以及 external DeploymentProof 环境门禁。Windows 仅支持开发，不提供 strict production assurance。

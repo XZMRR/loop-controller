@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from loop_controller.executors.base import ExecutionReceipt
 from loop_controller.identity import KillSwitchConfig, RevocationEntry, RevocationType
 
 
@@ -14,8 +15,18 @@ class GovernToolRequest(BaseModel):
     """POST /v1/govern/tool-call 请求体。"""
 
     agent_id: str = Field(..., description="Agent 身份标识")
-    user_id: str = Field(..., description="用户身份标识")
+    user_id: str | None = Field(default=None, description="可选真实用户身份；不得由 Agent 身份推导")
     tool_name: str = Field(..., description="Loop Controller 内部 canonical_name")
+    request_id: str | None = None
+    interaction_id: str | None = None
+    decision_id: str | None = None
+    call_id: str | None = None
+    delegation_jti: str | None = None
+    delegation_token: str | None = Field(default=None, exclude=True)
+    tenant_id: str | None = None
+    target_workload_id: str | None = None
+    target_instance_id: str | None = None
+    required_security_capabilities: list[str] | None = None
     arguments: dict = Field(default_factory=dict, description="工具参数")
     task_context: str = Field(default="", description="任务上下文")
     session_id: str | None = Field(default=None, description="可选 Session ID")
@@ -38,9 +49,12 @@ class GovernResponse(BaseModel):
     """治理接口统一响应体。"""
 
     status: str = Field(..., description="治理结果状态：allow / deny / require_approval / error / blocked / pending")
-    result: str = Field(..., description="给 Agent 的自然语言结果")
+    result: Any = Field(..., description="工具结果或治理说明")
     request_id: str | None = Field(default=None, description="require_approval / pending 时返回的 request_id")
     error_code: str | None = Field(default=None, description="error / blocked 时的错误码")
+    terminal_status: str | None = None
+    supported_security_capabilities: list[str] | None = None
+    execution_receipt: ExecutionReceipt | None = None
 
 
 class WaitApprovalResponse(BaseModel):
@@ -71,6 +85,13 @@ class HealthResponse(BaseModel):
     uptime_seconds: float = Field(default=0.0, description="服务运行秒数")
     harness_backends: list[dict[str, Any]] = Field(
         default_factory=list, description="Harness 后端状态摘要（v0.31.0）"
+    )
+    degraded_backends: list[str] = Field(
+        default_factory=list, description="显式启用的降级治理后端"
+    )
+    policy: dict[str, Any] = Field(default_factory=dict, description="OPA 策略加载状态")
+    execution_security: dict[str, Any] = Field(
+        default_factory=dict, description="净化后的执行安全状态"
     )
 
 

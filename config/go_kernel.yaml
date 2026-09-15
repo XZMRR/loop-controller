@@ -1,11 +1,20 @@
-# v0.36.1 Go 交互治理内核配置样例。
-# 默认禁用；启用后 Python Runtime 会自动连接 Go 内核并注册本地 Agent Card。
+# v0.54 Go 交互治理内核客户端配置样例。
+# 凭据在进程启动时读取为静态快照；SSE 重连复用同一安全客户端。
 go_kernel:
   enabled: false
-  base_url: "http://127.0.0.1:8080"
+  base_url: "https://127.0.0.1:8080"
   timeout: 5.0
+  # 仅显式 development: true 才允许 HTTP 或缺少 mTLS/control token。
   development: false
   dispatch_entrypoints: true
+  # Control Bearer 与 Go 内核签发 delegation token 的 HMAC secret 必须分离。
+  control_token_env: "LC_A2A_CONTROL_TOKEN"
+  approver_token_env: "LC_A2A_APPROVAL_TOKEN"
+  token_secret_env: "GO_KERNEL_TOKEN_SECRET"
+  mtls:
+    ca_file: "config/tls/ca.pem"
+    client_cert_file: "config/tls/client.pem"
+    client_key_file: "config/tls/client-key.pem"
   discovery:
     static_file: "config/a2a_agents.yaml"
   local_agent:
@@ -14,7 +23,4 @@ go_kernel:
     entrypoint: "http://127.0.0.1:8000"
     capabilities:
       - "delegate_execution"
-    version: "0.48.0"
-  # Go Kernel 非开发模式必须通过 -secret 或 GO_KERNEL_TOKEN_SECRET 注入密钥；
-  # 本地开发需显式使用 -development，此时会禁用正式 HTTP entrypoint 派发。
-  token_secret_env: "GO_KERNEL_TOKEN_SECRET"
+    version: "0.54.0"

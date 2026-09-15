@@ -33,9 +33,26 @@ from typing import Any
 
 import httpx
 
-from loop_controller.approval_service import ApprovalServiceError, build_approval_record
+from loop_controller.approval_service import (
+    ApprovalAuthenticationError,
+    ApprovalAuthorizationError,
+    ApprovalServiceError,
+    build_approval_record,
+    resolve_approver_principal,
+)
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
+from loop_controller.execution_security import (
+    REQUIRED_SECURITY_CAPABILITY_UNAVAILABLE,
+    ExecutionRequestContext,
+    ExecutionSecurityPolicy,
+    TLSWorkloadIdentityResolver,
+    WorkloadIdentityResolver,
+    canonical_arguments_sha256,
+    current_execution_request,
+    resolve_workload_identity,
+    supports_security_capabilities,
+)
 from loop_controller.identity import (
     AgentIdentity,
     IdentityCredential,
@@ -44,6 +61,15 @@ from loop_controller.identity import (
     RevocationType,
 )
 from loop_controller.infra.approval_store import ApprovalStoreError
+from loop_controller.infra.policy_delivery import (
+    ArtifactConflictError,
+    CandidateLimitError,
+    CandidateStateError,
+    InvalidCandidateError,
+    PolicyCASConflictError,
+    SeparationOfDutiesError,
+)
+from loop_controller.infra.state_db import StateDatabaseError
 from loop_controller.interaction.engine import (
     InteractionAuthorizeEndpoint,
     InteractionGovernanceEngine,
@@ -60,6 +86,28 @@ from loop_controller.metrics import (
     set_trace_id as metrics_set_trace_id,
 )
 from loop_controller.models import AuditEvent
+from loop_controller.policy_lifecycle import PolicyStatusError, PolicyStatusForbiddenError
+from loop_controller.policy_shadow import PolicyShadowService
+from loop_controller.rbac import (
+    AuthenticatedPrincipal,
+    RbacDenial,
+    RbacEnforcer,
+    Role,
+    StaticCredentialResolver,
+)
+from loop_controller.rbac.models import (
+    PERM_APPROVAL_DECIDE,
+    PERM_AUDIT_READ,
+    PERM_CANDIDATE_CREATE,
+    PERM_CANDIDATE_READ,
+    PERM_PUBLISH,
+    PERM_RBAC_MANAGE,
+    PERM_ROLLBACK,
+    PERM_SHADOW_RUN,
+    PERM_STATUS_READ,
+    PERM_VALIDATE_RUN,
+    RESOURCE_PUBLISH_GLOBAL,
+)
 from loop_controller.server_models import (
     AuditQueryResponse,
     GovernResponse,
@@ -225,6 +273,9 @@ class ToolGovernServer:
         start_time: float | None = None,
         identity_provider: IdentityProvider | None = None,
         entrypoints_config: dict[str, Any] | None = None,
+        execution_security: ExecutionSecurityPolicy | None = None,
+        workload_identity_resolver: WorkloadIdentityResolver | None = None,
+        delegation_token_verifier: Any = None,
     ) -> None:
         self._controller = controller
         self._api_key = api_key
@@ -232,6 +283,18 @@ class ToolGovernServer:
         self._start_time = start_time or time.time()
         self._identity_provider = identity_provider or _extract_identity_provider(controller)
         self._entrypoints_config = entrypoints_config or {}
+        runtime_policy = getattr(
+            controller._runtime, "execution_security_policy", None
+        )
+        self._execution_security = (
+            execution_security or runtime_policy or ExecutionSecurityPolicy()
+        )
+        self._workload_identity_resolver = workload_identity_resolver or TLSWorkloadIdentityResolver(
+            self._execution_security.workload_registry
+        )
+        self._delegation_token_verifier = delegation_token_verifier or getattr(
+            controller._runtime, "delegation_token_verifier", None
+        )
 
     def _http_require_auth(self) -> bool:
         """读取 entrypoints.http.require_auth；缺省 false 保持向后兼容。"""
@@ -254,6 +317,14 @@ class ToolGovernServer:
                     return True
         return False
 
+    @staticmethod
+    def _check_bearer(request: Request, expected: str | None) -> bool:
+        if not expected:
+            return False
+        auth = request.headers.get("authorization") or ""
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        return bool(token and len(token) == len(expected) and hmac.compare_digest(token, expected))
+
     def _admin_actor_id(self, request: Request) -> str:
         """从请求中提取管理员 API key 的匿名标识；未认证时返回 unauthenticated。"""
         if not self._api_key:
@@ -269,6 +340,183 @@ class ToolGovernServer:
             return "unauthenticated"
         return f"api-key:{hashlib.sha256(key.encode()).hexdigest()[:12]}"
 
+    # ------------------------------------------------------------------
+    # v0.52 统一访问控制平面（认证 + 授权）
+    # ------------------------------------------------------------------
+
+    def _rbac_enforcer(self) -> RbacEnforcer | None:
+        return getattr(self._controller._runtime, "rbac_enforcer", None)
+
+    def _rbac_store(self) -> Any:
+        return getattr(self._controller._runtime, "rbac_store", None)
+
+    def _bearer_token(self, request: Request) -> str | None:
+        auth = request.headers.get("authorization") or ""
+        return auth[7:].strip() if auth.lower().startswith("bearer ") else None
+
+    async def _authenticate(self, request: Request) -> AuthenticatedPrincipal | None:
+        """凭证层解析（fail-closed）：静态角色凭证 → JWT → legacy api key 兼容层。
+
+        凭证即身份：token 不落盘，轮换 = 替换 env 值，旧 token 即时失效。
+        """
+        runtime = self._controller._runtime
+        resolver: StaticCredentialResolver | None = getattr(
+            runtime, "rbac_credential_resolver", None
+        )
+        token = self._bearer_token(request)
+        if resolver is not None:
+            principal = resolver.resolve(request.headers.get("x-lc-principal"), token)
+            if principal is not None:
+                return principal
+        provider: IdentityProvider | None = getattr(self, "_identity_provider", None)
+        if provider is not None and token:
+            identity = await provider.verify(IdentityCredential(token=token))
+            if identity is not None:
+                roles: tuple[str, ...] = ()
+                rbac_cfg = getattr(getattr(runtime, "config", None), "rbac", None)
+                if getattr(rbac_cfg, "dynamic_role_bindings", False):
+                    role_map = getattr(rbac_cfg, "role_map", {}) or {}
+                    mapped = {role_map[name] for name in identity.roles if name in role_map}
+                    roles = tuple(sorted(mapped))
+                return AuthenticatedPrincipal(
+                    principal_id=identity.user_id or identity.agent_id,
+                    tenant_id=identity.tenant_id,
+                    roles=roles,
+                    auth_method="jwt",
+                )
+        if self._check_api_key(request):
+            rbac_cfg = getattr(getattr(runtime, "config", None), "rbac", None)
+            if getattr(rbac_cfg, "legacy_key_role", "platform_admin") == "reject":
+                return None
+            return AuthenticatedPrincipal(
+                principal_id=self._admin_actor_id(request),
+                tenant_id=None,
+                roles=(Role.PLATFORM_ADMIN.value,),
+                auth_method="legacy-key",
+            )
+        return None
+
+    def _record_denial(
+        self,
+        request: Request,
+        principal: AuthenticatedPrincipal,
+        permission: str,
+        reason: str,
+    ) -> None:
+        """每次 403 写 rbac_denials（无自动清理，由部署方归档）。"""
+        from datetime import UTC, datetime
+
+        store = self._rbac_store()
+        if store is None:
+            return
+        try:
+            store.record_denial(
+                RbacDenial(
+                    denial_id=uuid.uuid4().hex,
+                    actor=principal.principal_id,
+                    endpoint=request.url.path,
+                    required_permission=permission,
+                    principal_tenant=principal.tenant_id,
+                    reason=reason[:512],
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - 拒绝事件失败不阻断 403
+            logger.warning("记录 RBAC 拒绝事件失败: %s", exc)
+
+    async def _require(
+        self,
+        request: Request,
+        permission: str,
+        tenant_id: str | None = None,
+    ) -> tuple[AuthenticatedPrincipal | None, JSONResponse | None]:
+        """认证 + 授权一步式入口。
+
+        enforcement 关闭（runtime.rbac_enforcer 为 None）时维持 legacy api key 行为，
+        零行为变化；开启时未绑定角色一律 403 并写拒绝审计。
+        """
+        enforcer = self._rbac_enforcer()
+        if enforcer is None:
+            if not self._check_api_key(request):
+                return None, JSONResponse({"error": "unauthorized"}, status_code=401)
+            return (
+                AuthenticatedPrincipal(
+                    principal_id=self._admin_actor_id(request),
+                    tenant_id=None,
+                    roles=(Role.PLATFORM_ADMIN.value,),
+                    auth_method="legacy-key",
+                ),
+                None,
+            )
+        principal = await self._authenticate(request)
+        if principal is None:
+            return None, JSONResponse({"error": "unauthorized"}, status_code=401)
+        decision = enforcer.authorize(principal, permission, tenant_id)
+        if not decision.allowed:
+            self._record_denial(request, principal, permission, decision.reason)
+            return None, JSONResponse(
+                {"error": "forbidden", "reason": decision.reason}, status_code=403
+            )
+        return principal, None
+
+    def _is_platform_admin(self, principal: AuthenticatedPrincipal) -> bool:
+        enforcer = self._rbac_enforcer()
+        if enforcer is None:
+            return True
+        return Role.PLATFORM_ADMIN in enforcer.roles_for(principal)
+
+    async def _authenticate_only(
+        self, request: Request
+    ) -> tuple[AuthenticatedPrincipal | None, JSONResponse | None]:
+        """仅认证（enforcement 关闭时维持 legacy api key 行为，零行为变化）。"""
+        enforcer = self._rbac_enforcer()
+        if enforcer is None:
+            if not self._check_api_key(request):
+                return None, JSONResponse({"error": "unauthorized"}, status_code=401)
+            return (
+                AuthenticatedPrincipal(
+                    principal_id=self._admin_actor_id(request),
+                    tenant_id=None,
+                    roles=(Role.PLATFORM_ADMIN.value,),
+                    auth_method="legacy-key",
+                ),
+                None,
+            )
+        principal = await self._authenticate(request)
+        if principal is None:
+            return None, JSONResponse({"error": "unauthorized"}, status_code=401)
+        return principal, None
+
+    def _authorize(
+        self,
+        request: Request,
+        principal: AuthenticatedPrincipal,
+        permission: str,
+        tenant_id: str | None,
+    ) -> JSONResponse | None:
+        """资源租户已知的二次授权；返回 None 表示放行。"""
+        enforcer = self._rbac_enforcer()
+        if enforcer is None:
+            return None
+        decision = enforcer.authorize(principal, permission, tenant_id)
+        if decision.allowed:
+            return None
+        self._record_denial(request, principal, permission, decision.reason)
+        return JSONResponse({"error": "forbidden", "reason": decision.reason}, status_code=403)
+
+    async def _require_self(
+        self, request: Request, permission: str
+    ) -> tuple[AuthenticatedPrincipal | None, JSONResponse | None]:
+        """仅按角色集合鉴权（数据域由 handler 按 principal.tenant_id 过滤）。"""
+        principal, error = await self._authenticate_only(request)
+        if error is not None:
+            return None, error
+        assert principal is not None
+        error = self._authorize(request, principal, permission, principal.tenant_id)
+        if error is not None:
+            return None, error
+        return principal, None
+
     async def _audit_admin_operation(
         self,
         request: Request,
@@ -276,11 +524,12 @@ class ToolGovernServer:
         *,
         target: str,
         metadata: dict[str, Any] | None = None,
+        actor_id: str | None = None,
     ) -> None:
         audit_store = getattr(self._controller._runtime, "audit_store", None)
         if audit_store is None:
             return
-        actor_id = self._admin_actor_id(request)
+        actor_id = actor_id or self._admin_actor_id(request)
         trace_id = getattr(request.state, "trace_id", uuid.uuid4().hex[:16])
         await audit_store.append_async(
             AuditEvent(
@@ -361,11 +610,46 @@ class ToolGovernServer:
             backend["status"] not in {"healthy", "degraded"} or backend.get("draining", False)
             for backend in harness_backends
         )
+        degraded_backends = list(
+            getattr(self._controller._runtime, "degraded_backends", ())
+        )
+        lifecycle = getattr(self._controller._runtime, "policy_lifecycle", None)
+        policy_status = lifecycle.status() if lifecycle is not None else {}
+        policy_degraded = bool(
+            lifecycle is not None
+            and (
+                not opa_reachable
+                or not policy_status.get("expected_revision")
+                or policy_status.get("active_revision") != policy_status.get("expected_revision")
+                or policy_status.get("stale_instances")
+                or policy_status.get("error_instances")
+            )
+        )
+        security_status = getattr(self._controller._runtime, "security_status", None)
+        execution_security = (
+            security_status.as_dict()
+            if security_status is not None
+            else {"status": "not_strict", "mode": "compatibility", "runtime_assurance": "unknown"}
+        )
+        index_status = getattr(audit_store, "index_status", None)
+        if index_status is not None:
+            execution_security["audit_correlation"] = {
+                "status": "ready" if index_status.healthy else "degraded",
+                "reason": None if index_status.healthy else "audit_index_degraded",
+            }
+            if execution_security.get("mode") == "strict" and not index_status.healthy:
+                execution_security["status"] = "degraded"
+                reasons = list(execution_security.get("reasons", []))
+                if "audit_index_degraded" not in reasons:
+                    reasons.append("audit_index_degraded")
+                execution_security["reasons"] = reasons
         degraded = (
             evidence_status == "degraded"
             or anchor_summary["anchor_status"] not in {"disabled", "healthy"}
             or persistence_status != "healthy"
             or harness_degraded
+            or bool(degraded_backends)
+            or policy_degraded
         )
         return JSONResponse(
             HealthResponse(
@@ -377,9 +661,32 @@ class ToolGovernServer:
                 durability=durability,
                 uptime_seconds=round(uptime, 2),
                 harness_backends=harness_backends,
+                degraded_backends=degraded_backends,
+                policy=policy_status,
+                execution_security=execution_security,
                 **anchor_summary,
             ).model_dump()
         )
+
+    async def _handle_ready(self, request: Request) -> JSONResponse:
+        response = await self._handle_health(request)
+        body = bytes(response.body)
+        import json
+        payload = json.loads(body)
+        security = payload["execution_security"]
+        if security.get("mode") == "strict":
+            runtime = self._controller._runtime
+            harness = getattr(runtime, "harness_executor", None)
+            harness_ready = True
+            if "remote_harness" in security.get("enabled_egress_types", []):
+                harness_ready = harness is not None and all(
+                    item.status == "healthy" and not item.draining
+                    for item in harness.backend_statuses()
+                )
+            ready = security.get("status") == "ready" and harness_ready
+        else:
+            ready = True
+        return JSONResponse(payload, status_code=200 if ready else 503)
 
     async def _handle_identity(self, request: Request) -> JSONResponse:
         """v0.20.0：调试端点，返回当前 Bearer token 解析出的身份摘要。"""
@@ -442,11 +749,57 @@ class ToolGovernServer:
             )
         return JSONResponse(response)
 
+    def _verify_delegation_token(
+        self, token: str | None, payload: dict[str, Any], *, lifecycle: bool = False
+    ) -> str | None:
+        if not token or self._delegation_token_verifier is None:
+            return "delegation_token_required"
+        try:
+            claims = self._delegation_token_verifier.verify(token)
+        except Exception:
+            return "delegation_token_invalid"
+        bindings = {
+            "request_id": payload.get("request_id"),
+            "interaction_id": payload.get("interaction_id"),
+            "decision_id": payload.get("decision_id"),
+            "task_id": payload.get("task_id"),
+            "jti": payload.get("delegation_jti"),
+            "tenant_id": payload.get("tenant_id"),
+            "target_agent_id": payload.get("target_agent_id") or payload.get("agent_id"),
+            "target_workload_id": payload.get("target_workload_id"),
+            "target_instance_id": payload.get("target_instance_id"),
+        }
+        for name, expected in bindings.items():
+            if expected is not None and claims.get(name) != expected:
+                return "delegation_token_binding_mismatch"
+        if claims.get("aud") != bindings["target_agent_id"]:
+            return "delegation_token_binding_mismatch"
+        if not lifecycle:
+            if claims.get("tool_name") != payload.get("tool_name"):
+                return "delegation_token_binding_mismatch"
+            if claims.get("arguments_sha256") != canonical_arguments_sha256(
+                payload.get("arguments") or {}
+            ):
+                return "delegation_token_binding_mismatch"
+            if claims.get("allowed_tools") != payload.get("allowed_tools") or claims.get(
+                "allowed_capabilities"
+            ) != payload.get("allowed_capabilities"):
+                return "delegation_token_binding_mismatch"
+            if bool(claims.get("allow_redelegation")) != bool(
+                payload.get("allow_redelegation")
+            ):
+                return "delegation_token_binding_mismatch"
+        return None
+
     async def _handle_interaction_lifecycle(self, request: Request) -> JSONResponse:
         """接收 Go Kernel 的 Interaction/Task 生命周期审计通知。"""
-        authorized, _identity = await self._check_agent_auth(request)
-        if not authorized:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        workload = await resolve_workload_identity(self._workload_identity_resolver, request)
+        if self._execution_security.strict and workload is None:
+            return JSONResponse({"error": "workload_identity_required"}, status_code=401)
+        if not self._execution_security.strict:
+            authorized, _identity = await self._check_agent_auth(request)
+            if not authorized:
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
         try:
             payload = await request.json()
             if not isinstance(payload, dict):
@@ -463,6 +816,36 @@ class ToolGovernServer:
             missing = [field for field in required if not payload.get(field)]
             if missing:
                 raise ValueError(f"missing lifecycle fields: {', '.join(missing)}")
+            if self._execution_security.strict:
+                strict_required = ("request_id", "tenant_id", "target_workload_id", "required_security_capabilities")
+                strict_missing = [field for field in strict_required if not payload.get(field)]
+                if strict_missing or workload is None:
+                    raise ValueError(REQUIRED_SECURITY_CAPABILITY_UNAVAILABLE)
+                if not supports_security_capabilities(
+                    payload["required_security_capabilities"],
+                    self._execution_security.supported_security_capabilities,
+                ):
+                    raise ValueError(REQUIRED_SECURITY_CAPABILITY_UNAVAILABLE)
+                target_instance_id = payload.get("target_instance_id")
+                if self._execution_security.require_instance_identity and (
+                    not workload.authenticated_instance_id
+                    or not target_instance_id
+                    or workload.authenticated_instance_id != target_instance_id
+                ):
+                    return JSONResponse({"error": "workload_scope_mismatch"}, status_code=403)
+                if payload["target_workload_id"] != workload.workload_id or not self._execution_security.workload_registry.authorize(
+                    workload,
+                    agent_id=payload["target_agent_id"],
+                    tenant_id=payload["tenant_id"],
+                    target_instance_id=(target_instance_id if self._execution_security.require_instance_identity else None),
+                    lifecycle=True,
+                ):
+                    return JSONResponse({"error": "workload_scope_mismatch"}, status_code=403)
+                token_error = self._verify_delegation_token(
+                    payload.get("delegation_token"), payload, lifecycle=True
+                )
+                if token_error:
+                    return JSONResponse({"error": token_error}, status_code=403)
             expected_event_id = f"lifecycle:{payload['task_id']}:{payload['event']}"
             if payload["event_id"] != expected_event_id:
                 raise ValueError("lifecycle event_id does not match task and event")
@@ -482,9 +865,15 @@ class ToolGovernServer:
         )
 
     async def _handle_govern_tool_call(self, request: Request) -> JSONResponse:
-        authorized, identity = await self._check_agent_auth(request)
-        if not authorized:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        workload = await resolve_workload_identity(self._workload_identity_resolver, request)
+        if self._execution_security.strict:
+            if workload is None:
+                return JSONResponse({"error": "workload_identity_required"}, status_code=401)
+            identity = None
+        else:
+            authorized, identity = await self._check_agent_auth(request)
+            if not authorized:
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         try:
             body = GovernToolRequest(**await request.json())
@@ -492,7 +881,50 @@ class ToolGovernServer:
             logger.warning("invalid tool-call request: %s", exc)
             return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
 
+        if self._execution_security.strict:
+            required_fields = (
+                "request_id", "decision_id", "task_id", "call_id", "tenant_id",
+                "target_workload_id", "delegation_jti", "required_security_capabilities",
+            )
+            if any(not getattr(body, field) for field in required_fields):
+                return JSONResponse(
+                    {"status": "blocked", "result": REQUIRED_SECURITY_CAPABILITY_UNAVAILABLE,
+                     "error_code": REQUIRED_SECURITY_CAPABILITY_UNAVAILABLE,
+                     "supported_security_capabilities": sorted(self._execution_security.supported_security_capabilities)},
+                    status_code=503,
+                )
+            if not supports_security_capabilities(
+                body.required_security_capabilities or (),
+                self._execution_security.supported_security_capabilities,
+            ):
+                return JSONResponse(
+                    {"status": "blocked", "result": REQUIRED_SECURITY_CAPABILITY_UNAVAILABLE,
+                     "error_code": REQUIRED_SECURITY_CAPABILITY_UNAVAILABLE,
+                     "supported_security_capabilities": sorted(self._execution_security.supported_security_capabilities)},
+                    status_code=503,
+                )
+            assert workload is not None and body.tenant_id is not None
+            if self._execution_security.require_instance_identity and (
+                not workload.authenticated_instance_id
+                or not body.target_instance_id
+                or workload.authenticated_instance_id != body.target_instance_id
+            ):
+                return JSONResponse({"error": "workload_scope_mismatch"}, status_code=403)
+            if body.target_workload_id != workload.workload_id or not self._execution_security.workload_registry.authorize(
+                workload,
+                agent_id=body.agent_id,
+                tenant_id=body.tenant_id,
+                target_instance_id=(body.target_instance_id if self._execution_security.require_instance_identity else None),
+            ):
+                return JSONResponse({"error": "workload_scope_mismatch"}, status_code=403)
+            token_error = self._verify_delegation_token(
+                body.delegation_token, body.model_dump(mode="json")
+            )
+            if token_error:
+                return JSONResponse({"error": token_error}, status_code=403)
+
         # 当身份 Provider 可用时，使用凭证中的 agent_id/user_id，请求体只做一致性校验。
+        user_id: str | None
         if identity is not None:
             if body.agent_id and body.agent_id != identity.agent_id:
                 return JSONResponse(
@@ -538,15 +970,35 @@ class ToolGovernServer:
             user_id,
             body.tool_name,
         )
-        result = await self._controller.evaluate_and_execute(
-            agent_id=agent_id,
-            user_id=user_id,
-            tool_name=body.tool_name,
-            arguments=body.arguments,
-            task_context=body.task_context,
-            session_id=body.session_id,
-            task_id=body.task_id,
-        )
+        context_token = None
+        if self._execution_security.strict:
+            assert workload is not None
+            context_token = current_execution_request.set(
+                ExecutionRequestContext(
+                    workload_identity=workload,
+                    request_id=body.request_id or "",
+                    interaction_id=body.interaction_id,
+                    decision_id=body.decision_id or "",
+                    task_id=body.task_id or "",
+                    call_id=body.call_id or "",
+                    delegation_jti=body.delegation_jti,
+                    tenant_id=body.tenant_id or "",
+                    security_capabilities=frozenset(body.required_security_capabilities or ()),
+                )
+            )
+        try:
+            result = await self._controller.evaluate_and_execute(
+                agent_id=agent_id,
+                user_id=user_id or "",
+                tool_name=body.tool_name,
+                arguments=body.arguments,
+                task_context=body.task_context,
+                session_id=body.session_id,
+                task_id=body.task_id,
+            )
+        finally:
+            if context_token is not None:
+                current_execution_request.reset(context_token)
         observe_tool_call(body.tool_name, result.status)
         self._refresh_pending_approvals()
 
@@ -555,6 +1007,16 @@ class ToolGovernServer:
             result=result.content if result.content is not None else result.reason or result.status,
             request_id=result.request_id if result.status == "require_approval" else None,
             error_code=result.error_code,
+            terminal_status=(
+                result.terminal_status
+                or (result.execution_receipt.status.value if result.execution_receipt else None)
+            ),
+            execution_receipt=result.execution_receipt,
+            supported_security_capabilities=(
+                sorted(self._execution_security.supported_security_capabilities)
+                if self._execution_security.strict
+                else None
+            ),
         )
         logger.info(
             "tool_call result status=%s tool=%s request_id=%s",
@@ -562,7 +1024,7 @@ class ToolGovernServer:
             body.tool_name,
             result.request_id,
         )
-        return JSONResponse(response.model_dump())
+        return JSONResponse(response.model_dump(mode="json"))
 
     def _validate_delegated_tool_scope(self, body: GovernToolRequest) -> str | None:
         delegated = body.task_id is not None or body.allowed_tools is not None or body.allowed_capabilities is not None
@@ -625,7 +1087,12 @@ class ToolGovernServer:
                 else result.reason or result.status,
                 request_id=body.request_id if result.status == "require_approval" else None,
                 error_code=result.error_code,
-            ).model_dump()
+                terminal_status=(
+                    result.terminal_status
+                    or (result.execution_receipt.status.value if result.execution_receipt else None)
+                ),
+                execution_receipt=result.execution_receipt,
+            ).model_dump(mode="json")
         )
 
     async def _handle_wait_for_approval(self, request: Request) -> JSONResponse:
@@ -992,8 +1459,17 @@ class ToolGovernServer:
         return JSONResponse(summary)
 
     async def _handle_admin_approval(self, request: Request, *, verdict: str) -> JSONResponse:
-        if not self._check_api_key(request):
+        auth = request.headers.get("authorization") or ""
+        credential = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        try:
+            principal = resolve_approver_principal(
+                credential,
+                self._entrypoints_config.get("approval_auth") or {},
+            )
+        except ApprovalAuthenticationError:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
+        except ApprovalAuthorizationError:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
 
         decision_id = request.path_params["decision_id"]
         try:
@@ -1002,16 +1478,31 @@ class ToolGovernServer:
             body = {}
         if not isinstance(body, dict):
             body = {}
-        approver_id = str(body.get("approver", "")).strip()
         comment = str(body.get("comment", "")).strip()
-        if not approver_id:
-            return JSONResponse({"error": "approver is required"}, status_code=422)
 
         approval_manager = self._controller._runtime.approval_manager
         store = approval_manager._store
         store.refresh()
         req = store.get_request(decision_id)
         existing = store.get_record(decision_id)
+
+        # 审批 tenant 双轨锚定（v0.52 §4.4）：approval_auth principal 必须持有落在
+        # 请求租户上的 approver RBAC 绑定；不一致即 403，fail-closed。
+        enforcer = self._rbac_enforcer()
+        if enforcer is not None and req is not None:
+            req_tenant = getattr(req, "tenant_id", None)
+            if not enforcer.approver_binding_matches(principal, req_tenant):
+                denial_principal = AuthenticatedPrincipal(
+                    principal_id=principal,
+                    tenant_id=req_tenant,
+                    roles=(),
+                    auth_method="approval-auth",
+                )
+                reason = (
+                    f"approver RBAC 绑定与请求租户不一致: request_tenant={req_tenant!r}"
+                )
+                self._record_denial(request, denial_principal, PERM_APPROVAL_DECIDE, reason)
+                return JSONResponse({"error": "forbidden", "reason": reason}, status_code=403)
 
         identity = self._identity_provider
 
@@ -1024,11 +1515,13 @@ class ToolGovernServer:
             record = build_approval_record(
                 req,
                 existing,
-                approver_id,
+                principal,
                 verdict,
                 comment,
                 approver_exists=_approver_exists,
             )
+        except ApprovalAuthorizationError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=403)
         except ApprovalServiceError as exc:
             status = 409 if "已有审批结果" in str(exc) else 422
             return JSONResponse({"error": str(exc)}, status_code=status)
@@ -1045,7 +1538,14 @@ class ToolGovernServer:
             request,
             f"approval_{verdict}",
             target=f"decision:{decision_id}",
-            metadata={"approver_id": approver_id, "comment": comment},
+            metadata={
+                "principal": principal,
+                "request_id": req.request_id if req is not None else None,
+                "decision_id": decision_id,
+                "action_summary": f"approval_{verdict}",
+                "comment": comment,
+            },
+            actor_id=principal,
         )
         return JSONResponse({"decision_id": decision_id, "verdict": verdict})
 
@@ -1055,16 +1555,514 @@ class ToolGovernServer:
     async def _handle_admin_approvals_deny(self, request: Request) -> JSONResponse:
         return await self._handle_admin_approval(request, verdict="deny")
 
-    async def _handle_admin_audit(self, request: Request) -> JSONResponse:
-        if not self._check_api_key(request):
+    @staticmethod
+    def _candidate_payload(candidate: Any) -> dict[str, Any]:
+        return {
+            "candidate_id": candidate.candidate_id,
+            "state": candidate.state.value,
+            "base_revision": candidate.base_revision,
+            "source_sha256": candidate.source_sha256,
+            "revision": candidate.revision,
+            "artifact_sha256": candidate.artifact_sha256,
+            "artifact_size": candidate.artifact_size,
+            "created_by": candidate.created_by,
+            "created_at": candidate.created_at,
+            "published_at": candidate.published_at,
+            "rollback_of_revision": candidate.rollback_of_revision,
+            "tenant_id": candidate.tenant_id,
+        }
+
+    def _policy_services(self) -> tuple[Any, Any, Any]:
+        runtime = self._controller._runtime
+        return (
+            getattr(runtime, "policy_delivery", None),
+            getattr(runtime, "policy_validation", None),
+            getattr(runtime, "policy_lifecycle", None),
+        )
+
+    async def _handle_policy_candidates(self, request: Request) -> JSONResponse:
+        delivery, _validation, _lifecycle = self._policy_services()
+        if delivery is None:
+            return JSONResponse({"error": "policy_delivery_unavailable"}, status_code=503)
+        if request.method == "GET":
+            principal, error = await self._require_self(request, PERM_CANDIDATE_READ)
+            if error is not None:
+                return error
+            assert principal is not None
+            if self._is_platform_admin(principal):
+                candidates = delivery.store.list_candidates()
+            else:
+                candidates = delivery.store.list_candidates(tenant_id=principal.tenant_id)
+            return JSONResponse({"candidates": [self._candidate_payload(item) for item in candidates]})
+        principal, error = await self._require_self(request, PERM_CANDIDATE_CREATE)
+        if error is not None:
+            return error
+        assert principal is not None
+        try:
+            body = await request.json()
+            files = body.get("files")
+            if isinstance(files, list):
+                files = {item["path"]: item["content"] for item in files}
+            candidate = delivery.create_candidate(
+                files, base_revision=body.get("base_revision"),
+                actor=principal.principal_id, tenant_id=principal.tenant_id,
+            )
+            await self._audit_admin_operation(
+                request, "policy_candidate_create", target=candidate.candidate_id,
+                metadata={"base_revision": candidate.base_revision, "source_sha256": candidate.source_sha256, "result": "success", "actor": principal.principal_id, "auth_method": principal.auth_method},
+                actor_id=principal.principal_id,
+            )
+            return JSONResponse(self._candidate_payload(candidate), status_code=201)
+        except CandidateLimitError:
+            return JSONResponse({"error": "candidate_limit"}, status_code=413)
+        except (InvalidCandidateError, KeyError, TypeError, ValueError):
+            return JSONResponse({"error": "invalid_candidate"}, status_code=400)
+        except StateDatabaseError:
+            return JSONResponse({"error": "policy_delivery_unavailable"}, status_code=503)
+
+    async def _handle_policy_candidate(self, request: Request) -> JSONResponse:
+        delivery, _validation, _lifecycle = self._policy_services()
+        if delivery is None:
+            return JSONResponse({"error": "policy_delivery_unavailable"}, status_code=503)
+        principal, error = await self._authenticate_only(request)
+        if error is not None:
+            return error
+        assert principal is not None
+        candidate = delivery.store.get_candidate(request.path_params["candidate_id"])
+        if candidate is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        error = self._authorize(request, principal, PERM_CANDIDATE_READ, candidate.tenant_id)
+        if error is not None:
+            return error
+        return JSONResponse(self._candidate_payload(candidate))
+
+    async def _handle_policy_validate(self, request: Request) -> JSONResponse:
+        delivery, validation, _lifecycle = self._policy_services()
+        if delivery is None or validation is None:
+            return JSONResponse({"error": "policy_validation_unavailable"}, status_code=503)
+        principal, error = await self._authenticate_only(request)
+        if error is not None:
+            return error
+        assert principal is not None
+        candidate_id = request.path_params["candidate_id"]
+        existing = delivery.store.get_candidate(candidate_id)
+        if existing is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        error = self._authorize(request, principal, PERM_VALIDATE_RUN, existing.tenant_id)
+        if error is not None:
+            return error
+        if existing.state.value != "draft":
+            return JSONResponse(self._candidate_payload(existing))
+        try:
+            candidate, result = validation.validate(candidate_id, actor=principal.principal_id)
+            await self._audit_admin_operation(
+                request, "policy_validate", target=candidate_id,
+                metadata={"base_revision": candidate.base_revision, "target_revision": candidate.revision, "source_sha256": candidate.source_sha256, "artifact_sha256": candidate.artifact_sha256, "result": "success" if result.ok else "failed", "result_sha256": result.result_sha256, "actor": principal.principal_id, "auth_method": principal.auth_method},
+                actor_id=principal.principal_id,
+            )
+            payload = {**self._candidate_payload(candidate), "validation": result.model_dump(mode="json")}
+            return JSONResponse(payload, status_code=200 if result.ok else 422)
+        except (InvalidCandidateError, CandidateStateError):
+            return JSONResponse({"error": "candidate_state_conflict"}, status_code=409)
+        except (StateDatabaseError, OSError):
+            return JSONResponse({"error": "policy_validation_unavailable"}, status_code=503)
+
+    async def _handle_policy_shadow(self, request: Request) -> JSONResponse:
+        runtime = self._controller._runtime
+        delivery = getattr(runtime, "policy_delivery", None)
+        shadow = getattr(runtime, "policy_shadow", None)
+        runner = getattr(runtime, "policy_shadow_runner", None)
+        if delivery is None or (shadow is None and runner is None):
+            return JSONResponse({"error": "shadow_unavailable"}, status_code=503)
+        principal, error = await self._authenticate_only(request)
+        if error is not None:
+            return error
+        assert principal is not None
+        candidate = delivery.store.get_candidate(request.path_params["candidate_id"])
+        if candidate is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        error = self._authorize(request, principal, PERM_SHADOW_RUN, candidate.tenant_id)
+        if error is not None:
+            return error
+        if candidate.state.value not in {"validated", "published", "loaded"}:
+            return JSONResponse({"error": "candidate_state_conflict"}, status_code=409)
+        try:
+            body = await request.json()
+            requested_revision = body.get("revision")
+            requested_hash = body.get("artifact_sha256")
+            if requested_revision != candidate.revision or requested_hash != candidate.artifact_sha256:
+                return JSONResponse({"error": "candidate_artifact_mismatch"}, status_code=409)
+            if runner is not None:
+                config = getattr(runtime, "config", None)
+                delivery_cfg = getattr(config, "policy_delivery", None) if config is not None else None
+                shadow = PolicyShadowService.for_candidate(
+                    delivery, runner, candidate.candidate_id, requested_revision, requested_hash,
+                    max_samples=getattr(delivery_cfg, "shadow_max_samples", 1000),
+                    max_input_bytes=getattr(delivery_cfg, "shadow_max_input_bytes", 65536),
+                )
+            if shadow is None:
+                return JSONResponse({"error": "shadow_unavailable"}, status_code=503)
+            result = await shadow.run(body.get("samples", []))
+            await self._audit_admin_operation(
+                request, "policy_shadow", target=candidate.candidate_id,
+                metadata={"base_revision": candidate.base_revision, "target_revision": candidate.revision, "source_sha256": candidate.source_sha256, "artifact_sha256": candidate.artifact_sha256, "input_set_digest": result.input_set_digest, "result_sha256": result.result_sha256, "result": "success" if result.ok else "failed", "actor": principal.principal_id, "auth_method": principal.auth_method},
+                actor_id=principal.principal_id,
+            )
+            return JSONResponse(result.model_dump(mode="json"), status_code=200 if result.ok else 503)
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "invalid_shadow_samples"}, status_code=400)
+
+    async def _handle_policy_publish(self, request: Request) -> JSONResponse:
+        delivery, _validation, _lifecycle = self._policy_services()
+        if delivery is None:
+            return JSONResponse({"error": "policy_delivery_unavailable"}, status_code=503)
+        principal, error = await self._authenticate_only(request)
+        if error is not None:
+            return error
+        assert principal is not None
+        candidate_id = request.path_params["candidate_id"]
+        candidate = delivery.store.get_candidate(candidate_id)
+        if candidate is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        error = self._authorize(request, principal, PERM_PUBLISH, candidate.tenant_id)
+        if error is not None:
+            return error
+        enforcer = self._rbac_enforcer()
+        if enforcer is not None:
+            scope = enforcer.check_publish_scope(principal)
+            if not scope.allowed:
+                self._record_denial(request, principal, RESOURCE_PUBLISH_GLOBAL, scope.reason)
+                return JSONResponse({"error": "forbidden", "reason": scope.reason}, status_code=403)
+        try:
+            body = await request.json()
+            waiver_reason = body.get("waiver_reason")
+            waive = bool(waiver_reason) and enforcer is not None and enforcer.can_waive_separation(principal)
+            result = delivery.store.publish(
+                candidate_id, body.get("base_revision"), principal.principal_id,
+                enforce_separation=enforcer is not None,
+                waive_separation=waive, waiver_reason=waiver_reason,
+            )
+            candidate = delivery.store.get_candidate(candidate_id)
+            assert candidate is not None
+            await self._audit_admin_operation(
+                request, "policy_publish", target=candidate_id,
+                metadata={"base_revision": body.get("base_revision"), "target_revision": result["revision"], "source_sha256": candidate.source_sha256, "artifact_sha256": candidate.artifact_sha256, "generation": result["generation"], "result": "success", "actor": principal.principal_id, "auth_method": principal.auth_method, "separation_waived": waive},
+                actor_id=principal.principal_id,
+            )
+            return JSONResponse({**result, "state": "published"}, status_code=202)
+        except SeparationOfDutiesError as exc:
+            return JSONResponse({"error": "separation_of_duties_violation", "reason": str(exc)}, status_code=409)
+        except PolicyCASConflictError:
+            return JSONResponse({"error": "base_revision_conflict"}, status_code=409)
+        except CandidateStateError:
+            return JSONResponse({"error": "candidate_state_conflict"}, status_code=409)
+        except (ArtifactConflictError, StateDatabaseError):
+            return JSONResponse({"error": "policy_delivery_unavailable"}, status_code=503)
+
+    async def _handle_policy_rollback(self, request: Request) -> JSONResponse:
+        delivery, _validation, _lifecycle = self._policy_services()
+        if delivery is None:
+            return JSONResponse({"error": "policy_delivery_unavailable"}, status_code=503)
+        principal, error = await self._authenticate_only(request)
+        if error is not None:
+            return error
+        assert principal is not None
+        # 回滚按平台级影响面处理：全局 current pointer，仅 platform_admin 或 publish_scope 授权
+        enforcer = self._rbac_enforcer()
+        error = self._authorize(request, principal, PERM_ROLLBACK, principal.tenant_id)
+        if error is not None:
+            return error
+        if enforcer is not None:
+            scope = enforcer.check_publish_scope(principal)
+            if not scope.allowed:
+                self._record_denial(request, principal, RESOURCE_PUBLISH_GLOBAL, scope.reason)
+                return JSONResponse({"error": "forbidden", "reason": scope.reason}, status_code=403)
+        try:
+            body = await request.json()
+            waiver_reason = body.get("waiver_reason")
+            waive = bool(waiver_reason) and enforcer is not None and enforcer.can_waive_separation(principal)
+            candidate, result = delivery.store.rollback(
+                body["revision"], body.get("base_revision"), principal.principal_id,
+                enforce_separation=enforcer is not None,
+                waive_separation=waive, waiver_reason=waiver_reason,
+            )
+            await self._audit_admin_operation(
+                request, "policy_rollback", target=candidate.candidate_id,
+                metadata={"base_revision": body.get("base_revision"), "target_revision": result["revision"], "artifact_sha256": candidate.artifact_sha256, "generation": result["generation"], "result": "success", "actor": principal.principal_id, "auth_method": principal.auth_method, "separation_waived": waive},
+                actor_id=principal.principal_id,
+            )
+            return JSONResponse({**result, "candidate_id": candidate.candidate_id, "state": "published"}, status_code=202)
+        except (KeyError, InvalidCandidateError):
+            return JSONResponse({"error": "invalid_revision"}, status_code=404)
+        except SeparationOfDutiesError as exc:
+            return JSONResponse({"error": "separation_of_duties_violation", "reason": str(exc)}, status_code=409)
+        except (PolicyCASConflictError, CandidateStateError):
+            return JSONResponse({"error": "base_revision_conflict"}, status_code=409)
+        except (ArtifactConflictError, StateDatabaseError):
+            return JSONResponse({"error": "policy_delivery_unavailable"}, status_code=503)
+
+    async def _handle_policy_status(self, request: Request) -> JSONResponse:
+        _principal, error = await self._require_self(request, PERM_STATUS_READ)
+        if error is not None:
+            return error
+        _delivery, _validation, lifecycle = self._policy_services()
+        if lifecycle is None:
+            return JSONResponse({"error": "policy_delivery_unavailable"}, status_code=503)
+        return JSONResponse(lifecycle.status())
+
+    async def _handle_policy_audit(self, request: Request) -> JSONResponse:
+        principal, error = await self._require_self(request, PERM_AUDIT_READ)
+        if error is not None:
+            return error
+        assert principal is not None
+        delivery, _validation, _lifecycle = self._policy_services()
+        if delivery is None:
+            return JSONResponse({"error": "policy_delivery_unavailable"}, status_code=503)
+        if self._is_platform_admin(principal) or principal.tenant_id is None:
+            events = delivery.store.list_audit()
+        else:
+            events = delivery.store.list_audit(tenant_id=principal.tenant_id)
+        return JSONResponse({"events": events})
+
+    @staticmethod
+    def _binding_payload(binding) -> dict:
+        return {
+            "binding_id": binding.binding_id,
+            "principal": binding.principal,
+            "tenant_id": binding.tenant_id,
+            "role": binding.role.value,
+            "granted_by": binding.granted_by,
+            "created_at": binding.created_at,
+        }
+
+    @staticmethod
+    def _grant_payload(grant) -> dict:
+        return {
+            "grant_id": grant.grant_id,
+            "source_principal": grant.source_principal,
+            "source_tenant": grant.source_tenant,
+            "target_tenant": grant.target_tenant,
+            "resources": list(grant.resources),
+            "granted_by": grant.granted_by,
+            "created_at": grant.created_at,
+        }
+
+    async def _handle_rbac_bindings(self, request: Request) -> JSONResponse:
+        store = self._rbac_store()
+        if store is None:
+            return JSONResponse({"error": "rbac_unavailable"}, status_code=503)
+        if request.method == "GET":
+            principal, error = await self._require_self(request, PERM_RBAC_MANAGE)
+            if error is not None:
+                return error
+            assert principal is not None
+            if self._is_platform_admin(principal):
+                bindings = store.list_all_bindings()
+            elif principal.tenant_id is not None:
+                bindings = store.list_all_bindings(tenant_id=principal.tenant_id)
+            else:
+                bindings = []
+            return JSONResponse({"bindings": [self._binding_payload(b) for b in bindings]})
+        principal, error = await self._require_self(request, PERM_RBAC_MANAGE)
+        if error is not None:
+            return error
+        assert principal is not None
+        try:
+            body = await request.json()
+            target_principal = body["principal"]
+            tenant_id = body.get("tenant_id")
+            role = Role(body["role"])
+        except (KeyError, TypeError, ValueError):
+            return JSONResponse({"error": "invalid_binding"}, status_code=400)
+        if not isinstance(target_principal, str) or not target_principal:
+            return JSONResponse({"error": "invalid_binding"}, status_code=400)
+        # tenant_admin 只能管理本租户绑定；platform_admin 不限
+        if not self._is_platform_admin(principal) and tenant_id != principal.tenant_id:
+            self._record_denial(
+                request, principal, PERM_RBAC_MANAGE,
+                "tenant_admin 仅能管理本租户角色绑定",
+            )
+            return JSONResponse(
+                {"error": "forbidden", "reason": "tenant_admin 仅能管理本租户角色绑定"},
+                status_code=403,
+            )
+        try:
+            binding = store.add_binding(target_principal, tenant_id, role, principal.principal_id)
+        except StateDatabaseError:
+            return JSONResponse({"error": "rbac_unavailable"}, status_code=503)
+        await self._audit_admin_operation(
+            request, "rbac_binding_create", target=binding.binding_id,
+            metadata={"principal": target_principal, "tenant_id": tenant_id, "role": role.value, "result": "success", "actor": principal.principal_id, "auth_method": principal.auth_method},
+            actor_id=principal.principal_id,
+        )
+        return JSONResponse(self._binding_payload(binding), status_code=201)
+
+    async def _handle_rbac_binding_revoke(self, request: Request) -> JSONResponse:
+        store = self._rbac_store()
+        if store is None:
+            return JSONResponse({"error": "rbac_unavailable"}, status_code=503)
+        principal, error = await self._require_self(request, PERM_RBAC_MANAGE)
+        if error is not None:
+            return error
+        assert principal is not None
+        binding_id = request.path_params["binding_id"]
+        binding = next(
+            (b for b in store.list_all_bindings() if b.binding_id == binding_id), None
+        )
+        if binding is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        if not self._is_platform_admin(principal) and binding.tenant_id != principal.tenant_id:
+            self._record_denial(
+                request, principal, PERM_RBAC_MANAGE,
+                "tenant_admin 仅能吊销本租户角色绑定",
+            )
+            return JSONResponse(
+                {"error": "forbidden", "reason": "tenant_admin 仅能吊销本租户角色绑定"},
+                status_code=403,
+            )
+        try:
+            revoked = store.revoke_binding(binding_id, principal.principal_id)
+        except StateDatabaseError:
+            return JSONResponse({"error": "rbac_unavailable"}, status_code=503)
+        if not revoked:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        await self._audit_admin_operation(
+            request, "rbac_binding_revoke", target=binding_id,
+            metadata={"principal": binding.principal, "tenant_id": binding.tenant_id, "role": binding.role.value, "result": "success", "actor": principal.principal_id, "auth_method": principal.auth_method},
+            actor_id=principal.principal_id,
+        )
+        return JSONResponse({"binding_id": binding_id, "state": "revoked"})
+
+    async def _handle_rbac_grants(self, request: Request) -> JSONResponse:
+        store = self._rbac_store()
+        if store is None:
+            return JSONResponse({"error": "rbac_unavailable"}, status_code=503)
+        if request.method == "GET":
+            principal, error = await self._require_self(request, PERM_RBAC_MANAGE)
+            if error is not None:
+                return error
+            assert principal is not None
+            grants = store.list_all_grants()
+            if not self._is_platform_admin(principal) and principal.tenant_id is not None:
+                tenant = principal.tenant_id
+                grants = [
+                    g for g in grants
+                    if g.source_tenant == tenant or g.target_tenant == tenant
+                ]
+            return JSONResponse({"grants": [self._grant_payload(g) for g in grants]})
+        # 跨租户授权影响面为平台级：仅 platform_admin 可创建
+        principal, error = await self._require(request, PERM_RBAC_MANAGE, tenant_id=None)
+        if error is not None:
+            return error
+        assert principal is not None
+        try:
+            body = await request.json()
+            grant = store.add_grant(
+                body["source_principal"],
+                body["source_tenant"],
+                body["target_tenant"],
+                tuple(body["resources"]),
+                principal.principal_id,
+            )
+        except (KeyError, TypeError):
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        except StateDatabaseError:
+            return JSONResponse({"error": "rbac_unavailable"}, status_code=503)
+        await self._audit_admin_operation(
+            request, "rbac_grant_create", target=grant.grant_id,
+            metadata={"source_principal": grant.source_principal, "source_tenant": grant.source_tenant, "target_tenant": grant.target_tenant, "resources": list(grant.resources), "result": "success", "actor": principal.principal_id, "auth_method": principal.auth_method},
+            actor_id=principal.principal_id,
+        )
+        return JSONResponse(self._grant_payload(grant), status_code=201)
+
+    async def _handle_rbac_grant_revoke(self, request: Request) -> JSONResponse:
+        store = self._rbac_store()
+        if store is None:
+            return JSONResponse({"error": "rbac_unavailable"}, status_code=503)
+        principal, error = await self._require(request, PERM_RBAC_MANAGE, tenant_id=None)
+        if error is not None:
+            return error
+        assert principal is not None
+        grant_id = request.path_params["grant_id"]
+        grant = next((g for g in store.list_all_grants() if g.grant_id == grant_id), None)
+        if grant is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        try:
+            revoked = store.revoke_grant(grant_id, principal.principal_id)
+        except StateDatabaseError:
+            return JSONResponse({"error": "rbac_unavailable"}, status_code=503)
+        if not revoked:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        await self._audit_admin_operation(
+            request, "rbac_grant_revoke", target=grant_id,
+            metadata={"source_principal": grant.source_principal, "source_tenant": grant.source_tenant, "target_tenant": grant.target_tenant, "result": "success", "actor": principal.principal_id, "auth_method": principal.auth_method},
+            actor_id=principal.principal_id,
+        )
+        return JSONResponse({"grant_id": grant_id, "state": "revoked"})
+
+    async def _handle_opa_bundle(self, request: Request) -> Response:
+        runtime = self._controller._runtime
+        token = getattr(runtime, "bundle_reader_token", None)
+        if not self._check_bearer(request, token):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
+        lifecycle = getattr(runtime, "policy_lifecycle", None)
+        if lifecycle is None:
+            return JSONResponse({"error": "bundle_unavailable"}, status_code=503)
+        revision = request.path_params.get("revision")
+        try:
+            data, digest, size, revision = lifecycle.bundle(revision)
+        except FileNotFoundError:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        except (ArtifactConflictError, StateDatabaseError):
+            return JSONResponse({"error": "bundle_unavailable"}, status_code=503)
+        etag = f'"{digest}"'
+        headers = {"Content-Type": "application/gzip", "Content-Length": str(size), "ETag": etag, "X-OPA-Bundle-Revision": revision, "Cache-Control": "private, no-cache"}
+        if request.headers.get("if-none-match") == etag:
+            headers.pop("Content-Length")
+            return Response(status_code=304, headers=headers)
+        if request.method == "HEAD":
+            return Response(status_code=200, headers=headers)
+        return Response(data, media_type="application/gzip", headers=headers)
+
+    async def _handle_opa_status(self, request: Request) -> JSONResponse:
+        runtime = self._controller._runtime
+        if not self._check_bearer(request, getattr(runtime, "status_writer_token", None)):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        lifecycle = getattr(runtime, "policy_lifecycle", None)
+        if lifecycle is None:
+            return JSONResponse({"error": "status_unavailable"}, status_code=503)
+        raw = await request.body()
+        try:
+            import json
+            payload = json.loads(raw)
+            result = lifecycle.receive_status(payload, raw_size=len(raw))
+            return JSONResponse(result, status_code=202)
+        except PolicyStatusForbiddenError:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        except (PolicyStatusError, ValueError):
+            return JSONResponse({"error": "invalid_status"}, status_code=400)
+        except StateDatabaseError:
+            return JSONResponse({"error": "status_unavailable"}, status_code=503)
+
+    async def _handle_admin_audit(self, request: Request) -> JSONResponse:
+        principal, error = await self._require_self(request, PERM_AUDIT_READ)
+        if error is not None:
+            return error
+        assert principal is not None
 
         session_id = request.query_params.get("session_id")
         task_id = request.query_params.get("task_id")
+        correlation_id = request.query_params.get("correlation_id")
         interaction_id = request.query_params.get("interaction_id")
         source_agent_id = request.query_params.get("source_agent_id")
         target_agent_id = request.query_params.get("target_agent_id")
         verdict = request.query_params.get("verdict")
+        for name, value in (("session_id", session_id), ("task_id", task_id), ("correlation_id", correlation_id), ("interaction_id", interaction_id)):
+            if value is not None and (not value.strip() or len(value) > 256):
+                return JSONResponse(
+                    {"error": "invalid_parameter", "message": f"invalid {name}"},
+                    status_code=400,
+                )
         valid_verdicts = {"allow", "deny", "modify", "require_approval"}
         if verdict is not None and verdict not in valid_verdicts:
             return JSONResponse(
@@ -1085,27 +2083,33 @@ class ToolGovernServer:
             value is not None
             for value in (interaction_id, source_agent_id, target_agent_id, verdict)
         )
-        if interaction_filters:
-            interaction_events = audit_store.query_interactions(
+        if correlation_id is not None:
+            selected = audit_store.query_by_correlation(correlation_id, limit=limit)
+        elif interaction_filters:
+            selected = audit_store.query_interactions(
                 interaction_id=interaction_id,
                 source_agent_id=source_agent_id,
                 target_agent_id=target_agent_id,
                 verdict=verdict,
                 limit=limit,
             )
-            events = [event.model_dump(mode="json") for event in interaction_events]
+        elif task_id and hasattr(audit_store, "query_by_task"):
+            selected = audit_store.query_by_task(task_id)[-limit:]
+        elif session_id and hasattr(audit_store, "query_by_session"):
+            selected = audit_store.query_by_session(session_id)[-limit:]
+        elif not session_id and hasattr(audit_store, "list_recent"):
+            selected = audit_store.list_recent(limit)
         else:
-            events = []
+            selected = []
             async for event in audit_store.iter_events():
-                payload = event.model_dump()
-                if session_id and payload.get("session_id") != session_id:
+                if session_id and event.session_id != session_id:
                     continue
-                if task_id and payload.get("task_id") != task_id:
-                    continue
-                events.append(payload)
-                if len(events) >= limit:
-                    break
-            events.reverse()
+                selected.append(event)
+            selected = selected[-limit:]
+        if not self._is_platform_admin(principal):
+            assert principal.tenant_id is not None
+            selected = [event for event in selected if event.tenant_id == principal.tenant_id]
+        events = [event.model_dump() for event in selected]
         return JSONResponse(AuditQueryResponse(events=events).model_dump())
 
     def _refresh_pending_approvals(self) -> None:
@@ -1144,18 +2148,27 @@ def build_app(
     configure_logs: bool = True,
     identity_provider: IdentityProvider | None = None,
     entrypoints_config: dict[str, Any] | None = None,
+    execution_security: ExecutionSecurityPolicy | None = None,
+    workload_identity_resolver: WorkloadIdentityResolver | None = None,
+    delegation_token_verifier: Any = None,
 ) -> Starlette:
     """从 LoopController 构造 Starlette ASGI 应用。"""
     if configure_logs:
         configure_logging(
             json_format=os.environ.get("LOOP_CONTROLLER_JSON_LOGS", "").lower() == "true"
         )
+    runtime_config = getattr(controller._runtime, "config", None)
+    if entrypoints_config is None and runtime_config is not None:
+        entrypoints_config = getattr(runtime_config, "entrypoints_config", None)
     server = ToolGovernServer(
         controller,
         api_key=api_key,
         watcher=watcher,
         identity_provider=identity_provider,
         entrypoints_config=entrypoints_config,
+        execution_security=execution_security,
+        workload_identity_resolver=workload_identity_resolver,
+        delegation_token_verifier=delegation_token_verifier,
     )
 
     @asynccontextmanager
@@ -1201,6 +2214,7 @@ def build_app(
         middleware=middleware,
         routes=[
             Route("/health", server._handle_health, methods=["GET"]),
+            Route("/ready", server._handle_ready, methods=["GET"]),
             Route("/v1/identity", server._handle_identity, methods=["GET"]),
             Route("/v1/health", server._handle_health, methods=["GET"]),
             Route("/metrics", server._handle_metrics, methods=["GET"]),
@@ -1278,6 +2292,21 @@ def build_app(
             Route("/admin/revoke", server._handle_admin_revoke, methods=["POST", "DELETE"]),
             Route("/admin/revocation-list", server._handle_admin_revocation_list, methods=["GET"]),
             Route("/admin/kill-switch", server._handle_admin_kill_switch, methods=["POST"]),
+            Route("/v1/admin/policy/candidates", server._handle_policy_candidates, methods=["GET", "POST"]),
+            Route("/v1/admin/policy/candidates/{candidate_id}", server._handle_policy_candidate, methods=["GET"]),
+            Route("/v1/admin/policy/candidates/{candidate_id}/validate", server._handle_policy_validate, methods=["POST"]),
+            Route("/v1/admin/policy/candidates/{candidate_id}/shadow", server._handle_policy_shadow, methods=["POST"]),
+            Route("/v1/admin/policy/candidates/{candidate_id}/publish", server._handle_policy_publish, methods=["POST"]),
+            Route("/v1/admin/policy/rollback", server._handle_policy_rollback, methods=["POST"]),
+            Route("/v1/admin/policy/status", server._handle_policy_status, methods=["GET"]),
+            Route("/v1/admin/policy/audit", server._handle_policy_audit, methods=["GET"]),
+            Route("/v1/admin/rbac/bindings", server._handle_rbac_bindings, methods=["GET", "POST"]),
+            Route("/v1/admin/rbac/bindings/{binding_id}/revoke", server._handle_rbac_binding_revoke, methods=["POST"]),
+            Route("/v1/admin/rbac/grants", server._handle_rbac_grants, methods=["GET", "POST"]),
+            Route("/v1/admin/rbac/grants/{grant_id}/revoke", server._handle_rbac_grant_revoke, methods=["POST"]),
+            Route("/v1/opa/bundles/current", server._handle_opa_bundle, methods=["GET", "HEAD"]),
+            Route("/v1/opa/bundles/{revision}", server._handle_opa_bundle, methods=["GET", "HEAD"]),
+            Route("/v1/opa/status", server._handle_opa_status, methods=["POST"]),
             Route("/v1/admin/audit", server._handle_admin_audit, methods=["GET"]),
         ],
     )

@@ -1,0 +1,29 @@
+COMPATIBILITY_MODE = "compatibility"
+STRICT_MODE = "strict"
+PROTECTED_HTTP_EGRESS = "protected_http"
+PROTECTED_MCP_EGRESS = "protected_mcp_network"
+REMOTE_HARNESS_EGRESS = "remote_harness"
+STRICT_EGRESS_TYPES = frozenset(
+    {PROTECTED_HTTP_EGRESS, PROTECTED_MCP_EGRESS, REMOTE_HARNESS_EGRESS}
+)
+
+WORKLOAD_IDENTITY_V1 = "workload_identity_v1"
+DELEGATED_SUBJECT_BINDING_V1 = "delegated_subject_binding_v1"
+WORKLOAD_BOUND_DELEGATION_TOKEN_V1 = "workload_bound_delegation_token_v1"
+EXECUTION_RECEIPT_V1 = "execution_receipt_v1"
+TENANT_SECRET_NO_FALLBACK_V1 = "tenant_secret_no_fallback_v1"
+PROTECTED_MCP_NETWORK_V1 = "protected_mcp_network_v1"
+DEPLOYMENT_OBSERVATION_V1 = "deployment_observation_v1"
+DEPLOYMENT_PROOF_V1 = "deployment_proof_v1"
+SECURITY_CAPABILITIES = frozenset(
+    {
+        WORKLOAD_IDENTITY_V1,
+        DELEGATED_SUBJECT_BINDING_V1,
+        WORKLOAD_BOUND_DELEGATION_TOKEN_V1,
+        EXECUTION_RECEIPT_V1,
+        TENANT_SECRET_NO_FALLBACK_V1,
+        PROTECTED_MCP_NETWORK_V1,
+        DEPLOYMENT_OBSERVATION_V1,
+        DEPLOYMENT_PROOF_V1,
+    }
+)

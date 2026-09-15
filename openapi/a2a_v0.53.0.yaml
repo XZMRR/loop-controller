@@ -1,0 +1,415 @@
+openapi: 3.1.0
+info:
+  title: Loop Controller A2A Protocol
+  version: 0.53.0
+  description: |
+    Authoritative archived v0.53.0 compatibility contract; referenced shared components remain
+    frozen for v0.53 semantics. Security capability
+    negotiation is independent of protocol-version compatibility. Strict target
+    execution uses workload-authenticated /v1/govern/tool-call and validates the
+    complete delegation, workload, correlation, capability, and receipt wire.
+servers:
+  - url: http://127.0.0.1:8080
+paths:
+  /a2a/v1/agents:
+    $ref: './paths/agents.yaml#/~1a2a~1v1~1agents'
+  /a2a/v1/agents/{id}:
+    $ref: './paths/agents.yaml#/~1a2a~1v1~1agents~1{id}'
+  /a2a/v1/tasks:
+    $ref: './paths/tasks.yaml#/~1a2a~1v1~1tasks'
+  /a2a/v1/tasks/{id}:
+    $ref: './paths/tasks.yaml#/~1a2a~1v1~1tasks~1{id}'
+  /a2a/v1/tasks/{id}/stream:
+    $ref: './paths/tasks.yaml#/~1a2a~1v1~1tasks~1{id}~1stream'
+  /a2a/v1/tasks/{id}/cancel:
+    $ref: './paths/tasks.yaml#/~1a2a~1v1~1tasks~1{id}~1cancel'
+  /a2a/v1/entrypoint/tasks:
+    post:
+      operationId: entrypointReceiveTask
+      summary: Target agent entrypoint receives a v0.53.0 delegated Task
+      tags: [Entrypoint]
+      security:
+        - TaskDelegationToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EntrypointTaskRequest'}
+      responses:
+        '201':
+          description: Task received
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Task'}
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '403':
+          description: Delegation token rejected
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+  /a2a/v1/entrypoint/tasks/{id}/accept:
+    $ref: './paths/tasks.yaml#/~1a2a~1v1~1entrypoint~1tasks~1{id}~1accept'
+  /a2a/v1/entrypoint/tasks/{id}/start:
+    $ref: './paths/tasks.yaml#/~1a2a~1v1~1entrypoint~1tasks~1{id}~1start'
+  /a2a/v1/entrypoint/tasks/{id}/cancel:
+    $ref: './paths/tasks.yaml#/~1a2a~1v1~1entrypoint~1tasks~1{id}~1cancel'
+  /a2a/v1/entrypoint/tasks/{id}:
+    $ref: './paths/tasks.yaml#/~1a2a~1v1~1entrypoint~1tasks~1{id}'
+  /a2a/v1/entrypoint/tasks/{id}/results:
+    post:
+      operationId: entrypointSubmitResults
+      summary: Target agent submits v0.53.0 Task execution results
+      tags: [Entrypoint]
+      security:
+        - TaskDelegationToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EntrypointResultRequest'}
+      responses:
+        '200':
+          description: Result recorded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Task'}
+        '400':
+          description: Invalid result
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '409':
+          description: Invalid state transition
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+  /a2a/v1/messages:
+    $ref: './paths/messages.yaml#/~1a2a~1v1~1messages'
+  /a2a/v1/delegations:
+    post:
+      operationId: requestDelegation
+      summary: Request authorization for a v0.53.0 delegated tool execution
+      tags: [Delegations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DelegationRequest'}
+      responses:
+        '200':
+          description: Delegation authorization result
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DelegationResponse'}
+        '202':
+          description: Delegation persisted and awaiting approval
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DelegationResponse'}
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '403':
+          description: Delegation denied or target agent not trusted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '409':
+          description: Conflict with an in-flight idempotent request
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+  /v1/govern/tool-call:
+    post:
+      operationId: governToolCall
+      summary: Execute a delegated tool call through the strict governance boundary
+      tags: [Governance]
+      security:
+        - WorkloadMTLS: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GovernToolRequest'}
+      responses:
+        '200':
+          description: Governed execution result
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GovernToolResponse'}
+        '401':
+          description: Workload identity is missing or invalid
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '403':
+          description: Delegation or workload binding rejected
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '422':
+          description: Invalid request body
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '503':
+          description: Required security capability unavailable
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GovernToolResponse'}
+  /health:
+    $ref: './paths/health.yaml#/~1health'
+components:
+  securitySchemes:
+    TaskDelegationToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Task-scoped delegation token issued by the A2A kernel.
+    WorkloadMTLS:
+      type: mutualTLS
+      description: TLS peer workload identity; strict mode forbids bearer fallback.
+  schemas:
+    ProtocolVersion: {$ref: './schemas/protocol-version.yaml'}
+    AgentCard: {$ref: './schemas/agent-card.yaml'}
+    Task: {$ref: './schemas/task.yaml'}
+    TaskEvent: {$ref: './schemas/task-event.yaml'}
+    Message: {$ref: './schemas/message.yaml'}
+    Part: {$ref: './schemas/part.yaml'}
+    DelegationRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, request_id, initiator_agent_id, target_agent_id, tool_name, arguments, session_id, task_id, risk_level, allowed_tools, allowed_capabilities, allow_redelegation, tenant_id, target_workload_id]
+      properties:
+        protocol_version: {$ref: './schemas/protocol-version.yaml'}
+        request_id: {type: string}
+        initiator_agent_id: {type: string}
+        target_agent_id: {type: string}
+        tool_name: {type: string}
+        arguments: {type: object, additionalProperties: true}
+        session_id: {type: string}
+        task_id: {type: string}
+        root_interaction_id: {type: string}
+        parent_interaction_id: {type: string}
+        root_task_id: {type: string}
+        parent_task_id: {type: string}
+        delegation_depth: {type: integer, minimum: 0}
+        deadline: {type: [string, 'null'], format: date-time}
+        budget: {type: object, additionalProperties: true}
+        risk_level: {type: string, enum: [low, medium, high, critical]}
+        allowed_tools: {type: array, items: {type: string}}
+        allowed_capabilities: {type: array, items: {type: string}}
+        allow_redelegation: {type: boolean}
+        tenant_id: {type: string}
+        target_workload_id: {type: string}
+        target_instance_id: {type: [string, 'null']}
+    DelegationResponse: {$ref: './schemas/delegation-response.yaml'}
+    DelegationApproval: {$ref: './schemas/delegation-approval.yaml'}
+    ApprovalActionRequest: {$ref: './schemas/approval-action-request.yaml'}
+    ErrorResponse: {$ref: './schemas/error-response.yaml'}
+    EntrypointTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, delivery_id, request_id, interaction_id, decision_id, task_id, session_id, initiator_agent_id, target_agent_id, tool_name, arguments, delegation_token, allowed_tools, allowed_capabilities, allow_redelegation, tenant_id, target_workload_id]
+      properties:
+        protocol_version: {$ref: './schemas/protocol-version.yaml'}
+        delivery_id: {type: string}
+        request_id: {type: string}
+        interaction_id: {type: string}
+        decision_id: {type: string}
+        task_id: {type: string}
+        session_id: {type: string}
+        initiator_agent_id: {type: string}
+        target_agent_id: {type: string}
+        tool_name: {type: string}
+        arguments: {type: object, additionalProperties: true}
+        delegation_token: {type: string, writeOnly: true}
+        allowed_tools: {type: array, items: {type: string}}
+        allowed_capabilities: {type: array, items: {type: string}}
+        allow_redelegation: {type: boolean}
+        tenant_id: {type: string}
+        target_workload_id: {type: string}
+        target_instance_id: {type: [string, 'null']}
+        root_interaction_id: {type: string}
+        parent_interaction_id: {type: string}
+        root_task_id: {type: string}
+        parent_task_id: {type: string}
+        delegation_depth: {type: integer, minimum: 0}
+        deadline: {type: [string, 'null'], format: date-time}
+        budget: {type: object, additionalProperties: true}
+    EntrypointResultRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, status, consumed_budget, execution_receipt]
+      properties:
+        protocol_version: {$ref: './schemas/protocol-version.yaml'}
+        status: {type: string, enum: [completed, failed]}
+        outcome: {}
+        error_code: {type: string}
+        consumed_budget: {type: object, additionalProperties: true}
+        execution_receipt: {$ref: '#/components/schemas/ExecutionReceipt'}
+    SecurityCapabilities:
+      type: object
+      required: [required, supported]
+      properties:
+        required: {type: array, uniqueItems: true, items: {type: string}}
+        supported: {type: array, uniqueItems: true, items: {type: string}}
+    WorkloadIdentity:
+      type: object
+      required: [workload_id, service, principal, authenticated_at, auth_method]
+      properties:
+        workload_id: {type: string, format: uri}
+        service: {type: string}
+        principal: {type: string}
+        tenant_id: {type: [string, 'null']}
+        authenticated_at: {type: string, format: date-time}
+        expires_at: {type: [string, 'null'], format: date-time}
+        auth_method: {type: string, enum: [mtls, trusted-proxy-mtls, static-dev]}
+        authenticated_instance_id: {type: [string, 'null']}
+    DelegatedSubject:
+      type: object
+      required: [agent_id, tenant_id, request_id, task_id, call_id, decision_id]
+      properties:
+        agent_id: {type: string}
+        user_id: {type: [string, 'null']}
+        tenant_id: {type: string}
+        request_id: {type: string}
+        task_id: {type: string}
+        call_id: {type: string}
+        decision_id: {type: string}
+        delegation_jti: {type: [string, 'null']}
+    ToolCredentialRef:
+      type: object
+      required: [name, scope, version_mode, injection]
+      properties:
+        name: {type: string}
+        scope: {type: string, enum: [global, tenant]}
+        tenant_id: {type: [string, 'null']}
+        key: {type: [string, 'null']}
+        version_mode: {type: string, enum: [pinned, current]}
+        version: {type: [string, 'null']}
+        injection: {type: string, enum: [header, query, body, mtls]}
+        allowed_tools: {type: array, items: {type: string}}
+        tenant_allowlist: {type: array, items: {type: string}}
+    ResolvedToolCredentialRef:
+      allOf:
+        - $ref: '#/components/schemas/ToolCredentialRef'
+        - type: object
+          required: [resolved_version]
+          properties:
+            resolved_version: {type: string}
+    ExecutionReceipt:
+      type: object
+      additionalProperties: false
+      required: [receipt_id, type, attester_workload_id, authenticated_instance_id, request_id, interaction_id, task_id, call_id, decision_id, delegation_jti, executor, backend, credential_ref_digest, resolved_credential_version, resolved_credential_digest, status, result_sha256, media_type, encoding, issued_at]
+      properties:
+        receipt_id: {type: string}
+        type: {type: string, enum: [controller_execution_record, proxy_attestation, remote_execution_attestation]}
+        attester_workload_id: {type: string}
+        authenticated_instance_id: {type: [string, 'null']}
+        request_id: {type: string}
+        interaction_id: {type: [string, 'null']}
+        task_id: {type: string}
+        call_id: {type: string}
+        decision_id: {type: string}
+        delegation_jti: {type: [string, 'null']}
+        executor: {type: string}
+        backend: {type: string}
+        credential_ref_digest: {type: [string, 'null']}
+        resolved_credential_version: {type: [string, 'null']}
+        resolved_credential_digest: {type: [string, 'null']}
+        status: {type: string, enum: [success, error, timeout, cancelled]}
+        result_sha256: {type: string}
+        media_type: {type: string}
+        encoding: {type: [string, 'null']}
+        issued_at: {type: string, format: date-time}
+    GovernToolRequest:
+      type: object
+      additionalProperties: false
+      required: [agent_id, tool_name, request_id, interaction_id, decision_id, task_id, call_id, delegation_jti, delegation_token, tenant_id, target_workload_id, required_security_capabilities, arguments, allowed_tools, allowed_capabilities, allow_redelegation]
+      properties:
+        agent_id: {type: string}
+        user_id: {type: [string, 'null']}
+        tool_name: {type: string}
+        request_id: {type: string}
+        interaction_id: {type: string}
+        decision_id: {type: string}
+        call_id: {type: string}
+        delegation_jti: {type: string}
+        delegation_token: {type: string, writeOnly: true}
+        tenant_id: {type: string}
+        target_workload_id: {type: string}
+        target_instance_id: {type: [string, 'null']}
+        required_security_capabilities: {type: array, uniqueItems: true, items: {type: string}}
+        arguments: {type: object, additionalProperties: true}
+        task_context: {type: string}
+        session_id: {type: [string, 'null']}
+        task_id: {type: string}
+        allowed_tools: {type: [array, 'null'], items: {type: string}}
+        allowed_capabilities: {type: [array, 'null'], items: {type: string}}
+        allow_redelegation: {type: boolean}
+        deadline: {type: [string, 'null'], format: date-time}
+    GovernToolResponse:
+      type: object
+      additionalProperties: false
+      required: [status, result, request_id, error_code, supported_security_capabilities, execution_receipt]
+      properties:
+        status: {type: string, enum: [allow, deny, require_approval, error, blocked, pending]}
+        result: {}
+        request_id: {type: [string, 'null']}
+        error_code: {type: [string, 'null']}
+        supported_security_capabilities: {type: [array, 'null'], items: {type: string}}
+        execution_receipt: {anyOf: [{$ref: '#/components/schemas/ExecutionReceipt'}, {type: 'null'}]}
+    ExecutionSecurityStatus:
+      type: object
+      required: [mode, strict_ready, assurance]
+      properties:
+        mode: {type: string, enum: [compatibility, strict]}
+        strict_ready: {type: boolean}
+        assurance: {type: string, enum: [not_strict, observed, externally_attested]}
+        supported_egress_types: {type: array, items: {type: string}}
+        supported_security_capabilities: {type: array, items: {type: string}}
+        failures: {type: array, items: {type: string}}
+    HealthResponse:
+      type: object
+      required: [status, execution_security]
+      properties:
+        status: {type: string}
+        execution_security: {$ref: '#/components/schemas/ExecutionSecurityStatus'}
+    ReadinessResponse:
+      allOf:
+        - $ref: '#/components/schemas/HealthResponse'
+        - description: Strict mode returns HTTP 503 whenever strict_ready is false.
+    ProtectedMCPEnvelope:
+      type: object
+      additionalProperties: false
+      required: [delegated_subject, required_capabilities, credential_refs]
+      properties:
+        delegated_subject: {$ref: '#/components/schemas/DelegatedSubject'}
+        interaction_id: {type: [string, 'null']}
+        required_capabilities: {type: array, uniqueItems: true, items: {type: string}}
+        credential_refs: {type: array, items: {$ref: '#/components/schemas/ResolvedToolCredentialRef'}}
+    ProtectedMCPMeta:
+      type: object
+      additionalProperties: false
+      required: [io.loop-controller/protected-mcp-v1]
+      properties:
+        io.loop-controller/protected-mcp-v1: {$ref: '#/components/schemas/ProtectedMCPEnvelope'}
+    ProtectedMCPReceipt:
+      type: object
+      additionalProperties: false
+      required: [supported_capabilities, proxy_attestation]
+      properties:
+        supported_capabilities: {type: array, uniqueItems: true, items: {type: string}}
+        proxy_attestation: {$ref: '#/components/schemas/ExecutionReceipt'}

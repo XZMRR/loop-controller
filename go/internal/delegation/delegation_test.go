@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +18,16 @@ import (
 	"github.com/loop-controller/go/internal/task"
 	"github.com/loop-controller/go/internal/token"
 )
+
+type countingIssuer struct {
+	delegate TokenIssuer
+	calls    int
+}
+
+func (i *countingIssuer) Issue(claims token.DelegationClaims, ttl time.Duration) (string, error) {
+	i.calls++
+	return i.delegate.Issue(claims, ttl)
+}
 
 func openTestDB(t *testing.T) *store.DB {
 	t.Helper()
@@ -35,6 +48,36 @@ func (a *recordingLifecycleAuditor) RecordLifecycle(_ context.Context, task mode
 	a.events = append(a.events, event)
 	a.tasks = append(a.tasks, task)
 	return nil
+}
+
+func TestDurableDelegationReplayReusesTokenAndBudget(t *testing.T) {
+	reg := registry.New()
+	_ = reg.Register(models.AgentCard{AgentID: "executor", TenantID: "tenant", Entrypoint: models.AgentEntrypoint{Type: "http", URL: "http://executor"}, Capabilities: []string{"delegate_execution"}})
+	db := openTestDB(t)
+	issuer := &countingIssuer{delegate: token.NewHMACIssuer([]byte("secret"))}
+	d := New(reg, task.New(db.TaskStore()).WithInstanceID(db.InstanceID()), issuer, nil, time.Hour).
+		WithR2Authorizer(&StaticR2Authorizer{Decision: models.DelegationResponse{Allowed: true, InteractionID: "int-1", DecisionID: "dec-1"}}).
+		WithOutboundQueue(db.DelegationDispatchOutboxStore())
+	req := models.DelegationRequest{RequestID: "req-1", SessionID: "session", InitiatorAgentID: "planner", TargetAgentID: "executor", ToolName: "echo", Arguments: json.RawMessage(`{"x":1}`), TenantID: "tenant"}
+	first, err := d.Request(context.Background(), req)
+	if err != nil || !first.Allowed {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	req.TaskID = first.TaskID
+	second, err := d.Request(context.Background(), req)
+	if err != nil || !second.Allowed || second.TaskID != first.TaskID || second.DelegationToken != first.DelegationToken || issuer.calls != 1 {
+		t.Fatalf("second=%+v issuer calls=%d err=%v", second, issuer.calls, err)
+	}
+	var events, assignments int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM events WHERE task_id=?`, first.TaskID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(`SELECT COUNT(*) FROM task_assignments WHERE task_id=?`, first.TaskID).Scan(&assignments); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 || assignments != 1 {
+		t.Fatalf("events=%d assignments=%d", events, assignments)
+	}
 }
 
 func TestInteractionLifecycleCarriesDecisionAndTaskLinkage(t *testing.T) {
@@ -103,18 +146,72 @@ func TestRequireApprovalPersistsAndResumeReevaluates(t *testing.T) {
 	if consumed.Status != "consumed" || consumed.TaskID == "" || authorizer.calls != 2 {
 		t.Fatalf("approval=%+v calls=%d", consumed, authorizer.calls)
 	}
-	items, err := db.DelegationDispatchOutboxStore().ClaimDue(context.Background(), time.Now().UTC().Add(time.Second), time.Minute, 10)
-	if err != nil || len(items) != 1 || items[0].Request.DeliveryID != "delegation-dispatch:"+a.ApprovalID {
-		t.Fatalf("items=%+v err=%v", items, err)
+	assignment, err := db.AssignmentStore().Get(context.Background(), "outbound-assignment-"+consumed.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := db.DelegationDispatchOutboxStore().LoadOutboundDelegation(context.Background(), assignment.AssignmentID)
+	if err != nil || item.Request.DeliveryID != "delegation-dispatch-"+consumed.TaskID {
+		t.Fatalf("item=%+v err=%v", item, err)
+	}
+}
+
+func TestStrictApprovalResumeRestoresSecurityBindings(t *testing.T) {
+	reg := registry.New()
+	_ = reg.Register(models.AgentCard{AgentID: "executor", TenantID: "tenant-1", Entrypoint: models.AgentEntrypoint{Type: "http", URL: "http://executor"}, Capabilities: []string{"delegate_execution"}})
+	db := openTestDB(t)
+	issuer := token.NewHMACIssuer([]byte("secret"))
+	authorizer := &sequenceAuthorizer{decisions: []models.DelegationResponse{{Allowed: false, Verdict: "require_approval", DecisionID: "approval-decision"}, {Allowed: true, DecisionID: "allow-decision"}}}
+	d := New(reg, task.New(db.TaskStore()).WithInstanceID(db.InstanceID()), issuer, nil, time.Hour).WithR2Authorizer(authorizer).WithStrict(true)
+	resp, err := d.Request(context.Background(), models.DelegationRequest{
+		RequestID: "strict-approval", InitiatorAgentID: "planner", TargetAgentID: "executor", ToolName: "echo",
+		Arguments: json.RawMessage(`{"x":1}`), AllowedTools: []string{"echo"}, TenantID: "tenant-1",
+		TargetWorkloadID: "spiffe://example/executor", TargetInstanceID: "instance-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := db.DelegationApprovalStore().Get(context.Background(), resp.ApprovalID)
+	if err != nil || a.TenantID != "tenant-1" || a.TargetWorkloadID != "spiffe://example/executor" || a.TargetInstanceID != "instance-1" {
+		t.Fatalf("approval bindings not persisted: %+v err=%v", a, err)
+	}
+	a, err = db.DelegationApprovalStore().Transition(context.Background(), a.ApprovalID, a.Version, "pending", "approved", "reviewer", "ok", "strict-action")
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumed, err := d.ResumeApproval(context.Background(), a.ApprovalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(authorizer.requests) != 2 || authorizer.requests[1].TenantID != a.TenantID || authorizer.requests[1].TargetWorkloadID != a.TargetWorkloadID || authorizer.requests[1].TargetInstanceID != a.TargetInstanceID {
+		t.Fatalf("strict re-evaluation lost bindings: %+v", authorizer.requests)
+	}
+	storedTask, err := db.TaskStore().Get(context.Background(), consumed.TaskID)
+	if err != nil || storedTask.TenantID != a.TenantID || storedTask.TargetWorkloadID != a.TargetWorkloadID || storedTask.TargetInstanceID != a.TargetInstanceID {
+		t.Fatalf("resumed task lost bindings: %+v err=%v", storedTask, err)
+	}
+	claims, err := issuer.Validate(storedTask.DelegationToken)
+	if err != nil || claims.TenantID != a.TenantID || claims.TargetWorkloadID != a.TargetWorkloadID || claims.TargetInstanceID != a.TargetInstanceID {
+		t.Fatalf("resumed claims lost bindings: %+v err=%v", claims, err)
+	}
+	assignment, err := db.AssignmentStore().Get(context.Background(), "outbound-assignment-"+consumed.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := db.DelegationDispatchOutboxStore().LoadOutboundDelegation(context.Background(), assignment.AssignmentID)
+	if err != nil || item.Request.TenantID != a.TenantID || item.Request.TargetWorkloadID != a.TargetWorkloadID || item.Request.TargetInstanceID != a.TargetInstanceID {
+		t.Fatalf("resumed dispatch lost bindings: %+v err=%v", item, err)
 	}
 }
 
 type sequenceAuthorizer struct {
 	decisions []models.DelegationResponse
+	requests  []models.DelegationRequest
 	calls     int
 }
 
-func (a *sequenceAuthorizer) Authorize(context.Context, models.DelegationRequest) (models.DelegationResponse, error) {
+func (a *sequenceAuthorizer) Authorize(_ context.Context, request models.DelegationRequest) (models.DelegationResponse, error) {
+	a.requests = append(a.requests, request)
 	d := a.decisions[a.calls]
 	a.calls++
 	return d, nil
@@ -532,6 +629,145 @@ func TestRequestNoCapability(t *testing.T) {
 	}
 	if resp.Allowed {
 		t.Fatal("expected not allowed")
+	}
+}
+
+type concurrentAuthorizer struct{ calls atomic.Int64 }
+
+func (a *concurrentAuthorizer) Authorize(context.Context, models.DelegationRequest) (models.DelegationResponse, error) {
+	a.calls.Add(1)
+	return models.DelegationResponse{Allowed: true, Verdict: "allow", DecisionID: "decision"}, nil
+}
+
+type concurrentIssuer struct{ calls atomic.Int64 }
+
+func (i *concurrentIssuer) Issue(claims token.DelegationClaims, ttl time.Duration) (string, error) {
+	i.calls.Add(1)
+	return token.NewHMACIssuer([]byte("secret")).Issue(claims, ttl)
+}
+
+type concurrentDispatcher struct{ calls atomic.Int64 }
+
+func (d *concurrentDispatcher) Dispatch(context.Context, models.AgentEntrypoint, models.EntrypointTaskRequest) error {
+	d.calls.Add(1)
+	return nil
+}
+func (d *concurrentDispatcher) Cancel(context.Context, models.AgentEntrypoint, string, string) (bool, error) {
+	return true, nil
+}
+
+func TestTenantScopedTargetLookupRejectsCrossTenantBeforeSideEffects(t *testing.T) {
+	db := openTestDB(t)
+	reg := registry.NewStore(db.AgentStore())
+	_ = reg.Register(models.AgentCard{AgentID: "executor-b", TenantID: "tenant-b", Entrypoint: models.AgentEntrypoint{Type: "http", URL: "http://tenant-b"}, Capabilities: []string{"delegate_execution"}})
+	authorizer := &concurrentAuthorizer{}
+	issuer := &concurrentIssuer{}
+	dispatcher := &concurrentDispatcher{}
+	d := New(reg, task.New(db.TaskStore()).WithInstanceID(db.InstanceID()), issuer, nil, time.Hour).
+		WithR2Authorizer(authorizer).WithEntrypointClient(dispatcher).WithOutboundQueue(db.DelegationDispatchOutboxStore())
+
+	request := func(id, target string) models.DelegationResponse {
+		resp, err := d.Request(context.Background(), models.DelegationRequest{RequestID: id, InitiatorAgentID: "planner", TargetAgentID: target, ToolName: "echo", AllowedTools: []string{"echo"}, TenantID: "tenant-a"})
+		if err != nil {
+			t.Errorf("request %s: %v", id, err)
+		}
+		return resp
+	}
+	cross := request("cross", "executor-b")
+	unknown := request("unknown", "missing")
+	crossJSON, _ := json.Marshal(cross)
+	unknownJSON, _ := json.Marshal(unknown)
+	if string(crossJSON) != string(unknownJSON) || cross.Allowed || cross.Reason != "target agent not found" {
+		t.Fatalf("cross=%+v unknown=%+v", cross, unknown)
+	}
+	for _, table := range []string{"tasks", "delegation_approvals", "delegation_dispatch_outbox", "task_assignments"} {
+		var count int
+		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("%s count=%d err=%v", table, count, err)
+		}
+	}
+	if authorizer.calls.Load() != 0 || issuer.calls.Load() != 0 || dispatcher.calls.Load() != 0 {
+		t.Fatalf("side effects: authorizer=%d issuer=%d dispatcher=%d", authorizer.calls.Load(), issuer.calls.Load(), dispatcher.calls.Load())
+	}
+}
+
+func TestTenantScopedTargetLookupAllowsSameTenantAndLegacyUnscoped(t *testing.T) {
+	for _, tenantID := range []string{"tenant-a", ""} {
+		db := openTestDB(t)
+		reg := registry.NewStore(db.AgentStore())
+		_ = reg.Register(models.AgentCard{AgentID: "executor", TenantID: "tenant-a", Capabilities: []string{"delegate_execution"}})
+		d := New(reg, task.New(db.TaskStore()), token.NewHMACIssuer([]byte("secret")), nil, time.Hour).WithR2Authorizer(&StaticR2Authorizer{Decision: models.DelegationResponse{Allowed: true}})
+		resp, err := d.Request(context.Background(), models.DelegationRequest{RequestID: "request-" + tenantID, InitiatorAgentID: "planner", TargetAgentID: "executor", ToolName: "echo", TenantID: tenantID})
+		if err != nil || !resp.Allowed {
+			t.Fatalf("tenant=%q response=%+v err=%v", tenantID, resp, err)
+		}
+	}
+}
+
+func TestApprovalResumeRechecksPersistedTenantAndTarget(t *testing.T) {
+	for _, mutate := range []struct{ name, sql, value string }{
+		{name: "tenant", sql: "UPDATE delegation_approvals SET tenant_id=? WHERE approval_id=?", value: "tenant-b"},
+		{name: "target", sql: "UPDATE delegation_approvals SET target_agent_id=? WHERE approval_id=?", value: "executor-b"},
+	} {
+		t.Run(mutate.name, func(t *testing.T) {
+			db := openTestDB(t)
+			reg := registry.NewStore(db.AgentStore())
+			_ = reg.Register(models.AgentCard{AgentID: "executor-a", TenantID: "tenant-a", Capabilities: []string{"delegate_execution"}})
+			_ = reg.Register(models.AgentCard{AgentID: "executor-b", TenantID: "tenant-b", Capabilities: []string{"delegate_execution"}})
+			authorizer := &sequenceAuthorizer{decisions: []models.DelegationResponse{{Allowed: false, Verdict: "require_approval", DecisionID: "approval-decision"}, {Allowed: true, Verdict: "allow"}}}
+			issuer := &concurrentIssuer{}
+			d := New(reg, task.New(db.TaskStore()).WithInstanceID(db.InstanceID()), issuer, nil, time.Hour).WithR2Authorizer(authorizer)
+			resp, err := d.Request(context.Background(), models.DelegationRequest{RequestID: "approval", InitiatorAgentID: "planner", TargetAgentID: "executor-a", ToolName: "echo", AllowedTools: []string{"echo"}, TenantID: "tenant-a"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, _ := db.DelegationApprovalStore().Get(context.Background(), resp.ApprovalID)
+			a, err = db.DelegationApprovalStore().Transition(context.Background(), a.ApprovalID, a.Version, "pending", "approved", "reviewer", "ok", "action")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = db.Exec(mutate.sql, mutate.value, a.ApprovalID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = d.ResumeApproval(context.Background(), a.ApprovalID); err == nil || err.Error() != "target agent not found" {
+				t.Fatalf("resume err=%v", err)
+			}
+			if authorizer.calls != 1 || issuer.calls.Load() != 0 {
+				t.Fatalf("authorizer=%d issuer=%d", authorizer.calls, issuer.calls.Load())
+			}
+			for _, table := range []string{"tasks", "delegation_dispatch_outbox", "task_assignments"} {
+				var count int
+				_ = db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count)
+				if count != 0 {
+					t.Fatalf("%s count=%d", table, count)
+				}
+			}
+		})
+	}
+}
+
+func TestConcurrentCrossTenantRequestsCannotBypassLookup(t *testing.T) {
+	db := openTestDB(t)
+	reg := registry.NewStore(db.AgentStore())
+	_ = reg.Register(models.AgentCard{AgentID: "executor", TenantID: "tenant-b", Capabilities: []string{"delegate_execution"}})
+	authorizer := &concurrentAuthorizer{}
+	issuer := &concurrentIssuer{}
+	dispatcher := &concurrentDispatcher{}
+	d := New(reg, task.New(db.TaskStore()).WithInstanceID(db.InstanceID()), issuer, nil, time.Hour).WithR2Authorizer(authorizer).WithEntrypointClient(dispatcher).WithOutboundQueue(db.DelegationDispatchOutboxStore())
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, err := d.Request(context.Background(), models.DelegationRequest{RequestID: fmt.Sprintf("cross-%d", i), InitiatorAgentID: "planner", TargetAgentID: "executor", ToolName: "echo", TenantID: "tenant-a"})
+			if err != nil || resp.Allowed || resp.Reason != "target agent not found" {
+				t.Errorf("response=%+v err=%v", resp, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if authorizer.calls.Load() != 0 || issuer.calls.Load() != 0 || dispatcher.calls.Load() != 0 {
+		t.Fatalf("side effects: authorizer=%d issuer=%d dispatcher=%d", authorizer.calls.Load(), issuer.calls.Load(), dispatcher.calls.Load())
 	}
 }
 

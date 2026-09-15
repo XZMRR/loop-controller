@@ -4,6 +4,7 @@ package delegation
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/loop-controller/go/internal/execution"
 	"github.com/loop-controller/go/internal/models"
 )
 
@@ -28,9 +30,13 @@ type R2Authorizer interface {
 // HTTPR2Authorizer calls the Python IIGE authorization endpoint. The legacy
 // type name is retained for source compatibility.
 type HTTPR2Authorizer struct {
-	BaseURL     string
-	BearerToken string
-	Client      *http.Client
+	BaseURL              string
+	BearerToken          string
+	Client               *http.Client
+	LifecycleBaseURL     string
+	LifecycleBearerToken string
+	LifecycleClient      *http.Client
+	StrictLifecycle      bool
 }
 
 type interactionAuthorizationRequest struct {
@@ -55,6 +61,7 @@ type interactionAuthorizationRequest struct {
 	Deadline                *time.Time              `json:"deadline,omitempty"`
 	Budget                  models.DelegationBudget `json:"budget"`
 	ParentAllowRedelegation bool                    `json:"parent_allow_redelegation"`
+	TenantID                string                  `json:"tenant_id,omitempty"`
 }
 
 func checkAuthorizationProtocolVersion(version string) error {
@@ -62,12 +69,11 @@ func checkAuthorizationProtocolVersion(version string) error {
 		return fmt.Errorf("invalid protocol version %q", version)
 	}
 	parts := strings.Split(version, ".")
-	current := strings.Split(interactionProtocolVersion, ".")
-	if parts[0] != current[0] || parts[1] != current[1] {
+	minor := parts[0] + "." + parts[1]
+	if minor != "0.53" && minor != "0.54" {
 		return fmt.Errorf(
-			"incompatible protocol version %q, expected %s",
+			"incompatible protocol version %q, expected 0.53.x or 0.54.x",
 			version,
-			interactionProtocolVersion,
 		)
 	}
 	return nil
@@ -109,6 +115,7 @@ func (a *HTTPR2Authorizer) Authorize(ctx context.Context, req models.DelegationR
 		Deadline:                req.Deadline,
 		Budget:                  req.Budget,
 		ParentAllowRedelegation: req.ParentAllowRedelegation,
+		TenantID:                req.TenantID,
 	})
 	if err != nil {
 		return denied("failed to marshal delegation request"), fmt.Errorf("marshal delegation request: %w", err)
@@ -209,36 +216,111 @@ func denied(reason string) models.DelegationResponse {
 	}
 }
 
+func delegationJTI(raw string) string {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		JTI string `json:"jti"`
+	}
+	if json.Unmarshal(payload, &claims) != nil {
+		return ""
+	}
+	return claims.JTI
+}
+
 // RecordLifecycle appends a committed Task transition to the Python audit timeline.
 func (a *HTTPR2Authorizer) RecordLifecycle(ctx context.Context, task models.Task, event, eventID string) error {
 	payload, err := json.Marshal(map[string]any{
-		"event_id":              eventID,
-		"interaction_id":        task.InteractionID,
-		"root_interaction_id":   task.RootInteractionID,
-		"parent_interaction_id": task.ParentInteractionID,
-		"decision_id":           task.DecisionID,
-		"task_id":               task.TaskID,
-		"session_id":            task.SessionID,
-		"source_agent_id":       task.InitiatorAgentID,
-		"target_agent_id":       task.TargetAgentID,
-		"event":                 event,
-		"root_task_id":          task.RootTaskID,
-		"parent_task_id":        task.ParentTaskID,
-		"delegation_depth":      task.DelegationDepth,
-		"allowed_tools":         task.AllowedTools,
-		"allowed_capabilities":  task.AllowedCapabilities,
-		"allow_redelegation":    task.AllowRedelegation,
-		"budget":                task.Budget,
-		"reserved_budget":       task.ReservedBudget,
-		"consumed_budget":       task.ConsumedBudget,
-		"deadline":              task.Deadline,
+		"event_id":                       eventID,
+		"request_id":                     task.RequestID,
+		"interaction_id":                 task.InteractionID,
+		"root_interaction_id":            task.RootInteractionID,
+		"parent_interaction_id":          task.ParentInteractionID,
+		"decision_id":                    task.DecisionID,
+		"task_id":                        task.TaskID,
+		"session_id":                     task.SessionID,
+		"source_agent_id":                task.InitiatorAgentID,
+		"target_agent_id":                task.TargetAgentID,
+		"event":                          event,
+		"root_task_id":                   task.RootTaskID,
+		"parent_task_id":                 task.ParentTaskID,
+		"delegation_depth":               task.DelegationDepth,
+		"allowed_tools":                  task.AllowedTools,
+		"allowed_capabilities":           task.AllowedCapabilities,
+		"allow_redelegation":             task.AllowRedelegation,
+		"budget":                         task.Budget,
+		"reserved_budget":                task.ReservedBudget,
+		"consumed_budget":                task.ConsumedBudget,
+		"deadline":                       task.Deadline,
+		"tenant_id":                      task.TenantID,
+		"target_workload_id":             task.TargetWorkloadID,
+		"target_instance_id":             task.TargetInstanceID,
+		"delegation_jti":                 delegationJTI(task.DelegationToken),
+		"delegation_token":               task.DelegationToken,
+		"required_security_capabilities": execution.StrictRequiredSecurityCapabilities,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal interaction lifecycle: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.BaseURL+"/interaction/v1/delegations/lifecycle", bytes.NewReader(payload))
+	baseURL := a.LifecycleBaseURL
+	if baseURL == "" {
+		baseURL = a.BaseURL
+	}
+	if a.StrictLifecycle && (a.LifecycleBaseURL == "" || a.LifecycleClient == nil || a.LifecycleBearerToken == "" || task.DelegationToken == "") {
+		return fmt.Errorf("strict lifecycle requires independent client, credential, and delegation token")
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/interaction/v1/delegations/lifecycle", bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("build interaction lifecycle request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	token := a.LifecycleBearerToken
+	if token == "" && !a.StrictLifecycle {
+		token = a.BearerToken
+	}
+	if token != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := a.LifecycleClient
+	if client == nil && !a.StrictLifecycle {
+		client = a.Client
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("interaction lifecycle endpoint unreachable: %w", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return fmt.Errorf("interaction lifecycle endpoint returned status %d", httpResp.StatusCode)
+	}
+	return nil
+}
+
+// RecordApprovalLifecycle appends a committed approval transition to the Python audit timeline.
+func (a *HTTPR2Authorizer) RecordApprovalLifecycle(ctx context.Context, approval models.DelegationApproval, event, eventID string) error {
+	payload, err := json.Marshal(map[string]any{
+		"event_id": eventID, "approval_id": approval.ApprovalID, "request_id": approval.RequestID,
+		"decision_id": approval.DecisionID, "session_id": approval.SessionID,
+		"source_agent_id": approval.InitiatorAgentID, "target_agent_id": approval.TargetAgentID,
+		"event": event, "status": approval.Status, "allowed_tools": approval.AllowedTools,
+		"allowed_capabilities": approval.AllowedCapabilities, "allow_redelegation": approval.AllowRedelegation,
+		"budget": approval.Budget, "deadline": approval.TaskDeadline, "expires_at": approval.ExpiresAt,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal approval lifecycle: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.BaseURL+"/interaction/v1/delegations/approvals/lifecycle", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build approval lifecycle request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if a.BearerToken != "" {
@@ -250,11 +332,11 @@ func (a *HTTPR2Authorizer) RecordLifecycle(ctx context.Context, task models.Task
 	}
 	httpResp, err := client.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("interaction lifecycle endpoint unreachable: %w", err)
+		return fmt.Errorf("approval lifecycle endpoint unreachable: %w", err)
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return fmt.Errorf("interaction lifecycle endpoint returned status %d", httpResp.StatusCode)
+		return fmt.Errorf("approval lifecycle endpoint returned status %d", httpResp.StatusCode)
 	}
 	return nil
 }

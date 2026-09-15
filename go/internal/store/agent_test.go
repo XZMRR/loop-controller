@@ -20,7 +20,7 @@ func TestAgentStoreUpsertGetListDelete(t *testing.T) {
 		Entrypoint:   models.AgentEntrypoint{Type: "http", URL: "http://localhost:8080"},
 		Capabilities: []string{"delegate_execution"},
 		TrustDomain:  "example.com",
-		Version:      "0.48.0",
+		Version:      "0.53.0",
 	}
 	if err := as.Upsert(ctx, card); err != nil {
 		t.Fatalf("upsert: %v", err)

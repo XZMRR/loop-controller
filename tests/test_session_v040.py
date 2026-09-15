@@ -200,6 +200,7 @@ async def test_checkpoint_session_consecutive_deny_block() -> None:
         identity=identity,
         budget_ledger=InMemoryBudgetLedger(),
         permission_analyzer=ConfigPermissionInteractionAnalyzer([]),
+        allow_degraded=True,
     )
 
     # 预置连续 3 次 deny
@@ -249,6 +250,7 @@ def test_build_runtime_injects_local_agent_config(tmp_path: Path) -> None:
 
     runtime = build_runtime(config)
 
+    assert runtime.degraded_backends == ()
     assert runtime.local_agent_config == config.go_kernel_config["go_kernel"]["local_agent"]
     assert runtime.local_agent_config is not config.go_kernel_config["go_kernel"]["local_agent"]
 

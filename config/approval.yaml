@@ -1,7 +1,19 @@
-# R0 审批人配置（v0.3.0 Iteration 5）
-# 仅用于确定 escalation_target；真实 approve/deny 由 `lc approvals` CLI 写入。
+# R0 审批路由、事实源与可靠 webhook 配置（当前 v0.54.0；可靠 webhook 于 v0.49.0 引入）
+# approvers/rules 只确定 escalation_target；approve/deny 身份由 entrypoints.yaml 的 approval_auth 认证。
 approvers:
   default: zhang_manager
+store_path: ./data/approvals.db
+webhook:
+  enabled: false
+  url: ""
+  auth_header_name: Authorization
+  auth_header_value: ""
+  timeout_seconds: 10
+  poll_interval_seconds: 1
+  lease_seconds: 30
+  batch_size: 20
+  retry_base_seconds: 1
+  retry_max_seconds: 300
 rules:
   - tool_name: send_email
     approver: zhang_manager

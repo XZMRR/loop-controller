@@ -47,11 +47,23 @@ class FileSecretBackend:
     # ------------------------------------------------------------------
 
     async def get(self, ref: SecretRef) -> SecretValue | None:
-        """按引用读取 secret；优先 tenant，未命中 fallback 到 global。"""
-        value = self._get_from_tenant(ref)
-        if value is not None:
-            return value
-        return self._get_global(ref.name, ref.key)
+        """按引用读取 secret；tenant 名称未命中时 fallback 到 global。"""
+        if ref.tenant_id is not None:
+            tenant_secret = self._tenant_cache.get(ref.tenant_id, {}).get(ref.name)
+            if tenant_secret is not None:
+                return self._resolve_key(tenant_secret, ref)
+        return self._resolve_key(self._cache.get(ref.name), ref)
+
+    async def get_exact(
+        self, ref: SecretRef, scope: SecretScope
+    ) -> SecretValue | None:
+        if scope == SecretScope.TENANT:
+            if ref.tenant_id is None:
+                return None
+            secret = self._tenant_cache.get(ref.tenant_id, {}).get(ref.name)
+        else:
+            secret = self._cache.get(ref.name)
+        return self._resolve_key(secret, ref)
 
     async def list(
         self, scope: SecretScope, tenant_id: str | None = None

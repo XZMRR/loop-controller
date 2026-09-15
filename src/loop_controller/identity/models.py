@@ -21,7 +21,8 @@ class AgentIdentity(BaseModel):
     user_id: str
     harness_id: str | None = None
     profile_id: str
-    tenant_id: str | None = None
+    tenant_id: str | None = None  # v0.22.0 预留；v0.52 起由 claim 映射 + 注册表绑定校验填充
+    roles: tuple[str, ...] = ()  # v0.52 OIDC roles claim（身份断言，授权以 RBAC 绑定为准）
     issued_at: datetime = Field(default_factory=_utc_now)
     expires_at: datetime | None = None
 

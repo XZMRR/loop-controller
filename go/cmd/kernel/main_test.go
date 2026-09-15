@@ -1,6 +1,12 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 )
@@ -11,6 +17,26 @@ func TestDispatchEntrypointsEnabled(t *testing.T) {
 	}
 	if dispatchEntrypointsEnabled(true) {
 		t.Fatal("development mode must disable HTTP entrypoint dispatch")
+	}
+}
+
+func TestDAGControllerDefaultAndDependencies(t *testing.T) {
+	const name = "LC_DAG_CONTROLLER_ENABLED"
+	t.Setenv(name, "")
+	if envBoolDefault(name, false) {
+		t.Fatal("DAG controller must default off")
+	}
+	if err := validateRuntimeFeatures(false, false, false); err != nil {
+		t.Fatalf("default configuration must not require scheduler/worker: %v", err)
+	}
+	if err := validateRuntimeFeatures(false, true, true); err == nil {
+		t.Fatal("DAG requires scheduler")
+	}
+	if err := validateRuntimeFeatures(true, true, false); err == nil {
+		t.Fatal("DAG/scheduler require assignment worker")
+	}
+	if err := validateRuntimeFeatures(true, true, true); err != nil {
+		t.Fatalf("explicit dependencies should be valid: %v", err)
 	}
 }
 
@@ -58,6 +84,46 @@ func TestResolveControlAuth(t *testing.T) {
 				t.Fatalf("got (%q, %q), want (%q, %q)", token, owner, tt.wantToken, tt.wantOwner)
 			}
 		})
+	}
+}
+
+func TestRequirePeerIdentityUsesErrorEnvelope(t *testing.T) {
+	called := false
+	handler := requirePeerIdentity("spiffe://example.test/control", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+
+	for _, tc := range []struct {
+		name string
+		tls  *tls.ConnectionState
+		code string
+	}{
+		{name: "missing", code: "client_identity_required"},
+		{name: "mismatch", tls: &tls.ConnectionState{
+			VerifiedChains:   [][]*x509.Certificate{{{}}},
+			PeerCertificates: []*x509.Certificate{{URIs: []*url.URL{{Scheme: "spiffe", Host: "example.test", Path: "/other"}}}},
+		}, code: "client_identity_mismatch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/health", nil)
+			req.TLS = tc.tls
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+			if res.Code != http.StatusForbidden || res.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("status/content-type = %d/%q", res.Code, res.Header().Get("Content-Type"))
+			}
+			var envelope struct {
+				ProtocolVersion string `json:"protocol_version"`
+				Error           string `json:"error"`
+				Code            string `json:"code"`
+			}
+			if err := json.Unmarshal(res.Body.Bytes(), &envelope); err != nil || envelope.ProtocolVersion != "0.54.0" || envelope.Error == "" || envelope.Code != tc.code {
+				t.Fatalf("error envelope = %+v, err=%v", envelope, err)
+			}
+		})
+	}
+	if called {
+		t.Fatal("protected handler called for invalid peer identity")
 	}
 }
 

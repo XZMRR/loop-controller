@@ -19,6 +19,21 @@ properties:
   request_id:
     type: string
     pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  tenant_id:
+    type: string
+  target_workload_id:
+    type: string
+  target_instance_id:
+    type: string
+  root_interaction_id:
+    type: string
+  parent_interaction_id:
+    type: string
+  root_task_id:
+    type: string
+  delegation_depth:
+    type: integer
+    minimum: 0
   initiator_agent_id:
     type: string
     pattern: '^[a-zA-Z0-9_.-]{1,128}$'

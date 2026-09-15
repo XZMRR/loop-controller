@@ -2,7 +2,12 @@ package stream
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,7 +15,7 @@ import (
 	"github.com/loop-controller/go/internal/store"
 )
 
-func openTestEventStore(t *testing.T, taskID string) EventStore {
+func openTestEventStore(t *testing.T, taskID string) store.EventStore {
 	t.Helper()
 	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "events.db"))
 	if err != nil {
@@ -218,7 +223,7 @@ func TestPublisherReplaysOnlyEventsAfterLastEventID(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ch, err := pub.Subscribe(ctx, "task-1", history[0].EventID)
+	ch, err := pub.Subscribe(ctx, "task-1", history[0].Cursor)
 	if err != nil {
 		t.Fatalf("subscribe failed: %v", err)
 	}
@@ -256,6 +261,66 @@ func TestConcurrentCancelAndPublish(t *testing.T) {
 	}
 }
 
+func TestServeTaskStreamUsesOpaqueCursorAndMapsCursorErrors(t *testing.T) {
+	es := openTestEventStore(t, "task-1")
+	pub := NewPublisher(es)
+	if err := pub.Publish(context.Background(), models.Task{TaskID: "task-1", Status: "pending"}); err != nil {
+		t.Fatal(err)
+	}
+	history, err := es.ListAfter(context.Background(), "task-1", "")
+	if err != nil || len(history) != 1 {
+		t.Fatalf("history=%+v err=%v", history, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+	done := make(chan error, 1)
+	go func() { done <- ServeTaskStream(pub, response, req, "task-1") }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+	body := response.Body.String()
+	if !strings.Contains(body, "id: "+history[0].Cursor) || strings.Contains(body, "id: "+history[0].EventID+"\n") {
+		t.Fatalf("SSE id is not opaque cursor: %q", body)
+	}
+
+	if _, err := es.Compact(context.Background(), "task-1", 2); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Last-Event-ID", history[0].Cursor)
+	response = httptest.NewRecorder()
+	err = ServeTaskStream(pub, response, req, "task-1")
+	if !errors.Is(err, store.ErrEventCursorExpired) || response.Code != http.StatusGone {
+		t.Fatalf("expired response=%d err=%v", response.Code, err)
+	}
+	if response.Header().Get("Content-Type") != "application/json" || !strings.Contains(response.Body.String(), `"code":"event_cursor_expired"`) {
+		t.Fatalf("expired response is not JSON envelope: headers=%v body=%q", response.Header(), response.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Last-Event-ID", "bad")
+	response = httptest.NewRecorder()
+	err = ServeTaskStream(pub, response, req, "task-1")
+	if !errors.Is(err, store.ErrEventCursorInvalid) || response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid response=%d err=%v", response.Code, err)
+	}
+	if response.Header().Get("Content-Type") != "application/json" || !strings.Contains(response.Body.String(), `"code":"event_cursor_invalid"`) {
+		t.Fatalf("invalid response is not JSON envelope: headers=%v body=%q", response.Header(), response.Body.String())
+	}
+
+	future, err := store.EncodeEventCursor("task-1", 2, models.TaskEventSchemaVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Last-Event-ID", future)
+	response = httptest.NewRecorder()
+	err = ServeTaskStream(pub, response, req, "task-1")
+	if !errors.Is(err, store.ErrEventCursorFuture) || response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"code":"event_cursor_future"`) {
+		t.Fatalf("future response=%d body=%q err=%v", response.Code, response.Body.String(), err)
+	}
+}
+
 func TestSubscribeEmptyTaskID(t *testing.T) {
 	pub := NewPublisher(openTestEventStore(t, ""))
 	ctx := context.Background()
@@ -263,4 +328,157 @@ func TestSubscribeEmptyTaskID(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for empty task_id")
 	}
+}
+
+func TestServeTaskStreamRetryHeartbeatAndCleanup(t *testing.T) {
+	pub := NewPublisher(openTestEventStore(t, "task-1"))
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+	done := make(chan error, 1)
+	cfg := DefaultConfig()
+	cfg.RetryInterval = 15 * time.Millisecond
+	cfg.HeartbeatInterval = 10 * time.Millisecond
+	go func() { done <- ServeTaskStreamWithConfig(pub, response, req, "task-1", cfg) }()
+	time.Sleep(40 * time.Millisecond)
+	cancel()
+	<-done
+	body := response.Body.String()
+	if strings.Count(body, "retry: 15\n\n") < 2 {
+		t.Fatalf("missing initial/periodic retry frames: %q", body)
+	}
+	if !strings.Contains(body, ": heartbeat\n\n") || strings.Contains(body, "event: heartbeat") {
+		t.Fatalf("heartbeat is not an SSE comment: %q", body)
+	}
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.subs) != 0 {
+		t.Fatalf("subscriber leaked after cancellation: %d", len(pub.subs))
+	}
+}
+
+func TestSlowSubscriberBoundariesAndFastSubscriber(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{name: "events", cfg: Config{PollInterval: time.Millisecond, MaxQueuedEvents: 1, MaxQueuedBytes: 1 << 20, MaxQueuedAge: time.Second}},
+		{name: "bytes", cfg: Config{PollInterval: time.Millisecond, MaxQueuedEvents: 100, MaxQueuedBytes: 1, MaxQueuedAge: time.Second}},
+		{name: "age", cfg: Config{PollInterval: time.Millisecond, MaxQueuedEvents: 100, MaxQueuedBytes: 1 << 20, MaxQueuedAge: 10 * time.Millisecond}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pub := NewPublisher(openTestEventStore(t, "task-1")).WithConfig(tc.cfg)
+			defer pub.Close()
+			slow, err := pub.Subscribe(context.Background(), "task-1", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			fast, err := pub.Subscribe(context.Background(), "task-1", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := pub.Publish(context.Background(), models.Task{TaskID: "task-1", Status: "running"}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-fast:
+			case <-time.After(time.Second):
+				t.Fatal("fast subscriber was blocked by slow subscriber")
+			}
+			if tc.name == "events" {
+				if err := pub.Publish(context.Background(), models.Task{TaskID: "task-1", Status: "accepted"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.name == "age" {
+				time.Sleep(30 * time.Millisecond)
+			}
+			select {
+			case _, ok := <-slow:
+				if ok {
+					select {
+					case _, ok = <-slow:
+						if ok {
+							t.Fatal("slow subscriber remained connected")
+						}
+					case <-time.After(time.Second):
+						t.Fatal("slow subscriber was not disconnected")
+					}
+				}
+			case <-time.After(time.Second):
+				t.Fatal("slow subscriber was not disconnected")
+			}
+		})
+	}
+}
+
+type failingResponseWriter struct {
+	header http.Header
+}
+
+func (w *failingResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+func (w *failingResponseWriter) WriteHeader(int)           {}
+func (w *failingResponseWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+func (w *failingResponseWriter) FlushError() error         { return errors.New("flush failed") }
+
+func TestServeTaskStreamWriterErrorCleansUp(t *testing.T) {
+	pub := NewPublisher(openTestEventStore(t, "task-1"))
+	err := ServeTaskStream(pub, &failingResponseWriter{}, httptest.NewRequest(http.MethodGet, "/", nil), "task-1")
+	if err == nil {
+		t.Fatal("expected writer error")
+	}
+	pub.Wait()
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.subs) != 0 {
+		t.Fatalf("subscriber leaked after writer error: %d", len(pub.subs))
+	}
+}
+
+func TestPublisherCloseIsIdempotentAndRejectsOperations(t *testing.T) {
+	pub := NewPublisher(openTestEventStore(t, "task-1"))
+	ch, err := pub.Subscribe(context.Background(), "task-1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pub.Wait()
+	if _, ok := <-ch; ok {
+		t.Fatal("subscriber channel remained open")
+	}
+	if _, err := pub.Subscribe(context.Background(), "task-1", ""); !errors.Is(err, ErrPublisherClosed) {
+		t.Fatalf("subscribe after close: %v", err)
+	}
+	if err := pub.Publish(context.Background(), models.Task{TaskID: "task-1"}); !errors.Is(err, ErrPublisherClosed) {
+		t.Fatalf("publish after close: %v", err)
+	}
+}
+
+func TestConcurrentClosePublishSubscribe(t *testing.T) {
+	pub := NewPublisher(openTestEventStore(t, "task-1"))
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = pub.Subscribe(context.Background(), "task-1", "")
+		}()
+		go func() {
+			defer wg.Done()
+			_ = pub.Publish(context.Background(), models.Task{TaskID: "task-1", Status: "running"})
+		}()
+	}
+	_ = pub.Close()
+	wg.Wait()
+	pub.Wait()
 }

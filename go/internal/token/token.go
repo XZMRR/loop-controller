@@ -26,6 +26,8 @@ type DelegationClaims struct {
 	ParentInteractionID string   `json:"parent_interaction_id,omitempty"`
 	InitiatorAgentID    string   `json:"initiator_agent_id"`
 	TargetAgentID       string   `json:"target_agent_id"`
+	TargetWorkloadID    string   `json:"target_workload_id,omitempty"`
+	TargetInstanceID    string   `json:"target_instance_id,omitempty"`
 	ToolName            string   `json:"tool_name"`
 	TaskID              string   `json:"task_id"`
 	TokenID             string   `json:"jti"`
@@ -44,6 +46,8 @@ type DelegationClaims struct {
 	BudgetPaymentAmount float64  `json:"budget_payment_amount"`
 	BudgetCurrency      string   `json:"budget_currency,omitempty"`
 	ExpiresAt           int64    `json:"exp"`
+	// TenantID 仅透传：内核不做 tenant 校验（v0.52 明确边界）。
+	TenantID string `json:"tenant_id,omitempty"`
 }
 
 // HMACIssuer issues and validates HMAC-SHA256 tokens.

@@ -149,7 +149,7 @@ async def test_legacy_endpoint_maps_initiator_to_source() -> None:
     endpoint = DelegationAuthorizeEndpoint(authorizer)
     response = await endpoint.handle(
         {
-            "protocol_version": "0.48.0",
+            "protocol_version": "0.53.0",
             "request_id": "req-1",
             "initiator_agent_id": "agent-a",
             "target_agent_id": "agent-b",
@@ -174,7 +174,7 @@ async def test_interaction_endpoint_exposes_modify_effective_args() -> None:
     endpoint = InteractionAuthorizeEndpoint(engine)
     response = await endpoint.handle(
         {
-            "protocol_version": "0.48.0",
+            "protocol_version": "0.53.0",
             "request_id": "req-1",
             "source_agent_id": "agent-a",
             "target_agent_id": "agent-b",
@@ -200,7 +200,7 @@ async def test_legacy_endpoint_protocol_version_fail_closed() -> None:
 async def test_legacy_endpoint_missing_fields_is_denied() -> None:
     authorizer, engine = _authorizer(_decision("allow", "allowed"))
     endpoint = DelegationAuthorizeEndpoint(authorizer)
-    response = await endpoint.handle({"protocol_version": "0.48.0"})
+    response = await endpoint.handle({"protocol_version": "0.53.0"})
     assert response["allowed"] is False
     assert "missing required delegation fields" in response["reason"]
     engine.evaluate.assert_not_awaited()

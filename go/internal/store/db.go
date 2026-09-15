@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/loop-controller/go/internal/instance"
 	_ "modernc.org/sqlite"
 )
 
+// schema is the exact DDL frozen into store migration 1. Do not edit it after
+// release; all future store schema changes must use a new migration.
 const schema = `
 CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT PRIMARY KEY,
@@ -46,7 +49,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     error_code TEXT,
     delegation_token TEXT NOT NULL DEFAULT '',
     exec_owner TEXT NOT NULL DEFAULT '',
-    exec_lease_expires_at INTEGER NOT NULL DEFAULT 0
+    exec_lease_expires_at INTEGER NOT NULL DEFAULT 0,
+    tenant_id TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT '',
+    target_workload_id TEXT NOT NULL DEFAULT '',
+    target_instance_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_target ON tasks(target_agent_id);
@@ -111,6 +118,9 @@ CREATE TABLE IF NOT EXISTS delegation_approvals (
     initiator_agent_id TEXT NOT NULL,
     target_agent_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL DEFAULT '',
+    target_workload_id TEXT NOT NULL DEFAULT '',
+    target_instance_id TEXT NOT NULL DEFAULT '',
     root_task_id TEXT NOT NULL DEFAULT '',
     parent_task_id TEXT NOT NULL DEFAULT '',
     delegation_depth INTEGER NOT NULL DEFAULT 0,
@@ -139,6 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_delegation_approvals_initiator ON delegation_appr
 
 CREATE TABLE IF NOT EXISTS approval_audit_outbox (
     outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id TEXT NOT NULL UNIQUE,
     approval_id TEXT NOT NULL REFERENCES delegation_approvals(approval_id),
     event TEXT NOT NULL,
     payload_json TEXT NOT NULL,
@@ -153,6 +164,26 @@ CREATE TABLE IF NOT EXISTS approval_audit_outbox (
     UNIQUE(approval_id, event)
 );
 CREATE INDEX IF NOT EXISTS idx_approval_audit_due ON approval_audit_outbox(delivered_at, next_attempt_at, outbox_id);
+
+CREATE TABLE IF NOT EXISTS approval_notification_outbox (
+    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id TEXT NOT NULL UNIQUE,
+    approval_id TEXT NOT NULL REFERENCES delegation_approvals(approval_id),
+    event TEXT NOT NULL,
+    destination_url TEXT NOT NULL,
+    destination_digest TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    delivered_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    claimed_by TEXT NOT NULL DEFAULT '',
+    claim_token TEXT NOT NULL DEFAULT '',
+    claim_expires_at INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(approval_id, event)
+);
+CREATE INDEX IF NOT EXISTS idx_approval_notification_due ON approval_notification_outbox(delivered_at, next_attempt_at, outbox_id);
 
 CREATE TABLE IF NOT EXISTS delegation_dispatch_outbox (
     delivery_id TEXT PRIMARY KEY,
@@ -169,6 +200,62 @@ CREATE TABLE IF NOT EXISTS delegation_dispatch_outbox (
     claim_expires_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_delegation_dispatch_due ON delegation_dispatch_outbox(delivered_at, next_attempt_at, delivery_id);
+
+CREATE TABLE IF NOT EXISTS task_assignments (
+    assignment_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id),
+    agent_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued','claimed','dispatched','executing','settled','retry_wait','dead_letter','cancelled')),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    execution_fence INTEGER NOT NULL DEFAULT 0 CHECK (execution_fence >= 0),
+    lease_owner TEXT NOT NULL DEFAULT '',
+    claim_token TEXT NOT NULL DEFAULT '',
+    lease_expires_at INTEGER NOT NULL DEFAULT 0,
+    not_before TEXT,
+    deadline TEXT,
+    delivery_id TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    failure_class TEXT NOT NULL DEFAULT '',
+    result_status TEXT NOT NULL DEFAULT '',
+    outcome_json TEXT,
+    error_code TEXT NOT NULL DEFAULT '',
+    consumed_token_count INTEGER NOT NULL DEFAULT 0,
+    consumed_payment_amount REAL NOT NULL DEFAULT 0,
+    consumed_currency TEXT NOT NULL DEFAULT '',
+    execution_receipt_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_assignments_tenant_idempotency ON task_assignments(tenant_id, idempotency_key) WHERE idempotency_key <> '';
+CREATE INDEX IF NOT EXISTS idx_task_assignments_due ON task_assignments(state, not_before, lease_expires_at, assignment_id);
+
+CREATE TABLE IF NOT EXISTS execution_attempts (
+    assignment_id TEXT NOT NULL REFERENCES task_assignments(assignment_id),
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt > 0),
+    execution_fence INTEGER NOT NULL CHECK (execution_fence > 0),
+    state TEXT NOT NULL CHECK (state IN ('claimed','dispatched','executing','settled','cancelled','superseded')),
+    lease_owner TEXT NOT NULL,
+    claim_token TEXT NOT NULL,
+    lease_expires_at INTEGER NOT NULL,
+    failure_class TEXT NOT NULL DEFAULT '',
+    result_status TEXT NOT NULL DEFAULT '',
+    outcome_json TEXT,
+    error_code TEXT NOT NULL DEFAULT '',
+    consumed_token_count INTEGER NOT NULL DEFAULT 0,
+    consumed_payment_amount REAL NOT NULL DEFAULT 0,
+    consumed_currency TEXT NOT NULL DEFAULT '',
+    execution_receipt_json TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    PRIMARY KEY (assignment_id, attempt),
+    UNIQUE (assignment_id, execution_fence)
+);
+CREATE INDEX IF NOT EXISTS idx_execution_attempts_assignment ON execution_attempts(assignment_id, attempt);
 
 CREATE TABLE IF NOT EXISTS agents (
     agent_id TEXT PRIMARY KEY,
@@ -204,9 +291,13 @@ const defaultExecutionLease = time.Minute
 // DB wraps a sql.DB with the Loop Controller schema.
 type DB struct {
 	*sql.DB
-	path           string
-	instanceID     string
-	executionLease time.Duration
+	path                    string
+	instanceID              string
+	executionLease          time.Duration
+	approvalNotifications   atomic.Bool
+	notificationDestination atomic.Value
+	delegationTokenIssuer   DelegationTokenIssuer
+	delegationTokenTTL      time.Duration
 }
 
 // Open opens the SQLite database at path, creating the directory and schema
@@ -228,61 +319,49 @@ func Open(ctx context.Context, path string) (*DB, error) {
 	// one-shot PRAGMA statement which only affects the single connection that
 	// ran it. Multiple kernel instances may share the same SQLite file, so
 	// foreign_keys and busy_timeout must hold for all connections.
-	dsn := abs + "?_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=ON"
+	dsn := abs + "?_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=ON&_txlock=immediate"
+	if err := runMigrations(ctx, dsn, storeMigrations); err != nil {
+		return nil, err
+	}
+
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-
-	if _, err := db.ExecContext(ctx, schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create schema: %w", err)
-	}
-	for _, column := range []string{"interaction_id", "decision_id", "root_interaction_id", "parent_interaction_id", "root_task_id", "parent_task_id", "budget_currency", "delegation_token", "allowed_tools_json", "allowed_capabilities_json"} {
-		if err := ensureTaskTextColumn(ctx, db, column); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	for _, column := range []string{"delegation_depth", "budget_token_count", "budget_payment_amount", "reserved_token_count", "reserved_payment_amount", "consumed_token_count", "consumed_payment_amount", "allow_redelegation", "exec_owner", "exec_lease_expires_at"} {
-		if err := ensureTaskColumn(ctx, db, column); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	if err := ensureColumn(ctx, db, "tasks", "deadline", "TEXT"); err != nil {
-		db.Close()
-		return nil, err
-	}
-	for _, column := range []string{"claimed_by", "claim_token", "claim_expires_at"} {
-		if err := ensureOutboxColumn(ctx, db, column); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	return &DB{DB: db, path: abs, instanceID: instance.New().String(), executionLease: defaultExecutionLease}, nil
+	result := &DB{DB: db, path: abs, instanceID: instance.New().String(), executionLease: defaultExecutionLease}
+	result.notificationDestination.Store("")
+	return result, nil
 }
 
-func ensureTaskTextColumn(ctx context.Context, db *sql.DB, column string) error {
+func ensureTaskTextColumn(ctx context.Context, db queryExecer, column string) error {
 	rows, err := db.QueryContext(ctx, "PRAGMA table_info(tasks)")
 	if err != nil {
 		return fmt.Errorf("inspect tasks schema: %w", err)
 	}
-	defer rows.Close()
+	found := false
 	for rows.Next() {
 		var cid int
 		var name, columnType string
 		var notNull, primaryKey int
 		var defaultValue any
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
 			return fmt.Errorf("scan tasks schema: %w", err)
 		}
 		if name == column {
-			return nil
+			found = true
+			break
 		}
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return fmt.Errorf("inspect tasks schema: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close tasks schema rows: %w", err)
+	}
+	if found {
+		return nil
 	}
 	if _, err := db.ExecContext(ctx, "ALTER TABLE tasks ADD COLUMN "+column+" TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("add task %s: %w", column, err)
@@ -292,26 +371,35 @@ func ensureTaskTextColumn(ctx context.Context, db *sql.DB, column string) error 
 
 // ensureColumn adds a column to a table if it is absent. decl must be a full
 // SQLite column declaration such as "TEXT NOT NULL DEFAULT ”".
-func ensureColumn(ctx context.Context, db *sql.DB, table, column, decl string) error {
+func ensureColumn(ctx context.Context, db queryExecer, table, column, decl string) error {
 	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
 	if err != nil {
 		return fmt.Errorf("inspect %s schema: %w", table, err)
 	}
-	defer rows.Close()
+	found := false
 	for rows.Next() {
 		var cid int
 		var name, columnType string
 		var notNull, primaryKey int
 		var defaultValue any
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
 			return fmt.Errorf("scan %s schema: %w", table, err)
 		}
 		if name == column {
-			return nil
+			found = true
+			break
 		}
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return fmt.Errorf("inspect %s schema: %w", table, err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close %s schema rows: %w", table, err)
+	}
+	if found {
+		return nil
 	}
 	if _, err := db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+decl); err != nil {
 		return fmt.Errorf("add %s.%s: %w", table, column, err)
@@ -319,7 +407,7 @@ func ensureColumn(ctx context.Context, db *sql.DB, table, column, decl string) e
 	return nil
 }
 
-func ensureTaskColumn(ctx context.Context, db *sql.DB, column string) error {
+func ensureTaskColumn(ctx context.Context, db queryExecer, column string) error {
 	switch column {
 	case "exec_owner":
 		return ensureColumn(ctx, db, "tasks", column, "TEXT NOT NULL DEFAULT ''")
@@ -333,7 +421,7 @@ func ensureTaskColumn(ctx context.Context, db *sql.DB, column string) error {
 	return ensureColumn(ctx, db, "tasks", column, "TEXT NOT NULL DEFAULT ''")
 }
 
-func ensureOutboxColumn(ctx context.Context, db *sql.DB, column string) error {
+func ensureOutboxColumn(ctx context.Context, db queryExecer, column string) error {
 	switch column {
 	case "claimed_by":
 		return ensureColumn(ctx, db, "lifecycle_outbox", column, "TEXT NOT NULL DEFAULT ''")
@@ -361,9 +449,31 @@ func (db *DB) SetExecutionLease(d time.Duration) {
 	}
 }
 
+// SetApprovalNotificationDestination controls whether future approval changes enqueue webhook deliveries.
+func (db *DB) SetApprovalNotificationDestination(destination string) {
+	db.notificationDestination.Store(destination)
+	db.approvalNotifications.Store(destination != "")
+}
+
+func (db *DB) SetApprovalNotificationsEnabled(enabled bool) {
+	destination := ""
+	if enabled {
+		destination = "http://approval-webhook.invalid/"
+	}
+	db.SetApprovalNotificationDestination(destination)
+}
+
 // TaskStore returns a store backed by the underlying database.
 func (db *DB) TaskStore() TaskStore {
 	return &taskStore{db: db.DB, owner: db.instanceID, lease: &db.executionLease}
+}
+
+// AssignmentStore returns a durable assignment and execution-attempt store.
+func (db *DB) AssignmentStore() AssignmentStore { return &assignmentStore{db: db.DB} }
+
+// ExecutionQueueStore returns the atomic task/assignment execution store.
+func (db *DB) ExecutionQueueStore() ExecutionQueueStore {
+	return &executionQueueStore{db: db.DB, owner: db.instanceID}
 }
 
 // MessageStore returns a store backed by the underlying database.

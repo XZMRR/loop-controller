@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -187,6 +188,170 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
+
+CREATE TABLE IF NOT EXISTS approval_requests (
+    decision_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    request_json TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status);
+
+CREATE TABLE IF NOT EXISTS approval_responses (
+    decision_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    response_json TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    FOREIGN KEY(decision_id) REFERENCES approval_requests(decision_id)
+);
+
+CREATE TABLE IF NOT EXISTS approval_notification_outbox (
+    delivery_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    claim_token TEXT,
+    lease_until TEXT,
+    delivered_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approval_outbox_ready
+    ON approval_notification_outbox(delivered_at, next_attempt_at, lease_until);
+
+CREATE TABLE IF NOT EXISTS policy_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    revision TEXT,
+    state TEXT NOT NULL CHECK (state IN
+      ('draft','validated','published','loaded','failed','superseded')),
+    base_revision TEXT,
+    source_manifest_json TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    source_candidate_id TEXT,
+    rollback_of_revision TEXT,
+    artifact_path TEXT,
+    artifact_sha256 TEXT,
+    artifact_size INTEGER,
+    artifact_ready INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    validated_at TEXT,
+    published_at TEXT,
+    loaded_at TEXT,
+    superseded_at TEXT,
+    failure_stage TEXT,
+    failure_code TEXT,
+    failure_summary TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_policy_candidates_state ON policy_candidates(state);
+CREATE INDEX IF NOT EXISTS idx_policy_candidates_revision ON policy_candidates(revision);
+
+CREATE TABLE IF NOT EXISTS policy_validations (
+    validation_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL UNIQUE,
+    opa_version TEXT,
+    check_ok INTEGER NOT NULL,
+    test_ok INTEGER NOT NULL,
+    tool_default_deny_ok INTEGER NOT NULL,
+    interaction_default_deny_ok INTEGER NOT NULL,
+    result_sha256 TEXT NOT NULL,
+    result_summary_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    FOREIGN KEY(candidate_id) REFERENCES policy_candidates(candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS policy_current (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    revision TEXT,
+    candidate_id TEXT,
+    generation INTEGER NOT NULL DEFAULT 0,
+    updated_by TEXT,
+    updated_at TEXT,
+    FOREIGN KEY(candidate_id) REFERENCES policy_candidates(candidate_id)
+);
+INSERT OR IGNORE INTO policy_current(singleton, generation) VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS opa_instance_status (
+    instance_id TEXT PRIMARY KEY,
+    revision TEXT,
+    bundle_name TEXT NOT NULL,
+    state TEXT NOT NULL,
+    error_code TEXT,
+    error_summary TEXT,
+    opa_version TEXT,
+    opa_reported_at TEXT,
+    report_sequence INTEGER,
+    generation INTEGER NOT NULL DEFAULT 0,
+    received_at TEXT NOT NULL,
+    report_sha256 TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_policy_status_revision ON opa_instance_status(revision);
+
+CREATE TABLE IF NOT EXISTS opa_instance_load_evidence (
+    generation INTEGER NOT NULL,
+    instance_id TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    report_sha256 TEXT NOT NULL,
+    opa_reported_at TEXT,
+    report_sequence INTEGER,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (generation, instance_id)
+);
+
+CREATE TABLE IF NOT EXISTS policy_change_audit (
+    audit_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    candidate_id TEXT,
+    base_revision TEXT,
+    target_revision TEXT,
+    source_sha256 TEXT,
+    artifact_sha256 TEXT,
+    result TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_policy_audit_created ON policy_change_audit(created_at);
+
+CREATE TABLE IF NOT EXISTS rbac_role_bindings (
+    binding_id TEXT PRIMARY KEY,
+    principal TEXT NOT NULL,
+    tenant_id TEXT,
+    role TEXT NOT NULL,
+    granted_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rbac_bindings_principal ON rbac_role_bindings(principal, revoked_at);
+
+CREATE TABLE IF NOT EXISTS rbac_cross_tenant_grants (
+    grant_id TEXT PRIMARY KEY,
+    source_principal TEXT NOT NULL,
+    source_tenant TEXT NOT NULL,
+    target_tenant TEXT NOT NULL,
+    resources_json TEXT NOT NULL,
+    granted_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS rbac_denials (
+    denial_id TEXT PRIMARY KEY,
+    actor TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    required_permission TEXT NOT NULL,
+    principal_tenant TEXT,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rbac_denials_created ON rbac_denials(created_at);
 """
 
 
@@ -275,10 +440,21 @@ class StateDatabase:
             )
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 5000;")
-            conn.execute("PRAGMA journal_mode=WAL;")
+            # 多个进程首次打开同一数据库时，切换 WAL 本身需要写锁。SQLite 的
+            # busy_timeout 对该 PRAGMA 并非始终生效，因此在初始化竞争窗口内有限退避。
+            for attempt in range(5):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
             conn.execute("PRAGMA foreign_keys=ON;")
             return conn
         except sqlite3.Error as exc:
+            if "conn" in locals():
+                conn.close()
             raise StateDatabaseError(f"无法连接状态数据库 {self._db_path}: {exc}") from exc
 
     @contextmanager
@@ -311,12 +487,56 @@ class StateDatabase:
         except sqlite3.Error as exc:
             raise StateDatabaseError(f"无法升级 decisions 表 Schema: {exc}") from exc
 
+    def _migrate_policy_columns(self) -> None:
+        try:
+            with self._connect() as conn:
+                existing = {row["name"] for row in conn.execute("PRAGMA table_info(opa_instance_status)")}
+                for column, declaration in (
+                    ("report_sequence", "INTEGER"),
+                    ("generation", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    if column not in existing:
+                        conn.execute(f"ALTER TABLE opa_instance_status ADD COLUMN {column} {declaration}")
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"无法升级 policy 表 Schema: {exc}") from exc
+
+    def _migrate_rbac_columns(self) -> None:
+        """v0.52：RBAC 与租户/双人复核列的增量迁移（幂等）。"""
+        try:
+            with self._connect() as conn, self._immediate(conn):
+                candidates = {row["name"] for row in conn.execute("PRAGMA table_info(policy_candidates)")}
+                if "tenant_id" not in candidates:
+                    conn.execute("ALTER TABLE policy_candidates ADD COLUMN tenant_id TEXT")
+                validations = {row["name"] for row in conn.execute("PRAGMA table_info(policy_validations)")}
+                if "validated_by" not in validations:
+                    conn.execute("ALTER TABLE policy_validations ADD COLUMN validated_by TEXT")
+                    conn.execute(
+                        """UPDATE policy_validations SET validated_by = (
+                           SELECT created_by FROM policy_candidates
+                           WHERE policy_candidates.candidate_id = policy_validations.candidate_id)
+                           WHERE validated_by IS NULL"""
+                    )
+                if "separation_ok" not in validations:
+                    conn.execute(
+                        "ALTER TABLE policy_validations ADD COLUMN separation_ok INTEGER NOT NULL DEFAULT 0"
+                    )
+                approval_requests = {row["name"] for row in conn.execute("PRAGMA table_info(approval_requests)")}
+                if "tenant_id" not in approval_requests:
+                    conn.execute("ALTER TABLE approval_requests ADD COLUMN tenant_id TEXT")
+                approval_responses = {row["name"] for row in conn.execute("PRAGMA table_info(approval_responses)")}
+                if "tenant_id" not in approval_responses:
+                    conn.execute("ALTER TABLE approval_responses ADD COLUMN tenant_id TEXT")
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"无法升级 RBAC/租户 Schema: {exc}") from exc
+
     def init_schema(self) -> None:
         """初始化/校验 Schema；幂等。"""
         try:
             with self._connect() as conn:
                 conn.executescript(SCHEMA)
             self._migrate_decisions_columns()
+            self._migrate_policy_columns()
+            self._migrate_rbac_columns()
         except sqlite3.Error as exc:
             raise StateDatabaseError(f"无法初始化状态数据库 Schema: {exc}") from exc
 
@@ -1544,6 +1764,275 @@ class StateDatabase:
                 return [self._conversation_row_to_dict(row) for row in rows]
         except sqlite3.Error as exc:
             raise StateDatabaseError(f"枚举会话消息失败: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Approval / notification outbox
+    # ------------------------------------------------------------------
+
+    def submit_approval_request_and_enqueue_notification(
+        self,
+        *,
+        decision_id: str,
+        request_id: str,
+        request_json: str,
+        request_hash: str,
+        created_at: str,
+        delivery_id: str | None,
+        destination: str | None,
+        payload_json: str | None,
+        tenant_id: str | None = None,
+    ) -> None:
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    row = conn.execute(
+                        "SELECT request_id, request_hash FROM approval_requests WHERE decision_id = ?",
+                        (decision_id,),
+                    ).fetchone()
+                    if row is not None:
+                        if row["request_id"] == request_id and row["request_hash"] == request_hash:
+                            return
+                        raise StateDatabaseError(
+                            f"decision {decision_id} 或 request {request_id} 已存在且内容冲突"
+                        )
+                    conn.execute(
+                        "INSERT INTO approval_requests "
+                        "(decision_id, request_id, request_json, request_hash, status, created_at, tenant_id) "
+                        "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                        (decision_id, request_id, request_json, request_hash, created_at, tenant_id),
+                    )
+                    if delivery_id is not None:
+                        conn.execute(
+                            "INSERT INTO approval_notification_outbox "
+                            "(delivery_id, request_id, decision_id, event_type, destination, "
+                            "payload_json, next_attempt_at, created_at) "
+                            "VALUES (?, ?, ?, 'created', ?, ?, ?, ?)",
+                            (
+                                delivery_id,
+                                request_id,
+                                decision_id,
+                                destination,
+                                payload_json,
+                                created_at,
+                                created_at,
+                            ),
+                        )
+        except StateDatabaseError:
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise StateDatabaseError(f"审批请求已存在且内容冲突: {exc}") from exc
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"提交审批请求失败: {exc}") from exc
+
+    def record_approval_response_and_enqueue_notification(
+        self,
+        *,
+        decision_id: str,
+        request_id: str,
+        response_json: str,
+        status: str,
+        decided_at: str,
+        delivery_id: str | None,
+        destination: str | None,
+        payload_json: str | None,
+    ) -> None:
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    request = conn.execute(
+                        "SELECT request_id FROM approval_requests WHERE decision_id = ?",
+                        (decision_id,),
+                    ).fetchone()
+                    if request is None or request["request_id"] != request_id:
+                        raise StateDatabaseError(f"decision {decision_id} 的审批请求不存在或不匹配")
+                    existing = conn.execute(
+                        "SELECT response_json FROM approval_responses WHERE decision_id = ?",
+                        (decision_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        if existing["response_json"] == response_json:
+                            return
+                        raise StateDatabaseError(
+                            f"decision {decision_id} 已有审批结果，不允许覆盖"
+                        )
+                    conn.execute(
+                        "INSERT INTO approval_responses "
+                        "(decision_id, request_id, response_json, decided_at) VALUES (?, ?, ?, ?)",
+                        (decision_id, request_id, response_json, decided_at),
+                    )
+                    conn.execute(
+                        "UPDATE approval_requests SET status = ? WHERE decision_id = ?",
+                        (status, decision_id),
+                    )
+                    if delivery_id is not None:
+                        conn.execute(
+                            "INSERT INTO approval_notification_outbox "
+                            "(delivery_id, request_id, decision_id, event_type, destination, "
+                            "payload_json, next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                delivery_id,
+                                request_id,
+                                decision_id,
+                                status,
+                                destination,
+                                payload_json,
+                                decided_at,
+                                decided_at,
+                            ),
+                        )
+        except StateDatabaseError:
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise StateDatabaseError(f"审批响应已存在且内容冲突: {exc}") from exc
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"记录审批响应失败: {exc}") from exc
+
+    def get_approval_request_json(self, decision_id: str) -> str | None:
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT request_json FROM approval_requests WHERE decision_id = ?",
+                    (decision_id,),
+                ).fetchone()
+                return row["request_json"] if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询审批请求失败: {exc}") from exc
+
+    def get_approval_request_json_by_id(self, request_id: str) -> str | None:
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT request_json FROM approval_requests WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                return row["request_json"] if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询审批请求失败: {exc}") from exc
+
+    def list_pending_approval_request_json(self) -> list[str]:
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT request_json FROM approval_requests WHERE status = 'pending' ORDER BY rowid"
+                ).fetchall()
+                return [row["request_json"] for row in rows]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举待审批请求失败: {exc}") from exc
+
+    def list_recent_approval_json(self, limit: int) -> list[dict[str, str | None]]:
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT r.request_json, p.response_json "
+                    "FROM approval_requests AS r "
+                    "LEFT JOIN approval_responses AS p ON p.decision_id = r.decision_id "
+                    "ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举最近审批请求失败: {exc}") from exc
+
+    def get_approval_response_json(self, decision_id: str) -> str | None:
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT response_json FROM approval_responses WHERE decision_id = ?",
+                    (decision_id,),
+                ).fetchone()
+                return row["response_json"] if row else None
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询审批响应失败: {exc}") from exc
+
+    def claim_approval_notifications(
+        self,
+        *,
+        now: str,
+        lease_until: str,
+        claim_token: str,
+        limit: int,
+        destination: str | None = None,
+    ) -> list[dict[str, Any]]:
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    destination_sql = " AND destination = ?" if destination is not None else ""
+                    params: tuple[Any, ...] = (
+                        (now, now, destination, limit)
+                        if destination is not None
+                        else (now, now, limit)
+                    )
+                    rows = conn.execute(
+                        "SELECT delivery_id FROM approval_notification_outbox "
+                        "WHERE delivered_at IS NULL AND next_attempt_at <= ? "
+                        "AND (lease_until IS NULL OR lease_until <= ?)"
+                        f"{destination_sql} ORDER BY created_at, delivery_id LIMIT ?",
+                        params,
+                    ).fetchall()
+                    ids = [row["delivery_id"] for row in rows]
+                    if not ids:
+                        return []
+                    placeholders = ",".join("?" for _ in ids)
+                    conn.execute(
+                        f"UPDATE approval_notification_outbox SET claim_token = ?, lease_until = ?, "
+                        f"attempts = attempts + 1 WHERE delivery_id IN ({placeholders})",
+                        (claim_token, lease_until, *ids),
+                    )
+                    claimed = conn.execute(
+                        f"SELECT * FROM approval_notification_outbox "
+                        f"WHERE delivery_id IN ({placeholders}) ORDER BY created_at, delivery_id",
+                        ids,
+                    ).fetchall()
+                    return [dict(row) for row in claimed]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"claim 审批通知失败: {exc}") from exc
+
+    def ack_approval_notification(
+        self, *, delivery_id: str, claim_token: str, delivered_at: str
+    ) -> bool:
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    cur = conn.execute(
+                        "UPDATE approval_notification_outbox SET delivered_at = ?, "
+                        "claim_token = NULL, lease_until = NULL, last_error = NULL "
+                        "WHERE delivery_id = ? AND claim_token = ? AND delivered_at IS NULL",
+                        (delivered_at, delivery_id, claim_token),
+                    )
+                    return cur.rowcount == 1
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"ACK 审批通知失败: {exc}") from exc
+
+    def fail_approval_notification(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: str,
+        next_attempt_at: str,
+        last_error: str,
+    ) -> bool:
+        try:
+            with self._connect() as conn:
+                with self._immediate(conn):
+                    cur = conn.execute(
+                        "UPDATE approval_notification_outbox SET next_attempt_at = ?, "
+                        "last_error = ?, claim_token = NULL, lease_until = NULL "
+                        "WHERE delivery_id = ? AND claim_token = ? AND delivered_at IS NULL",
+                        (next_attempt_at, last_error, delivery_id, claim_token),
+                    )
+                    return cur.rowcount == 1
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"重试审批通知失败: {exc}") from exc
+
+    def list_approval_notifications(self) -> list[dict[str, Any]]:
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM approval_notification_outbox ORDER BY created_at, delivery_id"
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举审批通知失败: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Migration helpers

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/loop-controller/go/internal/entrypointpolicy"
 	"github.com/loop-controller/go/internal/models"
 	"github.com/loop-controller/go/internal/registry"
 )
@@ -28,7 +29,7 @@ func TestStaticProviderLoadsCards(t *testing.T) {
 	os.WriteFile(path, data, 0644)
 
 	reg := registry.New()
-	mgr := NewManager(reg, NewStaticProvider(path))
+	mgr := NewManager(reg, NewStaticProvider(path)).WithEntrypointPolicy(entrypointpolicy.Development())
 	if err := mgr.Sync(context.Background()); err != nil {
 		t.Fatalf("sync failed: %v", err)
 	}
@@ -64,7 +65,7 @@ func TestSyncRemovesStaleCards(t *testing.T) {
 	os.WriteFile(path, data, 0644)
 
 	reg := registry.New()
-	mgr := NewManager(reg, NewStaticProvider(path))
+	mgr := NewManager(reg, NewStaticProvider(path)).WithEntrypointPolicy(entrypointpolicy.Development())
 	mgr.Sync(context.Background())
 	if len(reg.List()) != 2 {
 		t.Fatalf("expected 2 agents, got %d", len(reg.List()))
@@ -93,7 +94,7 @@ func TestHTTPProviderCaches(t *testing.T) {
 
 	reg := registry.New()
 	prov := NewHTTPProvider(server.URL, time.Minute)
-	mgr := NewManager(reg, prov)
+	mgr := NewManager(reg, prov).WithEntrypointPolicy(entrypointpolicy.Development())
 	if err := mgr.Sync(context.Background()); err != nil {
 		t.Fatalf("sync failed: %v", err)
 	}
@@ -117,7 +118,7 @@ func TestValidateCardRequiresEntrypointURL(t *testing.T) {
 	os.WriteFile(path, data, 0644)
 
 	reg := registry.New()
-	mgr := NewManager(reg, NewStaticProvider(path))
+	mgr := NewManager(reg, NewStaticProvider(path)).WithEntrypointPolicy(entrypointpolicy.Development())
 	if err := mgr.Sync(context.Background()); err == nil {
 		t.Fatal("expected sync to fail for invalid card")
 	}

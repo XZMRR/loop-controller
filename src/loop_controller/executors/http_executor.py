@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from loop_controller.executors.base import ExecutionContext, ToolExecutor
+from loop_controller.executors.base import (
+    ExecutionContext,
+    ExecutionReceiptType,
+    ExecutionTerminalStatus,
+    ToolExecutor,
+    issue_execution_receipt,
+)
 from loop_controller.executors.http_client import HTTPClient
 from loop_controller.executors.http_models import (
     HTTPToolSpec,
@@ -14,7 +22,12 @@ from loop_controller.executors.http_models import (
 )
 from loop_controller.executors.http_security import HTTPSecurityError, HTTPSecurityPolicy
 from loop_controller.models import CapabilityProfile, Tool, ToolResult
-from loop_controller.secrets import SecretBroker, SecretNotFoundError
+from loop_controller.secrets import (
+    CredentialInjection,
+    SecretBroker,
+    SecretNotFoundError,
+    ToolCredentialResolver,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,15 +39,29 @@ class HTTPExecutor(ToolExecutor):
     ``HTTPToolSpec``。
     """
 
+    security_egress_type = "protected_http"
+    security_capabilities = frozenset({"execution_receipt_v1"})
+
     def __init__(
         self,
         http_client: HTTPClient,
         tool_specs: dict[str, HTTPToolSpec],
         secret_broker: SecretBroker | None = None,
+        *,
+        security_mode: str = "compatibility",
+        credential_resolver: ToolCredentialResolver | None = None,
+        attester_workload_id: str = "loop-controller",
     ) -> None:
         self._client = http_client
         self._tool_specs = tool_specs
         self._secret_broker = secret_broker
+        self._security_mode = security_mode
+        self._credential_resolver = credential_resolver
+        self._attester_workload_id = attester_workload_id
+
+    @property
+    def supports_strict_security(self) -> bool:
+        return self._security_mode == "strict" and self._credential_resolver is not None
 
     def _get_spec(self, tool_name: str) -> HTTPToolSpec:
         spec = self._tool_specs.get(tool_name)
@@ -60,23 +87,65 @@ class HTTPExecutor(ToolExecutor):
         """渲染模板、安全校验、发送 HTTP 请求并返回 ToolResult。"""
         spec = self._get_spec(tool_name)
 
-        try:
-            url, headers, body = await spec.build_request(
-                arguments,
-                secret_broker=self._secret_broker,
-                tenant_id=context.tenant_id,
+        credential = None
+
+        def finish(result: ToolResult, terminal: ExecutionTerminalStatus) -> ToolResult:
+            if self._security_mode != "strict":
+                return result
+            receipt = issue_execution_receipt(
+                receipt_type=ExecutionReceiptType.CONTROLLER_EXECUTION_RECORD,
+                context=context,
+                attester_workload_id=self._attester_workload_id,
+                executor="http",
+                backend=spec.base_url,
+                status=terminal,
+                result=result.content,
+                credential=credential,
             )
+            return result.model_copy(
+                update={"terminal_status": terminal.value, "execution_receipt": receipt}
+            )
+
+        credential = None
+        try:
+            if self._security_mode == "strict":
+                if context.request_id is None or context.decision_id is None:
+                    raise ValueError("strict HTTP requires complete execution correlation")
+                ref = spec.protected_credential_ref
+                if ref is None or self._credential_resolver is None:
+                    raise ValueError("strict HTTP requires protected credential resolver")
+                if any(key in arguments for key in ("secret_ref", "credential", "credential_ref")):
+                    raise ValueError("arguments cannot override protected credentials")
+                credential, _ = await self._credential_resolver.resolve(
+                    ref, tool_name=tool_name, tenant_id=context.tenant_id
+                )
+                url, headers, body = await spec.build_request(arguments)
+                secret = await self._credential_resolver.revalidate(
+                    credential, tool_name=tool_name, tenant_id=context.tenant_id
+                )
+                url, headers, body = self._inject_credential(
+                    url, headers, body, spec, credential.injection, secret.value
+                )
+            else:
+                url, headers, body = await spec.build_request(
+                    arguments,
+                    secret_broker=self._secret_broker,
+                    tenant_id=context.tenant_id,
+                )
         except KeyError as exc:
-            return self._error_result(
-                context, tool_name, f"缺少参数: {exc}", "http_missing_argument"
+            return finish(
+                self._error_result(context, tool_name, f"缺少参数: {exc}", "http_missing_argument"),
+                ExecutionTerminalStatus.ERROR,
             )
         except ValueError as exc:
-            return self._error_result(
-                context, tool_name, f"模板渲染失败: {exc}", "http_template_error"
+            return finish(
+                self._error_result(context, tool_name, f"模板渲染失败: {exc}", "http_template_error"),
+                ExecutionTerminalStatus.ERROR,
             )
         except SecretNotFoundError as exc:
-            return self._error_result(
-                context, tool_name, str(exc), "http_auth_error"
+            return finish(
+                self._error_result(context, tool_name, str(exc), "http_auth_error"),
+                ExecutionTerminalStatus.ERROR,
             )
 
         # SSRF / allowlist 校验
@@ -87,8 +156,9 @@ class HTTPExecutor(ToolExecutor):
         try:
             security.check_url(url)
         except HTTPSecurityError as exc:
-            return self._error_result(
-                context, tool_name, str(exc), exc.error_code
+            return finish(
+                self._error_result(context, tool_name, str(exc), exc.error_code),
+                ExecutionTerminalStatus.ERROR,
             )
 
         # 发送请求
@@ -99,40 +169,87 @@ class HTTPExecutor(ToolExecutor):
                 headers=headers,
                 body=body,
                 url_checker=security.check_url,
+                protect_sensitive_headers=self._security_mode == "strict",
             )
         except HTTPSecurityError as exc:
-            return self._error_result(
-                context, tool_name, str(exc), exc.error_code
+            terminal = (
+                ExecutionTerminalStatus.TIMEOUT
+                if exc.error_code == "http_timeout"
+                else ExecutionTerminalStatus.ERROR
             )
+            return finish(self._error_result(context, tool_name, str(exc), exc.error_code), terminal)
+        except asyncio.CancelledError:
+            result = self._error_result(context, tool_name, "HTTP 调用已取消", "http_cancelled")
+            if self._security_mode == "strict":
+                return finish(result, ExecutionTerminalStatus.CANCELLED)
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.exception("HTTP 工具 %s 调用失败", tool_name)
-            return self._error_result(
-                context, tool_name, f"HTTP 调用失败: {exc}", "http_internal_error"
+            return finish(
+                self._error_result(context, tool_name, f"HTTP 调用失败: {exc}", "http_internal_error"),
+                ExecutionTerminalStatus.ERROR,
             )
 
         # 响应映射
         mapping = spec.response_mapping
         if status in mapping.success_status:
             content = self._map_success_response(text, mapping)
-            return ToolResult(
-                call_id=context.call_id,
-                task_id=context.task_id,
-                tool_name=tool_name,
-                status="success",
-                content=content,
-                elapsed_ms=int(elapsed_ms),
+            return finish(
+                ToolResult(
+                    call_id=context.call_id,
+                    task_id=context.task_id,
+                    tool_name=tool_name,
+                    status="success",
+                    content=content,
+                    elapsed_ms=int(elapsed_ms),
+                ),
+                ExecutionTerminalStatus.SUCCESS,
             )
 
         error_code = mapping.error_codes.get(status) or self._default_error_code(status)
-        return ToolResult(
-            call_id=context.call_id,
-            task_id=context.task_id,
-            tool_name=tool_name,
-            status="error",
-            content=text[:500],
-            error_code=error_code,
-            elapsed_ms=int(elapsed_ms),
+        terminal = (
+            ExecutionTerminalStatus.TIMEOUT
+            if status == 408
+            else ExecutionTerminalStatus.ERROR
         )
+        return finish(
+            ToolResult(
+                call_id=context.call_id,
+                task_id=context.task_id,
+                tool_name=tool_name,
+                status="error",
+                content=text[:500],
+                error_code=error_code,
+                elapsed_ms=int(elapsed_ms),
+            ),
+            terminal,
+        )
+
+    @staticmethod
+    def _inject_credential(
+        url: str,
+        headers: dict[str, str],
+        body: Any,
+        spec: HTTPToolSpec,
+        injection: CredentialInjection,
+        value: Any,
+    ) -> tuple[str, dict[str, str], Any]:
+        key = spec.auth.key_name or "Authorization"
+        if injection == CredentialInjection.HEADER:
+            token = str(value)
+            headers[key] = f"Bearer {token}" if spec.auth.type == "bearer_token" else token
+        elif injection == CredentialInjection.QUERY:
+            parts = urlsplit(url)
+            query = parse_qsl(parts.query, keep_blank_values=True)
+            query.append((key, str(value)))
+            url = urlunsplit((*parts[:3], urlencode(query), parts.fragment))
+        elif injection == CredentialInjection.BODY:
+            if not isinstance(body, dict) or not isinstance(value, (str, int, float, bool)):
+                raise ValueError("body credential injection requires object body and scalar value")
+            body[key] = value
+        elif injection == CredentialInjection.MTLS:
+            raise ValueError("mTLS credential injection must be configured on HTTPClient")
+        return url, headers, body
 
     async def list_tools(self, profile: CapabilityProfile) -> list[Tool]:
         """返回 HTTP 工具元数据列表，按 Profile 过滤。"""

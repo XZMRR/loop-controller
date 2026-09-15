@@ -1,0 +1,48 @@
+# Static strict conformance template only; not a directly runnable production stack.
+# Replace image tags and provision the referenced secret outside this repository; before
+# production, verify network/credential isolation, mTLS and external DeploymentProof.
+services:
+  agent:
+    image: loop-controller-agent:release
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.50
+    environment:
+      LOOP_CONTROLLER_URL: http://loop-controller:8080
+    tmpfs: [/tmp]
+    networks: [agent]
+  loop-controller:
+    image: loop-controller:release
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    tmpfs: [/tmp]
+    networks: [agent, governed]
+  executor:
+    image: loop-controller-executor:release
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.50
+    secrets: [tool_credential]
+    tmpfs: [/tmp]
+    networks: [governed]
+networks:
+  agent:
+    internal: true
+  governed:
+    internal: true
+secrets:
+  tool_credential:
+    file: ./secret-placeholder-not-for-production

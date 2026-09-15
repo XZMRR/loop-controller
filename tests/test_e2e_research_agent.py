@@ -107,6 +107,7 @@ def _build_controller(workdir: Path, opa_url: str) -> LoopController:
         decision_store=InMemoryDecisionStore(),
         budget_ledger=InMemoryBudgetLedger(),
         permission_analyzer=ConfigPermissionInteractionAnalyzer(config.permission_rules),
+        allow_degraded=True,
         tool_costs={
             name: __import__("loop_controller.models", fromlist=["BudgetCost"]).BudgetCost(
                 token_count=entry.cost_per_call

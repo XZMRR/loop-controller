@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/loop-controller/go/internal/models"
@@ -14,15 +13,23 @@ import (
 )
 
 type approvalAuthConfig struct {
-	token     string
-	principal string
+	token        string
+	principal    string
+	tenant       string
+	globalAccess bool
 }
-
-var approvalAuth sync.Map
 
 // SetApprovalAuth configures the independent credential used by approval principals.
 func (s *Server) SetApprovalAuth(bearerToken, principal string) {
-	approvalAuth.Store(s, approvalAuthConfig{token: strings.TrimSpace(bearerToken), principal: strings.TrimSpace(principal)})
+	s.SetApprovalAuthForTenant(bearerToken, principal, "", true)
+}
+
+// SetApprovalAuthForTenant scopes an approver credential to one tenant unless global access is explicit.
+func (s *Server) SetApprovalAuthForTenant(bearerToken, principal, tenant string, globalAccess bool) {
+	s.approvalAuth = approvalAuthConfig{
+		token: strings.TrimSpace(bearerToken), principal: strings.TrimSpace(principal),
+		tenant: strings.TrimSpace(tenant), globalAccess: globalAccess,
+	}
 }
 
 func (s *Server) registerApprovalRoutes(mux *http.ServeMux) {
@@ -33,9 +40,7 @@ func (s *Server) registerApprovalRoutes(mux *http.ServeMux) {
 }
 
 func (s *Server) approvalConfig() approvalAuthConfig {
-	value, _ := approvalAuth.Load(s)
-	config, _ := value.(approvalAuthConfig)
-	return config
+	return s.approvalAuth
 }
 
 func (s *Server) withInitiatorApprovalAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -58,8 +63,8 @@ func (s *Server) withInitiatorApprovalAuth(next http.HandlerFunc) http.HandlerFu
 			writeError(w, http.StatusInternalServerError, "approval_lookup_failed", err.Error())
 			return
 		}
-		if approval.InitiatorAgentID != s.controlInitiatorID {
-			writeError(w, http.StatusForbidden, "approval_access_denied", "approval is owned by another initiator")
+		if approval.InitiatorAgentID != s.controlInitiatorID || (s.controlTenantID != "" && approval.TenantID != s.controlTenantID) {
+			writeError(w, http.StatusNotFound, "approval_not_found", "approval not found")
 			return
 		}
 		next(w, r)
@@ -80,6 +85,15 @@ func (s *Server) withApproverAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if config.principal == s.controlInitiatorID {
 			writeError(w, http.StatusForbidden, "approver_not_independent", "approver principal must be independent from initiator")
+			return
+		}
+		approval, lookupErr := s.db.DelegationApprovalStore().Get(r.Context(), r.PathValue("id"))
+		if lookupErr != nil {
+			writeApprovalError(w, lookupErr)
+			return
+		}
+		if !config.globalAccess && (config.tenant == "" || approval.TenantID != config.tenant) {
+			writeError(w, http.StatusNotFound, "approval_not_found", "approval not found")
 			return
 		}
 		next(w, r)

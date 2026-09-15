@@ -43,6 +43,17 @@ class MemorySecretBackend:
         secret = self._global.get(ref.name)
         return self._resolve_key(secret, ref)
 
+    async def get_exact(
+        self, ref: SecretRef, scope: SecretScope
+    ) -> SecretValue | None:
+        if scope == SecretScope.TENANT:
+            if ref.tenant_id is None:
+                return None
+            secret = self._tenant.get(ref.tenant_id, {}).get(ref.name)
+        else:
+            secret = self._global.get(ref.name)
+        return self._resolve_key(secret, ref)
+
     async def list(
         self, scope: SecretScope, tenant_id: str | None = None
     ) -> list[str]:

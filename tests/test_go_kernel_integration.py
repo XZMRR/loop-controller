@@ -108,7 +108,7 @@ class _AllowIIGEHandler(BaseHTTPRequestHandler):
                 "decision_id": "test-decision",
                 "task_id": payload.get("task_id", ""),
                 "reason": "test IIGE allow",
-                "protocol_version": "0.48.0",
+                "protocol_version": "0.53.0",
             }
         ).encode()
         self.send_response(200)
@@ -151,6 +151,7 @@ def kernel_url(tmp_path_factory: pytest.TempPathFactory) -> str:
             "-db",
             str(db_path),
             "-development",
+            "-allow-http",
             "-interaction-url",
             f"http://127.0.0.1:{interaction_port}",
         ],
@@ -217,6 +218,7 @@ def _build_controller_with_bridge(audit_path: Path, bridge: GoKernelBridge) -> L
         risk_manager=risk_manager,
         decision_store=InMemoryDecisionStore(),
         budget_ledger=InMemoryBudgetLedger(),
+        allow_degraded=True,
         tool_costs={"web_search": BudgetCost(token_count=1)},
         masker=Masker(
             MaskingRules(
@@ -346,3 +348,6 @@ async def test_stream_task_updates(kernel_url: str) -> None:
 
     assert len(events) >= 1
     assert events[0].get("task_id") == task_id
+    assert events[0].get("schema_version") == 1
+    assert isinstance(events[0].get("sequence"), int)
+    assert events[0]["sequence"] >= 1

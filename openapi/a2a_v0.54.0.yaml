@@ -1,0 +1,558 @@
+openapi: 3.1.0
+info:
+  title: Loop Controller A2A Protocol
+  version: 0.54.0
+  description: |
+    Current v0.54.0 HTTP/JSON wire authority. AgentSpec/AgentStatus, scheduling,
+    assignment claim/renew/result and execution attempts are internal capabilities;
+    no public scheduler or worker endpoint exists. Assignment observation is exposed
+    only through task snapshots and dead-letter operations. AgentCard.version is the
+    agent implementation version; protocol_version is the negotiated wire version.
+servers:
+  - url: http://127.0.0.1:8080
+security: []
+paths:
+  /a2a/v1/agents:
+    post:
+      operationId: registerAgent
+      security: [{ControlBearer: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AgentCard'}}}}
+      responses:
+        '201': {description: Registered, content: {application/json: {schema: {$ref: '#/components/schemas/AgentRegistrationResponse'}}}}
+        '400': {description: Invalid registration; entrypoint policy rejection uses code `entrypoint_url_rejected`., content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {$ref: '#/components/responses/Error401'}
+    get:
+      operationId: listAgents
+      security: [{ControlBearer: []}]
+      responses:
+        '200': {description: Agent list envelope, content: {application/json: {schema: {$ref: '#/components/schemas/AgentList'}}}}
+        '401': {$ref: '#/components/responses/Error401'}
+  /a2a/v1/agents/{id}:
+    get:
+      operationId: getAgent
+      security: [{ControlBearer: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      responses:
+        '200': {description: Agent card, content: {application/json: {schema: {$ref: '#/components/schemas/AgentCard'}}}}
+        '401': {$ref: '#/components/responses/Error401'}
+        '404': {$ref: '#/components/responses/Error404'}
+  /a2a/v1/tasks:
+    post:
+      operationId: createTask
+      security: [{ControlBearer: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CreateTaskRequest'}}}}
+      responses:
+        '201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/Task'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+  /a2a/v1/tasks/{id}:
+    get:
+      operationId: getTask
+      security: [{ControlBearer: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      responses:
+        '200': {description: Task, content: {application/json: {schema: {$ref: '#/components/schemas/Task'}}}}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '404': {$ref: '#/components/responses/Error404'}
+  /a2a/v1/tasks/{id}/snapshot:
+    get:
+      operationId: getTaskSnapshot
+      security: [{ControlBearer: []}]
+      parameters:
+        - {$ref: '#/components/parameters/ID'}
+        - {name: tenant_id, in: query, required: false, description: Required when control auth is not tenant-bound; a bound credential overrides it., schema: {type: string}}
+      responses:
+        '200': {description: Consistent task/graph/assignment observation, content: {application/json: {schema: {$ref: '#/components/schemas/TaskSnapshot'}}}}
+        '401': {$ref: '#/components/responses/Error401'}
+        '404': {$ref: '#/components/responses/Error404'}
+  /a2a/v1/tasks/{id}/stream:
+    get:
+      operationId: streamTask
+      security: [{ControlBearer: []}]
+      parameters:
+        - {$ref: '#/components/parameters/ID'}
+        - {name: Last-Event-ID, in: header, required: false, description: Opaque cursor; clients must not parse it., schema: {type: string}}
+      responses:
+        '200':
+          description: SSE stream; id is an opaque cursor and data is TaskEvent.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-cache}}
+            Connection: {schema: {type: string, const: keep-alive}}
+          content: {text/event-stream: {schema: {type: string}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '404': {$ref: '#/components/responses/Error404'}
+        '410': {$ref: '#/components/responses/Error410'}
+        '503': {$ref: '#/components/responses/Error503'}
+  /a2a/v1/tasks/{id}/cancel:
+    post:
+      operationId: cancelTask
+      security: [{ControlBearer: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CancelTaskRequest'}}}}
+      responses:
+        '200': {description: Task after cancellation, content: {application/json: {schema: {$ref: '#/components/schemas/Task'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '404': {$ref: '#/components/responses/Error404'}
+        '409': {$ref: '#/components/responses/Error409'}
+  /a2a/v1/messages:
+    post:
+      operationId: sendMessage
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Message'}}}}
+      responses:
+        '200': {description: Accepted, content: {application/json: {schema: {$ref: '#/components/schemas/SendMessageResponse'}}}}
+        '400': {description: Rejected or invalid; routing rejection uses SendMessageResponse, malformed input uses ErrorResponse, content: {application/json: {schema: {oneOf: [{$ref: '#/components/schemas/SendMessageResponse'}, {$ref: '#/components/schemas/ErrorResponse'}]}}}}
+  /a2a/v1/delegations:
+    post:
+      operationId: requestDelegation
+      security: [{ControlBearer: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DelegationRequest'}}}}
+      responses:
+        '200': {description: Allowed, content: {application/json: {schema: {$ref: '#/components/schemas/DelegationResponse'}}}}
+        '202': {description: Awaiting approval, content: {application/json: {schema: {$ref: '#/components/schemas/DelegationResponse'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {description: Denied decision, content: {application/json: {schema: {$ref: '#/components/schemas/DelegationResponse'}}}}
+        '409': {$ref: '#/components/responses/Error409'}
+  /a2a/v1/delegation-approvals/{id}:
+    get:
+      operationId: getDelegationApproval
+      security: [{ControlBearer: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      responses:
+        '200': {description: Approval, content: {application/json: {schema: {$ref: '#/components/schemas/DelegationApproval'}}}}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '404': {$ref: '#/components/responses/Error404'}
+  /a2a/v1/delegation-approvals/{id}/approve:
+    post:
+      operationId: approveDelegation
+      security: [{ApproverBearer: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {$ref: '#/components/requestBodies/ApprovalAction'}
+      responses:
+        '200': {description: Consumed approval, content: {application/json: {schema: {$ref: '#/components/schemas/DelegationApproval'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '409': {$ref: '#/components/responses/Error409'}
+  /a2a/v1/delegation-approvals/{id}/reject:
+    post:
+      operationId: rejectDelegation
+      security: [{ApproverBearer: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {$ref: '#/components/requestBodies/ApprovalAction'}
+      responses:
+        '200': {description: Rejected approval, content: {application/json: {schema: {$ref: '#/components/schemas/DelegationApproval'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '409': {$ref: '#/components/responses/Error409'}
+  /a2a/v1/delegation-approvals/{id}/cancel:
+    post:
+      operationId: cancelDelegationApproval
+      security: [{ControlBearer: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {$ref: '#/components/requestBodies/ApprovalAction'}
+      responses:
+        '200': {description: Pending/approved returns DelegationApproval; consumed returns Task, content: {application/json: {schema: {oneOf: [{$ref: '#/components/schemas/DelegationApproval'}, {$ref: '#/components/schemas/Task'}]}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '409': {$ref: '#/components/responses/Error409'}
+  /a2a/v1/dead-letters:
+    get:
+      operationId: listDeadLetters
+      security: [{ControlBearer: []}]
+      parameters: [{name: tenant_id, in: query, required: false, schema: {type: string}}]
+      responses:
+        '200': {description: Dead letters, content: {application/json: {schema: {$ref: '#/components/schemas/DeadLetterList'}}}}
+        '401': {$ref: '#/components/responses/Error401'}
+        '404': {$ref: '#/components/responses/Error404'}
+        '500': {$ref: '#/components/responses/Error500'}
+  /a2a/v1/dead-letters/{id}/replay:
+    post:
+      operationId: replayDeadLetter
+      security: [{ControlBearer: []}]
+      parameters:
+        - {$ref: '#/components/parameters/ID'}
+        - {name: X-Correlation-ID, in: header, required: false, schema: {type: string}}
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DeadLetterReplayRequest'}}}}
+      responses:
+        '200': {description: Requeued assignment, content: {application/json: {schema: {$ref: '#/components/schemas/TaskAssignment'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '404': {$ref: '#/components/responses/Error404'}
+        '409': {$ref: '#/components/responses/Error409'}
+  /a2a/v1/task-graphs:
+    post:
+      operationId: createTaskGraph
+      security: [{ControlBearer: []}]
+      parameters: [{name: Idempotency-Key, in: header, required: true, schema: {type: string}}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TaskGraphCreate'}}}}
+      responses:
+        '201': {description: Created graph, content: {application/json: {schema: {$ref: '#/components/schemas/TaskGraph'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '404': {$ref: '#/components/responses/Error404'}
+        '409': {$ref: '#/components/responses/Error409'}
+  /a2a/v1/task-graphs/{id}:
+    get:
+      operationId: getTaskGraph
+      security: [{ControlBearer: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}, {name: tenant_id, in: query, required: false, schema: {type: string}}]
+      responses:
+        '200': {description: Graph, content: {application/json: {schema: {$ref: '#/components/schemas/TaskGraph'}}}}
+        '401': {$ref: '#/components/responses/Error401'}
+        '404': {$ref: '#/components/responses/Error404'}
+  /a2a/v1/task-graphs/{id}/cancel:
+    post:
+      operationId: cancelTaskGraph
+      security: [{ControlBearer: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TaskGraphCancelRequest'}}}}
+      responses:
+        '200': {description: Graph, content: {application/json: {schema: {$ref: '#/components/schemas/TaskGraph'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '404': {$ref: '#/components/responses/Error404'}
+        '409': {$ref: '#/components/responses/Error409'}
+  /a2a/v1/entrypoint/tasks:
+    post:
+      operationId: entrypointCreateTask
+      security: [{TaskDelegationToken: []}]
+      parameters: [{$ref: '#/components/parameters/AssignmentID'}, {$ref: '#/components/parameters/AssignmentAttempt'}, {$ref: '#/components/parameters/AssignmentFence'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/EntrypointTaskRequest'}}}}
+      responses:
+        '201': {description: Received, content: {application/json: {schema: {$ref: '#/components/schemas/Task'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '409': {$ref: '#/components/responses/Error409'}
+        '503': {$ref: '#/components/responses/Error503'}
+  /a2a/v1/entrypoint/tasks/{id}/accept:
+    post: {$ref: '#/components/schemas/EntrypointAcceptOperation'}
+  /a2a/v1/entrypoint/tasks/{id}/start:
+    post: {$ref: '#/components/schemas/EntrypointStartOperation'}
+  /a2a/v1/entrypoint/tasks/{id}/cancel:
+    post: {$ref: '#/components/schemas/EntrypointCancelOperation'}
+  /a2a/v1/entrypoint/tasks/{id}:
+    get:
+      operationId: entrypointGetTask
+      security: [{TaskDelegationToken: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      responses:
+        '200': {description: Task, content: {application/json: {schema: {$ref: '#/components/schemas/Task'}}}}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '404': {$ref: '#/components/responses/Error404'}
+  /a2a/v1/entrypoint/tasks/{id}/results:
+    post:
+      operationId: entrypointSubmitResult
+      security: [{TaskDelegationToken: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}, {$ref: '#/components/parameters/AssignmentID'}, {$ref: '#/components/parameters/AssignmentAttempt'}, {$ref: '#/components/parameters/AssignmentFence'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/EntrypointResultRequest'}}}}
+      responses:
+        '200': {description: Recorded, content: {application/json: {schema: {$ref: '#/components/schemas/Task'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '404': {$ref: '#/components/responses/Error404'}
+        '409': {$ref: '#/components/responses/Error409'}
+        '503': {$ref: '#/components/responses/Error503'}
+  /health:
+    get:
+      operationId: health
+      responses:
+        '200': {description: Liveness only., content: {application/json: {schema: {$ref: '#/components/schemas/HealthResponse'}}}}
+  /ready:
+    get:
+      operationId: readiness
+      responses:
+        '200': {description: Ready, content: {application/json: {schema: {$ref: '#/components/schemas/ReadinessResponse'}}}}
+        '503': {description: Not ready, content: {application/json: {schema: {$ref: '#/components/schemas/ReadinessResponse'}}}}
+  /metrics:
+    get:
+      operationId: metrics
+      responses:
+        '200': {description: Low-cardinality Prometheus text exposition, content: {'text/plain; version=0.0.4': {schema: {type: string}}}}
+components:
+  securitySchemes:
+    ControlBearer: {type: http, scheme: bearer, description: Control principal; optional only in explicitly configured local compatibility mode.}
+    ApproverBearer: {type: http, scheme: bearer, description: Independent approval principal.}
+    TaskDelegationToken: {type: http, scheme: bearer, bearerFormat: JWT, description: Task-scoped delegation token.}
+  parameters:
+    ID: {name: id, in: path, required: true, schema: {type: string}}
+    AssignmentID: {name: X-LC-Assignment-ID, in: header, required: false, schema: {type: string}}
+    AssignmentAttempt: {name: X-LC-Assignment-Attempt, in: header, required: false, schema: {type: integer, minimum: 1}}
+    AssignmentFence: {name: X-LC-Assignment-Fence, in: header, required: false, schema: {type: integer, minimum: 1}}
+  requestBodies:
+    ApprovalAction: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ApprovalActionRequest'}}}}
+  responses:
+    Error400: {description: Bad request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Error401: {description: Authentication required, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Error403: {description: Access denied, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Error404: {description: Not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Error409: {description: Conflict, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Error410: {description: Cursor expired, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Error500: {description: Internal service failure with a sanitized message, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Error502: {description: Upstream execution failure with a sanitized message, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Error503: {description: Service unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  schemas:
+    ProtocolVersion: {type: string, const: 0.54.0}
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, error, code]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, error: {type: string}, code: {type: string}}
+    AgentEntrypoint:
+      type: object
+      additionalProperties: false
+      required: [type, url]
+      properties:
+        type: {type: string, const: http}
+        url:
+          type: string
+          format: uri
+          pattern: '^https://[^@#]+$'
+          description: Production entrypoint URL. HTTPS only; userinfo and fragments are forbidden, and runtime policy rejects non-approved ports and non-public/reserved resolved addresses. Explicit development mode may relax HTTPS/network restrictions.
+    AgentCard:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, agent_id, name, description, entrypoint, capabilities, trust_domain, version]
+      properties:
+        protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}
+        agent_id: {type: string}
+        name: {type: string}
+        description: {type: string}
+        entrypoint: {$ref: '#/components/schemas/AgentEntrypoint'}
+        capabilities: {type: array, items: {type: string}}
+        trust_domain: {type: string}
+        version: {type: string, description: Agent implementation version, not the wire protocol version.}
+        tenant_id: {type: string}
+    AgentRegistrationResponse:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, agent_id]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, agent_id: {type: string}}
+    AgentList:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, agents]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, agents: {type: array, items: {$ref: '#/components/schemas/AgentCard'}}}
+    AgentSpec:
+      x-loop-controller-scope: internal-non-public
+      type: object
+      additionalProperties: false
+      required: [tenant_id, agent_id, name, entrypoint, capabilities, supported_tools, trust_domain, supported_protocol_versions, supported_security_capabilities, expected_workload_id, priority, weight, max_concurrency, schedulable, source_type, source_id, generation, resource_version, created_at, updated_at]
+      properties: {tenant_id: {type: string}, agent_id: {type: string}, name: {type: string}, description: {type: string}, entrypoint: {$ref: '#/components/schemas/AgentEntrypoint'}, capabilities: {type: array, items: {type: string}}, supported_tools: {type: array, items: {type: string}}, trust_domain: {type: string}, supported_protocol_versions: {type: array, items: {type: string}}, supported_security_capabilities: {type: array, items: {type: string}}, expected_workload_id: {type: string}, labels: {type: object, additionalProperties: {type: string}}, priority: {type: integer}, weight: {type: integer}, max_concurrency: {type: integer}, schedulable: {type: boolean}, source_type: {type: string}, source_id: {type: string}, external_revision: {type: string}, generation: {type: integer}, resource_version: {type: integer}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}, deleted_at: {type: string, format: date-time}}
+    AgentStatus:
+      x-loop-controller-scope: internal-non-public
+      type: object
+      additionalProperties: false
+      required: [tenant_id, agent_id, observed_generation, health, current_load, available_capacity, draining, last_seen_at, expires_at, status_revision, reported_by]
+      properties: {tenant_id: {type: string}, agent_id: {type: string}, observed_generation: {type: integer}, health: {type: string, enum: [healthy, degraded, unhealthy, unknown, expired]}, current_load: {type: integer}, available_capacity: {type: integer}, draining: {type: boolean}, last_seen_at: {type: string, format: date-time}, expires_at: {type: string, format: date-time}, status_revision: {type: integer}, reported_by: {type: string}}
+    Budget:
+      type: object
+      additionalProperties: false
+      properties: {token_count: {type: integer}, payment_amount: {type: number}, currency: {type: string}}
+    CreateTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, session_id, initiator_agent_id, target_agent_id]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, session_id: {type: string}, initiator_agent_id: {type: string}, target_agent_id: {type: string}}
+    Task:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, task_id, session_id, initiator_agent_id, target_agent_id, status, created_at, updated_at, allow_redelegation]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, task_id: {type: string}, request_id: {type: string}, session_id: {type: string}, interaction_id: {type: string}, decision_id: {type: string}, root_interaction_id: {type: string}, parent_interaction_id: {type: string}, root_task_id: {type: string}, parent_task_id: {type: string}, delegation_depth: {type: integer}, deadline: {type: string, format: date-time}, budget: {$ref: '#/components/schemas/Budget'}, reserved_budget: {$ref: '#/components/schemas/Budget'}, consumed_budget: {$ref: '#/components/schemas/Budget'}, allowed_tools: {type: array, items: {type: string}}, allowed_capabilities: {type: array, items: {type: string}}, allow_redelegation: {type: boolean}, initiator_agent_id: {type: string}, target_agent_id: {type: string}, status: {type: string, enum: [pending, accepted, running, completed, failed, cancelled, outcome_unknown]}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}, completed_at: {type: string, format: date-time}, outcome: {}, error_code: {type: string}, tenant_id: {type: string}, target_workload_id: {type: string}, target_instance_id: {type: string}}
+    ProtocolVersionRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}}
+    CancelTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, reason: {type: string}}
+    Part:
+      oneOf:
+        - {type: object, additionalProperties: false, required: [type, text], properties: {type: {const: text}, text: {type: string}}}
+        - {type: object, additionalProperties: false, required: [type, data], properties: {type: {const: data}, data: {}}}
+    Message:
+      type: object
+      additionalProperties: false
+      required: [message_id, task_id, from_agent_id, to_agent_id, role, parts, timestamp, protocol_version]
+      properties: {message_id: {type: string}, task_id: {type: string}, from_agent_id: {type: string}, to_agent_id: {type: string}, role: {type: string}, parts: {type: array, items: {$ref: '#/components/schemas/Part'}}, timestamp: {type: string, format: date-time}, protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}}
+    SendMessageResponse:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, accepted, reason]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, accepted: {type: boolean}, reason: {type: string}}
+    DelegationRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, request_id, initiator_agent_id, target_agent_id, tool_name, arguments, session_id, task_id, budget, risk_level, allowed_tools, allowed_capabilities, allow_redelegation]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, request_id: {type: string}, initiator_agent_id: {type: string}, target_agent_id: {type: string}, tool_name: {type: string}, arguments: {}, session_id: {type: string}, task_id: {type: string}, root_interaction_id: {type: string}, parent_interaction_id: {type: string}, root_task_id: {type: string}, parent_task_id: {type: string}, delegation_depth: {type: integer}, deadline: {type: string, format: date-time}, budget: {$ref: '#/components/schemas/Budget'}, risk_level: {type: string}, allowed_tools: {type: array, items: {type: string}}, allowed_capabilities: {type: array, items: {type: string}}, allow_redelegation: {type: boolean}, tenant_id: {type: string}, target_workload_id: {type: string}, target_instance_id: {type: string}}
+    DelegationResponse:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, allowed, verdict, task_id, reason]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, allowed: {type: boolean}, verdict: {type: string}, approval_id: {type: string}, interaction_id: {type: string}, decision_id: {type: string}, task_id: {type: string}, target_entrypoint: {$ref: '#/components/schemas/AgentEntrypoint'}, delegation_token: {type: string}, original_args: {}, modified_args: {}, effective_args: {}, reason: {type: string}}
+    DelegationApproval:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, approval_id, request_id, decision_id, request_hash, initiator_agent_id, target_agent_id, session_id, delegation_depth, allowed_tools, allowed_capabilities, allow_redelegation, budget, expires_at, status, created_at, updated_at, version]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, approval_id: {type: string}, request_id: {type: string}, decision_id: {type: string}, request_hash: {type: string}, initiator_agent_id: {type: string}, target_agent_id: {type: string}, session_id: {type: string}, tenant_id: {type: string}, target_workload_id: {type: string}, target_instance_id: {type: string}, root_task_id: {type: string}, parent_task_id: {type: string}, delegation_depth: {type: integer}, allowed_tools: {type: array, items: {type: string}}, allowed_capabilities: {type: array, items: {type: string}}, allow_redelegation: {type: boolean}, budget: {$ref: '#/components/schemas/Budget'}, task_deadline: {type: string, format: date-time}, expires_at: {type: string, format: date-time}, status: {type: string}, approver_id: {type: string}, reason: {type: string}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}, decided_at: {type: string, format: date-time}, task_id: {type: string}, version: {type: integer}}
+    ApprovalActionRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id]
+      properties: {request_id: {type: string}, reason: {type: string}}
+    RetryPolicy:
+      type: object
+      additionalProperties: false
+      required: [max_attempts, initial_backoff, max_backoff, backoff_multiplier, jitter, retryable_failure_classes, attempt_budget_limit]
+      properties: {max_attempts: {type: integer}, initial_backoff: {type: integer, description: Nanoseconds}, max_backoff: {type: integer, description: Nanoseconds}, backoff_multiplier: {type: number}, jitter: {type: number}, retryable_failure_classes: {type: array, items: {$ref: '#/components/schemas/FailureClass'}}, attempt_budget_limit: {$ref: '#/components/schemas/Budget'}, deadline: {type: string, format: date-time}}
+    FailureClass: {type: string, enum: [pre_dispatch_transient, pre_dispatch_permanent, sent_unacknowledged, remote_rejected, remote_timeout, receipt_invalid, security_violation, cancelled, budget_exhausted, deadline_exceeded]}
+    SchedulingRequest:
+      x-loop-controller-scope: internal-non-public
+      type: object
+      additionalProperties: false
+      required: [request_id, tenant_id, task_id, trust_domain, budget_envelope]
+      properties: {request_id: {type: string}, tenant_id: {type: string}, task_id: {type: string}, dag_id: {type: string}, node_id: {type: string}, required_agent_capabilities: {type: array, items: {type: string}}, required_security_capabilities: {type: array, items: {type: string}}, required_tools: {type: array, items: {type: string}}, trust_domain: {type: string}, deadline: {type: string, format: date-time}, budget_envelope: {$ref: '#/components/schemas/Budget'}, affinity: {type: object, additionalProperties: {type: string}}, anti_affinity: {type: object, additionalProperties: {type: string}}, excluded_agent_ids: {type: array, items: {type: string}}}
+    SchedulingDecision:
+      x-loop-controller-scope: internal-non-public
+      type: object
+      additionalProperties: false
+      required: [request_id, tenant_id, task_id, algorithm_version, candidates, created_at]
+      properties: {request_id: {type: string}, tenant_id: {type: string}, task_id: {type: string}, dag_id: {type: string}, node_id: {type: string}, selected_agent_id: {type: string}, algorithm_version: {type: string}, candidates: {type: array, items: {type: object, additionalProperties: false, required: [agent_id, eligible], properties: {agent_id: {type: string}, eligible: {type: boolean}, reason_codes: {type: array, items: {type: string}}, score_breakdown: {type: object, additionalProperties: {type: number}}, score: {type: number}}}}, created_at: {type: string, format: date-time}}
+    TaskAssignment:
+      type: object
+      additionalProperties: false
+      required: [assignment_id, assignment_kind, tenant_id, task_id, agent_id, state, revision, route_attempt, attempt, execution_fence, delivery_id, idempotency_key, replay_count, created_at, updated_at]
+      properties: {assignment_id: {type: string}, assignment_kind: {type: string}, tenant_id: {type: string}, task_id: {type: string}, agent_id: {type: string}, state: {type: string}, revision: {type: integer}, route_attempt: {type: integer}, attempt: {type: integer}, execution_fence: {type: integer}, supersedes_assignment_id: {type: string}, dispatch_disposition: {type: string}, failover_transition_id: {type: string}, lease_owner: {type: string}, claim_token: {type: string}, lease_expires_at: {type: string, format: date-time}, not_before: {type: string, format: date-time}, deadline: {type: string, format: date-time}, delivery_id: {type: string}, idempotency_key: {type: string}, retry_policy: {$ref: '#/components/schemas/RetryPolicy'}, replay_count: {type: integer}, failure_class: {$ref: '#/components/schemas/FailureClass'}, result_status: {type: string}, outcome: {}, error_code: {type: string}, consumed_budget: {$ref: '#/components/schemas/Budget'}, execution_receipt: {}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}}
+    ExecutionAttempt:
+      x-loop-controller-scope: observation-only
+      type: object
+      additionalProperties: false
+      required: [assignment_id, tenant_id, task_id, agent_id, attempt, execution_fence, state]
+      properties: {assignment_id: {type: string}, tenant_id: {type: string}, task_id: {type: string}, agent_id: {type: string}, attempt: {type: integer}, execution_fence: {type: integer}, state: {type: string}, lease_owner: {type: string}, claim_token: {type: string}, lease_expires_at: {type: string, format: date-time}, failure_class: {$ref: '#/components/schemas/FailureClass'}, result_status: {type: string}, outcome: {}, error_code: {type: string}, consumed_budget: {$ref: '#/components/schemas/Budget'}, execution_receipt: {}, started_at: {type: string, format: date-time}, finished_at: {type: string, format: date-time}}
+    TaskEvent:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, schema_version, sequence, event_id, task_id, event_type, payload, published_at]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, schema_version: {type: integer, const: 1}, sequence: {type: integer, minimum: 1}, event_id: {type: string}, task_id: {type: string}, event_type: {type: string}, payload: {}, published_at: {type: string, format: date-time}, published: {type: boolean}}
+    AssignmentSnapshot:
+      type: object
+      additionalProperties: false
+      required: [assignment, attempts]
+      properties: {assignment: {$ref: '#/components/schemas/TaskAssignment'}, attempts: {type: array, items: {$ref: '#/components/schemas/ExecutionAttempt'}}}
+    TaskSnapshot:
+      type: object
+      additionalProperties: false
+      required: [schema_version, read_at, task, assignments]
+      properties: {schema_version: {type: string, const: p54-08.v1}, read_at: {type: string, format: date-time}, task: {$ref: '#/components/schemas/Task'}, graph: {$ref: '#/components/schemas/TaskGraph'}, assignments: {type: array, items: {$ref: '#/components/schemas/AssignmentSnapshot'}}}
+    TaskNode:
+      type: object
+      additionalProperties: false
+      required: [node_id, task_id, failure_policy, retry_policy, budget_limit, scheduling_request, status, depth, topo_order, revision, created_at, updated_at]
+      properties: {node_id: {type: string}, dag_id: {type: string}, task_id: {type: string}, tenant_id: {type: string}, dependencies: {type: array, items: {type: string}}, failure_policy: {type: string, enum: [fail_fast, continue_independent]}, retry_policy: {$ref: '#/components/schemas/RetryPolicy'}, budget_limit: {$ref: '#/components/schemas/Budget'}, scheduling_request: {$ref: '#/components/schemas/SchedulingRequest'}, status: {type: string}, depth: {type: integer}, topo_order: {type: integer}, revision: {type: integer}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}, terminal_at: {type: string, format: date-time}}
+    TaskGraphCreate:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, dag_id, tenant_id, root_task_id, max_parallelism, budget_envelope, nodes]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, dag_id: {type: string}, tenant_id: {type: string}, root_task_id: {type: string}, max_parallelism: {type: integer}, deadline: {type: string, format: date-time}, budget_envelope: {$ref: '#/components/schemas/Budget'}, nodes: {type: array, items: {$ref: '#/components/schemas/TaskNode'}}}
+    TaskGraph:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, dag_id, tenant_id, root_task_id, status, max_parallelism, budget_envelope, reserved_budget, consumed_budget, revision, created_at, updated_at, nodes]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, dag_id: {type: string}, tenant_id: {type: string}, root_task_id: {type: string}, status: {type: string}, max_parallelism: {type: integer}, deadline: {type: string, format: date-time}, budget_envelope: {$ref: '#/components/schemas/Budget'}, reserved_budget: {$ref: '#/components/schemas/Budget'}, consumed_budget: {$ref: '#/components/schemas/Budget'}, revision: {type: integer}, cancel_reason: {type: string}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}, terminal_at: {type: string, format: date-time}, nodes: {type: array, items: {$ref: '#/components/schemas/TaskNode'}}}
+    TaskGraphCancelRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, tenant_id]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, tenant_id: {type: string}, reason: {type: string}}
+    DeadLetterList:
+      type: object
+      additionalProperties: false
+      required: [assignments]
+      properties: {assignments: {type: array, items: {$ref: '#/components/schemas/TaskAssignment'}}}
+    DeadLetterReplayRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, expected_revision]
+      properties: {tenant_id: {type: string}, expected_revision: {type: integer, minimum: 1}, not_before: {type: string, format: date-time}}
+    EntrypointTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, request_id, task_id, session_id, initiator_agent_id, target_agent_id, tool_name, arguments, delegation_token, budget, allowed_tools, allowed_capabilities, allow_redelegation]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, delivery_id: {type: string}, request_id: {type: string}, interaction_id: {type: string}, decision_id: {type: string}, root_interaction_id: {type: string}, parent_interaction_id: {type: string}, root_task_id: {type: string}, parent_task_id: {type: string}, delegation_depth: {type: integer}, deadline: {type: string, format: date-time}, budget: {$ref: '#/components/schemas/Budget'}, task_id: {type: string}, session_id: {type: string}, initiator_agent_id: {type: string}, target_agent_id: {type: string}, tool_name: {type: string}, arguments: {}, delegation_token: {type: string, writeOnly: true}, allowed_tools: {type: array, items: {type: string}}, allowed_capabilities: {type: array, items: {type: string}}, allow_redelegation: {type: boolean}, tenant_id: {type: string}, target_workload_id: {type: string}, target_instance_id: {type: string}}
+    EntrypointResultRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, status, consumed_budget]
+      properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, status: {type: string, enum: [completed, failed]}, outcome: {}, error_code: {type: string}, consumed_budget: {$ref: '#/components/schemas/Budget'}, execution_receipt: {}}
+    EntrypointAcceptOperation:
+      operationId: entrypointAcceptTask
+      security: [{TaskDelegationToken: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      responses:
+        '200': {description: Task, content: {application/json: {schema: {$ref: '#/components/schemas/Task'}}}}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '404': {$ref: '#/components/responses/Error404'}
+        '409': {$ref: '#/components/responses/Error409'}
+    EntrypointStartOperation:
+      operationId: entrypointStartTask
+      security: [{TaskDelegationToken: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ProtocolVersionRequest'}}}}
+      responses:
+        '200': {description: Task, content: {application/json: {schema: {$ref: '#/components/schemas/Task'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '404': {$ref: '#/components/responses/Error404'}
+        '409': {$ref: '#/components/responses/Error409'}
+        '502': {$ref: '#/components/responses/Error502'}
+    EntrypointCancelOperation:
+      operationId: entrypointCancelTask
+      security: [{TaskDelegationToken: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CancelTaskRequest'}}}}
+      responses:
+        '200': {description: Task, content: {application/json: {schema: {$ref: '#/components/schemas/Task'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
+        '403': {$ref: '#/components/responses/Error403'}
+        '404': {$ref: '#/components/responses/Error404'}
+        '409': {$ref: '#/components/responses/Error409'}
+        '502': {$ref: '#/components/responses/Error502'}
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status, protocol_version]
+      properties: {status: {type: string}, protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}}
+    ReadinessCheck:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties: {status: {type: string, enum: [passed, failed, skipped, degraded]}, observed: {}}
+    ReadinessResponse:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, schema_version, status, checks, reasons, observed_at]
+      properties:
+        protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}
+        schema_version: {type: string, const: p54-09.v1}
+        status: {type: string, enum: [ready, not_ready]}
+        checks: {type: object, additionalProperties: {$ref: '#/components/schemas/ReadinessCheck'}}
+        reasons: {type: array, items: {type: string}}
+        observed_at: {type: string, format: date-time}

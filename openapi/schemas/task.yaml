@@ -15,6 +15,18 @@ properties:
   task_id:
     type: string
     pattern: '^[a-zA-Z0-9_.-]{1,128}$'
+  request_id:
+    type: string
+  interaction_id:
+    type: string
+  decision_id:
+    type: string
+  tenant_id:
+    type: string
+  target_workload_id:
+    type: string
+  target_instance_id:
+    type: string
   session_id:
     type: string
     pattern: '^[a-zA-Z0-9_.-]{1,128}$'

@@ -13,20 +13,78 @@ import (
 	"time"
 
 	"github.com/loop-controller/go/internal/delegation"
+	"github.com/loop-controller/go/internal/entrypointpolicy"
 	"github.com/loop-controller/go/internal/models"
+	"github.com/loop-controller/go/internal/store"
 )
 
 var testSecret = []byte("test-secret")
 
+func TestDAGRoutesDefaultOff(t *testing.T) {
+	srv, err := NewServer(testSecret, filepath.Join(t.TempDir(), "dag-off.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	req := httptest.NewRequest(http.MethodPost, "/a2a/v1/task-graphs", strings.NewReader(`{}`))
+	res := httptest.NewRecorder()
+	muxFor(srv).ServeHTTP(res, req)
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestServerCloseWaitsForDispatcher(t *testing.T) {
+	srv, err := NewServer(testSecret, filepath.Join(t.TempDir(), "close.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := &blockingNotifier{started: make(chan struct{}), stopped: make(chan struct{})}
+	srv.SetApprovalNotifier(notifier)
+	now := time.Now().UTC()
+	a := models.DelegationApproval{ApprovalID: "close-wait", RequestID: "request-close", DecisionID: "decision-close", RequestHash: "h", InitiatorAgentID: "a", TargetAgentID: "b", ExpiresAt: now.Add(time.Hour), Status: "pending", CreatedAt: now, UpdatedAt: now, Version: 1}
+	if _, _, err := srv.db.DelegationApprovalStore().Create(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-notifier.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatcher did not start")
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-notifier.stopped:
+	default:
+		t.Fatal("Close returned before dispatcher exited")
+	}
+}
+
+type blockingNotifier struct {
+	started chan struct{}
+	stopped chan struct{}
+}
+
+func (*blockingNotifier) DestinationURL() string { return "http://approval-webhook.invalid/" }
+func (n *blockingNotifier) NotifyApproval(ctx context.Context, _ string, _ store.ApprovalNotification) error {
+	close(n.started)
+	<-ctx.Done()
+	close(n.stopped)
+	return ctx.Err()
+}
+
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
-	srv, err := NewServer(testSecret, filepath.Join(t.TempDir(), "a2a.db"))
+	srv, err := NewServer(testSecret, filepath.Join(t.TempDir(), "a2a-test.db"))
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
+	srv.SetEntrypointPolicy(entrypointpolicy.Development())
 	srv.SetR2Authorizer(&delegation.StaticR2Authorizer{
 		Decision: models.DelegationResponse{Allowed: true},
 	})
+	srv.EnableDAG()
 	server := httptest.NewServer(muxFor(srv))
 	t.Cleanup(func() {
 		server.Close()
@@ -64,6 +122,129 @@ func TestRegisterAgentAndGet(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&got)
 	if got.AgentID != "agent-1" {
 		t.Errorf("expected agent-1, got %q", got.AgentID)
+	}
+}
+
+func TestDeadLetterRoutesRequireControlAuthAndReplayAudits(t *testing.T) {
+	srv, server := newTestServer(t)
+	srv.SetControlAuth("control-secret", "control-agent")
+	ctx := context.Background()
+	now := time.Now().UTC()
+	deadline := now.Add(time.Hour)
+	task := models.Task{TaskID: "dead-task", SessionID: "s", InitiatorAgentID: "control-agent", TargetAgentID: "target", TenantID: "tenant", Status: "accepted", Deadline: &deadline, CreatedAt: now, UpdatedAt: now}
+	if err := srv.db.TaskStore().Create(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := srv.db.ExecutionQueueStore().EnqueueAcceptedTask(ctx, store.EnqueueAcceptedTaskParams{Kind: models.AssignmentKindTargetExecution, AssignmentID: "dead-assignment", DeliveryID: "dead-delivery", TaskID: task.TaskID, TenantID: task.TenantID, TargetAgentID: task.TargetAgentID, Deadline: &deadline, RetryPolicy: &models.RetryPolicy{MaxAttempts: 3, InitialBackoff: time.Second, MaxBackoff: time.Minute, BackoffMultiplier: 2, RetryableFailureClasses: []models.FailureClass{models.FailureClassPreDispatchTransient}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = srv.db.ExecContext(ctx, `UPDATE task_assignments SET state='dead_letter',revision=revision+1,execution_fence=execution_fence+1,failure_class='pre_dispatch_permanent',error_code='dead_lettered' WHERE assignment_id='dead-assignment'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = srv.db.ExecContext(ctx, `UPDATE tasks SET status='failed',error_code='dead_lettered' WHERE task_id='dead-task'`); err != nil {
+		t.Fatal(err)
+	}
+	dead, _ := srv.db.AssignmentStore().Get(ctx, "dead-assignment")
+
+	do := func(method, path, token, correlation string, body []byte) *http.Response {
+		req, reqErr := http.NewRequest(method, server.URL+path, bytes.NewReader(body))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		if correlation != "" {
+			req.Header.Set("X-Correlation-ID", correlation)
+		}
+		resp, reqErr := http.DefaultClient.Do(req)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		return resp
+	}
+	resp := do(http.MethodGet, "/a2a/v1/dead-letters?tenant_id=tenant", "", "", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized list=%d", resp.StatusCode)
+	}
+	resp = do(http.MethodGet, "/a2a/v1/dead-letters?tenant_id=other", "control-secret", "", nil)
+	var listed struct {
+		Assignments []models.TaskAssignment `json:"assignments"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&listed)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(listed.Assignments) != 0 {
+		t.Fatalf("cross tenant list=%d %+v", resp.StatusCode, listed)
+	}
+	body, _ := json.Marshal(map[string]any{"tenant_id": "tenant", "expected_revision": dead.Revision})
+	resp = do(http.MethodPost, "/a2a/v1/dead-letters/dead-assignment/replay", "control-secret", "corr-1", body)
+	var replay models.TaskAssignment
+	_ = json.NewDecoder(resp.Body).Decode(&replay)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || replay.State != models.AssignmentStateQueued || replay.ExecutionFence != dead.ExecutionFence+1 || replay.Revision != dead.Revision+1 {
+		t.Fatalf("replay status=%d assignment=%+v dead=%+v", resp.StatusCode, replay, dead)
+	}
+	var actor, action, result, correlation string
+	if err = srv.db.QueryRow(`SELECT actor,action,result,correlation_id FROM assignment_retry_events WHERE assignment_id=? AND event_type='replayed'`, replay.AssignmentID).Scan(&actor, &action, &result, &correlation); err != nil || actor != "control-agent" || action != "replay" || result != "success" || correlation != "corr-1" {
+		t.Fatalf("audit=%q/%q/%q/%q err=%v", actor, action, result, correlation, err)
+	}
+	resp = do(http.MethodPost, "/a2a/v1/dead-letters/dead-assignment/replay", "control-secret", "corr-2", body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("stale replay=%d", resp.StatusCode)
+	}
+}
+
+func TestAgentRoutesRequireConfiguredControlAuth(t *testing.T) {
+	srv, server := newTestServer(t)
+	srv.SetControlAuth("control-secret", "control-agent")
+	card := models.AgentCard{AgentID: "agent-auth", Name: "Auth Test"}
+	body, _ := json.Marshal(card)
+
+	do := func(method, path, bearer string, body []byte) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(method, server.URL+path, bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	for _, tc := range []struct {
+		method, path string
+		body         []byte
+	}{
+		{http.MethodPost, "/a2a/v1/agents", body},
+		{http.MethodGet, "/a2a/v1/agents", nil},
+		{http.MethodGet, "/a2a/v1/agents/agent-auth", nil},
+	} {
+		resp := do(tc.method, tc.path, "", tc.body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s %s without token=%d", tc.method, tc.path, resp.StatusCode)
+		}
+	}
+
+	resp := do(http.MethodPost, "/a2a/v1/agents", "control-secret", body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("authorized POST=%d", resp.StatusCode)
+	}
+	for _, path := range []string{"/a2a/v1/agents", "/a2a/v1/agents/agent-auth"} {
+		resp = do(http.MethodGet, path, "control-secret", nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("authorized GET %s=%d", path, resp.StatusCode)
+		}
 	}
 }
 
@@ -306,6 +487,35 @@ func TestTaskStreamSSE(t *testing.T) {
 	}
 }
 
+func TestServerCloseDisconnectsTaskStreams(t *testing.T) {
+	srv, err := NewServer([]byte("test-secret"), filepath.Join(t.TempDir(), "close.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := srv.tasks.CreateReliable("session-close", "agent-a", "agent-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := srv.publisher.Subscribe(context.Background(), task.TaskID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("stream remained open after Server.Close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stream did not close with server")
+	}
+}
+
 func TestTaskStreamLastEventIDReplaysOnlyNewerEvents(t *testing.T) {
 	srv, server := newTestServer(t)
 	task, err := srv.tasks.CreateReliable("session-replay", "agent-a", "agent-b")
@@ -326,7 +536,7 @@ func TestTaskStreamLastEventIDReplaysOnlyNewerEvents(t *testing.T) {
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/a2a/v1/tasks/"+task.TaskID+"/stream", nil)
 	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Last-Event-ID", history[0].EventID)
+	req.Header.Set("Last-Event-ID", history[0].Cursor)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("stream request: %v", err)
@@ -396,6 +606,100 @@ func TestControlAuthBindsInitiatorAndAuthorizesTaskObjects(t *testing.T) {
 		if resp.StatusCode != tc.want {
 			t.Errorf("%s: status = %d, want %d", tc.name, resp.StatusCode, tc.want)
 		}
+	}
+}
+
+func TestControlAuthTenantScopePreventsQueryOverrideAndEnumeration(t *testing.T) {
+	srv, server := newTestServer(t)
+	srv.SetControlAuthForTenant("control-secret", "owner", "tenant-a")
+	now := time.Now().UTC()
+	for _, task := range []models.Task{
+		{TaskID: "task-a", SessionID: "s", TenantID: "tenant-a", InitiatorAgentID: "owner", TargetAgentID: "agent", Status: "accepted", CreatedAt: now, UpdatedAt: now},
+		{TaskID: "task-b", SessionID: "s", TenantID: "tenant-b", Budget: models.DelegationBudget{Currency: "USD"}, InitiatorAgentID: "owner", TargetAgentID: "agent", Status: "accepted", CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := srv.db.TaskStore().Create(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	graph := models.TaskGraphCreate{ProtocolVersion: models.DAGProtocolVersion, DAGID: "dag-b", TenantID: "tenant-b", RootTaskID: "task-b", MaxParallelism: 1, BudgetEnvelope: models.DelegationBudget{Currency: "USD"}, Nodes: []models.TaskNode{{NodeID: "n", TaskID: "node-b", FailurePolicy: models.TaskFailurePolicyFailFast, BudgetLimit: models.DelegationBudget{Currency: "USD"}, SchedulingRequest: models.SchedulingRequest{RequestID: "r", TenantID: "tenant-b", TaskID: "node-b", DAGID: "dag-b", NodeID: "n"}}}}
+	node := models.Task{TaskID: "node-b", SessionID: "s", TenantID: "tenant-b", RootTaskID: "task-b", ParentTaskID: "task-b", Budget: models.DelegationBudget{Currency: "USD"}, InitiatorAgentID: "owner", TargetAgentID: "agent", Status: "accepted", CreatedAt: now, UpdatedAt: now}
+	if err := srv.db.TaskStore().Create(context.Background(), node); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.db.DAGStore().CreateGraph(context.Background(), graph, "key-b", now); err != nil {
+		t.Fatal(err)
+	}
+
+	status := func(path string) int {
+		req, _ := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer control-secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := status("/a2a/v1/tasks/task-a?tenant_id=tenant-b"); got != http.StatusOK {
+		t.Fatalf("trusted tenant ignored due to query override: %d", got)
+	}
+	for _, path := range []string{
+		"/a2a/v1/tasks/task-b",
+		"/a2a/v1/tasks/task-b/stream?cursor=forged",
+		"/a2a/v1/tasks/task-b/snapshot?tenant_id=tenant-b",
+		"/a2a/v1/task-graphs/dag-b?tenant_id=tenant-b",
+	} {
+		if got := status(path); got != http.StatusNotFound {
+			t.Errorf("%s status=%d want 404", path, got)
+		}
+	}
+	if got := status("/a2a/v1/tasks/task-a/snapshot"); got != http.StatusOK {
+		t.Fatalf("own snapshot status=%d", got)
+	}
+	if got := status("/a2a/v1/dead-letters?tenant_id=tenant-b"); got != http.StatusNotFound {
+		t.Fatalf("dead-letter tenant override status=%d", got)
+	}
+}
+
+func TestControlAuthTenantScopeIsAppliedToAgentSQL(t *testing.T) {
+	srv, server := newTestServer(t)
+	srv.SetControlAuthForTenant("control-secret", "owner", "tenant-a")
+	ctx := context.Background()
+	for _, card := range []models.AgentCard{
+		{AgentID: "agent-a", TenantID: "tenant-a", Name: "A"},
+		{AgentID: "agent-b", TenantID: "tenant-b", Name: "B"},
+	} {
+		if err := srv.db.AgentStore().Upsert(ctx, card); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := func(path string) *http.Response {
+		req, _ := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer control-secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	resp := request("/a2a/v1/agents")
+	defer resp.Body.Close()
+	var list models.AgentList
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || len(list.Agents) != 1 || list.Agents[0].AgentID != "agent-a" {
+		t.Fatalf("status=%d agents=%+v", resp.StatusCode, list.Agents)
+	}
+	resp = request("/a2a/v1/agents/agent-b")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-tenant agent GET=%d want 404", resp.StatusCode)
+	}
+	resp = request("/a2a/v1/agents/agent-a")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("own agent GET=%d", resp.StatusCode)
 	}
 }
 
