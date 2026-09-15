@@ -115,6 +115,13 @@ frontend/
 - 再做审批与审计闭环，是因为这是治理系统最重要的可运营能力，也是管理层最容易理解和验收的部分。
 - 最后接 A2A，是因为 A2A 依赖前面稳定的身份、配置、审计和审批语义，过早接入会放大接口返工成本。
 
+#### 进度记录（2026-09-15，第二轮）
+
+- **GitHub 推送问题已解决**：根因是全局 git 代理指向未运行的 `127.0.0.1:7890`；`gh` 完成登录（keyring）后，绕过代理直连可正常推送。后续如需长期避免，应清除全局 proxy 配置或保持代理常驻。
+- **审批与审计闭环基础能力落地**：新增 `GET /v1/admin/approvals`（分页契约 `approvals/total/limit/offset`，支持 `status/agent_id/tool_name/requester_id/approver_id` 筛选），审计接口补齐 `agent_id`/`tool_name` 筛选；前端审批页升级为“审批中心”（待审批/历史双 Tab + 筛选 + 分页）。后端 61 测试全绿。
+- **Agent 详情接口落地（多 Agent 底座）**：新增 `GET /v1/admin/agents/{agent_id}`，返回 `AdminAgentDetail`（在列表字段基础上扩展 `description`、`metadata`），404/401/503 语义完整；前端 Agent 管理页新增“详情”操作列与 Drawer 详情视图，接口不可用时回退列表行数据。后端 67 测试全绿，前端构建通过。
+- **实现注意**：审批历史查询不改 `ApprovalStore` Protocol，只给 `JSONLApprovalStore` 具体类加只读 `requests`/`responses` 视图属性，server 端 `getattr` 防御，避免对所有 store 实现造成兼容压力；verdict 序列化用 `getattr(record.verdict, "value", record.verdict)` 兼容枚举与字符串。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

@@ -1531,6 +1531,40 @@ def test_admin_agents_requires_api_key() -> None:
     assert resp.status_code == 401
 
 
+def test_admin_agent_detail_returns_full_fields() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/agents/researcher_001", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["agent_id"] == "researcher_001"
+    assert data["name"] == "Research Assistant"
+    assert data["profile_id"] == "research_v1"
+    assert data["owner_id"] == "zhang_manager"
+    assert data["owner_name"] == "张经理"
+    assert data["revoked"] is False
+    assert data["description"] is None
+    assert data["metadata"] == {}
+
+
+def test_admin_agent_detail_unknown_agent_returns_404() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/agents/ghost", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 404
+
+
+def test_admin_agent_detail_revoked_flag() -> None:
+    client, _controller = _build_admin_client(revoked=True)
+    resp = client.get("/v1/admin/agents/writer_001", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    assert resp.json()["revoked"] is True
+
+
+def test_admin_agent_detail_requires_api_key() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/agents/researcher_001")
+    assert resp.status_code == 401
+
+
 def test_admin_profiles_returns_serialized_profiles() -> None:
     client, _controller = _build_admin_client()
     resp = client.get("/v1/admin/profiles", headers={"X-API-Key": "test-key"})

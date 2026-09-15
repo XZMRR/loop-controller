@@ -64,6 +64,7 @@ from loop_controller.metrics import (
 )
 from loop_controller.models import ActionProposal, AuditEvent, Task
 from loop_controller.server_models import (
+    AdminAgentDetail,
     AdminAgentItem,
     AdminAgentsResponse,
     AdminApprovalsResponse,
@@ -1228,6 +1229,31 @@ class ToolGovernServer:
         ]
         return JSONResponse(AdminAgentsResponse(agents=items).model_dump(mode="json"))
 
+    async def _handle_admin_agent_detail(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/agents/{agent_id}：返回单个 Agent 详情。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        agent_id = request.path_params["agent_id"]
+        config = getattr(self._controller._runtime, "config", None)
+        if config is None:
+            return JSONResponse({"error": "config unavailable"}, status_code=503)
+        agent = config.agents.get(agent_id)
+        if agent is None:
+            return JSONResponse({"error": "agent not found"}, status_code=404)
+        revoked_ids = self._revoked_ids(RevocationType.AGENT)
+        item = AdminAgentDetail(
+            agent_id=agent.agent_id,
+            name=agent.name,
+            profile_id=agent.profile_id,
+            owner_id=agent.owner_id,
+            owner_name=config.users.get(agent.owner_id),
+            tenant_id=agent.tenant_id,
+            revoked=agent.agent_id in revoked_ids,
+            description=getattr(agent, "description", None),
+            metadata=getattr(agent, "metadata", {}) or {},
+        )
+        return JSONResponse(item.model_dump(mode="json"))
+
     async def _handle_admin_profiles(self, request: Request) -> JSONResponse:
         """GET /v1/admin/profiles：列出已加载的 CapabilityProfile。"""
         if not self._check_api_key(request):
@@ -1519,6 +1545,11 @@ def build_app(
             Route("/admin/kill-switch", server._handle_admin_kill_switch, methods=["POST"]),
             Route("/v1/admin/audit", server._handle_admin_audit, methods=["GET"]),
             Route("/v1/admin/agents", server._handle_admin_agents, methods=["GET"]),
+            Route(
+                "/v1/admin/agents/{agent_id}",
+                server._handle_admin_agent_detail,
+                methods=["GET"],
+            ),
             Route("/v1/admin/profiles", server._handle_admin_profiles, methods=["GET"]),
             Route("/v1/admin/identity", server._handle_admin_identity_config, methods=["GET"]),
             Route("/v1/admin/entrypoints", server._handle_admin_entrypoints, methods=["GET"]),

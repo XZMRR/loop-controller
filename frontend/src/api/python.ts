@@ -170,6 +170,16 @@ export async function getAdminAgents(): Promise<AdminAgent[]> {
   return data.agents || []
 }
 
+export interface AdminAgentDetail extends AdminAgent {
+  description?: string | null
+  metadata?: Record<string, any>
+}
+
+export async function getAdminAgentDetail(agentId: string): Promise<AdminAgentDetail> {
+  const { data } = await pythonClient.get(`/v1/admin/agents/${agentId}`)
+  return data
+}
+
 export async function getAdminProfiles(): Promise<Array<Record<string, any>>> {
   const { data } = await pythonClient.get('/v1/admin/profiles')
   return data.profiles || []

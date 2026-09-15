@@ -145,6 +145,13 @@ class AdminAgentsResponse(BaseModel):
     agents: list[AdminAgentItem] = Field(default_factory=list)
 
 
+class AdminAgentDetail(AdminAgentItem):
+    """GET /v1/admin/agents/{agent_id} 详情。"""
+
+    description: str | None = Field(default=None, description="Agent 描述")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="扩展元数据")
+
+
 class AdminProfilesResponse(BaseModel):
     """GET /v1/admin/profiles 响应体（CapabilityProfile 原样序列化）。"""
 
