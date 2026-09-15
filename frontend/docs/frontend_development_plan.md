@@ -148,6 +148,12 @@ frontend/
   - 为后续预留：Delegation / route_message / cancel_task 的 bridge 方法已存在，下一步可做管理端发起委托与任务取消。
 - **验证**：后端 80 个 server 测试全绿（新增 4 个 A2A 用例）；前端构建通过。
 
+#### 进度记录（2026-09-15，第六轮：管理端发起委托入口）
+
+- **后端**：新增 `POST /v1/admin/a2a/delegations`。管理端发起的委托与 Agent 自发委托走完全相同的治理路径：`InteractionGovernanceEngine.evaluate()`（Profile/信任/委托深度校验 → OPA interaction 策略）→ allow/modify 后经 Go 内核 `request_delegation` 派发；require_approval 返回升级对象由人工跟进；deny 不派发。全程写交互审计（`build_audit_event` 同一语义，提案标记 `interaction_context="admin-console"` 便于区分来源）。引擎支持构造注入（`build_app(interaction_engine=...)`），默认懒构造。
+- **前端**：A2A 治理页新增“发起委托”卡片——发起/目标 Agent 下拉、能力名、风险等级、参数 JSON；结果区展示判定（allow/modify/require_approval/deny）、原因、Decision/Interaction ID、升级对象与派发信息；require_approval 给出人工跟进提示。
+- **验证**：后端 84 个 server 测试全绿（新增 4 个：allow 派发、deny 跳过派发、未知 Agent 400、无内核时派发标记跳过）；前端构建通过。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

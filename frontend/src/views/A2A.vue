@@ -60,6 +60,80 @@
 
     <el-card class="mt-4" shadow="hover">
       <template #header>
+        <span>发起委托（管理端入口，与 Agent 自发委托同治理路径）</span>
+      </template>
+      <el-form label-position="top">
+        <el-row :gutter="16">
+          <el-col :span="6">
+            <el-form-item label="发起 Agent">
+              <el-select v-model="delegation.source_agent_id" placeholder="选择发起方" style="width: 100%">
+                <el-option v-for="a in agents" :key="a.agent_id" :label="a.agent_id" :value="a.agent_id" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="6">
+            <el-form-item label="目标 Agent">
+              <el-select v-model="delegation.target_agent_id" placeholder="选择目标方" style="width: 100%">
+                <el-option v-for="a in agents" :key="a.agent_id" :label="a.agent_id" :value="a.agent_id" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="6">
+            <el-form-item label="能力 / 工具">
+              <el-input v-model="delegation.tool_name" placeholder="如 send_email" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="6">
+            <el-form-item label="风险等级">
+              <el-select v-model="delegation.risk_level" style="width: 100%">
+                <el-option label="low" value="low" />
+                <el-option label="medium" value="medium" />
+                <el-option label="high" value="high" />
+                <el-option label="critical" value="critical" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item label="参数（JSON，可留空）">
+          <el-input v-model="delegation.argumentsJson" type="textarea" :rows="3" placeholder='{"to": "manager@company.com"}' />
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" :loading="delegating" :disabled="!canSubmit" @click="submitDelegation">
+            发起委托
+          </el-button>
+        </el-form-item>
+      </el-form>
+      <template v-if="delegationResult">
+        <el-divider />
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="判定">
+            <el-tag :type="verdictTagType(delegationResult.verdict)">{{ delegationResult.verdict }}</el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="原因">{{ delegationResult.reason }}</el-descriptions-item>
+          <el-descriptions-item label="Decision ID">{{ delegationResult.decision_id }}</el-descriptions-item>
+          <el-descriptions-item label="Interaction ID">{{ delegationResult.interaction_id }}</el-descriptions-item>
+          <el-descriptions-item v-if="delegationResult.escalation_target" label="升级对象">
+            {{ delegationResult.escalation_target }}
+          </el-descriptions-item>
+          <el-descriptions-item label="派发">
+            <template v-if="delegationResult.dispatch.attempted">
+              {{ delegationResult.dispatch.accepted ? `已接受（任务 ${delegationResult.dispatch.task_id}）` : `被拒绝：${delegationResult.dispatch.reason}` }}
+            </template>
+            <template v-else>{{ delegationResult.dispatch.reason || '未派发（判定未通过）' }}</template>
+          </el-descriptions-item>
+        </el-descriptions>
+        <el-alert
+          v-if="delegationResult.verdict === 'require_approval'"
+          class="mt-4"
+          type="warning"
+          :closable="false"
+          title="该委托需要审批：请联系升级对象确认后重新发起。"
+        />
+      </template>
+    </el-card>
+
+    <el-card class="mt-4" shadow="hover">
+      <template #header>
         <span>任务查询</span>
       </template>
       <el-form inline @submit.prevent="queryTask">
@@ -81,9 +155,17 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, reactive, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getA2AStatus, getA2AAgents, getA2ATask, type A2AStatus, type A2AAgent } from '@/api/python'
+import {
+  getA2AStatus,
+  getA2AAgents,
+  getA2ATask,
+  createAdminDelegation,
+  type A2AStatus,
+  type A2AAgent,
+  type AdminDelegationResult,
+} from '@/api/python'
 
 const status = ref<A2AStatus | null>(null)
 const agents = ref<A2AAgent[]>([])
@@ -93,6 +175,30 @@ const taskId = ref('')
 const task = ref<Record<string, any> | null>(null)
 const taskQueried = ref(false)
 const querying = ref(false)
+
+const delegation = reactive({
+  source_agent_id: '',
+  target_agent_id: '',
+  tool_name: '',
+  risk_level: 'low',
+  argumentsJson: '',
+})
+const delegating = ref(false)
+const delegationResult = ref<AdminDelegationResult | null>(null)
+
+const canSubmit = computed(
+  () =>
+    delegation.source_agent_id &&
+    delegation.target_agent_id &&
+    delegation.tool_name.trim() &&
+    !delegating.value,
+)
+
+function verdictTagType(verdict: string) {
+  if (verdict === 'allow' || verdict === 'modify') return 'success'
+  if (verdict === 'require_approval') return 'warning'
+  return 'danger'
+}
 
 async function loadData() {
   loading.value = true
@@ -104,6 +210,37 @@ async function loadData() {
     ElMessage.error(error.message || '加载 A2A 状态失败')
   } finally {
     loading.value = false
+  }
+}
+
+async function submitDelegation() {
+  let args: Record<string, any> = {}
+  if (delegation.argumentsJson.trim()) {
+    try {
+      args = JSON.parse(delegation.argumentsJson)
+    } catch {
+      ElMessage.error('参数 JSON 格式错误')
+      return
+    }
+  }
+  delegating.value = true
+  delegationResult.value = null
+  try {
+    delegationResult.value = await createAdminDelegation({
+      source_agent_id: delegation.source_agent_id,
+      target_agent_id: delegation.target_agent_id,
+      tool_name: delegation.tool_name.trim(),
+      arguments: args,
+      risk_level: delegation.risk_level,
+    })
+    if (!delegationResult.value.allowed) {
+      ElMessage.warning(`委托未通过治理判定：${delegationResult.value.reason}`)
+    }
+  } catch (error: any) {
+    const message = error?.response?.data?.message || error.message || '发起委托失败'
+    ElMessage.error(message)
+  } finally {
+    delegating.value = false
   }
 }
 

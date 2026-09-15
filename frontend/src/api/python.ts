@@ -252,6 +252,37 @@ export async function getA2ATask(taskId: string): Promise<Record<string, any>> {
   return data
 }
 
+export interface AdminDelegationResult {
+  verdict: string
+  allowed: boolean
+  reason: string
+  decision_id: string
+  interaction_id: string
+  escalation_target?: string | null
+  target_entrypoint?: Record<string, any> | null
+  modified_args?: Record<string, any> | null
+  dispatch: {
+    attempted: boolean
+    accepted: boolean
+    task_id: string
+    reason: string
+  }
+}
+
+export async function createAdminDelegation(payload: {
+  source_agent_id: string
+  target_agent_id: string
+  tool_name: string
+  arguments?: Record<string, any>
+  risk_level?: string
+  session_id?: string
+  task_id?: string
+  allow_redelegation?: boolean
+}): Promise<AdminDelegationResult> {
+  const { data } = await pythonClient.post('/v1/admin/a2a/delegations', payload)
+  return data
+}
+
 export interface AdminIdentityConfig {
   provider: string
   config: Record<string, any>

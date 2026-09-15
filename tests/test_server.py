@@ -18,7 +18,7 @@ from starlette.testclient import TestClient
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
 from loop_controller.identity import ConfigIdentityProvider
-from loop_controller.models import Agent, ApprovalRequest, GovernanceResult
+from loop_controller.models import Agent, ApprovalRequest, AuditEvent, GovernanceResult
 from loop_controller.server import build_app
 
 
@@ -1814,6 +1814,167 @@ def test_admin_a2a_task_query() -> None:
     client2, _controller2 = _build_admin_client()
     resp = client2.get("/v1/admin/a2a/tasks/t-1", headers={"X-API-Key": "test-key"})
     assert resp.status_code == 503
+
+
+class _FakeInteractionDecision:
+    def __init__(self, verdict: str, allowed: bool, reason: str = "") -> None:
+        self.verdict = verdict
+        self.allowed = allowed
+        self.reason = reason or verdict
+        self.decision_id = "decision-1"
+        self.interaction_id = "interaction-1"
+        self.escalation_target = "zhang_manager" if verdict == "require_approval" else None
+        self.target_entrypoint = {"type": "http", "url": "http://127.0.0.1:8001"}
+        self.modified_args = None
+        self.effective_args = None
+        self.policy_version = "interaction/v0"
+        self.profile_version = "p1"
+
+
+class _FakeInteractionEngine:
+    """模拟 InteractionGovernanceEngine：返回固定判定，记录提案。"""
+
+    last_proposal: Any = None
+    verdict: str = "allow"
+    allowed: bool = True
+
+    def __init__(self, controller: Any, policy_engine: Any = None) -> None:
+        pass
+
+    async def evaluate(self, proposal: Any) -> Any:
+        _FakeInteractionEngine.last_proposal = proposal
+        return _FakeInteractionDecision(self.verdict, self.allowed)
+
+    def build_audit_event(self, proposal: Any, decision: Any) -> Any:
+        return AuditEvent(
+            schema_version="1.0",
+            event_id="evt-delegation",
+            trace_id="trace-1",
+            session_id="",
+            actor_type="agent",
+            actor_id=proposal.source_agent_id,
+            action="execution_authorized",
+            target=proposal.tool_name,
+            decision="allow" if decision.allowed else "deny",
+            reason=decision.reason,
+            metadata={"interaction_context": proposal.interaction_context},
+        )
+
+
+class _FakeDelegationBridge:
+    def __init__(self, accept: bool = True) -> None:
+        self.accept = accept
+        self.requests: list[Any] = []
+
+    async def ping(self) -> bool:
+        return True
+
+    async def request_delegation(self, req: Any) -> Any:
+        self.requests.append(req)
+
+        class _Resp:
+            def __init__(self, accept: bool) -> None:
+                self.allowed = accept
+                self.task_id = "task-42" if accept else ""
+                self.reason = "" if accept else "go_kernel_rejected"
+
+        return _Resp(self.accept)
+
+
+def _delegation_payload() -> dict[str, Any]:
+    return {
+        "source_agent_id": "researcher_001",
+        "target_agent_id": "writer_001",
+        "tool_name": "send_email",
+        "arguments": {"to": "manager@company.com"},
+    }
+
+
+def test_admin_a2a_delegation_allow_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    _FakeInteractionEngine.verdict = "allow"
+    _FakeInteractionEngine.allowed = True
+    client, controller = _build_admin_client()
+    bridge = _FakeDelegationBridge(accept=True)
+    controller._runtime.go_kernel_bridge = bridge
+
+    resp = client.post(
+        "/v1/admin/a2a/delegations",
+        headers={"X-API-Key": "test-key"},
+        json=_delegation_payload(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verdict"] == "allow"
+    assert body["allowed"] is True
+    assert body["dispatch"]["attempted"] is True
+    assert body["dispatch"]["accepted"] is True
+    assert body["dispatch"]["task_id"] == "task-42"
+    # 治理引擎收到的提案标记了 admin-console 上下文
+    assert _FakeInteractionEngine.last_proposal.interaction_context == "admin-console"
+    # 交互审计已写入
+    reasons = [e.reason for e in controller._runtime.audit_store._events]
+    assert "allow" in reasons
+
+
+def test_admin_a2a_delegation_deny_skips_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    _FakeInteractionEngine.verdict = "deny"
+    _FakeInteractionEngine.allowed = False
+    client, controller = _build_admin_client()
+    bridge = _FakeDelegationBridge(accept=True)
+    controller._runtime.go_kernel_bridge = bridge
+
+    resp = client.post(
+        "/v1/admin/a2a/delegations",
+        headers={"X-API-Key": "test-key"},
+        json=_delegation_payload(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verdict"] == "deny"
+    assert body["allowed"] is False
+    assert body["dispatch"]["attempted"] is False
+    assert bridge.requests == []
+
+
+def test_admin_a2a_delegation_unknown_agent_returns_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    client, _controller = _build_admin_client()
+    payload = _delegation_payload()
+    payload["target_agent_id"] = "ghost"
+    resp = client.post(
+        "/v1/admin/a2a/delegations",
+        headers={"X-API-Key": "test-key"},
+        json=payload,
+    )
+    assert resp.status_code == 400
+
+
+def test_admin_a2a_delegation_allow_without_kernel_notes_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    _FakeInteractionEngine.verdict = "allow"
+    _FakeInteractionEngine.allowed = True
+    client, _controller = _build_admin_client()  # 无 go_kernel_bridge
+    resp = client.post(
+        "/v1/admin/a2a/delegations",
+        headers={"X-API-Key": "test-key"},
+        json=_delegation_payload(),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["dispatch"]["reason"] == "go kernel disabled"
 
 
 def test_admin_identity_masks_sensitive_values() -> None:

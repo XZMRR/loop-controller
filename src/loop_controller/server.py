@@ -39,6 +39,7 @@ from loop_controller.approval_service import ApprovalServiceError, build_approva
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.checkpoint import CheckpointError
 from loop_controller.controller import LoopController
+from loop_controller.go_kernel_bridge import DelegationRequest
 from loop_controller.identity import (
     AgentIdentity,
     IdentityCredential,
@@ -54,6 +55,7 @@ from loop_controller.interaction.engine import (
     InteractionAuthorizeEndpoint,
     InteractionGovernanceEngine,
 )
+from loop_controller.interaction.models import InteractionProposal
 from loop_controller.logging_config import configure_logging, set_trace_id
 from loop_controller.metrics import (
     observe_request,
@@ -80,6 +82,9 @@ from loop_controller.server_models import (
     AdminSessionLoginResponse,
     AdminA2AAgentItem,
     AdminA2AStatusResponse,
+    AdminDelegationDispatch,
+    AdminDelegationRequest,
+    AdminDelegationResponse,
     AuditQueryResponse,
     GovernResponse,
     GovernToolRequest,
@@ -265,6 +270,7 @@ class ToolGovernServer:
         identity_provider: IdentityProvider | None = None,
         entrypoints_config: dict[str, Any] | None = None,
         session_store: AdminSessionStore | None = None,
+        interaction_engine: InteractionGovernanceEngine | None = None,
     ) -> None:
         self._controller = controller
         self._api_key = api_key
@@ -273,6 +279,15 @@ class ToolGovernServer:
         self._identity_provider = identity_provider or _extract_identity_provider(controller)
         self._entrypoints_config = entrypoints_config or {}
         self._session_store = session_store or AdminSessionStore()
+        # 管理端委托走 InteractionGovernanceEngine（与 Agent 自发委托同治理路径）；
+        # 未注入时懒构造默认实例（默认 OPA 策略引擎）。
+        self._interaction_engine = interaction_engine
+
+    @property
+    def interaction_engine(self) -> InteractionGovernanceEngine:
+        if self._interaction_engine is None:
+            self._interaction_engine = InteractionGovernanceEngine(self._controller)
+        return self._interaction_engine
 
     def _http_require_auth(self) -> bool:
         """读取 entrypoints.http.require_auth；缺省 false 保持向后兼容。"""
@@ -1419,6 +1434,85 @@ class ToolGovernServer:
             return JSONResponse({"error": "task not found"}, status_code=404)
         return JSONResponse(task)
 
+    async def _handle_admin_a2a_delegation(self, request: Request) -> JSONResponse:
+        """POST /v1/admin/a2a/delegations：管理端发起委托（与 Agent 自发委托同治理路径）。"""
+        if not self._check_api_key(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = AdminDelegationRequest(**await request.json())
+        except Exception as exc:
+            return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
+        runtime = self._controller._runtime
+        config = getattr(runtime, "config", None)
+        if config is None:
+            return JSONResponse({"error": "config unavailable"}, status_code=503)
+        if body.source_agent_id not in config.agents:
+            return JSONResponse({"error": "unknown source agent"}, status_code=400)
+        if body.target_agent_id not in config.agents:
+            return JSONResponse({"error": "unknown target agent"}, status_code=400)
+
+        proposal = InteractionProposal(
+            interaction_id=uuid.uuid4().hex,
+            request_id=uuid.uuid4().hex,
+            session_id=body.session_id,
+            task_id=body.task_id,
+            source_agent_id=body.source_agent_id,
+            target_agent_id=body.target_agent_id,
+            tool_name=body.tool_name,
+            arguments=body.arguments,
+            risk_level=body.risk_level,
+            parent_allow_redelegation=body.allow_redelegation,
+            interaction_context="admin-console",
+        )
+        engine = self.interaction_engine
+        decision = await engine.evaluate(proposal)
+
+        # 交互审计：与 Agent 自发委托同一审计语义
+        audit_store = getattr(runtime, "audit_store", None)
+        if audit_store is not None:
+            await audit_store.append_async(engine.build_audit_event(proposal, decision))
+
+        dispatch = AdminDelegationDispatch()
+        if decision.allowed:
+            bridge, _gk = self._go_kernel_view()
+            if bridge is None:
+                dispatch = AdminDelegationDispatch(
+                    attempted=False, accepted=False, reason="go kernel disabled"
+                )
+            else:
+                delegation = await bridge.request_delegation(
+                    DelegationRequest(
+                        request_id=decision.decision_id,
+                        initiator_agent_id=body.source_agent_id,
+                        target_agent_id=body.target_agent_id,
+                        tool_name=body.tool_name,
+                        arguments=decision.effective_args or body.arguments,
+                        session_id=body.session_id,
+                        task_id=body.task_id,
+                        risk_level=body.risk_level,
+                        allow_redelegation=body.allow_redelegation,
+                    )
+                )
+                dispatch = AdminDelegationDispatch(
+                    attempted=True,
+                    accepted=delegation.allowed,
+                    task_id=delegation.task_id or "",
+                    reason="" if delegation.allowed else delegation.reason,
+                )
+        return JSONResponse(
+            AdminDelegationResponse(
+                verdict=decision.verdict,
+                allowed=decision.allowed,
+                reason=decision.reason,
+                decision_id=decision.decision_id,
+                interaction_id=decision.interaction_id,
+                escalation_target=decision.escalation_target,
+                target_entrypoint=decision.target_entrypoint,
+                modified_args=decision.modified_args,
+                dispatch=dispatch,
+            ).model_dump(mode="json")
+        )
+
     async def _handle_admin_session_login(self, request: Request) -> JSONResponse:
         """POST /v1/admin/session/login：验证 Admin API Key，签发 Session Token。"""
         try:
@@ -1597,6 +1691,7 @@ def build_app(
     identity_provider: IdentityProvider | None = None,
     entrypoints_config: dict[str, Any] | None = None,
     session_store: AdminSessionStore | None = None,
+    interaction_engine: InteractionGovernanceEngine | None = None,
 ) -> Starlette:
     """从 LoopController 构造 Starlette ASGI 应用。"""
     if configure_logs:
@@ -1610,6 +1705,7 @@ def build_app(
         identity_provider=identity_provider,
         entrypoints_config=entrypoints_config,
         session_store=session_store,
+        interaction_engine=interaction_engine,
     )
 
     @asynccontextmanager
@@ -1767,6 +1863,11 @@ def build_app(
                 "/v1/admin/a2a/tasks/{task_id}",
                 server._handle_admin_a2a_task_query,
                 methods=["GET"],
+            ),
+            Route(
+                "/v1/admin/a2a/delegations",
+                server._handle_admin_a2a_delegation,
+                methods=["POST"],
             ),
             Route("/v1/admin/identity", server._handle_admin_identity_config, methods=["GET"]),
             Route("/v1/admin/entrypoints", server._handle_admin_entrypoints, methods=["GET"]),

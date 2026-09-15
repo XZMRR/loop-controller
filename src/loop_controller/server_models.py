@@ -211,6 +211,46 @@ class AdminA2AAgentItem(BaseModel):
     )
 
 
+class AdminDelegationRequest(BaseModel):
+    """POST /v1/admin/a2a/delegations 请求体（管理端发起委托）。
+
+    与 Agent 自发委托走完全相同的治理路径：Profile/信任/深度校验
+    → OPA interaction 策略 → allow/modify 后由 Go 内核派发。
+    """
+
+    source_agent_id: str
+    target_agent_id: str
+    tool_name: str = Field(..., description="委托的能力/工具名（如 send_email）")
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    risk_level: str = Field(default="low")
+    session_id: str = Field(default="")
+    task_id: str = Field(default="")
+    allow_redelegation: bool = Field(default=False)
+
+
+class AdminDelegationDispatch(BaseModel):
+    """委托派发结果（allow/modify 且 Go 内核可用时才会尝试）。"""
+
+    attempted: bool = False
+    accepted: bool = False
+    task_id: str = ""
+    reason: str = ""
+
+
+class AdminDelegationResponse(BaseModel):
+    """POST /v1/admin/a2a/delegations 响应体。"""
+
+    verdict: str = Field(description="allow / modify / require_approval / deny")
+    allowed: bool
+    reason: str
+    decision_id: str = ""
+    interaction_id: str = ""
+    escalation_target: str | None = None
+    target_entrypoint: dict[str, Any] | None = None
+    modified_args: dict[str, Any] | None = None
+    dispatch: AdminDelegationDispatch = Field(default_factory=AdminDelegationDispatch)
+
+
 class AdminGovernEvaluateRequest(BaseModel):
     """POST /v1/admin/govern/evaluate 请求体（只读判定调试）。"""
 
