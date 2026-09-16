@@ -218,6 +218,16 @@ frontend/
 - **E2E 全链路验证**（OPA 8181 + Python 8000 + 内核 18080 + stub 8001）：管理端委托 → require_approval → 审批单入台 → Python 审批台批准 → 自动派发内核 → Consume → outbox dispatcher → stub create/accept/start → 内核 executor → govern/tool-call（影子任务+策略 allow+本地函数执行）→ 任务 `completed`，两次复验均通过。
 - **回归**：Python `pytest` 981 passed / 8 skipped；Go `go test ./...` 全包通过。
 
+#### 进度记录（2026-09-16，第十二轮：任务取消闭环）
+
+- **勘察结论**：Go 内核管理端取消链路已完整——`POST /a2a/v1/tasks/{id}/cancel`（`withControlAuth`）→ `handleCancelTask` 级联取消子孙任务 → `cancelTaskExecution` 经 `entrypointClient.Cancel` 推送 `POST /a2a/v1/entrypoint/tasks/{id}/cancel` 到目标 entrypoint（Bearer delegation token），传播确认置 `cancelled`、失败置 `outcome_unknown`、终态幂等；既有集成测试覆盖（`TestCancelMainChainPropagatesToTarget` 等）。**唯一缺口在 stub**：内核推 cancel 时 stub 404 → `confirmed=false` → running 任务被误置 `outcome_unknown`。
+- **Python entrypoint stub 扩展**（[entrypoint_stub.py](file:///D:/Agent/loop-controller-latest-develop/src/loop_controller/entrypoint_stub.py)）：新增 `_task_status`/`_task_tokens` 状态跟踪（create 记 accepted→running）；`POST /a2a/v1/entrypoint/tasks/{id}/cancel` 路由——校验 delegation token → 置 cancelled → 移出驱动集合并清 token → 响应 `{"task_id","status":"cancelled"}` 供内核确认；已取消任务被 dispatcher 重投 create 时直接返回 200 不再驱动（防内核 409 重试循环）；`/health` 暴露 `task_status`。
+- **管理端查询缺陷修复**（[go_kernel_bridge.py](file:///D:/Agent/loop-controller-latest-develop/src/loop_controller/go_kernel_bridge.py)）：`query_task` 原未带 control token → 内核 401 → 管理端查询 500；补 `headers=self._headers()`（与 `stream_task`/`cancel_task` 对齐），新增 `test_query_task_sends_control_token`。
+- **E2E 双场景验证**（OPA 8181 + Python 8000 + 内核 18080 + stub 8001）：
+  - 场景 A（accepted 取消，stub `--no-auto-start`）：管理端委托 → 派发 → stub create/accept → 管理端 cancel → 内核推 cancel → stub 确认 → 任务 `cancelled`；
+  - 场景 B（running 取消，stub 自动 start）：委托 → 派发 → accept/start → 轮询命中 running 窗口即管理端 cancel → 任务 `cancelled`（非 outcome_unknown，确认传播成功）。
+- **回归**：Python `pytest` 988 passed / 8 skipped（stub 16 全绿含 6 个新取消用例，bridge 新增 1 个）；Go `go test ./...` 全包通过；`config/go_kernel.yaml` 临时改动已还原。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）

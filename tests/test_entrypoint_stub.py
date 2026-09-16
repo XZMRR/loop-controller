@@ -1,7 +1,7 @@
-"""Entrypoint stub（任务执行闭环）测试。
+"""Entrypoint stub（任务执行闭环 + 取消）测试。
 
 覆盖：投递接收与 token 校验、create/accept/start 回调链路、回调失败重试
-语义、重复投递幂等。
+语义、重复投递幂等、取消通知（token 校验/状态机/幂等/重投防御）。
 """
 
 from __future__ import annotations
@@ -206,3 +206,109 @@ def test_app_rejects_invalid_json() -> None:
     )
     assert resp.status_code == 400
     assert json.loads(resp.content)["error"] == "invalid_json"
+
+
+def _driven_stub(calls: list[str] | None = None) -> EntrypointStub:
+    stub = EntrypointStub(
+        "http://kernel:8080",
+        client=_recording_client(_kernel_handler(calls if calls is not None else [])),
+    )
+    status, _ = stub.handle_create(dict(TASK_PAYLOAD), "delegation-token-1")
+    assert status == 201
+    return stub
+
+
+def test_cancel_marks_task_cancelled_and_undriven() -> None:
+    stub = _driven_stub()
+    status, body = stub.handle_cancel("task-1", "delegation-token-1")
+
+    assert status == 200
+    assert body == {"task_id": "task-1", "status": "cancelled"}
+    assert stub.task_status["task-1"] == "cancelled"
+    assert "task-1" not in stub.driven_tasks
+
+
+def test_cancel_rejects_token_mismatch_and_unknown_task() -> None:
+    stub = _driven_stub()
+    status, body = stub.handle_cancel("task-1", "wrong-token")
+    assert status == 403
+    assert body["error"] == "token_scope_mismatch"
+
+    status, _ = stub.handle_cancel("task-unknown", "delegation-token-1")
+    assert status == 403
+
+
+def test_cancel_is_idempotent_after_terminal() -> None:
+    stub = _driven_stub()
+    first_status, first_body = stub.handle_cancel("task-1", "delegation-token-1")
+    second_status, second_body = stub.handle_cancel("task-1", "delegation-token-1")
+
+    assert first_status == 200
+    assert first_body["status"] == "cancelled"
+    # 已终态且 token 已清除：第二次取消无法通过 token 校验（与未登记一致）
+    assert second_status == 403
+
+
+def test_create_redispatch_after_cancel_is_not_redriven() -> None:
+    calls: list[str] = []
+    stub = _driven_stub(calls)
+    calls.clear()
+    stub.handle_cancel("task-1", "delegation-token-1")
+
+    status, body = stub.handle_create(dict(TASK_PAYLOAD), "delegation-token-1")
+
+    assert status == 200
+    assert body["status"] == "cancelled"
+    assert body["idempotent"] is True
+    assert calls == []  # 不再回调 accept/start
+    assert "task-1" not in stub.driven_tasks
+
+
+def test_cancel_partially_accepted_task_without_start() -> None:
+    calls: list[str] = []
+    stub = EntrypointStub(
+        "http://kernel:8080",
+        auto_accept=True,
+        auto_start=False,
+        client=_recording_client(_kernel_handler(calls)),
+    )
+    status, _ = stub.handle_create(dict(TASK_PAYLOAD), "delegation-token-1")
+    assert status == 201
+    assert stub.task_status["task-1"] == "accepted"
+
+    cancel_status, body = stub.handle_cancel("task-1", "delegation-token-1")
+    assert cancel_status == 200
+    assert body["status"] == "cancelled"
+
+
+def test_app_cancel_route_end_to_end() -> None:
+    calls: list[str] = []
+    app = create_app("http://kernel:8080", client=_recording_client(_kernel_handler(calls)))
+    client = TestClient(app)
+
+    resp = client.post(
+        "/a2a/v1/entrypoint/tasks",
+        json=TASK_PAYLOAD,
+        headers={"Authorization": "Bearer delegation-token-1"},
+    )
+    assert resp.status_code == 201
+    assert client.get("/health").json()["task_status"] == {"task-1": "running"}
+
+    cancel = client.post(
+        "/a2a/v1/entrypoint/tasks/task-1/cancel",
+        json={"protocol_version": "0.48.0"},
+        headers={"Authorization": "Bearer delegation-token-1"},
+    )
+    assert cancel.status_code == 200
+    assert cancel.json()["status"] == "cancelled"
+
+    bad = client.post(
+        "/a2a/v1/entrypoint/tasks/task-1/cancel",
+        json={"protocol_version": "0.48.0"},
+        headers={"Authorization": "Bearer other"},
+    )
+    assert bad.status_code == 403
+
+    health = client.get("/health").json()
+    assert health["task_status"] == {"task-1": "cancelled"}
+    assert health["driven_tasks"] == []

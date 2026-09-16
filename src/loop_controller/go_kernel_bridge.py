@@ -590,7 +590,7 @@ class GoKernelBridge:
         url = f"{self._base_url}/a2a/v1/tasks/{task_id}"
         try:
             client = await self._client_context()
-            response = await client.get(url)
+            response = await client.get(url, headers=self._headers())
             if response.status_code == 404:
                 return None
             response.raise_for_status()

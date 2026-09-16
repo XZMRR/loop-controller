@@ -314,6 +314,26 @@ async def test_list_delegation_approvals_uses_control_token() -> None:
 
 
 @pytest.mark.asyncio
+async def test_query_task_sends_control_token() -> None:
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers.get("Authorization", "")
+        assert request.url.path == "/a2a/v1/tasks/task-1"
+        return httpx.Response(200, json={"task_id": "task-1", "status": "accepted"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bridge = GoKernelBridge(
+            base_url="http://kernel", client=client, token="control-token"
+        )
+        task = await bridge.query_task("task-1")
+
+    assert captured["auth"] == "Bearer control-token"
+    assert task is not None
+    assert task["status"] == "accepted"
+
+
+@pytest.mark.asyncio
 async def test_approve_delegation_posts_with_approver_token() -> None:
     captured: dict[str, Any] = {}
 
