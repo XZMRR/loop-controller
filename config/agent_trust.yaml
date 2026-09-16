@@ -3,3 +3,7 @@ agent_trust:
     target_agent_id: research-agent
     trust_level: limited
     conditions: {}
+  - source_agent_id: research-agent
+    target_agent_id: specialist-agent
+    trust_level: limited
+    conditions: {}

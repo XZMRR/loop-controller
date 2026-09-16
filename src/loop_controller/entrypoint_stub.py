@@ -23,6 +23,12 @@ CLI::
 
     lc entrypoint-stub --port 8001 --kernel-url http://127.0.0.1:8080 \\
         --tool-url http://127.0.0.1:8000 --tool-token dev-token-agent-001
+
+多 Agent 重委托（如 research-agent 把 calculate_checksum 转给 specialist-agent）::
+
+    lc entrypoint-stub --port 8001 --agent-id research-agent \\
+        --control-token dev-token-research-agent-001 \\
+        --redelegate calculate_checksum=specialist-agent
 """
 
 from __future__ import annotations
@@ -30,7 +36,9 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from starlette.applications import Starlette
@@ -61,6 +69,9 @@ class EntrypointStub:
         auto_start: bool = True,
         tool_url: str = "",
         tool_token: str = "",
+        agent_id: str = "",
+        control_token: str = "",
+        redelegate: dict[str, str] | None = None,
         client: httpx.Client | None = None,
     ) -> None:
         self.kernel_url = kernel_url.rstrip("/")
@@ -68,6 +79,15 @@ class EntrypointStub:
         self.auto_start = auto_start
         self.tool_url = tool_url.rstrip("/")
         self.tool_token = tool_token
+        # 本实例服务的 Agent 身份（重委托时作为子委托 initiator；为空时取
+        # 投递 payload 的 target_agent_id）。
+        self.agent_id = agent_id
+        # 本 Agent 自己的内核 control 凭证（token=initiator 绑定），用于发起
+        # 子委托与查询子任务状态。
+        self.control_token = control_token
+        # 工具 -> 下游 Agent 的重委托映射：命中映射的工具不在本地执行，
+        # 而是经内核发起带子任务 lineage 的子委托（防扩大由内核校验）。
+        self.redelegate = dict(redelegate or {})
         self._client = client or httpx.Client(timeout=15.0)
         self._driven_tasks: set[str] = set()
         self._task_status: dict[str, str] = {}
@@ -123,8 +143,10 @@ class EntrypointStub:
         self._driven_tasks.add(task_id)
         if payload.get("execution_mode") == "remote_results":
             # 远端回报模式：内核挂起等待 results；stub 在后台线程执行真实
-            # 工作（经 Python 治理层）并回调 results 回报终态与消耗。
-            if not self.tool_url:
+            # 工作（本地工具经 Python 治理层，命中重委托映射则转发下游
+            # Agent）并回调 results 回报终态与消耗。
+            tool_name = str(payload.get("tool_name") or "")
+            if not self.tool_url and tool_name not in self.redelegate:
                 logger.warning("remote_results task %s dispatched without tool_url; skipping execution", task_id)
             else:
                 threading.Thread(
@@ -136,7 +158,12 @@ class EntrypointStub:
 
     def _execute_remote(self, task_id: str, payload: dict[str, Any], delegation_token: str) -> None:
         """目标 Agent 运行时替身：执行工作并回报 results（后台线程）。"""
-        status, outcome, error_code, consumed = self._run_tool(payload)
+        tool_name = str(payload.get("tool_name") or "")
+        if self.redelegate and tool_name in self.redelegate:
+            status, outcome, error_code, consumed = self._run_child_delegation(payload)
+        else:
+            status, outcome, error_code, consumed = self._run_tool(payload)
+        consumed = self._clamp_consumed(consumed, payload)
         self._task_status[task_id] = status
         self._task_tokens.pop(task_id, None)
         body: dict[str, Any] = {
@@ -148,9 +175,33 @@ class EntrypointStub:
             body["outcome"] = outcome
         if error_code:
             body["error_code"] = error_code
-        code, _ = self._callback(task_id, delegation_token, "results", body)
+        # results 是终态回报的关键回调：对瞬时失败（内核存储忙 409/不可达
+        # 503）做有限重试，避免任务永远挂起在 running。
+        code, parsed = 0, {}
+        for _ in range(5):
+            code, parsed = self._callback(task_id, delegation_token, "results", body)
+            if code in (200, 201) or code not in (409, 503):
+                break
+            time.sleep(0.5)
         if code not in (200, 201):
-            logger.warning("results callback for %s -> %s; kernel will reject late results", task_id, code)
+            logger.warning("results callback for %s -> %s: %s; kernel will reject late results", task_id, code, parsed)
+
+    @staticmethod
+    def _clamp_consumed(consumed: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        """把自报消耗钳制到任务预算信封内，避免结算被内核 409 拒绝。"""
+        budget = payload.get("budget") or {}
+        try:
+            cap = int(budget.get("token_count") or 0)
+        except (TypeError, ValueError):
+            cap = 0
+        clamped = dict(consumed or {"token_count": 0})
+        try:
+            reported = int(clamped.get("token_count") or 0)
+        except (TypeError, ValueError):
+            reported = 0
+        if reported > cap:
+            clamped["token_count"] = cap
+        return clamped
 
     def _run_tool(self, payload: dict[str, Any]) -> tuple[str, Any, str, dict[str, Any]]:
         """调用 Python 治理层执行委托工具，返回 (status, outcome, error_code, consumed)。"""
@@ -185,6 +236,89 @@ class EntrypointStub:
         # Agent 自报消耗：以结果体量估算 token 消耗（真实 Agent 由自身运行时上报）
         consumed = {"token_count": len(json.dumps(result, ensure_ascii=False)) if result is not None else 0}
         return "completed", {"result": result}, "", consumed
+
+    def _run_child_delegation(self, payload: dict[str, Any]) -> tuple[str, Any, str, dict[str, Any]]:
+        """把任务按重委托映射转发给下游 Agent，等待子任务终态并聚合结果。
+
+        子委托带 parent_task_id 与父 delegation_token，内核 deriveLineage 会
+        执行父链校验（发起方必须是父任务目标、父 token 签名与 claims 一致、
+        scope 交集防扩大、deadline 收窄、防环与深度限制）。
+        """
+        tool_name = str(payload.get("tool_name") or "")
+        target = self.redelegate.get(tool_name, "")
+        task_id = str(payload.get("task_id") or "")
+        if not payload.get("allow_redelegation"):
+            return "failed", None, "redelegation_not_allowed", {"token_count": 0}
+        if not self.control_token:
+            return "failed", None, "control_token_missing", {"token_count": 0}
+        initiator = self.agent_id or str(payload.get("target_agent_id") or "")
+        body = {
+            "protocol_version": str(payload.get("protocol_version") or ""),
+            "request_id": f"redelegation-{task_id}-{uuid4().hex[:12]}",
+            "initiator_agent_id": initiator,
+            "target_agent_id": target,
+            "tool_name": tool_name,
+            "arguments": payload.get("arguments") or {},
+            "session_id": payload.get("session_id") or "",
+            "parent_task_id": task_id,
+            "allow_redelegation": False,
+            "allowed_tools": [tool_name],
+            "allowed_capabilities": payload.get("allowed_capabilities") or [],
+            "risk_level": "low",
+            # 继承父任务预算信封：子任务结算要求 consumed <= 子任务 budget，
+            # 写死零预算会导致子任务真实消耗上报时被内核 409 拒绝。
+            "budget": payload.get("budget") or {"token_count": 0, "payment_amount": 0},
+        }
+        headers = {"Authorization": f"Bearer {self.control_token}"}
+        try:
+            resp = self._client.post(f"{self.kernel_url}/a2a/v1/delegations", json=body, headers=headers)
+        except httpx.HTTPError as exc:
+            logger.warning("child delegation request failed: %s", exc)
+            return "failed", None, "kernel_unreachable", {"token_count": 0}
+        try:
+            parsed = resp.json()
+        except ValueError:
+            return "failed", None, "kernel_invalid_response", {"token_count": 0}
+        if resp.status_code < 200 or resp.status_code >= 300 or not parsed.get("allowed"):
+            reason = str(parsed.get("reason") or parsed.get("error") or "child_delegation_denied")
+            return "failed", {"reason": reason, "child_verdict": parsed.get("verdict", "")}, "child_delegation_denied", {"token_count": 0}
+        child_id = str(parsed.get("task_id") or "")
+        if not child_id:
+            return "failed", None, "child_task_missing", {"token_count": 0}
+        child = self._wait_child_task(child_id)
+        if child is None:
+            return "failed", {"child_task_id": child_id}, "child_task_timeout", {"token_count": 0}
+        status = str(child.get("status") or "failed")
+        consumed = child.get("consumed_budget") or {"token_count": 0}
+        if status == "completed":
+            return "completed", {"child_task_id": child_id, "child_outcome": child.get("outcome")}, "", consumed
+        if status == "cancelled":
+            return "cancelled", {"child_task_id": child_id}, "child_task_cancelled", consumed
+        return "failed", {"child_task_id": child_id}, str(child.get("error_code") or "child_task_failed"), consumed
+
+    def _wait_child_task(self, child_id: str, timeout_seconds: float = 60.0) -> dict[str, Any] | None:
+        """轮询子任务直至终态（父任务挂起期间子任务独立推进）。"""
+        headers = {"Authorization": f"Bearer {self.control_token}"}
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                resp = self._client.get(f"{self.kernel_url}/a2a/v1/tasks/{child_id}", headers=headers)
+            except httpx.HTTPError as exc:
+                logger.warning("child task poll failed: %s", exc)
+                time.sleep(0.5)
+                continue
+            if resp.status_code != 200:
+                time.sleep(0.5)
+                continue
+            try:
+                task = resp.json()
+            except ValueError:
+                time.sleep(0.5)
+                continue
+            if task.get("status") in TERMINAL_STATUSES:
+                return task
+            time.sleep(0.5)
+        return None
 
     def handle_cancel(self, task_id: str, bearer_token: str) -> tuple[int, dict[str, Any]]:
         """处理内核 entrypoint client 推送的取消通知。"""
@@ -249,6 +383,9 @@ def create_app(
     auto_start: bool = True,
     tool_url: str = "",
     tool_token: str = "",
+    agent_id: str = "",
+    control_token: str = "",
+    redelegate: dict[str, str] | None = None,
     client: httpx.Client | None = None,
 ) -> Starlette:
     stub = EntrypointStub(
@@ -257,6 +394,9 @@ def create_app(
         auto_start=auto_start,
         tool_url=tool_url,
         tool_token=tool_token,
+        agent_id=agent_id,
+        control_token=control_token,
+        redelegate=redelegate,
         client=client,
     )
 
@@ -283,9 +423,11 @@ def create_app(
             {
                 "status": "ok",
                 "kernel_url": stub.kernel_url,
+                "agent_id": stub.agent_id,
                 "auto_accept": stub.auto_accept,
                 "auto_start": stub.auto_start,
                 "tool_url": stub.tool_url,
+                "redelegate": dict(stub.redelegate),
                 "driven_tasks": sorted(stub.driven_tasks),
                 "task_status": stub.task_status,
             }

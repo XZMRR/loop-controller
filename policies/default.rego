@@ -80,6 +80,13 @@ decision := {"verdict": "allow", "reason": "analyze_sales allowed for delegated 
     not session_risk_above_threshold
 }
 
+# ---- calculate_checksum：多 Agent 重委托链路由 specialist-agent 执行 ----
+decision := {"verdict": "allow", "reason": "calculate_checksum allowed for delegated specialist agent", "policy_hits": ["calculate_checksum_allow"]} if {
+    input.tool_name == "calculate_checksum"
+    input.risk_level != "critical"
+    not session_risk_above_threshold
+}
+
 # ---- web_search ----
 decision := {"verdict": "allow", "reason": "web search allowed", "policy_hits": ["web_search_allow"]} if {
     input.tool_name == "web_search"

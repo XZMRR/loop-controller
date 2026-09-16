@@ -49,3 +49,7 @@ profiles:
       analyze_sales:
         allowed: true
         max_calls_per_task: 10
+      # 多 Agent 链路：校验和工具由 specialist-agent 在远端执行
+      calculate_checksum:
+        allowed: true
+        max_calls_per_task: 10

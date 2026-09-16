@@ -28,9 +28,25 @@ type R2Authorizer interface {
 // HTTPR2Authorizer calls the Python IIGE authorization endpoint. The legacy
 // type name is retained for source compatibility.
 type HTTPR2Authorizer struct {
-	BaseURL     string
+	BaseURL string
+	// BearerToken is the default IIGE credential (legacy single-agent mode).
 	BearerToken string
-	Client      *http.Client
+	// Tokens maps initiator_agent_id to that agent's IIGE Bearer token, so
+	// each agent's delegation is authorized under its own Python identity
+	// (the IIGE authorize endpoint asserts source_agent_id == token identity).
+	Tokens map[string]string
+	Client *http.Client
+}
+
+// tokenFor returns the IIGE credential for the given initiator, falling back
+// to the legacy default BearerToken.
+func (a *HTTPR2Authorizer) tokenFor(initiatorAgentID string) string {
+	if a.Tokens != nil {
+		if token, ok := a.Tokens[initiatorAgentID]; ok && token != "" {
+			return token
+		}
+	}
+	return a.BearerToken
 }
 
 type interactionAuthorizationRequest struct {
@@ -114,7 +130,7 @@ func (a *HTTPR2Authorizer) Authorize(ctx context.Context, req models.DelegationR
 		return denied("failed to marshal delegation request"), fmt.Errorf("marshal delegation request: %w", err)
 	}
 
-	response, status, err := a.authorizeAt(ctx, "/interaction/v1/delegations/authorize", payload)
+	response, status, err := a.authorizeAt(ctx, "/interaction/v1/delegations/authorize", payload, a.tokenFor(req.InitiatorAgentID))
 	if err == nil || status != http.StatusNotFound {
 		return response, err
 	}
@@ -122,18 +138,18 @@ func (a *HTTPR2Authorizer) Authorize(ctx context.Context, req models.DelegationR
 }
 
 func (a *HTTPR2Authorizer) authorizeAtLegacy(ctx context.Context, payload []byte) (models.DelegationResponse, error) {
-	response, _, err := a.authorizeAt(ctx, "/r2/v1/delegations/authorize", payload)
+	response, _, err := a.authorizeAt(ctx, "/r2/v1/delegations/authorize", payload, a.BearerToken)
 	return response, err
 }
 
-func (a *HTTPR2Authorizer) authorizeAt(ctx context.Context, path string, payload []byte) (models.DelegationResponse, int, error) {
+func (a *HTTPR2Authorizer) authorizeAt(ctx context.Context, path string, payload []byte, bearerToken string) (models.DelegationResponse, int, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.BaseURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return denied("failed to build interaction authorization request"), 0, fmt.Errorf("build authorization request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if a.BearerToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+a.BearerToken)
+	if bearerToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+bearerToken)
 	}
 
 	httpResp, err := a.Client.Do(httpReq)

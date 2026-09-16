@@ -4,3 +4,8 @@ delegation_policies:
     allowed_target_profiles: []
     denied_target_profiles: []
     reason: Approved research delegation capability
+  - tool_name: calculate_checksum
+    allowed: true
+    allowed_target_profiles: []
+    denied_target_profiles: []
+    reason: Approved checksum delegation capability for multi-agent chain

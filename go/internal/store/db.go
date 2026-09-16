@@ -233,11 +233,21 @@ func Open(ctx context.Context, path string) (*DB, error) {
 	// one-shot PRAGMA statement which only affects the single connection that
 	// ran it. Multiple kernel instances may share the same SQLite file, so
 	// foreign_keys and busy_timeout must hold for all connections.
-	dsn := abs + "?_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=ON"
+	//
+	// NOTE: the driver is modernc.org/sqlite, whose DSN pragma syntax is
+	// _pragma=<pragma>(<value>) — the mattn-style _busy_timeout/_journal_mode
+	// params are silently ignored and leave the pool without any busy timeout.
+	dsn := abs + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// modernc.org/sqlite multiplexes pooled connections onto shared per-DSN
+	// state: concurrent use from database/sql yields SQLITE_BUSY ("database is
+	// locked") under any real request overlap (E2E: entrypoint accept/start
+	// callbacks racing a child delegation). A single connection serializes
+	// access; WAL keeps readers from blocking on the writer.
+	db.SetMaxOpenConns(1)
 
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		db.Close()

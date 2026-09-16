@@ -51,6 +51,22 @@ type Server struct {
 	recoveryCancel     context.CancelFunc
 	controlToken       string
 	controlInitiatorID string
+	// agentControlTokens 允许多个 Agent 以自己的 control 身份调用控制面
+	//（map: token -> initiator_agent_id）。每个 Agent 只能以自己被绑定的
+	// initiator 身份发起委托/建任务，任务查询也只能访问自己发起的任务。
+	agentControlTokens map[string]string
+}
+
+// controlInitiatorContextKey 将认证通过的 control initiator 注入请求上下文。
+type controlInitiatorContextKey struct{}
+
+// contextControlInitiator 返回请求上下文中的 control initiator；未注入时
+// 回退到单一 control token 绑定的 legacy initiator。
+func (s *Server) contextControlInitiator(r *http.Request) string {
+	if initiator, ok := r.Context().Value(controlInitiatorContextKey{}).(string); ok && initiator != "" {
+		return initiator
+	}
+	return s.controlInitiatorID
 }
 
 // currentProtocolVersion is the A2A HTTP/JSON protocol version implemented by
@@ -200,6 +216,21 @@ func (s *Server) SetControlAuth(controlToken, initiatorAgentID string) {
 	s.controlInitiatorID = strings.TrimSpace(initiatorAgentID)
 }
 
+// SetAgentControlTokens registers additional control-plane Bearer tokens, each
+// bound to a single initiator_agent_id (map: token -> initiator). Agents call
+// the control APIs with their own token to act as themselves, which is the
+// supported path for redelegation (child delegation with parent lineage).
+func (s *Server) SetAgentControlTokens(tokens map[string]string) {
+	s.agentControlTokens = make(map[string]string, len(tokens))
+	for token, initiator := range tokens {
+		token = strings.TrimSpace(token)
+		initiator = strings.TrimSpace(initiator)
+		if token != "" && initiator != "" {
+			s.agentControlTokens[token] = initiator
+		}
+	}
+}
+
 // SetTargetTaskAutomation configures automatic target-side acceptance and execution.
 func (s *Server) SetTargetTaskAutomation(autoAccept, autoStart bool) {
 	s.autoAcceptTarget = autoAccept || autoStart
@@ -261,26 +292,42 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 func (s *Server) withControlAuth(bindRequestInitiator bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.controlToken == "" {
+		if s.controlToken == "" && len(s.agentControlTokens) == 0 {
 			next(w, r)
 			return
 		}
 		tokenStr, err := bearerToken(r.Header.Get("Authorization"))
-		if err != nil || subtle.ConstantTimeCompare([]byte(tokenStr), []byte(s.controlToken)) != 1 {
+		if err != nil {
 			writeError(w, http.StatusUnauthorized, "invalid_control_token", "valid Bearer control token is required")
 			return
 		}
-		if s.controlInitiatorID == "" {
+		initiator := ""
+		if s.controlToken != "" && subtle.ConstantTimeCompare([]byte(tokenStr), []byte(s.controlToken)) == 1 {
+			initiator = s.controlInitiatorID
+		} else {
+			for agentToken, agentInitiator := range s.agentControlTokens {
+				if subtle.ConstantTimeCompare([]byte(tokenStr), []byte(agentToken)) == 1 {
+					initiator = agentInitiator
+					break
+				}
+			}
+		}
+		if initiator == "" {
+			writeError(w, http.StatusUnauthorized, "invalid_control_token", "valid Bearer control token is required")
+			return
+		}
+		if s.controlToken != "" && s.controlInitiatorID == "" {
 			writeError(w, http.StatusInternalServerError, "control_auth_misconfigured", "control initiator_agent_id is required")
 			return
 		}
+		r = r.WithContext(context.WithValue(r.Context(), controlInitiatorContextKey{}, initiator))
 		if !bindRequestInitiator {
 			t, err := s.tasks.Get(r.PathValue("id"))
 			if err != nil {
 				writeError(w, http.StatusNotFound, "task_not_found", err.Error())
 				return
 			}
-			if t.InitiatorAgentID != s.controlInitiatorID {
+			if t.InitiatorAgentID != initiator {
 				writeError(w, http.StatusForbidden, "task_access_denied", "task is owned by another initiator")
 				return
 			}
@@ -368,9 +415,11 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "incompatible_protocol_version", err.Error())
 		return
 	}
-	if s.controlToken != "" && req.InitiatorAgentID != s.controlInitiatorID {
-		writeError(w, http.StatusForbidden, "initiator_mismatch", "initiator_agent_id does not match authenticated principal")
-		return
+	if s.controlToken != "" || len(s.agentControlTokens) > 0 {
+		if req.InitiatorAgentID != s.contextControlInitiator(r) {
+			writeError(w, http.StatusForbidden, "initiator_mismatch", "initiator_agent_id does not match authenticated principal")
+			return
+		}
 	}
 	t, err := s.tasks.CreateReliable(req.SessionID, req.InitiatorAgentID, req.TargetAgentID)
 	if err != nil {
@@ -425,9 +474,11 @@ func (s *Server) handleDelegation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "incompatible_protocol_version", err.Error())
 		return
 	}
-	if s.controlToken != "" && req.InitiatorAgentID != s.controlInitiatorID {
-		writeError(w, http.StatusForbidden, "initiator_mismatch", "initiator_agent_id does not match authenticated principal")
-		return
+	if s.controlToken != "" || len(s.agentControlTokens) > 0 {
+		if req.InitiatorAgentID != s.contextControlInitiator(r) {
+			writeError(w, http.StatusForbidden, "initiator_mismatch", "initiator_agent_id does not match authenticated principal")
+			return
+		}
 	}
 	scope := "delegation:" + req.InitiatorAgentID
 	requestData, err := json.Marshal(req)

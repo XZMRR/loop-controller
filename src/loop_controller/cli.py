@@ -174,6 +174,23 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="remote_results 模式下调用治理层使用的工作负载凭证（Bearer token）",
     )
+    entrypoint_stub.add_argument(
+        "--agent-id",
+        default="",
+        help="本实例服务的 Agent 身份（重委托时作为子委托 initiator）",
+    )
+    entrypoint_stub.add_argument(
+        "--control-token",
+        default="",
+        help="本 Agent 自己的内核 control 凭证（token=initiator 绑定），用于发起子委托与查询子任务",
+    )
+    entrypoint_stub.add_argument(
+        "--redelegate",
+        action="append",
+        default=[],
+        metavar="TOOL=TARGET_AGENT",
+        help="重委托映射（可重复）：命中 TOOL 的任务不本地执行，转发给 TARGET_AGENT",
+    )
 
     server = subparsers.add_parser("server", help="启动 HTTP 治理服务（v0.17.0）")
     server.add_argument("--host", default="127.0.0.1", help="监听 host（默认 127.0.0.1）")
@@ -374,12 +391,25 @@ def _cmd_entrypoint_stub(args: argparse.Namespace) -> int:
         )
         return 1
 
+    redelegate: dict[str, str] = {}
+    for entry in args.redelegate:
+        tool, sep, target = entry.partition("=")
+        tool = tool.strip()
+        target = target.strip()
+        if not sep or not tool or not target:
+            print(f"错误：--redelegate 需要 TOOL=TARGET_AGENT 格式，收到：{entry!r}", file=sys.stderr)
+            return 2
+        redelegate[tool] = target
+
     app = create_app(
         args.kernel_url,
         auto_accept=not args.no_auto_accept,
         auto_start=not args.no_auto_start,
         tool_url=args.tool_url,
         tool_token=args.tool_token,
+        agent_id=args.agent_id,
+        control_token=args.control_token,
+        redelegate=redelegate,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0

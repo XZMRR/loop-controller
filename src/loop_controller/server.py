@@ -153,6 +153,20 @@ def _mask_sensitive(value: Any, key: str = "") -> Any:
     return value
 
 
+def _delegation_capabilities(body: Any) -> list[str] | None:
+    """委托请求的能力白名单；允许重委托时默认请求 delegate_execution。
+
+    内核按 请求能力 ∩ 目标 Agent Card 能力 收窄 allow_redelegation scope：
+    管理端显式允许重委托时若不请求该能力，重委托 scope 会被收窄为 false。
+    """
+    capabilities = list(getattr(body, "allowed_capabilities", None) or [])
+    if capabilities:
+        return capabilities
+    if getattr(body, "allow_redelegation", False):
+        return ["delegate_execution"]
+    return None
+
+
 class MetricsMiddleware(BaseHTTPMiddleware):
     """记录请求耗时与 trace_id。"""
 
@@ -1269,7 +1283,10 @@ class ToolGovernServer:
                     task_id=None,
                     risk_level=str(payload.get("risk_level") or "low"),
                     allow_redelegation=bool(payload.get("allow_redelegation")),
+                    allowed_tools=list(payload.get("allowed_tools") or []) or None,
+                    allowed_capabilities=list(payload.get("allowed_capabilities") or []) or None,
                     parent_interaction_id=interaction_id,
+                    budget=payload.get("budget") or None,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -1732,7 +1749,10 @@ class ToolGovernServer:
                         task_id=body.task_id,
                         risk_level=body.risk_level,
                         allow_redelegation=body.allow_redelegation,
+                        allowed_tools=list(body.allowed_tools) or None,
+                        allowed_capabilities=_delegation_capabilities(body),
                         parent_interaction_id=decision.interaction_id,
+                        budget=body.budget or None,
                     )
                 )
                 dispatch = AdminDelegationDispatch(
@@ -1797,6 +1817,9 @@ class ToolGovernServer:
                 "session_id": body.session_id,
                 "task_id": body.task_id,
                 "allow_redelegation": body.allow_redelegation,
+                "allowed_tools": list(body.allowed_tools),
+                "allowed_capabilities": _delegation_capabilities(body),
+                "budget": dict(body.budget),
             },
             original_decision=None,
             reason=(

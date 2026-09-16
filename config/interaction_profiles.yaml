@@ -12,3 +12,22 @@ interaction_profiles:
         require_approval: false
         allowed_target_agents:
           - research-agent
+      calculate_checksum:
+        allowed: true
+        require_approval: false
+        allowed_target_agents:
+          - research-agent
+  # 多 Agent 重委托链：research-agent 作为子委托发起方的交互画像
+  - profile_id: research_agent_interaction_v1
+    agent_id: research-agent
+    version: "0.48.0"
+    description: External research agent redelegation profile
+    max_delegation_depth: 2
+    allow_external_delegation: true
+    require_approval_for_external: false
+    capabilities:
+      calculate_checksum:
+        allowed: true
+        require_approval: false
+        allowed_target_agents:
+          - specialist-agent

@@ -889,6 +889,95 @@ func TestEntrypointCancelTransition(t *testing.T) {
 	}
 }
 
+func TestAgentControlTokenDelegatesAsBoundInitiator(t *testing.T) {
+	srv, server := newTestServer(t)
+	srv.SetR2Authorizer(&delegation.StaticR2Authorizer{Decision: models.DelegationResponse{Allowed: true, Reason: "mock R2"}})
+	srv.SetControlAuth("admin-token", "planner")
+	srv.SetAgentControlTokens(map[string]string{"agent-token": "research-agent"})
+	registerExecutorAtURL(t, server, "http://executor:8080")
+
+	postDelegation := func(token, initiator, requestID string) *http.Response {
+		req := models.DelegationRequest{
+			RequestID:           requestID,
+			InitiatorAgentID:    initiator,
+			TargetAgentID:       "executor",
+			ToolName:            "echo",
+			Arguments:           json.RawMessage(`{"x":"hello"}`),
+			SessionID:           "session-agent-token",
+			ProtocolVersion:     currentProtocolVersion,
+			AllowedTools:        []string{"echo"},
+			AllowedCapabilities: []string{"echo_capability"},
+		}
+		body, _ := json.Marshal(req)
+		httpReq, err := http.NewRequest(http.MethodPost, server.URL+"/a2a/v1/delegations", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(httpReq)
+		if err != nil {
+			t.Fatalf("delegation request: %v", err)
+		}
+		return resp
+	}
+
+	resp := postDelegation("wrong-token", "research-agent", "req-agent-token-1")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unknown token: expected 401, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = postDelegation("agent-token", "planner", "req-agent-token-2")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("initiator mismatch: expected 403, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = postDelegation("agent-token", "research-agent", "req-agent-token-3")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("agent token delegation: expected 200, got %d", resp.StatusCode)
+	}
+	var delegated models.DelegationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&delegated); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	resp.Body.Close()
+	if !delegated.Allowed || delegated.TaskID == "" {
+		t.Fatalf("expected allowed delegation with task, got %+v", delegated)
+	}
+
+	getTask := func(token string) *http.Response {
+		httpReq, err := http.NewRequest(http.MethodGet, server.URL+"/a2a/v1/tasks/"+delegated.TaskID, nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(httpReq)
+		if err != nil {
+			t.Fatalf("get task: %v", err)
+		}
+		return resp
+	}
+
+	resp = getTask("agent-token")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("agent token task query: expected 200, got %d", resp.StatusCode)
+	}
+	var task models.Task
+	if err := json.NewDecoder(resp.Body).Decode(&task); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	resp.Body.Close()
+	if task.InitiatorAgentID != "research-agent" {
+		t.Errorf("expected initiator research-agent, got %q", task.InitiatorAgentID)
+	}
+
+	resp = getTask("admin-token")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-initiator task query: expected 403, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
 type apiRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f apiRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }

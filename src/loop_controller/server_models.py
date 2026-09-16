@@ -226,6 +226,18 @@ class AdminDelegationRequest(BaseModel):
     session_id: str = Field(default="")
     task_id: str = Field(default="")
     allow_redelegation: bool = Field(default=False)
+    allowed_tools: list[str] = Field(
+        default_factory=list,
+        description="随委托传递的工具白名单（防扩大 scope 交集的初始上限）",
+    )
+    allowed_capabilities: list[str] = Field(
+        default_factory=list,
+        description="随委托传递的能力白名单；allow_redelegation=true 且为空时管理端默认请求 delegate_execution",
+    )
+    budget: dict[str, Any] = Field(
+        default_factory=dict,
+        description="委托预算信封（token_count/payment_amount/currency），缺省为零预算",
+    )
 
 
 class AdminDelegationDispatch(BaseModel):

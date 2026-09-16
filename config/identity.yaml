@@ -13,6 +13,11 @@ identity:
       - token: dev-token-research-agent-001
         agent_id: research-agent
         user_id: researcher_001
+      # specialist-agent 的工作负载凭证：research-agent 重委托后由内核
+      # 以目标 agent 身份回调 /v1/govern/tool-call 时使用。
+      - token: dev-token-specialist-agent-001
+        agent_id: specialist-agent
+        user_id: research-agent
 
   # 生产环境示例：JWT
   # jwt:

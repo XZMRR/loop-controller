@@ -2383,6 +2383,31 @@ def test_admin_a2a_delegation_allow_without_kernel_notes_skip(
     assert resp.json()["dispatch"]["reason"] == "go kernel disabled"
 
 
+def test_admin_a2a_delegation_passes_allowed_tools_to_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    _FakeInteractionEngine.verdict = "allow"
+    _FakeInteractionEngine.allowed = True
+    client, controller = _build_admin_client()
+    bridge = _FakeDelegationBridge(accept=True)
+    controller._runtime.go_kernel_bridge = bridge
+
+    payload = _delegation_payload()
+    payload["allowed_tools"] = ["calculate_checksum", "analyze_sales"]
+    payload["allow_redelegation"] = True
+    resp = client.post(
+        "/v1/admin/a2a/delegations",
+        headers={"X-API-Key": "test-key"},
+        json=payload,
+    )
+    assert resp.status_code == 200
+    assert bridge.requests[0].allowed_tools == ["calculate_checksum", "analyze_sales"]
+    assert bridge.requests[0].allow_redelegation is True
+
+
 def test_admin_identity_masks_sensitive_values() -> None:
     client, _controller = _build_admin_client()
     resp = client.get("/v1/admin/identity", headers={"X-API-Key": "test-key"})

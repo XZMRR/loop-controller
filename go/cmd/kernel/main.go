@@ -36,6 +36,18 @@ func main() {
 	)
 	controlToken := flag.String("control-token", "", "A2A control-plane Bearer token (falls back to LC_A2A_CONTROL_TOKEN)")
 	controlInitiator := flag.String("control-initiator", "", "initiator_agent_id bound to the control token (falls back to LC_A2A_CONTROL_INITIATOR)")
+	agentControlTokens := make(tokenInitiatorPairs)
+	flag.Var(
+		&agentControlTokens,
+		"agent-control-token",
+		"extra control-plane token bound to an agent identity, repeatable as token=initiator_agent_id (env LC_A2A_AGENT_CONTROL_TOKENS, comma-separated)",
+	)
+	interactionAgentTokens := make(tokenInitiatorPairs)
+	flag.Var(
+		&interactionAgentTokens,
+		"interaction-agent-token",
+		"IIGE token bound to an agent identity, repeatable as token=initiator_agent_id (env LC_INTERACTION_AGENT_TOKENS, comma-separated)",
+	)
 	approvalToken := flag.String("approval-token", "", "independent approval Bearer token (falls back to LC_A2A_APPROVAL_TOKEN)")
 	approverPrincipal := flag.String("approver-principal", "", "principal bound to the approval token (falls back to LC_A2A_APPROVER_PRINCIPAL)")
 	executorURL := flag.String(
@@ -122,6 +134,7 @@ func main() {
 		log.Fatal(err)
 	}
 	srv.SetControlAuth(controlBearerToken, controlInitiatorID)
+	srv.SetAgentControlTokens(mergeTokenPairs(agentControlTokens, parseTokenPairList(os.Getenv("LC_A2A_AGENT_CONTROL_TOKENS"))))
 	approvalBearerToken, approverID, err := resolveApprovalAuth(*approvalToken, os.Getenv("LC_A2A_APPROVAL_TOKEN"), *approverPrincipal, os.Getenv("LC_A2A_APPROVER_PRINCIPAL"))
 	if err != nil {
 		log.Fatal(err)
@@ -145,6 +158,7 @@ func main() {
 		srv.SetR2Authorizer(&delegation.HTTPR2Authorizer{
 			BaseURL:     interactionBaseURL,
 			BearerToken: interactionBearerToken,
+			Tokens:      invertTokenPairs(mergeTokenPairs(interactionAgentTokens, parseTokenPairList(os.Getenv("LC_INTERACTION_AGENT_TOKENS")))),
 			Client:      &http.Client{Timeout: 10 * time.Second},
 		})
 	}
@@ -168,6 +182,62 @@ func main() {
 
 func dispatchEntrypointsEnabled(development bool) bool {
 	return !development
+}
+
+// tokenInitiatorPairs collects repeatable token=initiator_agent_id flag values.
+type tokenInitiatorPairs map[string]string
+
+func (m tokenInitiatorPairs) String() string {
+	parts := make([]string, 0, len(m))
+	for token, initiator := range m {
+		parts = append(parts, token+"="+initiator)
+	}
+	return strings.Join(parts, ",")
+}
+
+func (m tokenInitiatorPairs) Set(value string) error {
+	token, initiator, ok := strings.Cut(strings.TrimSpace(value), "=")
+	token = strings.TrimSpace(token)
+	initiator = strings.TrimSpace(initiator)
+	if !ok || token == "" || initiator == "" {
+		return errors.New("expected token=initiator_agent_id")
+	}
+	m[token] = initiator
+	return nil
+}
+
+// parseTokenPairList parses a comma-separated token=initiator_agent_id list
+// (env var form) into tokenInitiatorPairs; malformed entries are skipped.
+func parseTokenPairList(raw string) tokenInitiatorPairs {
+	pairs := make(tokenInitiatorPairs)
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		_ = pairs.Set(entry)
+	}
+	return pairs
+}
+
+func mergeTokenPairs(base, extra tokenInitiatorPairs) tokenInitiatorPairs {
+	merged := make(tokenInitiatorPairs, len(base)+len(extra))
+	for token, initiator := range base {
+		merged[token] = initiator
+	}
+	for token, initiator := range extra {
+		merged[token] = initiator
+	}
+	return merged
+}
+
+// invertTokenPairs swaps key/value so callers can look up by initiator.
+func invertTokenPairs(pairs tokenInitiatorPairs) map[string]string {
+	inverted := make(map[string]string, len(pairs))
+	for token, initiator := range pairs {
+		inverted[initiator] = token
+	}
+	return inverted
 }
 
 func resolveControlAuth(flagToken, envToken, flagInitiator, envInitiator string, development bool) (string, string, error) {

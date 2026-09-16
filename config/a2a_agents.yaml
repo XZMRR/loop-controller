@@ -13,9 +13,22 @@
 
 - agent_id: research-agent
   name: Research Agent
+  execution_mode: remote_results
   entrypoint:
     type: http
     url: http://127.0.0.1:8001
+  capabilities:
+    - delegate_execution
+    - stream_task
+  version: 0.48.0
+
+# 下游专业 Agent：承接 research-agent 的重委托（entrypoint stub :8002 演示实例）。
+- agent_id: specialist-agent
+  name: Specialist Agent
+  execution_mode: remote_results
+  entrypoint:
+    type: http
+    url: http://127.0.0.1:8002
   capabilities:
     - delegate_execution
     - stream_task

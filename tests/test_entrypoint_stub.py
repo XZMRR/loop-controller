@@ -390,3 +390,119 @@ def test_remote_results_without_tool_url_skips_execution() -> None:
     # 未配置 tool_url：不执行、不回调 results，任务停留在 running
     assert stub.task_status["task-1"] == "running"
     assert [c for c in calls if "results" in c] == []
+
+
+def _redelegate_payload() -> dict[str, Any]:
+    payload = _remote_payload()
+    payload["tool_name"] = "calculate_checksum"
+    payload["arguments"] = {"path": "data/kb/report.txt"}
+    payload["allow_redelegation"] = True
+    payload["budget"] = {"token_count": 1000, "payment_amount": 0}
+    return payload
+
+
+def _redelegate_client(denied_reason: str = "") -> tuple[httpx.Client, dict[str, Any]]:
+    """内核打桩：delegations 受理 + 子任务轮询 + results 记录。"""
+    calls: list[str] = []
+    recorded: dict[str, Any] = {}
+    child_polls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/a2a/v1/delegations"):
+            body = json.loads(request.content.decode())
+            recorded["delegation"] = body
+            assert request.headers.get("Authorization") == "Bearer agent-control-token"
+            if denied_reason:
+                return httpx.Response(403, json={"allowed": False, "verdict": "deny", "reason": denied_reason})
+            return httpx.Response(200, json={"allowed": True, "verdict": "allow", "task_id": "child-1"})
+        if url.endswith("/a2a/v1/tasks/child-1"):
+            assert request.headers.get("Authorization") == "Bearer agent-control-token"
+            child_polls["count"] += 1
+            if child_polls["count"] < 2:
+                return httpx.Response(200, json={"task_id": "child-1", "status": "running"})
+            return httpx.Response(
+                200,
+                json={
+                    "task_id": "child-1",
+                    "status": "completed",
+                    "outcome": {"result": {"checksum": "ab12"}},
+                    "consumed_budget": {"token_count": 9},
+                },
+            )
+        if url.endswith("/results"):
+            recorded["results"] = json.loads(request.content.decode())
+        return _kernel_handler(calls)(request)
+
+    return _recording_client(handler), recorded
+
+
+def _redelegate_stub(client: httpx.Client) -> EntrypointStub:
+    return EntrypointStub(
+        "http://kernel:8080",
+        agent_id="research-agent",
+        control_token="agent-control-token",
+        redelegate={"calculate_checksum": "specialist-agent"},
+        client=client,
+    )
+
+
+def _wait_status(stub: EntrypointStub, expected: str) -> None:
+    deadline = time.time() + 5
+    while stub.task_status.get("task-1") != expected and time.time() < deadline:
+        time.sleep(0.01)
+    assert stub.task_status["task-1"] == expected
+
+
+def test_redelegate_dispatches_child_and_aggregates_result() -> None:
+    client, recorded = _redelegate_client()
+    stub = _redelegate_stub(client)
+    status, _ = stub.handle_create(_redelegate_payload(), "delegation-token-1")
+    assert status == 201
+
+    _wait_status(stub, "completed")
+    delegation = recorded["delegation"]
+    assert delegation["initiator_agent_id"] == "research-agent"
+    assert delegation["target_agent_id"] == "specialist-agent"
+    assert delegation["tool_name"] == "calculate_checksum"
+    assert delegation["parent_task_id"] == "task-1"
+    assert delegation["allowed_tools"] == ["calculate_checksum"]
+    assert delegation["budget"]["token_count"] == 1000
+    results = recorded["results"]
+    assert results["status"] == "completed"
+    assert results["consumed_budget"] == {"token_count": 9}
+    assert results["outcome"]["child_task_id"] == "child-1"
+    assert results["outcome"]["child_outcome"] == {"result": {"checksum": "ab12"}}
+
+
+def test_clamp_consumed_caps_at_task_budget() -> None:
+    payload = {"budget": {"token_count": 10, "payment_amount": 0}}
+    assert EntrypointStub._clamp_consumed({"token_count": 9}, payload) == {"token_count": 9}
+    assert EntrypointStub._clamp_consumed({"token_count": 99}, payload) == {"token_count": 10}
+    # 无预算信封（cap=0）时任何自报消耗都会被钳到 0，保证结算不被 409 拒绝
+    assert EntrypointStub._clamp_consumed({"token_count": 5}, {}) == {"token_count": 0}
+    assert EntrypointStub._clamp_consumed(None, payload) == {"token_count": 0}
+
+
+def test_redelegate_child_denied_reports_failed() -> None:
+    client, recorded = _redelegate_client(denied_reason="scope denied")
+    stub = _redelegate_stub(client)
+    status, _ = stub.handle_create(_redelegate_payload(), "delegation-token-1")
+    assert status == 201
+
+    _wait_status(stub, "failed")
+    results = recorded["results"]
+    assert results["status"] == "failed"
+    assert results["error_code"] == "child_delegation_denied"
+
+
+def test_redelegate_without_permission_reports_failed() -> None:
+    calls: list[str] = []
+    stub = _redelegate_stub(_recording_client(_kernel_handler(calls)))
+    payload = _redelegate_payload()
+    payload["allow_redelegation"] = False
+    status, _ = stub.handle_create(payload, "delegation-token-1")
+    assert status == 201
+
+    _wait_status(stub, "failed")
+    assert [c for c in calls if "delegations" in c] == []

@@ -15,6 +15,11 @@ agents:
     name: External Research Agent
     profile_id: research_assistant_v1
     owner_id: zhang_manager
+  # 下游专业 Agent：承接 research-agent 的重委托（如 calculate_checksum）。
+  - agent_id: specialist-agent
+    name: Specialist Agent
+    profile_id: research_assistant_v1
+    owner_id: zhang_manager
 
 users:
   - user_id: alice
