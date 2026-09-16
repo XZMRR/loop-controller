@@ -136,9 +136,7 @@ def check_protocol_version(version: str) -> None:
         return
     if parts[0] == "0" and parts[1] == "53":
         return
-    raise ValueError(
-        f"incompatible protocol version {version!r}, expected 0.53.x or 0.54.x"
-    )
+    raise ValueError(f"incompatible protocol version {version!r}, expected 0.53.x or 0.54.x")
 
 
 class AgentEntrypoint:
@@ -499,6 +497,8 @@ class GoKernelBridge:
         headers: dict[str, str] | None = None,
         control_token: str = "",
         approver_token: str = "",
+        token: str = "",
+        approval_token: str = "",
         verify: Any = True,
         cert: Any = None,
         min_reconnect_delay: float = 0.05,
@@ -509,10 +509,10 @@ class GoKernelBridge:
         self._client = client
         self._owned_client = client is None
         self._headers = {
-            key: value
-            for key, value in (headers or {}).items()
-            if key.lower() != "authorization"
+            key: value for key, value in (headers or {}).items() if key.lower() != "authorization"
         }
+        control_token = control_token or token
+        approver_token = approver_token or approval_token
         self._control_headers = dict(self._headers)
         if control_token:
             self._control_headers["Authorization"] = f"Bearer {control_token}"
@@ -561,7 +561,11 @@ class GoKernelBridge:
         except ValueError:
             payload = {}
         code = str(payload.get("code", "")) if isinstance(payload, dict) else ""
-        message = str(payload.get("error", "")) if isinstance(payload, dict) else ""
+        message = (
+            str(payload.get("error") or payload.get("reason") or "")
+            if isinstance(payload, dict)
+            else ""
+        )
         error_type: type[GoKernelBridgeError]
         if response.status_code == 401:
             error_type = GoKernelAuthenticationError
@@ -584,9 +588,7 @@ class GoKernelBridge:
         supplied = kwargs.pop("headers", {}) or {}
         headers = self._auth_headers(approver=approver)
         headers.update(
-            (key, value)
-            for key, value in supplied.items()
-            if key.lower() != "authorization"
+            (key, value) for key, value in supplied.items() if key.lower() != "authorization"
         )
         response = await client.request(method, url, headers=headers, **kwargs)
         if response.is_error:
@@ -662,9 +664,7 @@ class GoKernelBridge:
         url = f"{self._base_url}/a2a/v1/delegations"
         try:
             client = await self._client_context()
-            response = await client.post(
-                url, json=req.to_dict(), headers=self._auth_headers()
-            )
+            response = await client.post(url, json=req.to_dict(), headers=self._auth_headers())
             # A policy denial is a successful DelegationResponse, not an error envelope.
             if response.status_code == 403:
                 try:
@@ -681,7 +681,7 @@ class GoKernelBridge:
             logger.warning("Go kernel protocol rejected, fail-closed: %s", exc)
             return DelegationResponse(allowed=False, reason="incompatible_protocol_version")
         except GoKernelBridgeError as exc:
-            return DelegationResponse(allowed=False, reason=exc.response_code)
+            return DelegationResponse(allowed=False, reason=str(exc) or exc.response_code)
         except httpx.RequestError as exc:
             logger.warning("Go kernel unreachable, fail-closed: %s", exc)
             return DelegationResponse(
@@ -746,6 +746,27 @@ class GoKernelBridge:
             logger.warning("Go kernel cancel_task failed: %s", exc)
             return None
 
+    async def list_delegation_approvals(
+        self, *, status: str = "", limit: int = 0
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        if limit > 0:
+            params["limit"] = limit
+        try:
+            data = await self._request_object(
+                "GET",
+                f"{self._base_url}/a2a/v1/delegation-approvals",
+                params=params,
+            )
+        except (httpx.RequestError, GoKernelBridgeError):
+            return []
+        approvals = data.get("approvals")
+        if not isinstance(approvals, list):
+            return []
+        return [item for item in approvals if isinstance(item, dict)]
+
     async def get_delegation_approval(self, approval_id: str) -> DelegationApproval:
         data = await self._request_object(
             "GET", f"{self._base_url}/a2a/v1/delegation-approvals/{approval_id}"
@@ -805,7 +826,11 @@ class GoKernelBridge:
         return data
 
     async def stream_task(
-        self, task_id: str, timeout: float = 30.0, *, cursor: str | None = None,
+        self,
+        task_id: str,
+        timeout: float = 30.0,
+        *,
+        cursor: str | None = None,
         include_sse: bool = False,
     ) -> AsyncGenerator[dict[str, Any] | tuple[dict[str, Any], str | None, str | None], None]:
         """订阅任务 SSE 更新；游标在本 generator 内保存，同任务可并发独立订阅。"""
@@ -824,9 +849,7 @@ class GoKernelBridge:
                 headers["Last-Event-ID"] = cursor
             try:
                 client = await self._client_context()
-                async with client.stream(
-                    "GET", url, headers=headers, timeout=timeout
-                ) as response:
+                async with client.stream("GET", url, headers=headers, timeout=timeout) as response:
                     if response.status_code in (400, 410):
                         await self._raise_cursor_error(response)
                     response.raise_for_status()
