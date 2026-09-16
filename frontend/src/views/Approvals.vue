@@ -22,8 +22,9 @@
           <el-table-column prop="tool_name" label="工具" width="160" />
           <el-table-column prop="requester_id" label="申请人" width="140" />
           <el-table-column prop="reason" label="原因" show-overflow-tooltip />
-          <el-table-column label="操作" width="220" fixed="right">
+          <el-table-column label="操作" width="280" fixed="right">
             <template #default="{ row }">
+              <el-button size="small" @click="openDetail(row)">详情</el-button>
               <el-button type="success" size="small" @click="openAction(row, 'approve')">
                 通过
               </el-button>
@@ -83,6 +84,48 @@
       </template>
     </el-card>
 
+    <el-drawer v-model="detailVisible" title="审批详情" size="420px">
+      <template v-if="detailRow">
+        <el-descriptions :column="1" border>
+          <el-descriptions-item label="工具">{{ detailRow.tool_name }}</el-descriptions-item>
+          <el-descriptions-item label="申请人">{{ detailRow.requester_id }}</el-descriptions-item>
+          <el-descriptions-item label="原因">
+            <span style="white-space: pre-wrap">{{ detailRow.reason || '-' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="Request ID">
+            <div class="copyable">
+              <span class="mono">{{ detailRow.request_id }}</span>
+              <el-button size="small" text type="primary" @click="copyText(detailRow.request_id)">
+                复制
+              </el-button>
+            </div>
+          </el-descriptions-item>
+          <el-descriptions-item label="Decision ID">
+            <div class="copyable">
+              <span class="mono">{{ detailRow.decision_id }}</span>
+              <el-button size="small" text type="primary" @click="copyText(detailRow.decision_id)">
+                复制
+              </el-button>
+            </div>
+          </el-descriptions-item>
+        </el-descriptions>
+        <el-alert
+          type="info"
+          :closable="false"
+          style="margin-top: 16px"
+          title="参数与升级链字段待后端审批详情接口补齐后展示"
+        />
+        <div style="margin-top: 16px; display: flex; gap: 12px">
+          <el-button type="success" style="flex: 1" @click="openAction(detailRow, 'approve')">
+            通过
+          </el-button>
+          <el-button type="danger" style="flex: 1" @click="openAction(detailRow, 'deny')">
+            拒绝
+          </el-button>
+        </div>
+      </template>
+    </el-drawer>
+
     <el-dialog v-model="dialogVisible" :title="dialogTitle" width="500px" @closed="clearForm">
       <el-form :model="form" label-position="top">
         <el-form-item label="独立审批凭证">
@@ -117,6 +160,7 @@ import {
   approveDecision,
   denyDecision,
 } from '@/api/python'
+import { usePolling } from '@/composables/useAsyncData'
 import type { PendingApproval, ApprovalHistoryItem } from '@/api/python'
 
 const activeTab = ref<'pending' | 'history'>('pending')
@@ -136,9 +180,32 @@ const dialogVisible = ref(false)
 const submitting = ref(false)
 const currentRow = ref<PendingApproval | null>(null)
 const currentAction = ref<'approve' | 'deny'>('approve')
+// v0.54 安全边界：独立审批凭证，用后即焚，不持久化
 const form = ref({ credential: '', comment: '' })
+const detailVisible = ref(false)
+const detailRow = ref<PendingApproval | null>(null)
+
+// 后端 SSE 端点是"Agent 等待自己的审批结果"通道（按 request_id + agent 鉴权），
+// 不适合管理台推送；审批台采用静默轮询实现准实时刷新。
+const APPROVALS_POLL_INTERVAL = 15000
 
 const dialogTitle = computed(() => (currentAction.value === 'approve' ? '通过审批' : '拒绝审批'))
+
+usePolling(() => loadApprovals(true), APPROVALS_POLL_INTERVAL)
+
+function openDetail(row: PendingApproval) {
+  detailRow.value = row
+  detailVisible.value = true
+}
+
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.warning('复制失败，请手动选择复制')
+  }
+}
 
 function statusLabel(status: string) {
   if (status === 'pending') return '待审批'
@@ -154,12 +221,14 @@ function statusTagType(status: string) {
   return 'info'
 }
 
-async function loadApprovals() {
+async function loadApprovals(silent = false) {
   loading.value = true
   try {
     approvals.value = await getPendingApprovals()
   } catch (error: any) {
-    ElMessage.error(error.message || '加载审批失败')
+    if (!silent) {
+      ElMessage.error(error.message || '加载审批失败')
+    }
   } finally {
     loading.value = false
   }
@@ -251,5 +320,18 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+.copyable {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mono {
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  word-break: break-all;
 }
 </style>

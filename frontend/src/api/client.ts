@@ -3,8 +3,19 @@ import { ElMessage } from 'element-plus'
 import router from '@/router'
 import { useAuthStore } from '@/stores/auth'
 
+// 联调模式默认走开发代理；登录页"高级设置"中可自定义直连地址（持久化到 localStorage）
+export const DEFAULT_PYTHON_BASE_URL = '/api/python'
+export const DEFAULT_A2A_BASE_URL = '/api/a2a'
+
+function resolveBaseUrl(storageKey: string, fallback: string): string {
+  return localStorage.getItem(storageKey) || fallback
+}
+
+export const PYTHON_URL_STORAGE_KEY = 'lc_python_url'
+export const A2A_URL_STORAGE_KEY = 'lc_a2a_url'
+
 export const pythonClient = axios.create({
-  baseURL: '/api/python',
+  baseURL: resolveBaseUrl(PYTHON_URL_STORAGE_KEY, DEFAULT_PYTHON_BASE_URL),
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
@@ -12,12 +23,18 @@ export const pythonClient = axios.create({
 })
 
 export const a2aClient = axios.create({
-  baseURL: '/api/a2a',
+  baseURL: resolveBaseUrl(A2A_URL_STORAGE_KEY, DEFAULT_A2A_BASE_URL),
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
   },
 })
+
+/** 登录页修改地址后调用，使已创建的 client 立即使用新 baseURL。 */
+export function applyCustomBaseUrls(): void {
+  pythonClient.defaults.baseURL = resolveBaseUrl(PYTHON_URL_STORAGE_KEY, DEFAULT_PYTHON_BASE_URL)
+  a2aClient.defaults.baseURL = resolveBaseUrl(A2A_URL_STORAGE_KEY, DEFAULT_A2A_BASE_URL)
+}
 
 pythonClient.interceptors.request.use((config) => {
   const auth = useAuthStore()

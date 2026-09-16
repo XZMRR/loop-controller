@@ -135,6 +135,30 @@
     <el-card class="mt-4" shadow="hover">
       <template #header>
         <div class="card-header">
+          <span>多跳委托链路（演示数据）</span>
+          <div>
+            <el-tag type="warning" effect="plain" style="margin-right: 12px">
+              Mock 数据源
+            </el-tag>
+            <el-button size="small" :loading="treesLoading" @click="loadTaskTrees">刷新</el-button>
+          </div>
+        </div>
+      </template>
+      <el-alert
+        type="info"
+        :closable="false"
+        style="margin-bottom: 12px"
+        title="当前为演示数据源：复现 planner → research-agent → specialist-agent 两跳链路。后端 v0.54 推送后切换为真实内核数据，视图无需改动。"
+      />
+      <div v-loading="treesLoading">
+        <TaskTree v-if="taskTrees.length > 0" :trees="taskTrees" />
+        <el-empty v-else-if="!treesLoading" description="暂无委托链路" />
+      </div>
+    </el-card>
+
+    <el-card class="mt-4" shadow="hover">
+      <template #header>
+        <div class="card-header">
           <span>任务查询</span>
           <el-tag v-if="streaming" type="primary" effect="dark">流式订阅中</el-tag>
         </div>
@@ -192,10 +216,26 @@ import {
   type A2AAgent,
   type AdminDelegationResult,
 } from '@/api/python'
+import { a2aTaskSource, type A2ATaskNode } from '@/api/a2a'
+import TaskTree from '@/components/TaskTree.vue'
 
 const status = ref<A2AStatus | null>(null)
 const agents = ref<A2AAgent[]>([])
 const loading = ref(false)
+
+const taskTrees = ref<A2ATaskNode[]>([])
+const treesLoading = ref(false)
+
+async function loadTaskTrees() {
+  treesLoading.value = true
+  try {
+    taskTrees.value = await a2aTaskSource.listTaskTrees()
+  } catch (error: any) {
+    ElMessage.error(error.message || '加载委托链路失败')
+  } finally {
+    treesLoading.value = false
+  }
+}
 
 const taskId = ref('')
 const task = ref<Record<string, any> | null>(null)
@@ -352,7 +392,10 @@ function stopStream() {
 
 onBeforeUnmount(stopStream)
 
-onMounted(loadData)
+onMounted(() => {
+  loadData()
+  loadTaskTrees()
+})
 </script>
 
 <style scoped>
