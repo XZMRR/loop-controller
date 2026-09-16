@@ -17,7 +17,12 @@ from loop_controller.infra.alert_store import AlertStore
 from loop_controller.infra.approval_crypto import ApprovalCrypto, ApprovalCryptoError
 from loop_controller.infra.durable_io import DurableIOError, DurableJsonlFile
 from loop_controller.infra.state_db import StateDatabase, StateDatabaseError
-from loop_controller.models import ApprovalRecord, ApprovalRequest, AuditAlert
+from loop_controller.models import (
+    ApprovalHistoryItem,
+    ApprovalRecord,
+    ApprovalRequest,
+    AuditAlert,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +190,70 @@ class ApprovalStore(Protocol):
     def get_record(self, decision_id: str) -> ApprovalRecord | None: ...
     def list_recent(self, limit: int = 100) -> list[dict[str, Any]]: ...
     def refresh(self) -> None: ...
+
+
+def list_approval_history(
+    pending_requests: list[ApprovalRequest],
+    completed_records: list[tuple[ApprovalRequest, ApprovalRecord]],
+    *,
+    status: str | None = None,
+    agent_id: str | None = None,
+    tool_name: str | None = None,
+    requester_id: str | None = None,
+    approver_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[ApprovalHistoryItem]:
+    """按统一契约返回审批历史（多 Agent / 多 Profile 场景预留）。"""
+
+    items: list[ApprovalHistoryItem] = []
+    for request in pending_requests:
+        items.append(
+            ApprovalHistoryItem(
+                request_id=request.request_id,
+                decision_id=request.decision_id,
+                agent_id=request.agent_id,
+                tool_name=request.tool_name,
+                requester_id=request.requester_id,
+                approver_id=request.approver_id,
+                reason=request.reason,
+                status="pending",
+                created_at=request.created_at,
+            )
+        )
+    for request, record in completed_records:
+        verdict = getattr(record.verdict, "value", record.verdict)
+        items.append(
+            ApprovalHistoryItem(
+                request_id=request.request_id,
+                decision_id=request.decision_id,
+                agent_id=request.agent_id,
+                tool_name=request.tool_name,
+                requester_id=request.requester_id,
+                approver_id=record.approver_id,
+                reason=request.reason,
+                status=verdict,
+                created_at=request.created_at,
+                decided_at=record.decided_at,
+            )
+        )
+    if status not in (None, "all"):
+        items = [item for item in items if item.status == status]
+    if agent_id:
+        items = [item for item in items if item.agent_id == agent_id]
+    if tool_name:
+        items = [item for item in items if item.tool_name == tool_name]
+    if requester_id:
+        items = [item for item in items if item.requester_id == requester_id]
+    if approver_id:
+        items = [item for item in items if item.approver_id == approver_id]
+    items.sort(
+        key=lambda item: item.created_at or item.decided_at or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    if offset:
+        items = items[offset:]
+    return items[:limit]
 
 
 class JsonlApprovalStore:
@@ -549,6 +618,14 @@ class InMemoryApprovalStore:
     def __init__(self) -> None:
         self._requests: dict[str, ApprovalRequest] = {}
         self._responses: dict[str, ApprovalRecord] = {}
+
+    @property
+    def requests(self) -> dict[str, ApprovalRequest]:
+        return dict(self._requests)
+
+    @property
+    def responses(self) -> dict[str, ApprovalRecord]:
+        return dict(self._responses)
 
     def refresh(self) -> None:
         pass

@@ -392,6 +392,21 @@ class ApprovalRecord(BaseModel):
     decided_at: datetime = Field(default_factory=_utc_now)
 
 
+class ApprovalHistoryItem(BaseModel):
+    """审批历史列表项（兼容 JSONL / 未来数据库分页查询）。"""
+
+    request_id: str
+    decision_id: str
+    agent_id: str
+    tool_name: str
+    requester_id: str
+    approver_id: str
+    reason: str = ""
+    status: str
+    decided_at: datetime | None = None
+    created_at: datetime | None = None
+
+
 # ---------------------------------------------------------------------------
 # §7.1 AuditEvent
 # ---------------------------------------------------------------------------

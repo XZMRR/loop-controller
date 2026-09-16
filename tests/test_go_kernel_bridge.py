@@ -396,13 +396,13 @@ async def test_stream_parses_multiline_data_heartbeat_retry_and_unknown_fields()
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         bridge = GoKernelBridge(base_url="https://kernel", client=client)
-        stream = bridge.stream_task("task-stream")
-        assert await anext(stream) == {
+        stream = bridge.stream_task("task-stream", cursor="previous:opaque", include_sse=True)
+        assert await anext(stream) == ({
             "schema_version": 1,
             "sequence": 1,
             "event_id": "ev-1",
             "task_id": "task-stream",
-        }
+        }, "opaque:cursor/one", "task_updated")
         await stream.aclose()
     assert requests == 1
 

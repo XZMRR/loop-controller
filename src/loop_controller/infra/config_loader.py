@@ -934,6 +934,10 @@ class ConfigLoader:
         except TypeError as exc:
             raise ConfigValidationError(f"execution_security 配置非法：{exc}") from exc
 
+    def reload_profiles(self, config_dir: str | Path) -> dict[str, CapabilityProfile]:
+        """热更新：重新加载 profiles.yaml，返回最新的 CapabilityProfile 映射。"""
+        return self._load_profiles(Path(config_dir) / "profiles.yaml")
+
     def _load_optional_config(self, path: Path) -> dict[str, Any]:
         """加载可选 YAML 配置；文件缺失时保持旧版本行为。"""
         if not path.exists():

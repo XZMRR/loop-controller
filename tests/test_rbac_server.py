@@ -52,7 +52,7 @@ class AuditEvent:
         self.correlation_id = correlation_id
         self.interaction_id = interaction_id
 
-    def model_dump(self) -> dict[str, Any]:
+    def model_dump(self, mode: str | None = None) -> dict[str, Any]:
         return {
             "event_id": self.event_id,
             "tenant_id": self.tenant_id,
@@ -507,6 +507,77 @@ class TestRbacAdminEndpoints:
             json={"principal": "eve", "tenant_id": "tenant-a", "role": "policy_auditor"},
         )
         assert own.status_code == 201, own.text
+
+    def test_tenant_admin_cannot_escalate_to_platform_admin(self, tmp_path: Path) -> None:
+        client, store, runtime = _setup(tmp_path)
+        store.add_binding("creator-a", "tenant-a", Role.TENANT_ADMIN, "admin")
+        for actor in ("creator-a", "eve"):
+            denied = client.post(
+                "/v1/admin/rbac/bindings", headers=_auth("creator-a"),
+                json={"principal": actor, "tenant_id": "tenant-a", "role": "platform_admin"},
+            )
+            assert denied.status_code == 403
+        assert Role.PLATFORM_ADMIN not in runtime.rbac_enforcer.roles_for(
+            runtime.rbac_credential_resolver.resolve("creator-a", TOKENS["creator-a"])
+        )
+        # 历史租户级平台绑定也不得在判定阶段产生平台权限。
+        store.add_binding("creator-a", "tenant-a", Role.PLATFORM_ADMIN, "admin")
+        assert client.get("/v1/admin/rbac/grants", headers=_auth("creator-a")).status_code == 200
+        assert Role.PLATFORM_ADMIN not in runtime.rbac_enforcer.roles_for(
+            runtime.rbac_credential_resolver.resolve("creator-a", TOKENS["creator-a"])
+        )
+        admin = client.post(
+            "/v1/admin/rbac/bindings", headers=_auth("admin"),
+            json={"principal": "eve", "role": "platform_admin"},
+        )
+        assert admin.status_code == 201
+
+    def test_admin_a2a_task_scope_and_delegation_source(self, tmp_path: Path) -> None:
+        client, store, runtime = _setup(tmp_path)
+        store.add_binding("creator-a", "tenant-a", Role.TENANT_ADMIN, "admin")
+        class Bridge:
+            canceled = False
+            streamed = False
+            async def query_task(self, task_id: str) -> dict[str, str]:
+                return {"task_id": task_id, "tenant_id": "tenant-b" if task_id == "foreign" else "tenant-a"}
+            async def cancel_task(self, task_id: str, reason: str = "") -> dict[str, str]:
+                self.canceled = True
+                return {"task_id": task_id}
+            async def stream_task(self, task_id: str, *, cursor=None, include_sse=False):
+                assert cursor is None
+                assert include_sse is True
+                self.streamed = True
+                yield ({"task_id": task_id}, None, None)
+        runtime.go_kernel_bridge = Bridge()
+        for path in ("foreign", "own"):
+            expected = 403 if path == "foreign" else 200
+            assert client.get(f"/v1/admin/a2a/tasks/{path}", headers=_auth("creator-a")).status_code == expected
+            assert client.get(f"/v1/admin/a2a/tasks/{path}/stream", headers=_auth("creator-a")).status_code == expected
+            assert client.post(f"/v1/admin/a2a/tasks/{path}/cancel", headers=_auth("creator-a")).status_code == expected
+        assert runtime.go_kernel_bridge.canceled
+        runtime.go_kernel_bridge.canceled = False
+        runtime.go_kernel_bridge.streamed = False
+        assert client.post("/v1/admin/a2a/tasks/foreign/cancel", headers=_auth("creator-a")).status_code == 403
+        assert not runtime.go_kernel_bridge.canceled
+        assert client.get("/v1/admin/a2a/tasks/foreign/stream", headers=_auth("creator-a")).status_code == 403
+        assert not runtime.go_kernel_bridge.streamed
+        runtime.config = type("Config", (), {"rbac": _RbacConfig(), "agents": {
+            "source": type("Agent", (), {"tenant_id": "tenant-a", "owner_id": "other"})(),
+            "target": type("Agent", (), {"tenant_id": "tenant-b", "owner_id": "other"})(),
+        }})()
+        denied = client.post("/v1/admin/a2a/delegations", headers=_auth("creator-a"), json={
+            "source_agent_id": "source", "target_agent_id": "target", "tool_name": "echo",
+        })
+        assert denied.status_code == 403
+        runtime.config.agents["source"].owner_id = "creator-a"
+        assert client.post("/v1/admin/a2a/delegations", headers=_auth("creator-a"), json={
+            "source_agent_id": "source", "target_agent_id": "target", "tool_name": "echo",
+        }).status_code == 403
+
+    def test_rbac_rejects_unbound_api_key_session(self, tmp_path: Path) -> None:
+        client, _store, _runtime = _setup(tmp_path)
+        assert client.post("/v1/admin/session/login", json={"api_key": "admin-secret"}).status_code == 403
+        assert client.get("/v1/admin/rbac/bindings", headers={"x-api-key": "admin-secret"}).status_code == 401
 
     def test_grants_platform_admin_only(self, tmp_path: Path) -> None:
         client, _store, _runtime = _setup(tmp_path)

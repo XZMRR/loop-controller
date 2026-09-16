@@ -187,6 +187,7 @@ class Runtime:
     bundle_reader_token: str | None = None
     status_writer_token: str | None = None
     config: AppConfig | None = None
+    config_dir: str | None = None  # v0.37.0 Profile 在线编辑/重载定位 profiles.yaml
     rbac_enforcer: RbacEnforcer | None = None  # v0.52
     rbac_store: SqliteRoleBindingStore | None = None  # v0.52
     rbac_credential_resolver: StaticCredentialResolver | None = None  # v0.52
@@ -1124,4 +1125,5 @@ def build_runtime(
         rbac_credential_resolver=rbac_credential_resolver,
         execution_security_policy=execution_security_policy,
         security_status=security_status,
+        config_dir=str(config_dir),
     )

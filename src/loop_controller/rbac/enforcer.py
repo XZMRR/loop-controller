@@ -48,11 +48,17 @@ class RbacEnforcer:
         roles: set[Role] = set()
         for binding in self._static_bindings:
             if binding.principal == principal.principal_id and binding.revoked_at is None:
-                if binding.tenant_id is None or binding.tenant_id == principal.tenant_id:
+                if binding.role is Role.PLATFORM_ADMIN:
+                    if binding.tenant_id is None and principal.tenant_id is None:
+                        roles.add(binding.role)
+                elif binding.tenant_id is None or binding.tenant_id == principal.tenant_id:
                     roles.add(binding.role)
         try:
             for binding in self._store.list_bindings(principal.principal_id):
-                if binding.tenant_id is None or binding.tenant_id == principal.tenant_id:
+                if binding.role is Role.PLATFORM_ADMIN:
+                    if binding.tenant_id is None and principal.tenant_id is None:
+                        roles.add(binding.role)
+                elif binding.tenant_id is None or binding.tenant_id == principal.tenant_id:
                     roles.add(binding.role)
         except Exception:  # noqa: BLE001 - 存储异常按 fail-closed 处理
             return ()
