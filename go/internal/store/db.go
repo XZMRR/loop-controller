@@ -46,7 +46,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     error_code TEXT,
     delegation_token TEXT NOT NULL DEFAULT '',
     exec_owner TEXT NOT NULL DEFAULT '',
-    exec_lease_expires_at INTEGER NOT NULL DEFAULT 0
+    executor_agent_id TEXT NOT NULL DEFAULT '',
+    executor_entrypoint_type TEXT NOT NULL DEFAULT '',
+    executor_entrypoint_url TEXT NOT NULL DEFAULT '',
+    exec_lease_expires_at INTEGER NOT NULL DEFAULT 0,
+    execution_mode TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_target ON tasks(target_agent_id);
@@ -178,7 +182,8 @@ CREATE TABLE IF NOT EXISTS agents (
     entrypoint_url TEXT NOT NULL DEFAULT '',
     capabilities_json TEXT NOT NULL DEFAULT '[]',
     trust_domain TEXT NOT NULL DEFAULT '',
-    version TEXT NOT NULL DEFAULT ''
+    version TEXT NOT NULL DEFAULT '',
+    execution_mode TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS routed_messages (
@@ -251,6 +256,14 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		}
 	}
 	if err := ensureColumn(ctx, db, "tasks", "deadline", "TEXT"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureColumn(ctx, db, "tasks", "execution_mode", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureColumn(ctx, db, "agents", "execution_mode", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, err
 	}

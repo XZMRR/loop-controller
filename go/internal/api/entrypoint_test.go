@@ -96,6 +96,264 @@ func cancelRequestBody() []byte {
 	return []byte(`{"protocol_version":"` + currentProtocolVersion + `","reason":"test"}`)
 }
 
+func resultsRequestBody(status, outcome, errorCode string, consumed int64) []byte {
+	payload := map[string]any{
+		"protocol_version": currentProtocolVersion,
+		"status":           status,
+		"error_code":       errorCode,
+		"consumed_budget":  map[string]any{"token_count": consumed},
+	}
+	if outcome != "" {
+		payload["outcome"] = json.RawMessage(outcome)
+	}
+	body, _ := json.Marshal(payload)
+	return body
+}
+
+func registerRemoteAgent(t *testing.T, server *httptest.Server) {
+	t.Helper()
+	card := models.AgentCard{
+		AgentID:       "remote-executor",
+		Name:          "Remote Executor",
+		Entrypoint:    models.AgentEntrypoint{Type: "http", URL: "http://remote-executor:8080"},
+		Capabilities:  []string{"delegate_execution", "echo_capability"},
+		ExecutionMode: "remote_results",
+	}
+	body, _ := json.Marshal(card)
+	resp, err := http.Post(server.URL+"/a2a/v1/agents", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("register agent: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", resp.StatusCode)
+	}
+}
+
+func createDelegationTo(t *testing.T, server *httptest.Server, target, tool string, deadline *time.Time) (models.Task, string) {
+	t.Helper()
+	req := models.DelegationRequest{
+		RequestID:           "req-remote-1",
+		InitiatorAgentID:    "planner",
+		TargetAgentID:       target,
+		ToolName:            tool,
+		Arguments:           json.RawMessage(`{"x":"hello"}`),
+		SessionID:           "session-remote-1",
+		ProtocolVersion:     currentProtocolVersion,
+		AllowedTools:        []string{tool},
+		AllowedCapabilities: []string{"echo_capability"},
+		Deadline:            deadline,
+	}
+	body, _ := json.Marshal(req)
+	resp, err := http.Post(server.URL+"/a2a/v1/delegations", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("delegation request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var d models.DelegationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		t.Fatalf("decode delegation response: %v", err)
+	}
+	if !d.Allowed || d.TaskID == "" || d.DelegationToken == "" {
+		t.Fatalf("unexpected delegation response: %+v", d)
+	}
+	getResp, err := http.Get(server.URL + "/a2a/v1/tasks/" + d.TaskID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	defer getResp.Body.Close()
+	var task models.Task
+	if err := json.NewDecoder(getResp.Body).Decode(&task); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	return task, d.DelegationToken
+}
+
+// startRemoteTask drives a remote_results task through entrypoint
+// create/accept/start and returns once the kernel reports it running. No
+// executor is registered on purpose: the kernel must not execute locally.
+func startRemoteTask(t *testing.T, srv *Server, server *httptest.Server, task models.Task, delegationToken string) models.Task {
+	t.Helper()
+	req := entrypointRequest(t, server, task, delegationToken)
+	req.RequestID = task.InteractionID // 静态 R2 未提供 interaction_id 时 interactionID 即 requestID
+	req.ToolName = task.AllowedTools[0]
+	req.ExecutionMode = "remote_results"
+	createBody, _ := json.Marshal(req)
+	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks", createBody, delegationToken)
+	if err != nil {
+		t.Fatalf("entrypoint create: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusConflict {
+		t.Fatalf("entrypoint create -> %d", resp.StatusCode)
+	}
+	acceptBody, _ := json.Marshal(map[string]string{"protocol_version": currentProtocolVersion})
+	resp, err = postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/accept", acceptBody, delegationToken)
+	if err != nil {
+		t.Fatalf("entrypoint accept: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("entrypoint accept -> %d", resp.StatusCode)
+	}
+	startBody, _ := json.Marshal(map[string]string{"protocol_version": currentProtocolVersion})
+	resp, err = postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/start", startBody, delegationToken)
+	if err != nil {
+		t.Fatalf("entrypoint start: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("entrypoint start -> %d", resp.StatusCode)
+	}
+	var started models.Task
+	if err := json.NewDecoder(resp.Body).Decode(&started); err != nil {
+		t.Fatalf("decode started task: %v", err)
+	}
+	if started.Status != "running" {
+		t.Fatalf("expected running after start, got %q", started.Status)
+	}
+	return started
+}
+
+func waitForTaskStatus(t *testing.T, server *httptest.Server, taskID, want string) models.Task {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(server.URL + "/a2a/v1/tasks/" + taskID)
+		if err != nil {
+			t.Fatalf("get task: %v", err)
+		}
+		var task models.Task
+		if err := json.NewDecoder(resp.Body).Decode(&task); err != nil {
+			resp.Body.Close()
+			t.Fatalf("decode task: %v", err)
+		}
+		resp.Body.Close()
+		if task.Status == want || task.IsTerminal() {
+			return task
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("task %s did not reach %s in time", taskID, want)
+	return models.Task{}
+}
+
+func TestEntrypointRemoteResultsCompletesWithConsumption(t *testing.T) {
+	srv, server := newTestServerWithMockR2(t, true)
+	registerRemoteAgent(t, server)
+	task, delegationToken := createDelegationTo(t, server, "remote-executor", "echo", nil)
+	if task.ExecutionMode != "remote_results" {
+		t.Fatalf("task execution_mode = %q, want remote_results", task.ExecutionMode)
+	}
+
+	started := startRemoteTask(t, srv, server, task, delegationToken)
+	if started.ExecutionMode != "remote_results" {
+		t.Errorf("started task execution_mode = %q", started.ExecutionMode)
+	}
+
+	outcome := json.RawMessage(`{"result":{"value":"done"}}`)
+	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/results", resultsRequestBody("completed", string(outcome), "", 42), delegationToken)
+	if err != nil {
+		t.Fatalf("results callback: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("results callback -> %d", resp.StatusCode)
+	}
+	var completed models.Task
+	if err := json.NewDecoder(resp.Body).Decode(&completed); err != nil {
+		t.Fatalf("decode completed task: %v", err)
+	}
+	if completed.Status != "completed" {
+		t.Errorf("expected completed, got %q", completed.Status)
+	}
+	if completed.ConsumedBudget.TokenCount != 42 {
+		t.Errorf("consumed token_count = %d, want 42", completed.ConsumedBudget.TokenCount)
+	}
+	if len(completed.Outcome) == 0 {
+		t.Error("expected outcome to be persisted")
+	}
+	if completed.CompletedAt == nil {
+		t.Error("expected completed_at to be set")
+	}
+}
+
+func TestEntrypointRemoteResultsFailureReportedByTarget(t *testing.T) {
+	srv, server := newTestServerWithMockR2(t, true)
+	registerRemoteAgent(t, server)
+	task, delegationToken := createDelegationTo(t, server, "remote-executor", "echo", nil)
+	startRemoteTask(t, srv, server, task, delegationToken)
+
+	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/results", resultsRequestBody("failed", "", "tool_execution_failed", 7), delegationToken)
+	if err != nil {
+		t.Fatalf("results callback: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("results callback -> %d", resp.StatusCode)
+	}
+	got := waitForTaskStatus(t, server, task.TaskID, "failed")
+	if got.ErrorCode != "tool_execution_failed" {
+		t.Errorf("error_code = %q, want tool_execution_failed", got.ErrorCode)
+	}
+	if got.ConsumedBudget.TokenCount != 7 {
+		t.Errorf("consumed token_count = %d, want 7", got.ConsumedBudget.TokenCount)
+	}
+}
+
+func TestEntrypointRemoteResultsCancelWhileRunning(t *testing.T) {
+	srv, server := newTestServerWithMockR2(t, true)
+	registerRemoteAgent(t, server)
+	task, delegationToken := createDelegationTo(t, server, "remote-executor", "echo", nil)
+	startRemoteTask(t, srv, server, task, delegationToken)
+
+	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/cancel", cancelRequestBody(), delegationToken)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cancel -> %d", resp.StatusCode)
+	}
+	var cancelled models.Task
+	if err := json.NewDecoder(resp.Body).Decode(&cancelled); err != nil {
+		t.Fatalf("decode cancelled task: %v", err)
+	}
+	if cancelled.Status != "cancelled" {
+		t.Errorf("expected cancelled, got %q", cancelled.Status)
+	}
+
+	// 取消后的迟到结果必须被拒绝，且不能覆写终态。
+	resp2, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/results", resultsRequestBody("completed", `{"result":true}`, "", 1), delegationToken)
+	if err != nil {
+		t.Fatalf("late results: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusConflict {
+		t.Errorf("late results -> %d, want 409", resp2.StatusCode)
+	}
+	got := waitForTaskStatus(t, server, task.TaskID, "cancelled")
+	if got.Status != "cancelled" {
+		t.Errorf("task status after late results = %q", got.Status)
+	}
+}
+
+func TestEntrypointRemoteResultsDeadlineTimeout(t *testing.T) {
+	srv, server := newTestServerWithMockR2(t, true)
+	registerRemoteAgent(t, server)
+	deadline := time.Now().UTC().Add(300 * time.Millisecond)
+	task, delegationToken := createDelegationTo(t, server, "remote-executor", "echo", &deadline)
+	startRemoteTask(t, srv, server, task, delegationToken)
+
+	got := waitForTaskStatus(t, server, task.TaskID, "failed")
+	if got.ErrorCode != "execution_deadline_exceeded" {
+		t.Errorf("error_code = %q, want execution_deadline_exceeded", got.ErrorCode)
+	}
+}
+
 func postEntrypoint(t *testing.T, url string, body []byte, delegationToken string) (*http.Response, error) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))

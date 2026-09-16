@@ -19,6 +19,11 @@ type AgentCard struct {
 	Capabilities []string        `json:"capabilities" yaml:"capabilities"`
 	TrustDomain  string          `json:"trust_domain" yaml:"trust_domain"`
 	Version      string          `json:"version" yaml:"version"`
+	// ExecutionMode selects who executes a delegated task: empty or
+	// "kernel_executor" lets the kernel executor run it, "remote_results"
+	// suspends the task at running and waits for the target agent to report
+	// results via the entrypoint results endpoint.
+	ExecutionMode string `json:"execution_mode,omitempty" yaml:"execution_mode,omitempty"`
 }
 
 // AgentEntrypoint describes how to reach an agent.
@@ -58,6 +63,7 @@ type Task struct {
 	InitiatorAgentID    string           `json:"initiator_agent_id"`
 	TargetAgentID       string           `json:"target_agent_id"`
 	Status              string           `json:"status"`
+	ExecutionMode       string           `json:"execution_mode,omitempty"`
 	CreatedAt           time.Time        `json:"created_at"`
 	UpdatedAt           time.Time        `json:"updated_at"`
 	CompletedAt         *time.Time       `json:"completed_at,omitempty"`
@@ -182,6 +188,7 @@ type EntrypointTaskRequest struct {
 	AllowedTools        []string         `json:"allowed_tools"`
 	AllowedCapabilities []string         `json:"allowed_capabilities"`
 	AllowRedelegation   bool             `json:"allow_redelegation"`
+	ExecutionMode       string           `json:"execution_mode,omitempty"`
 }
 
 // CancelTaskRequest requests cancellation using the negotiated protocol version.

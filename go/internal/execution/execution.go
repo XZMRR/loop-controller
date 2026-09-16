@@ -191,3 +191,63 @@ func (e *HTTPExecutor) run(ctx context.Context, req *http.Request, handle *httpH
 
 var _ TargetExecutor = (*HTTPExecutor)(nil)
 var _ Handle = (*httpHandle)(nil)
+
+// PendingResultsHandle suspends a delegated task at running while the target
+// agent executes the work in its own runtime and reports the final result via
+// the entrypoint results endpoint. Complete wakes the awaiting finishExecution
+// goroutine; Cancel mirrors a local cancellation; an optional deadline timer
+// fails the execution with execution_deadline_exceeded, matching the
+// HTTPExecutor semantics.
+type PendingResultsHandle struct {
+	done  chan Result
+	once  sync.Once
+	timer *time.Timer
+}
+
+// NewPendingResultsHandle returns a handle whose result is supplied later via
+// Complete. If deadline is non-nil, the handle fails automatically once it
+// passes.
+func NewPendingResultsHandle(deadline *time.Time) *PendingResultsHandle {
+	h := &PendingResultsHandle{done: make(chan Result, 1)}
+	if deadline != nil {
+		delay := time.Until(*deadline)
+		if delay <= 0 {
+			delay = time.Nanosecond
+		}
+		h.timer = time.AfterFunc(delay, func() {
+			h.complete(Result{Status: "failed", ErrorCode: "execution_deadline_exceeded"})
+		})
+	}
+	return h
+}
+
+func (h *PendingResultsHandle) Done() <-chan Result { return h.done }
+
+// Cancel mirrors local cancellation: the task status is already transitioned
+// by the cancel handler, so the goroutine only needs to observe a terminal
+// result and stop renewing the execution lease.
+func (h *PendingResultsHandle) Cancel() bool {
+	h.complete(Result{Status: "failed", ErrorCode: "execution_cancelled"})
+	return true
+}
+
+// Complete supplies the final result reported by the target agent. It returns
+// false when the handle is already completed (cancelled, timed out, or a
+// duplicate results delivery).
+func (h *PendingResultsHandle) Complete(result Result) bool {
+	return h.complete(result)
+}
+
+func (h *PendingResultsHandle) complete(result Result) bool {
+	completed := false
+	h.once.Do(func() {
+		if h.timer != nil {
+			h.timer.Stop()
+		}
+		h.done <- result
+		completed = true
+	})
+	return completed
+}
+
+var _ Handle = (*PendingResultsHandle)(nil)

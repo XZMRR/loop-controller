@@ -159,3 +159,56 @@ func TestHTTPExecutorCancelCancelsRequestContext(t *testing.T) {
 		t.Fatal("HTTP request context was not cancelled")
 	}
 }
+
+func TestPendingResultsHandleCompleteWakesWaiter(t *testing.T) {
+	handle := NewPendingResultsHandle(nil)
+	if !handle.Complete(Result{Status: "completed", Outcome: json.RawMessage(`{"ok":true}`)}) {
+		t.Fatal("first Complete should succeed")
+	}
+	select {
+	case result := <-handle.Done():
+		if result.Status != "completed" {
+			t.Errorf("status = %q", result.Status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Done was not woken by Complete")
+	}
+	// A duplicate (late or repeated) delivery must be rejected.
+	if handle.Complete(Result{Status: "failed"}) {
+		t.Error("duplicate Complete should return false")
+	}
+}
+
+func TestPendingResultsHandleCancel(t *testing.T) {
+	handle := NewPendingResultsHandle(nil)
+	if !handle.Cancel() {
+		t.Fatal("Cancel should succeed")
+	}
+	select {
+	case result := <-handle.Done():
+		if result.ErrorCode != "execution_cancelled" {
+			t.Errorf("error_code = %q", result.ErrorCode)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Done was not woken by Cancel")
+	}
+	// Complete after cancel must be rejected.
+	if handle.Complete(Result{Status: "completed"}) {
+		t.Error("Complete after cancel should return false")
+	}
+}
+
+func TestPendingResultsHandleDeadlineTimeout(t *testing.T) {
+	deadline := time.Now().Add(50 * time.Millisecond)
+	handle := NewPendingResultsHandle(&deadline)
+	select {
+	case result := <-handle.Done():
+		if result.ErrorCode != "execution_deadline_exceeded" {
+			t.Errorf("error_code = %q", result.ErrorCode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("deadline timer did not fire")
+	}
+	// A racing Complete after timeout must not block or redeliver.
+	handle.Complete(Result{Status: "completed"})
+}

@@ -164,6 +164,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="收到任务后不回调内核 start（隐含 --no-auto-accept）",
     )
+    entrypoint_stub.add_argument(
+        "--tool-url",
+        default="",
+        help="remote_results 模式下执行工具调用的治理层 base URL（Python /v1/govern/tool-call）",
+    )
+    entrypoint_stub.add_argument(
+        "--tool-token",
+        default="",
+        help="remote_results 模式下调用治理层使用的工作负载凭证（Bearer token）",
+    )
 
     server = subparsers.add_parser("server", help="启动 HTTP 治理服务（v0.17.0）")
     server.add_argument("--host", default="127.0.0.1", help="监听 host（默认 127.0.0.1）")
@@ -368,6 +378,8 @@ def _cmd_entrypoint_stub(args: argparse.Namespace) -> int:
         args.kernel_url,
         auto_accept=not args.no_auto_accept,
         auto_start=not args.no_auto_start,
+        tool_url=args.tool_url,
+        tool_token=args.tool_token,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0

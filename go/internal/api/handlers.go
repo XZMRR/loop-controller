@@ -807,6 +807,20 @@ func (s *Server) startTargetExecution(ctx context.Context, current models.Task) 
 	if current.Deadline != nil && !current.Deadline.After(time.Now().UTC()) {
 		return models.Task{}, errors.New("task deadline has expired")
 	}
+	if current.ExecutionMode == "remote_results" {
+		// 远端回报模式：内核不执行，任务挂起在 running，由目标 Agent 在
+		// 自己的运行时完成工作后经 entrypoint results 端点回报终态与消耗。
+		updated, err := s.tasks.UpdateStatus(current.TaskID, "running")
+		if err != nil {
+			return models.Task{}, err
+		}
+		handle := execution.NewPendingResultsHandle(current.Deadline)
+		s.executionsMu.Lock()
+		s.executions[current.TaskID] = handle
+		s.executionsMu.Unlock()
+		go s.finishExecution(current.TaskID, handle)
+		return updated, nil
+	}
 	if s.executor == nil {
 		return models.Task{}, errors.New("target executor is not configured")
 	}
@@ -976,6 +990,18 @@ func (s *Server) handleEntrypointResults(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		writeError(w, http.StatusConflict, "invalid_status_transition", err.Error())
 		return
+	}
+	// 远端回报模式：唤醒挂起的 finishExecution goroutine 并释放执行槽位；
+	// goroutine 内的 Complete 因状态已终态而 CAS 失败，不会覆写结果。
+	s.executionsMu.Lock()
+	if handle, ok := s.executions[taskID]; ok {
+		delete(s.executions, taskID)
+		s.executionsMu.Unlock()
+		if pending, ok := handle.(*execution.PendingResultsHandle); ok {
+			pending.Complete(execution.Result{Status: req.Status, Outcome: req.Outcome, ErrorCode: req.ErrorCode})
+		}
+	} else {
+		s.executionsMu.Unlock()
 	}
 	writeJSON(w, http.StatusOK, updated)
 }

@@ -228,6 +228,18 @@ frontend/
   - 场景 B（running 取消，stub 自动 start）：委托 → 派发 → accept/start → 轮询命中 running 窗口即管理端 cancel → 任务 `cancelled`（非 outcome_unknown，确认传播成功）。
 - **回归**：Python `pytest` 988 passed / 8 skipped（stub 16 全绿含 6 个新取消用例，bridge 新增 1 个）；Go `go test ./...` 全包通过；`config/go_kernel.yaml` 临时改动已还原。
 
+#### 进度记录（2026-09-16，第十三轮：results 回调模式 / 远端执行）
+
+- **架构定位**：落实"多 Agent 强控制治理"设计——执行方式不是全局开关，而是每个 Agent Card 的配置属性：execution_mode=`kernel_executor`（默认，内核 HTTPExecutor 调 Python `/v1/govern/tool-call`）或 `remote_results`（内核 start 后挂起，目标 Agent 在自己的运行时执行，经 entrypoint results 端点回报终态 + ConsumedBudget，喂预算衰减链路）。空值向后兼容。
+- **Go 内核全链路**（[models.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/models/models.go) / [delegation.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/delegation/delegation.go) / [handlers.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/api/handlers.go) / [db.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/store/db.go) / [task.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/store/task.go) / [agent.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/store/agent.go)）：AgentCard/Task/EntrypointTaskRequest 增 `execution_mode`；SQLite schema + ensureColumn 迁移 + 全列接线；delegation 直接路径与审批 Consume 路径均透传。
+- **PendingResultsHandle**（[execution.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/execution/execution.go)）：实现 Handle 接口（Done/Cancel）；`Complete(result)` 由 sync.Once 保证单次完成；可选 deadline 定时器超时返回 `execution_deadline_exceeded`（对齐 HTTPExecutor 语义）。
+- **内核 start 分支**：`remote_results` 任务 UpdateStatus(running) 后注册 PendingResultsHandle 并挂起；`handleEntrypointResults` 先 `CompleteWithConsumption` 落库再唤醒 `finishExecution` goroutine（goroutine 内 Complete 因终态 CAS 失败不覆写）；租约续期复用现有 finishExecution/awaitExecution 机制。
+- **store 缺陷修复**：`UpdateStatusWithConsumption` 原只结算父任务消耗、从不写本任务行——UPDATE 增 `consumed_token_count`/`consumed_payment_amount`，使 results 回写的 ConsumedBudget 可查询。
+- **Python entrypoint stub 扩展**（[entrypoint_stub.py](file:///D:/Agent/loop-controller-latest-develop/src/loop_controller/entrypoint_stub.py) + CLI `--tool-url`/`--tool-token`）：投递 payload 带 `execution_mode=remote_results` 时在自己的运行时执行——POST `{tool_url}/v1/govern/tool-call`（agent_id=target、user_id=initiator、Bearer tool_token），allow → completed + outcome + 消耗估算；deny/异常 → failed + error_code；随后回调内核 results 端点；未配置 tool_url 仅告警不执行。
+- **测试**：Go 集成测试 4 个（completed+ConsumedBudget 落库 / failed 回报 / cancel 后迟到 results 409 终态不覆写 / deadline 超时）+ PendingResultsHandle 单测 3 个；Python stub 单测 19 个全绿。
+- **E2E 全链路验证**（OPA 8181 + Python 8000 + 内核 18080 + stub 8001 `--tool-url/--tool-token`）：管理端委托（researcher_001→research-agent, analyze_sales）→ 内核派发 → stub create/accept/start → **内核挂起等 results** → stub 调治理层 tool-call（策略 allow + 本地函数执行）→ results 回调 → 任务 `completed`、`consumed_budget.token_count=74` 回写、outcome 含执行结果；execution_mode 全程透传可见。首轮失败用例（缺 `period` 参数 → `local_function_runtime_error`）亦验证了远端失败回报路径。
+- **回归**：Python `pytest` 全量；Go `go test ./...` 全包；`config/go_kernel.yaml` 与 `config/a2a_agents.yaml` 临时改动已还原。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）
