@@ -84,7 +84,7 @@ frontend/
 
 ## 4. 功能阶段规划
 
-### 长线开发顺序与决策记录（2026-09-15）
+### 长线开发顺序与决策记录
 
 当前已确认进入长线开发阶段，不再只做静态展示或单次演示。
 
@@ -115,14 +115,14 @@ frontend/
 - 再做审批与审计闭环，是因为这是治理系统最重要的可运营能力，也是管理层最容易理解和验收的部分。
 - 最后接 A2A，是因为 A2A 依赖前面稳定的身份、配置、审计和审批语义，过早接入会放大接口返工成本。
 
-#### 进度记录（2026-09-15，第二轮）
+#### 进度记录（第二轮）
 
 - **GitHub 推送问题已解决**：根因是全局 git 代理指向未运行的 `127.0.0.1:7890`；`gh` 完成登录（keyring）后，绕过代理直连可正常推送。后续如需长期避免，应清除全局 proxy 配置或保持代理常驻。
 - **审批与审计闭环基础能力落地**：新增 `GET /v1/admin/approvals`（分页契约 `approvals/total/limit/offset`，支持 `status/agent_id/tool_name/requester_id/approver_id` 筛选），审计接口补齐 `agent_id`/`tool_name` 筛选；前端审批页升级为“审批中心”（待审批/历史双 Tab + 筛选 + 分页）。后端 61 测试全绿。
 - **Agent 详情接口落地（多 Agent 底座）**：新增 `GET /v1/admin/agents/{agent_id}`，返回 `AdminAgentDetail`（在列表字段基础上扩展 `description`、`metadata`），404/401/503 语义完整；前端 Agent 管理页新增“详情”操作列与 Drawer 详情视图，接口不可用时回退列表行数据。后端 67 测试全绿，前端构建通过。
 - **实现注意**：审批历史查询不改 `ApprovalStore` Protocol，只给 `JSONLApprovalStore` 具体类加只读 `requests`/`responses` 视图属性，server 端 `getattr` 防御，避免对所有 store 实现造成兼容压力；verdict 序列化用 `getattr(record.verdict, "value", record.verdict)` 兼容枚举与字符串。
 
-#### 进度记录（2026-09-15，第三轮：Profile 工具策略在线编辑与统一 reload）
+#### 进度记录（第三轮：Profile 工具策略在线编辑与统一 reload）
 
 - **后端新增接口**：`PUT /v1/admin/profiles/{profile_id}/tools`（工具权限整体替换：先经 `ToolPermission` 模型校验，再原子写回 `profiles.yaml`，随后从磁盘重载并原地刷新运行时共享映射，全程写审计）；`POST /v1/admin/profiles/reload`（放弃内存修改，从磁盘统一重载全部 Profile）。
 - **统一 reload 底座**：`HotReloader` 纳入 `profiles.yaml` 监视，文件被手工编辑后按轮询周期自动热更新；`Runtime` 新增 `config_dir` 字段供管理接口定位配置文件；`ConfigLoader.reload_profiles()` 与既有 http/harness/revocation 重载方法同构。
@@ -130,7 +130,7 @@ frontend/
 - **前端**：工具策略页升级为在线编辑（每 Profile“编辑”对话框：允许/需审批开关、调用上限、参数黑白名单 JSON 编辑器、增删工具），保存即热更新；“从磁盘重载”按钮对应统一 reload；数据加载优先在线 API，失败回退静态 YAML。
 - **验证**：后端 72 个 server 测试全绿（新增 5 个：写回+热更新+审计、未知 Profile 400、非法权限 400 且不落盘、磁盘直改后 reload 同步、无 config_dir 503）；全量 869 通过（3 个 go_kernel 集成测试错误为既有环境问题，与本轮改动无关，已 stash 基线复核）；前端构建通过。
 
-#### 进度记录（2026-09-15，第四轮：身份、审计、配置底座收口）
+#### 进度记录（第四轮：身份、审计、配置底座收口）
 
 - **最小后端 Session 登录落地**（对应已确认决策“短期保留 API Key 联调，同时补最小 Session 登录”）：新增 `POST /v1/admin/session/login`（验证 API Key 后签发 8 小时随机 token）与 `POST /v1/admin/session/logout`（吊销当前 token）；`_check_api_key` 接受 `Authorization: Bearer <session-token>` 作为 API Key 的替代凭据，审计 actor 区分 `api-key:` 与 `session:` 前缀。存储为进程内存（重启全失效，接口预留持久化替换空间），登录/登出均写审计。
 - **前端登录改造**：登录时优先换取 Session Token（旧后端无该端点自动降级 API Key 直连）；axios 拦截器优先携带 Bearer Session Token；退出时先调用后端吊销再清理本地状态。
@@ -138,7 +138,7 @@ frontend/
 - **配置底座现状**：Profile 在线编辑 + 统一 reload + profiles.yaml 热更新已闭环；Identity/Entrypoints 仍为只读脱敏展示（热更新字段拆分未做，属长期项）。
 - **验证**：后端 76 个 server 测试全绿（新增 4 个 session 用例）；前端构建通过。
 
-#### 进度记录（2026-09-15，第五轮：路由守卫收口 + A2A 接入第一步）
+#### 进度记录（第五轮：路由守卫收口 + A2A 接入第一步）
 
 - **路由级权限守卫**：路由守卫此前已存在（未登录跳 `/login`、已登录访问登录页跳首页），本轮补齐缺口——axios 响应拦截器统一处理 401：清理本地凭据、3 秒防抖提示并跳回登录页；登录页自身的 401 不触发跳转，避免循环。
 - **A2A 接入第一步（治理视角，不依赖 Go 内核在线）**：
@@ -148,13 +148,13 @@ frontend/
   - 为后续预留：Delegation / route_message / cancel_task 的 bridge 方法已存在，下一步可做管理端发起委托与任务取消。
 - **验证**：后端 80 个 server 测试全绿（新增 4 个 A2A 用例）；前端构建通过。
 
-#### 进度记录（2026-09-15，第六轮：管理端发起委托入口）
+#### 进度记录（第六轮：管理端发起委托入口）
 
 - **后端**：新增 `POST /v1/admin/a2a/delegations`。管理端发起的委托与 Agent 自发委托走完全相同的治理路径：`InteractionGovernanceEngine.evaluate()`（Profile/信任/委托深度校验 → OPA interaction 策略）→ allow/modify 后经 Go 内核 `request_delegation` 派发；require_approval 返回升级对象由人工跟进；deny 不派发。全程写交互审计（`build_audit_event` 同一语义，提案标记 `interaction_context="admin-console"` 便于区分来源）。引擎支持构造注入（`build_app(interaction_engine=...)`），默认懒构造。
 - **前端**：A2A 治理页新增“发起委托”卡片——发起/目标 Agent 下拉、能力名、风险等级、参数 JSON；结果区展示判定（allow/modify/require_approval/deny）、原因、Decision/Interaction ID、升级对象与派发信息；require_approval 给出人工跟进提示。
 - **验证**：后端 84 个 server 测试全绿（新增 4 个：allow 派发、deny 跳过派发、未知 Agent 400、无内核时派发标记跳过）；前端构建通过。
 
-#### 进度记录（2026-09-15，第七轮：Go 内核启动与完整链路验证）
+#### 进度记录（第七轮：Go 内核启动与完整链路验证）
 
 - **环境就绪**：下载 OPA 1.19.0 至 `tools/opa.exe`（本机 8181 已有 OPA 实例运行且加载 `policies/interaction/default.rego`，直接复用）；Go 模块经 `GOPROXY=https://goproxy.cn,direct` 绕过被墙的 proxy.golang.org 完成编译。
 - **Go 内核启动命令**：`go run ./cmd/kernel -addr :8080 -development -discovery-file ..\config\a2a_agents.yaml -interaction-url http://127.0.0.1:8000 -interaction-token dev-token-researcher-001`。
@@ -167,7 +167,7 @@ frontend/
 - **完整链路验证通过**：Session 登录 → `POST /v1/admin/a2a/delegations`（researcher_001 → research-agent / analyze_sales）→ IIGE 治理 allow（profile → capability → 深度 → trust → OPA interaction 策略）→ Go 内核二次 authorize（200）→ 任务创建 accepted=true 返回 task_id → `GET /v1/admin/a2a/tasks/{task_id}` 查到 pending 任务（research-agent :8001 无真实执行端，development 模式不实际派发，符合预期）。全程审计落盘。
 - **验证**：`test_server.py` + `test_delegation_authorizer.py` 共 94 测试全绿。
 
-#### 进度记录（2026-09-15，第八轮：任务生命周期闭环——取消与 SSE 流式）
+#### 进度记录（第八轮：任务生命周期闭环——取消与 SSE 流式）
 
 - **后端新增两个管理接口**（[server.py](file:///D:/Agent/loop-controller-latest-develop/src/loop_controller/server.py)）：
   - `POST /v1/admin/a2a/tasks/{task_id}/cancel`：透传 `bridge.cancel_task`，内核不可达/拒绝返回 502，无 bridge 503（fail-closed）；
@@ -179,7 +179,7 @@ frontend/
 - **完整链路验证**：发起委托 → task pending → 管理端 cancel → 任务 `cancelled`；SSE 流依次收到 `task_created`(pending) 与 `task_cancelled`(cancelled) 两帧。
 - **验证**：`tests/test_server.py` 86 测试全绿（新增 cancel 200/502/503 与 stream SSE 内容/503）；前端构建通过。
 
-#### 进度记录（2026-09-15，第九轮：require_approval 委托挂接审批台）
+#### 进度记录（第九轮：require_approval 委托挂接审批台）
 
 - **闭环设计**：管理端委托判定为 `require_approval` 时，handler 自动构造审批单提交审批台（`call_id=a2a-delegation:{interaction_id}`，`tool_arguments` 保存委托快照明文供批准后重建）；`POST /v1/admin/approvals/{id}/approve` 批准此类审批单后自动重建 `DelegationRequest` 派发到 Go 内核，响应附 `dispatch` 字段；内核回调 `/interaction/v1/delegations/authorize` 二次评估仍为 require_approval 时，Python 按 call_id 查审批记录，已批准则翻转为 allow。
 - **防篡改**：翻转除 call_id 外还校验委托快照与 authorize 请求一致（目标 Agent、工具名、参数），防止复用已批准 interaction 放行被篡改的委托（新增专项测试覆盖一致/篡改/错目标三种情形）。
@@ -191,7 +191,7 @@ frontend/
 - **E2E 验证**：发起委托（analyze_sales require_approval）→ 审批单进审批台 → 批准 → 自动派发 `accepted=true` 返回内核 task_id → 任务查询可见（parent_interaction_id 正确回链，allowed_tools=[analyze_sales]，status=pending）。
 - **验证**：`tests/test_server.py` 89 全绿 + `test_delegation_authorizer.py` 10 全绿；Go `internal/delegation` 测试全绿；前端构建通过。联调用 `config/interaction_profiles.yaml`、`config/go_kernel.yaml` 本地改动已还原，未提交。
 
-#### 进度记录（2026-09-16，第十轮：审批状态对账）
+#### 进度记录（第十轮：审批状态对账）
 
 - **架构**：Python 审批台为唯一人工审批入口，Go 内核原生审批（DelegationApproval）为执行事实源。内核审批单经 LIST 端点枚举，与审批台记录按 `kernel.request_id == console.decision_id` 关联（Python 派发时 `DelegationRequest.request_id` 即审批单 decision_id）。
 - **Go 内核新增 LIST 端点**（对账最大缺口，此前内核审批单完全无法枚举）：
@@ -205,7 +205,7 @@ frontend/
 - **前端审批中心加"内核对账"页签**（[Approvals.vue](file:///D:/Agent/loop-controller-latest-develop/frontend/src/views/Approvals.vue)）：内核状态过滤下拉、对账表格（Approval ID/目标 Agent/工具/内核状态/任务/审批台关联/审批台结论/过期时间），未启用内核时提示。
 - **验证**：`tests/test_server.py` + `test_go_kernel_bridge.py` 共 102 全绿（新增代批准 Resume、对账视图、202 解析、403 透传、control/approver token 共 6 个）；Go `internal/api` + `internal/store` 测试全绿（新增 control token initiator 过滤用例）；前端构建通过。
 
-#### 进度记录（2026-09-16，第十一轮：任务执行闭环）
+#### 进度记录（第十一轮：任务执行闭环）
 
 - **架构**：采用"内核执行"语义——审批 Consume 后内核经 outbox dispatcher 把任务投递给目标 agent entrypoint，stub 回调 accept/start，由内核 executor 调用 Python `/v1/govern/tool-call` 完成工具执行，任务终态 `completed`。
 - **Go 内核 dispatcher 接线**（[handlers.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/api/handlers.go)）：`SetEntrypointClient` 内启动 `DelegationDispatchOutboxDispatcher`（仿 `SetR2Authorizer` 模式），`dispatchCancel` 在 `Close()` 释放；Consume 写入的 outbox 记录由此投递（Claim→Dispatch→MarkDelivered/MarkFailed 指数退避）。
@@ -218,7 +218,7 @@ frontend/
 - **E2E 全链路验证**（OPA 8181 + Python 8000 + 内核 18080 + stub 8001）：管理端委托 → require_approval → 审批单入台 → Python 审批台批准 → 自动派发内核 → Consume → outbox dispatcher → stub create/accept/start → 内核 executor → govern/tool-call（影子任务+策略 allow+本地函数执行）→ 任务 `completed`，两次复验均通过。
 - **回归**：Python `pytest` 981 passed / 8 skipped；Go `go test ./...` 全包通过。
 
-#### 进度记录（2026-09-16，第十二轮：任务取消闭环）
+#### 进度记录（第十二轮：任务取消闭环）
 
 - **勘察结论**：Go 内核管理端取消链路已完整——`POST /a2a/v1/tasks/{id}/cancel`（`withControlAuth`）→ `handleCancelTask` 级联取消子孙任务 → `cancelTaskExecution` 经 `entrypointClient.Cancel` 推送 `POST /a2a/v1/entrypoint/tasks/{id}/cancel` 到目标 entrypoint（Bearer delegation token），传播确认置 `cancelled`、失败置 `outcome_unknown`、终态幂等；既有集成测试覆盖（`TestCancelMainChainPropagatesToTarget` 等）。**唯一缺口在 stub**：内核推 cancel 时 stub 404 → `confirmed=false` → running 任务被误置 `outcome_unknown`。
 - **Python entrypoint stub 扩展**（[entrypoint_stub.py](file:///D:/Agent/loop-controller-latest-develop/src/loop_controller/entrypoint_stub.py)）：新增 `_task_status`/`_task_tokens` 状态跟踪（create 记 accepted→running）；`POST /a2a/v1/entrypoint/tasks/{id}/cancel` 路由——校验 delegation token → 置 cancelled → 移出驱动集合并清 token → 响应 `{"task_id","status":"cancelled"}` 供内核确认；已取消任务被 dispatcher 重投 create 时直接返回 200 不再驱动（防内核 409 重试循环）；`/health` 暴露 `task_status`。
@@ -228,7 +228,7 @@ frontend/
   - 场景 B（running 取消，stub 自动 start）：委托 → 派发 → accept/start → 轮询命中 running 窗口即管理端 cancel → 任务 `cancelled`（非 outcome_unknown，确认传播成功）。
 - **回归**：Python `pytest` 988 passed / 8 skipped（stub 16 全绿含 6 个新取消用例，bridge 新增 1 个）；Go `go test ./...` 全包通过；`config/go_kernel.yaml` 临时改动已还原。
 
-#### 进度记录（2026-09-16，第十三轮：results 回调模式 / 远端执行）
+#### 进度记录（第十三轮：results 回调模式 / 远端执行）
 
 - **架构定位**：落实"多 Agent 强控制治理"设计——执行方式不是全局开关，而是每个 Agent Card 的配置属性：execution_mode=`kernel_executor`（默认，内核 HTTPExecutor 调 Python `/v1/govern/tool-call`）或 `remote_results`（内核 start 后挂起，目标 Agent 在自己的运行时执行，经 entrypoint results 端点回报终态 + ConsumedBudget，喂预算衰减链路）。空值向后兼容。
 - **Go 内核全链路**（[models.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/models/models.go) / [delegation.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/delegation/delegation.go) / [handlers.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/api/handlers.go) / [db.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/store/db.go) / [task.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/store/task.go) / [agent.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/store/agent.go)）：AgentCard/Task/EntrypointTaskRequest 增 `execution_mode`；SQLite schema + ensureColumn 迁移 + 全列接线；delegation 直接路径与审批 Consume 路径均透传。
@@ -240,7 +240,7 @@ frontend/
 - **E2E 全链路验证**（OPA 8181 + Python 8000 + 内核 18080 + stub 8001 `--tool-url/--tool-token`）：管理端委托（researcher_001→research-agent, analyze_sales）→ 内核派发 → stub create/accept/start → **内核挂起等 results** → stub 调治理层 tool-call（策略 allow + 本地函数执行）→ results 回调 → 任务 `completed`、`consumed_budget.token_count=74` 回写、outcome 含执行结果；execution_mode 全程透传可见。首轮失败用例（缺 `period` 参数 → `local_function_runtime_error`）亦验证了远端失败回报路径。
 - **回归**：Python `pytest` 全量；Go `go test ./...` 全包；`config/go_kernel.yaml` 与 `config/a2a_agents.yaml` 临时改动已还原。
 
-#### 进度记录（2026-09-16，第十四轮：多 Agent 演示底座 / 两跳重委托链路）
+#### 进度记录（第十四轮：多 Agent 演示底座 / 两跳重委托链路）
 
 - **目标**：落实"多 Agent 强控制治理架构"定位——planner（researcher_001）委托 research-agent、research-agent 再以自己的 control token 向内核重委托 specialist-agent 的真实两跳链路可系统性演示。
 - **Go 内核：按 Agent 的控制凭证**（[main.go](file:///D:/Agent/loop-controller-latest-develop/go/cmd/kernel/main.go) / [r2_authorizer.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/delegation/r2_authorizer.go) / [handlers.go](file:///D:/Agent/loop-controller-latest-develop/go/internal/api/handlers.go)）：新增 `-agent-control-token token=agent_id`（与 `-interaction-agent-token`）flag，映射表注入 `withControlAuth`——每个 Agent 用自己的 token 调内核 delegations/tasks 端点，任务枚举按 initiator 隔离（403 task_access_denied）；新增 `TestAgentControlTokenDelegatesAsBoundInitiator`。
@@ -253,9 +253,9 @@ frontend/
 - **演示拓扑**（`config/go_kernel.yaml` 已还原，演示时临时启用）：Python 服务 `PYTHONPATH=src LOOP_CONTROLLER_API_KEY=e2e-admin-key LOOP_CONTROLLER_AUDIT_HMAC_KEY=<hmac>` + `go_kernel.enabled=true/base_url=:18080/token=dev-token-researcher-001/approval_token=dev-token-approver-001`；内核 `-agent-control-token dev-token-research-agent-001=research-agent -interaction-agent-token dev-token-research-agent-001=research-agent -discovery-file config/a2a_agents.yaml`；stub 8001 `--agent-id research-agent --control-token dev-token-research-agent-001 --tool-token dev-token-research-agent-001 --redelegate calculate_checksum=specialist-agent`；stub 8002 `--agent-id specialist-agent --tool-token dev-token-specialist-agent-001`。后台服务须用 `Start-Process -WindowStyle Hidden -RedirectStandardOutput/Error` 脱离终端，否则随终端回收；PowerShell 写 JSON 重放文件须用 UTF8Encoding($false) 防 BOM。
 - **回归**：Python `pytest` 977 passed / 5 skipped + integration 19 passed / 3 skipped；Go `go test ./...` 全包通过（`SetMaxOpenConns(1)` 对并发幂等测试无回归）。
 
-#### 进度记录（2026-09-17，第十五轮：前端体验完善 + A2A 链路可视化脚手架）
+#### 进度记录（第十五轮：前端体验完善 + A2A 链路可视化脚手架）
 
-- **背景与约束**：后端 develop 已推进至 v0.54，整合方反馈与本分支存在 14 处文本冲突与 5 项语义交叉（审批恢复原子性、stub 接入 durable assignment/lease/fence、remote_results 经 fenced settlement、control token 不进浏览器、contract 迁移到 v0.54 authority）。本轮起**冻结一切后端改动**，仅做前端增量，待后端推送 v0.54 后再协调。
+- **背景与约束**：后端 develop 推进至 v0.54 后，合并评估发现本分支与 v0.54 存在 14 处文本冲突与 5 项语义交叉（审批恢复原子性、stub 接入 durable assignment/lease/fence、remote_results 经 fenced settlement、control token 不进浏览器、contract 迁移到 v0.54 authority）。本轮起**冻结一切后端改动**，仅做前端增量，待 v0.54 合入后再协调。
 - **R15-1 体验完善**（纯前端）：
   - 新增 [useAsyncData.ts](file:///D:/Agent/loop-controller-latest-develop/frontend/src/composables/useAsyncData.ts)：统一 loading / 错误提示 / 静默刷新 / `usePolling` 轮询（页面不可见自动跳过）。
   - [Dashboard.vue](file:///D:/Agent/loop-controller-latest-develop/frontend/src/views/Dashboard.vue)：15s 静默轮询 + 手动刷新按钮 + 上次刷新时间。
@@ -271,23 +271,23 @@ frontend/
 - **R15-4 质量基线**：接入 Vitest（`npm run test`），8 个用例覆盖 Mock 数据源与 useAsyncData；`npm run typecheck` 独立脚本；`npm run build` 全量通过。
 - **回归**：`vue-tsc --noEmit` 零错误；Vitest 8 passed；vite build 成功。
 
-#### 进度记录（2026-09-17，第十六轮：R15 移植到 integration/frontend-v054）
+#### 进度记录（第十六轮：R15 移植到 integration/frontend-v054）
 
-- **分支事实**：组员推送 `integration/frontend-v054`（= 546c9af 把我们的 41c9d9f 与 v0.54 后端整合 + ac116ac entrypoint 强化），R15（809c819）未包含。新基线分支 `frontend/r15-port` 从 `integration/frontend-v054` 切出，cherry-pick 809c819 并解冲突。
-- **整合方的 v0.54 前端安全设计（后续必须遵守）**：
+- **分支事实**：上游推送 `integration/frontend-v054`（= 546c9af 将前端主线 41c9d9f 与 v0.54 后端整合 + ac116ac entrypoint 强化），R15（809c819）未包含。新基线分支 `frontend/r15-port` 从 `integration/frontend-v054` 切出，cherry-pick 809c819 并解冲突。
+- **v0.54 前端安全设计（后续必须遵守）**：
   - 纯 Session 认证：移除 X-API-Key 直连回退与 API Key 持久化，store 启动主动清除旧 `lc_api_key`/`lc_session_token`，token 不落 localStorage；
   - 删除全部 YAML fallback 与 vite `/config/*` 中间件，配置只走 Admin API；
   - 审批操作要求**独立审批凭证**（用后即焚、不走 admin session 的 pythonClient）；
   - 删除"内核对账"页签（v0.54 内核审批端点已变）；SSE 硬化（cursor/Last-Event-ID、重连退避、401 跳登录）。
-- **冲突解决原则（用户裁定：后端安全优先）**：以整合方设计为准——Login 恢复 session-only 流程（API Key 不预填、换取 session 后即弃），仅保留与之正交的"自定义后端地址"持久化；Approvals 保留独立审批凭证对话框（`@closed="clearForm"`），详情抽屉与轮询叠加其上；client.ts 自动合并结果复核无误。
+- **冲突解决原则（裁定：后端安全优先）**：以 v0.54 安全设计为准——Login 恢复 session-only 流程（API Key 不预填、换取 session 后即弃），仅保留与之正交的"自定义后端地址"持久化；Approvals 保留独立审批凭证对话框（`@closed="clearForm"`），详情抽屉与轮询叠加其上；client.ts 自动合并结果复核无误。
 - **v0.54 后端变化对 R15-3 的影响**：Task 移除 `execution_mode`、新增 tenant/workload/instance 与 assignment/lease/fence + TaskGraph 调度；lineage/budget 字段保留，契约 types.ts 暂不变，列为核对项。后端仍无任务列表接口，Mock 数据源策略维持。
-- **协调事项**（待与组员确认）：`GET /v1/admin/a2a/tasks` 列表接口、审批详情字段（参数/升级链）、types.ts 与 v0.54 authority 对齐、frontend_api_gaps.md 同步。
+- **协调事项**（待后端契约确认）：`GET /v1/admin/a2a/tasks` 列表接口、审批详情字段（参数/升级链）、types.ts 与 v0.54 authority 对齐、frontend_api_gaps.md 同步。
 
-#### 进度记录（2026-09-17，第十七轮：分支整理 + 死端点排查结论 + 文档同步）
+#### 进度记录（第十七轮：分支整理 + 死端点排查结论 + 文档同步）
 
-- **分支整理**（组员裁定：develop / frontend/main / integration/frontend-v054 均已被超越）：
+- **分支整理**（develop / frontend/main / integration/frontend-v054 均已被超越）：
   - 删除过时分支前做游离提交核查——develop、integration/frontend-v054 内容全部已在主线内；
-    frontend/main 仅 R15 提交本体游离（内容已含于 cherry-pick）；main-legacy 为古早设计，组员确认废弃；
+    frontend/main 仅 R15 提交本体游离（内容已含于 cherry-pick）；main-legacy 为古早设计，确认废弃；
   - `frontend/r15-port` 改名 **`develop`** 成为唯一开发主线（HEAD `7500fe6`），两库（个人/公司）一致。
 - **死端点排查结论（误报澄清）**：曾判定 Dashboard/Settings 调用的 `/admin/revoke`、
   `/admin/revocation-list`、`/admin/kill-switch` 为 v0.54 已删除的死端点——**不成立**。
@@ -301,7 +301,7 @@ frontend/
   - 新增 §7.2 剩余缺口：A2A 任务树列表端点（高）、审批详情字段、Secret 枚举、
     Agent CRUD、审批转交、Identity/Entrypoints 热更新。
 
-#### 进度记录（2026-09-17，第十八轮：死信队列页 + Dashboard 增强）
+#### 进度记录（第十八轮：死信队列页 + Dashboard 增强）
 
 - **任务 1 死信队列治理页**（commit `deb05c8`）：
   - `api/a2a/types.ts` 新增 `A2ADeadLetterItem` / `A2ADeadLetterReplayParams` /
@@ -329,7 +329,7 @@ frontend/
   `npm run test && npm run typecheck && npm run build` 后提交
   `develop` 并 `git push origin develop && git push company develop`。
 
-#### 进度记录（2026-09-17，第十九轮：任务 3 RBAC 绑定管理页）
+#### 进度记录（第十九轮：任务 3 RBAC 绑定管理页）
 
 - **契约层** `api/rbac/types.ts`：字段对齐 Python runtime `_binding_payload` /
   `_grant_payload`（server.py:1951-1972；路由 server.py:3020-3023）；
@@ -347,7 +347,7 @@ frontend/
   新建绑定对话框（platform_admin 时租户选择自动锁定为平台级）、
   新建授权对话框（resources 逐行输入）、确认式吊销；grants 区标注
   "仅 platform_admin 可管理"（数据标识，不做前端权限裁剪——enforcement
-  默认关闭，用户裁定）。
+  默认关闭，权限区分暂不生效）。
 - **测试**：`tests/rbac-mock.test.ts` 13 用例（列表形状/创建成功/两类创建拒绝/
   吊销退列表/ not_found/深拷贝隔离），vitest 总计 26 passed；typecheck +
   build 全绿。
@@ -355,6 +355,34 @@ frontend/
   1. 任务 4：Policy 生命周期页（candidates validate/shadow/publish/rollback，Mock 起步）；
   2. 任务 6：审批 SSE 推送替代 15s 轮询（`wait-for-approval/sse`，复用 streamA2ATask 模式）；
   3. 任务 7~9：Playwright E2E 骨架 / 本文档 §4·§6 重写 / 空态与错误态统一。
+
+#### 进度记录（第二十轮：任务 4 Policy 生命周期页 + 文档表述规范化）
+
+- **契约层** `api/policy/types.ts`：字段对齐 Python runtime——候选 payload
+  （server.py:1683-1697）、路由 server.py:3012-3019、validate/shadow/publish/rollback
+  handler（server.py:1763-1926）、status 形状（policy_lifecycle.py:227-259）、
+  CandidateValidationResult（policy_validation.py:48-56）、ShadowRunResult
+  （policy_shadow.py:66-81）。数据 100% 在 Python 侧（policy_delivery 存储），
+  与 Go 内核无关——Http 实现走 pythonClient。
+- **Mock**：`mock.ts` 复现生命周期语义——draft 校验（源内容含 `violation` 即失败
+  转 failed，422 不抛错）、非 draft 重复校验返回当前状态（200 幂等）、
+  shadow 仅 validated/published/loaded 可运行且 revision+artifact_sha256 必须匹配、
+  publish 仅 validated 可发布、rollback 按历史 revision 找回候选；
+  status generation 单调递增，生命周期操作写审计。
+- **视图** `Policies.vue`（路由 `/policies` + 菜单）：顶部生命周期状态卡
+  （期望/活跃版本、generation、实例加载，独立加载失败不影响列表）；
+  候选 Tab（状态标签、详情抽屉含校验阶段结果、按状态显示 校验/影子/发布/回滚到此
+  操作）、影子运行对话框（样本 JSON 输入 + 差异统计 + 逐样本对比表）、
+  操作审计 Tab；15s 轮询。注意：validateCandidate 有状态副作用，详情抽屉只读
+  不得触发校验，校验结果经本页 Map 缓存展示。
+- **测试**：`tests/policy-mock.test.ts` 17 用例（六状态覆盖/校验成败/幂等/
+  发布与三类拒绝/回滚/影子差异与三类拒绝/审计/深拷贝），vitest 总计 43 passed；
+  typecheck + build 全绿。
+- **文档表述规范化**：两份文档移除人员指称与日期——进度记录只写轮次，
+  协调事项写"待后端契约确认"，分支事实写"上游推送"。后续记录保持此风格。
+- **当前剩余队列**（按既定顺序）：
+  1. 任务 6：审批 SSE 推送替代 15s 轮询（`wait-for-approval/sse`，复用 streamA2ATask 模式）；
+  2. 任务 7~9：Playwright E2E 骨架 / 本文档 §4·§6 重写 / 空态与错误态统一。
 
 ---
 

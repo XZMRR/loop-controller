@@ -2,7 +2,6 @@
 
 > 版本：`v0.54.0`
 > 分支：`develop`（v0.54 后端 + 前端全部工作；原 frontend/r15-port 已改名合并至此）
-> 更新日期：2026-09-17
 > 用途：为公司展示用前端控制台提供 API 支撑
 > 作者：前端开发规划
 >
@@ -131,7 +130,7 @@
 
 ## 3. 接口缺口详单
 
-> **v0.54 状态总览**（2026-09-17 更新）：
+> **v0.54 状态总览**：
 > - ✅ 已兑现：1.1 Agent 列表、1.2 Agent 详情、2.1 Profile 列表、2.2 Profile 工具策略更新
 >   （`GET/PUT /v1/admin/profiles/{id}/tools` + `POST /v1/admin/profiles/reload` 热重载）、
 >   3.1 Identity 只读、4.1 Entrypoints 只读、7.1 审批历史、8.1 Govern 只读评估。
