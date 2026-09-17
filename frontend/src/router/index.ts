@@ -69,6 +69,18 @@ const router = createRouter({
           component: () => import('@/views/DeadLetters.vue'),
           meta: { title: '死信队列' },
         },
+        {
+          path: 'rbac',
+          name: 'RbacBindings',
+          component: () => import('@/views/RbacBindings.vue'),
+          meta: { title: 'RBAC 绑定' },
+        },
+        {
+          path: 'policies',
+          name: 'Policies',
+          component: () => import('@/views/Policies.vue'),
+          meta: { title: '策略生命周期' },
+        },
       ],
     },
     {

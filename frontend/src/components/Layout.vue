@@ -49,6 +49,14 @@
           <el-icon><Warning /></el-icon>
           <span>死信队列</span>
         </el-menu-item>
+        <el-menu-item index="/rbac">
+          <el-icon><Lock /></el-icon>
+          <span>RBAC 绑定</span>
+        </el-menu-item>
+        <el-menu-item index="/policies">
+          <el-icon><Files /></el-icon>
+          <span>策略生命周期</span>
+        </el-menu-item>
       </el-menu>
     </el-aside>
     <el-container>
