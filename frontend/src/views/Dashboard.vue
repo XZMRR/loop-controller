@@ -35,6 +35,40 @@
       </el-col>
     </el-row>
 
+    <el-row :gutter="16" class="mt-4">
+      <el-col :span="6">
+        <el-card shadow="hover">
+          <div class="stat-title">Go 内核 Readiness</div>
+          <div class="stat-value">
+            <el-tag :type="kernelReady ? 'success' : 'danger'">
+              {{ kernelReady ? '就绪' : '未就绪' }}
+            </el-tag>
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :span="6">
+        <el-card shadow="hover" class="clickable" @click="$router.push('/dead-letters')">
+          <div class="stat-title">死信</div>
+          <div class="stat-value" :class="{ danger: deadLetterCount > 0 }">
+            {{ deadLetterCount }}
+          </div>
+        </el-card>
+      </el-col>
+    </el-row>
+
+    <el-card class="mt-4" shadow="hover">
+      <template #header>
+        <div class="card-header">
+          <span>关键指标（/metrics）</span>
+        </div>
+      </template>
+      <el-table v-if="metricsRows.length" :data="metricsRows" size="small">
+        <el-table-column prop="name" label="指标" min-width="320" show-overflow-tooltip />
+        <el-table-column prop="value" label="值" width="160" />
+      </el-table>
+      <el-empty v-else description="暂无指标数据" />
+    </el-card>
+
     <el-card class="mt-4" shadow="hover">
       <template #header>
         <div class="card-header">
@@ -58,7 +92,8 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getHealth, getPendingApprovals, getRevocationList } from '@/api/python'
+import { getHealth, getPendingApprovals, getRevocationList, getMetrics } from '@/api/python'
+import { fetchKernelReadiness, a2aDeadLetterSource } from '@/api/a2a'
 import { loadAgentsConfig } from '@/api/config'
 import { usePolling } from '@/composables/useAsyncData'
 import type { HealthStatus } from '@/api/python'
@@ -68,10 +103,27 @@ const healthStatus = ref('unknown')
 const pendingCount = ref(0)
 const agentCount = ref(0)
 const killSwitchActive = ref(false)
+const kernelReady = ref(false)
+const deadLetterCount = ref(0)
+const metricsRows = ref<Array<{ name: string; value: string }>>([])
 const refreshing = ref(false)
 const lastRefreshedAt = ref('')
 
 const DASHBOARD_POLL_INTERVAL = 15000
+
+/** 从 Prometheus 文本中挑选治理/调度相关指标（最多 12 条） */
+function parseMetrics(text: string): Array<{ name: string; value: string }> {
+  const interesting = /^(lc_|a2a_|go_goroutines)/
+  const rows: Array<{ name: string; value: string }> = []
+  for (const line of text.split('\n')) {
+    if (line.startsWith('#')) continue
+    const match = /^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+(\S+)$/.exec(line.trim())
+    if (!match || !interesting.test(match[1])) continue
+    rows.push({ name: match[1], value: match[2] })
+    if (rows.length >= 12) break
+  }
+  return rows
+}
 
 async function loadData(silent = false) {
   refreshing.value = true
@@ -94,6 +146,19 @@ async function loadData(silent = false) {
     }
   } finally {
     refreshing.value = false
+  }
+  // 增强区块独立加载，失败不影响主卡片
+  try {
+    const [ready, deadLetters, metrics] = await Promise.all([
+      fetchKernelReadiness(),
+      a2aDeadLetterSource.listDeadLetters(),
+      getMetrics(),
+    ])
+    kernelReady.value = ready
+    deadLetterCount.value = deadLetters.length
+    metricsRows.value = parseMetrics(metrics)
+  } catch {
+    // 静默：增强区块不可用时保持现状
   }
 }
 
@@ -121,6 +186,14 @@ onMounted(() => loadData(true))
 
 .mt-4 {
   margin-top: 16px;
+}
+
+.clickable {
+  cursor: pointer;
+}
+
+.stat-value.danger {
+  color: #f56c6c;
 }
 
 .card-header {

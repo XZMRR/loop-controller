@@ -1,5 +1,6 @@
 import type { A2ADeadLetterDataSource, A2ATaskDataSource } from './types'
 import { MockA2ADeadLetterDataSource, MockA2ATaskDataSource } from './mock'
+import { a2aClient } from '@/api/client'
 
 /**
  * 当前数据源：Mock（演示）。
@@ -20,6 +21,16 @@ export const a2aTaskSource: A2ATaskDataSource = new MockA2ATaskDataSource()
  */
 export const a2aDeadLetterSource: A2ADeadLetterDataSource =
   new MockA2ADeadLetterDataSource()
+
+/** Go 内核 readiness（GET /ready，公开端点）；不可达时返回 false 而非抛错 */
+export async function fetchKernelReadiness(): Promise<boolean> {
+  try {
+    const resp = await a2aClient.get('/ready')
+    return resp.status >= 200 && resp.status < 300
+  } catch {
+    return false
+  }
+}
 
 export type {
   A2ATaskDataSource,

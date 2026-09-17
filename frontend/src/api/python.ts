@@ -75,6 +75,12 @@ export async function getHealth(): Promise<HealthStatus> {
   return data
 }
 
+/** Prometheus 指标原文（text/plain），由视图层挑选关键指标展示 */
+export async function getMetrics(): Promise<string> {
+  const { data } = await pythonClient.get('/metrics', { responseType: 'text' })
+  return data
+}
+
 export interface ApprovalHistoryItem {
   request_id: string
   decision_id: string
