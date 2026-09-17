@@ -301,6 +301,34 @@ frontend/
   - 新增 §7.2 剩余缺口：A2A 任务树列表端点（高）、审批详情字段、Secret 枚举、
     Agent CRUD、审批转交、Identity/Entrypoints 热更新。
 
+#### 进度记录（2026-09-17，第十八轮：死信队列页 + Dashboard 增强）
+
+- **任务 1 死信队列治理页**（commit `deb05c8`）：
+  - `api/a2a/types.ts` 新增 `A2ADeadLetterItem` / `A2ADeadLetterReplayParams` /
+    `A2ADeadLetterDataSource`，契约对齐 Go 内核 `models.TaskAssignment` 序列化
+    （`GET /a2a/v1/dead-letters?tenant_id=` → `{assignments:[...]}`；
+    `POST /a2a/v1/dead-letters/{id}/replay` ← `{tenant_id, expected_revision, not_before?}`）；
+  - `mock.ts` 新增 `MockA2ADeadLetterDataSource`（三种典型失败类别；重放语义与内核一致：
+    revision 乐观校验、replay_count+1、state 回 queued 并**退出列表**——list 只返回
+    state=dead_letter 条目，与 `ListDeadLetters` 语义一致）；
+  - 新视图 `DeadLetters.vue`（路由 `/dead-letters` + 菜单）：租户过滤、15s 轮询、
+    失败类别标签、详情抽屉、确认式重放；
+  - 测试 `tests/deadletter-mock.test.ts` 5 用例，vitest 总计 13 passed。
+- **任务 2（A2A SSE 增强）：核实无需做**——v0.54 整合已带入硬化 SSE
+  （cursor/Last-Event-ID、指数退避、401 跳登录、generation 防串扰，`python.ts streamA2ATask`）。
+- **任务 5 Dashboard 增强**（commit `9016833`）：Go 内核 Readiness 卡片（`GET /ready`）、
+  死信计数卡片（点击跳死信页）、关键指标卡片（`/metrics` 解析 `lc_*`/`a2a_*`/`go_goroutines`
+  前 12 条）；增强区块独立加载，失败不影响主卡片。
+- **当前剩余队列**（按既定顺序）：
+  1. 任务 3：RBAC 绑定管理页（bindings/grants 列表 + revoke；Mock 起步，契约见
+     `server.py:3020-3023`，建表参照 DeadLetters.vue 模式）；
+  2. 任务 4：Policy 生命周期页（candidates validate/shadow/publish/rollback，Mock 起步）；
+  3. 任务 6：审批 SSE 推送替代 15s 轮询（`wait-for-approval/sse`，复用 streamA2ATask 模式）；
+  4. 任务 7~9：Playwright E2E 骨架 / 本文档 §4·§6 重写 / 空态与错误态统一。
+- **协作约定不变**：纯前端、Mock 隔离未定契约、不碰后端、每批完成跑
+  `npm run test && npm run typecheck && npm run build` 后提交
+  `develop` 并 `git push origin develop && git push company develop`。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）
