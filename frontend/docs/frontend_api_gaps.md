@@ -1,9 +1,19 @@
 # Loop Controller 前端所需后端接口缺口报告
 
-> 版本：`v0.48.0`
-> 分支：`frontend/main`
+> 版本：`v0.54.0`
+> 分支：`frontend/r15-port`（基于 `integration/frontend-v054`，v0.54 后端 + R15 前端移植）
+> 更新日期：2026-09-17
 > 用途：为公司展示用前端控制台提供 API 支撑
 > 作者：前端开发规划
+>
+> 相对 v0.48.0 报告的整体变化：
+> - **认证模式变更**：`X-API-Key` 直连已移除，改为 `POST /v1/admin/session/login` 换取
+>   Session Token（`Authorization: Bearer <session>`）；审批通过/拒绝要求**独立审批凭证**
+>   （用后即焚，不落入 admin session）。
+> - **v0.52~v0.54 新增能力已上线**：多租户 RBAC、policy candidates 全生命周期、
+>   workload/Secret 引用/ExecutionReceipt、可靠调度（assignment/outbox/lease/fence、
+>   retry/failover/dead-letter、有界 DAG、可恢复 SSE）、SQLite migration、Prometheus metrics。
+> - 本文档 §3 缺口清单大部分已被 v0.54 后端兑现，剩余缺口见 §7.2。
 
 ---
 
@@ -25,30 +35,66 @@
 
 ### 2.1 Python Runtime（默认 `http://127.0.0.1:8000`）
 
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| GET | `/health` / `/v1/health` | 健康检查 |
-| GET | `/v1/identity` | 当前身份/Provider 信息 |
-| GET | `/metrics` | Prometheus 指标 |
-| POST | `/v1/govern/tool-call` | 工具调用治理 |
-| POST | `/v1/govern/resume-after-approval` | 审批通过后恢复执行 |
-| GET | `/v1/wait-for-approval` | 轮询等待审批结果 |
-| GET | `/v1/wait-for-approval/sse` | SSE 实时等待审批结果 |
-| GET | `/v1/admin/approvals/pending` | 待审批列表 |
-| POST | `/v1/admin/approvals/{decision_id}/approve` | 通过审批 |
-| POST | `/v1/admin/approvals/{decision_id}/deny` | 拒绝审批 |
-| GET | `/v1/admin/harness/backends` | Harness 后端状态 |
-| POST | `/v1/admin/harness/{name}/drain` | 排空 Harness 后端 |
-| POST | `/v1/admin/harness/{name}/reset` | Reset Harness 后端 |
-| GET/POST | `/v1/admin/evidence/anchor/*` | Evidence 锚点管理 |
-| POST/DELETE | `/admin/revoke` | 吊销 |
-| GET | `/admin/revocation-list` | 吊销列表 |
-| POST | `/admin/kill-switch` | Kill Switch |
-| GET | `/v1/admin/audit` | 审计事件查询 |
+> v0.54 认证说明：除登录端点外，所有 `/v1/admin/*` 请求需带
+> `Authorization: Bearer <session_token>`；审批通过/拒绝另需独立审批凭证
+> （详见 `_handle_admin_decision_approve/deny` 的 approver 凭证解析与 RBAC 租户绑定校验）。
 
-实现文件：`src/loop_controller/server.py`（路由注册于 `build_app()`，约 1198–1282 行）。
+| 方法 | 路径 | 用途 | 认证 |
+|---|---|---|---|
+| GET | `/v1/health` | 健康检查 | 无 |
+| GET | `/v1/identity` | 当前身份/Provider 信息 | 无 |
+| GET | `/metrics` | Prometheus 指标 | 无 |
+| POST | `/v1/govern/tool-call` | 工具调用治理 | 按 entrypoint 配置 |
+| POST | `/v1/govern/resume-after-approval` | 审批通过后恢复执行 | 按 entrypoint 配置 |
+| GET | `/v1/wait-for-approval` | 轮询等待审批结果 | 按 entrypoint 配置 |
+| GET | `/v1/wait-for-approval/sse` | SSE 实时等待审批结果 | 按 entrypoint 配置 |
+| POST | `/v1/admin/session/login` | 换取 Session Token | 无（API Key 仅用于换 Session） |
+| POST | `/v1/admin/session/logout` | 注销 Session | Session |
+| GET | `/v1/admin/approvals/pending` | 待审批列表 | Session |
+| GET | `/v1/admin/approvals` | 审批历史（支持状态/时间过滤） | Session |
+| POST | `/v1/admin/approvals/{id}/approve` | 通过审批 | Session + **独立审批凭证** |
+| POST | `/v1/admin/approvals/{id}/deny` | 拒绝审批 | Session + **独立审批凭证** |
+| GET | `/v1/admin/harness/backends` | Harness 后端状态 | Session |
+| POST | `/v1/admin/harness/{name}/drain` | 排空 Harness 后端 | Session |
+| POST | `/v1/admin/harness/{name}/reset` | Reset Harness 后端 | Session |
+| GET/POST | `/v1/admin/evidence/anchor/*` | Evidence 锚点管理（anchor/verify/publish/bootstrap） | Session |
+| GET | `/v1/admin/policy/candidates` | Policy 候选列表 / 创建 | Session |
+| GET | `/v1/admin/policy/candidates/{id}` | Policy 候选详情 | Session |
+| POST | `/v1/admin/policy/candidates/{id}/validate` | 候选校验 | Session |
+| POST | `/v1/admin/policy/candidates/{id}/shadow` | 候选影子运行 | Session |
+| POST | `/v1/admin/policy/candidates/{id}/publish` | 候选发布 | Session |
+| POST | `/v1/admin/policy/rollback` | Policy 回滚 | Session |
+| GET | `/v1/admin/policy/status` | Policy 状态 | Session |
+| GET | `/v1/admin/policy/audit` | Policy 审计 | Session |
+| GET/POST | `/v1/admin/rbac/bindings` | RBAC 绑定查询/创建（v0.52） | Session |
+| POST | `/v1/admin/rbac/bindings/{id}/revoke` | 撤销绑定 | Session |
+| GET/POST | `/v1/admin/rbac/grants` | RBAC 授权查询/创建 | Session |
+| POST | `/v1/admin/rbac/grants/{id}/revoke` | 撤销授权 | Session |
+| GET/HEAD | `/v1/opa/bundles/current` `/v1/opa/bundles/{rev}` | OPA Bundle 分发（v0.50） | 无 |
+| POST | `/v1/opa/status` | OPA 状态上报 | 无 |
+| GET | `/v1/admin/audit` | 审计事件查询（含时间过滤） | Session |
+| GET | `/v1/admin/agents` | Agent 列表 | Session |
+| GET | `/v1/admin/agents/{agent_id}` | Agent 详情 | Session |
+| GET | `/v1/admin/profiles` | Profile 列表 | Session |
+| POST | `/v1/admin/profiles/reload` | Profile 热重载 | Session |
+| GET/PUT | `/v1/admin/profiles/{id}/tools` | Profile 工具策略读取/在线编辑（`de89059`） | Session |
+| GET | `/v1/admin/identity` | Identity 配置（脱敏） | Session |
+| GET | `/v1/admin/entrypoints` | Entrypoints 配置 | Session |
+| GET | `/v1/admin/a2a/status` | A2A 治理总览 | Session |
+| GET | `/v1/admin/a2a/agents` | A2A 已注册 Agent | Session |
+| GET | `/v1/admin/a2a/tasks/{task_id}` | 单任务查询（经 Go 内核） | Session |
+| POST | `/v1/admin/a2a/tasks/{task_id}/cancel` | 管理端取消任务 | Session |
+| GET | `/v1/admin/a2a/tasks/{task_id}/stream` | 任务状态 SSE 转发 | Session |
+| POST | `/v1/admin/a2a/delegations` | 发起委托 | Session |
+| POST | `/v1/admin/govern/evaluate` | Govern 只读评估（dry-run） | Session |
+
+实现文件：`src/loop_controller/server.py`（路由注册于 `build_app()`，约 2934–3080 行）。
 
 ### 2.2 Go A2A Kernel（默认 `http://127.0.0.1:8080`）
+
+> v0.54 调度体系：Durable assignment/outbox、lease/attempt/fence、预算感知
+> retry/failover/dead-letter、有界静态 DAG（task-graphs，特性开关控制）、
+> 可恢复 SSE（cursor/Last-Event-ID）。dispatch 语义为 at-least-once。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
@@ -57,19 +103,40 @@
 | GET | `/a2a/v1/agents/{id}` | 查询 Agent Card |
 | POST | `/a2a/v1/tasks` | 创建任务 |
 | GET | `/a2a/v1/tasks/{id}` | 查询任务 |
-| GET | `/a2a/v1/tasks/{id}/stream` | SSE 任务事件流 |
+| GET | `/a2a/v1/tasks/{id}/snapshot` | 任务快照（v0.54 新增） |
+| GET | `/a2a/v1/tasks/{id}/stream` | SSE 任务事件流（可恢复） |
 | POST | `/a2a/v1/messages` | 发送消息 |
 | POST | `/a2a/v1/delegations` | 请求委托授权 |
-| GET/POST | `/a2a/v1/delegation-approvals/*` | 委托审批 |
+| GET | `/a2a/v1/delegation-approvals/{id}` | 查询委托审批 |
+| POST | `/a2a/v1/delegation-approvals/{id}/approve` | 委托审批通过 |
+| POST | `/a2a/v1/delegation-approvals/{id}/reject` | 委托审批拒绝 |
+| POST | `/a2a/v1/delegation-approvals/{id}/cancel` | 委托审批取消 |
 | POST | `/a2a/v1/tasks/{id}/cancel` | 取消任务 |
-| POST/GET | `/a2a/v1/entrypoint/tasks/*` | Entrypoint 任务操作 |
+| GET | `/a2a/v1/dead-letters` | Dead-letter 列表（v0.54 新增） |
+| POST | `/a2a/v1/dead-letters/{id}/replay` | Dead-letter 重放（v0.54 新增） |
+| POST | `/a2a/v1/task-graphs` | 创建有界 DAG（v0.54，特性开关） |
+| GET | `/a2a/v1/task-graphs/{id}` | 查询 DAG |
+| POST | `/a2a/v1/task-graphs/{id}/cancel` | 取消 DAG |
+| POST/GET | `/a2a/v1/entrypoint/tasks/*` | Entrypoint 任务操作（create/accept/start/cancel/get/results） |
 | GET | `/health` | 健康检查 |
+| GET | `/ready` | Readiness（v0.54 新增） |
+| GET | `/metrics` | Prometheus 指标（v0.54 新增） |
 
-实现文件：`go/internal/api/handlers.go`（`RegisterRoutes()`，约 222–243 行）。
+实现文件：`go/internal/api/handlers.go`（`RegisterRoutes()`，约 372–401 行）。
 
 ---
 
 ## 3. 接口缺口详单
+
+> **v0.54 状态总览**（2026-09-17 更新）：
+> - ✅ 已兑现：1.1 Agent 列表、1.2 Agent 详情、2.1 Profile 列表、2.2 Profile 工具策略更新
+>   （`GET/PUT /v1/admin/profiles/{id}/tools` + `POST /v1/admin/profiles/reload` 热重载）、
+>   3.1 Identity 只读、4.1 Entrypoints 只读、7.1 审批历史、8.1 Govern 只读评估。
+> - ⏳ 部分兑现：3.2 Identity 更新（需确认热重载范围）、3.6 配置热重载
+>   （profiles 已支持，agents/identity/entrypoints 待确认）。
+> - ❌ 仍未兑现：1.3 Agent CRUD、5.1/5.2 Secret 枚举与 CRUD、7.2 审批转交，
+>   以及新增缺口 **A2A 任务树列表端点**（见 §7.2）。
+> - 下文中标注「已实现」的缺口保留原始建议，仅供溯源。
 
 ### 3.1 Agent 管理（高优先级）
 
@@ -446,51 +513,58 @@ Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` �
 
 ---
 
-## 6. 前端当前已实现的兼容方案
+## 6. 前端当前实现状态（v0.54，frontend/r15-port）
 
-为不阻塞前端开发，第一期采用：
+v0.54 前端已全面改为 API 直连，**YAML fallback 与 vite `/config/*` 中间件已移除**：
 
-1. **Agent / 工具列表**：直接读取 `config/agents.yaml`、`config/profiles.yaml` 静态文件。
-2. **配置展示**：只读展示 `entrypoints.yaml`、`identity.yaml`。
-3. **审批操作**：使用现有 `/v1/admin/approvals/{id}/approve|deny`，已支持 `approver` + `comment`。
-4. **审计**：使用现有 `/v1/admin/audit`。
-5. **吊销/Kill Switch**：使用现有 `/admin/revoke`、`/admin/kill-switch`。
-
-当后端补齐对应接口后，前端只需替换 `api/*.ts` 中的实现，视图层无需大改。
+1. **认证**：`Login.vue` 通过 `POST /v1/admin/session/login` 换取 Session；
+   `client.ts` 请求拦截器统一携带 `Authorization: Bearer <session>`，401 自动登出跳登录；
+   store 启动时清除历史遗留的 `lc_api_key`/`lc_session_token`，token 不落 localStorage。
+2. **Agent / Profile**：走 `/v1/admin/agents(+详情)`、`/v1/admin/profiles`、`profiles/{id}/tools`
+   在线编辑 + `profiles/reload` 热重载。
+3. **审批台**：待审批 + 审批历史（状态/时间过滤）均已接入；通过/拒绝使用**独立审批凭证**
+   （credential 用后即焚，不随 admin session），`approver` 字段已从请求体移除；
+   「内核对账」页签已随 v0.54 内核审批端点变更删除。
+4. **审计**：`/v1/admin/audit`（含时间过滤）已接入。
+5. **SSE 硬化**：cursor/Last-Event-ID、指数退避重连、generation 防串扰。
+6. **A2A 任务树**：`TaskTree.vue` 通过 `A2ATaskDataSource` 接口消费数据，当前为
+   Mock 实现（`api/a2a/mock.ts`），待后端提供任务树列表端点后切换 HTTP 实现，视图零改动。
 
 ---
 
-## 7. 后端最小可行接口集（MVP）
+## 7. 接口兑现状态
 
-如果后端希望用最小成本支撑前端第一期上线，建议优先补齐以下 5 个接口：
+### 7.1 最小可行接口集（MVP）—— 全部已完成
 
-1. `GET /v1/admin/agents`
-2. `GET /v1/admin/profiles`
-3. `GET /v1/admin/identity`（脱敏）
-4. `GET /v1/admin/entrypoints`
-5. `POST /v1/admin/govern/evaluate`（只读调试）
+v0.48.0 报告建议的 5 个接口全部实现，且远超预期：
 
-这样前端就可以完全脱离直接读取 YAML 文件，统一走后端 API。
+1. ✅ `GET /v1/admin/agents`
+2. ✅ `GET /v1/admin/profiles`
+3. ✅ `GET /v1/admin/identity`（脱敏）
+4. ✅ `GET /v1/admin/entrypoints`
+5. ✅ `POST /v1/admin/govern/evaluate`（只读调试）
 
-### 实现状态（已完成）
+额外已兑现（v0.49~v0.54）：审批历史+时间过滤（`8383ea9`）、Profile 工具在线编辑+
+热重载（`de89059`）、Agent 详情（`3c3e288`）、A2A 治理端点（status/agents/task/cancel/
+stream/delegations，`b20a9b5`~`e1a6677`）、Session 认证（`1948248`）、RBAC/policy/evidence
+端点面（v0.50~v0.52）。
 
-以上 5 个接口已在 `src/loop_controller/server.py` 实现并注册路由，请求/响应模型见
-`src/loop_controller/server_models.py`（`AdminAgentItem` / `AdminAgentsResponse` /
-`AdminProfilesResponse` / `AdminGovernEvaluateRequest` / `AdminGovernEvaluateResponse`），
-测试覆盖见 `tests/test_server.py` 末尾的管理接口测试段。
+### 7.2 剩余缺口（v0.54 待后端评估）
 
-实现要点：
+| 缺口 | 建议接口 | 前端场景 | 优先级 |
+|---|---|---|---|
+| A2A 任务树列表 | `GET /v1/admin/a2a/tasks?root_only=true` 或 `/a2a/v1/tasks?list=roots` | TaskTree 页需要列出多跳委托链路（当前仅有 `tasks/{id}` 单查，Mock 无法上线） | 高 |
+| 审批详情字段 | 在 `GET /v1/admin/approvals` 响应中补充 escalation/租户/工具参数等全字段 | 审批详情抽屉完整展示 | 中 |
+| Secret 引用枚举 | `GET /v1/admin/secrets`（只列 ref/backend/has_value，不明文） | 系统配置页 Secret 管理 | 中 |
+| Secret CRUD | `POST/PUT/DELETE /v1/admin/secrets[/{ref}]` | Secret 管理写入 | 低 |
+| Agent CRUD | `POST/PUT/DELETE /v1/admin/agents[/{id}]` | Agent 管理在线增改 | 低 |
+| 审批转交 | `POST /v1/admin/approvals/{id}/reassign` | 审批人繁忙时转交 | 低 |
+| Identity/Entrypoints 热更新 | `PUT /v1/admin/identity` `PUT /v1/admin/entrypoints`（或统一 reload 目标） | 配置在线生效范围确认 | 低 |
 
-- **鉴权**：与既有 `/v1/admin/*` 一致，强制 `X-API-Key` / `Authorization: Bearer` 校验。
-- **Agent 列表**：数据源为 `runtime.config.agents`，结合 `RevocationList` 计算 `revoked`
-  字段（过期吊销条目不计入）。
-- **Profile 列表**：数据源为 `runtime.profiles`，`CapabilityProfile` 原样序列化。
-- **Identity / Entrypoints**：直接返回内存配置，经 `_mask_sensitive` 递归脱敏——键名命中
-  `secret|token|password|private|credential|api_key`（忽略大小写）的字符串值替换为
-  `******`（如 `static.allowed_tokens` 中的 token 字段）。
-- **Govern 只读调试**：绕过 `LoopController.evaluate`（避免提交审批请求），直接调用
-  `Checkpoint.evaluate`。已知可控副作用：防重放记录 call_id、按随机 task_id 预留预算
-  （下次启动由 `recover_stale_reservations` 回收）、deny 时更新随机 session 风险状态
-  （不累积）。所有合成 ID 带 `dryrun-` 前缀便于审计识别。
-- **前端接入**：`frontend/src/api/config.ts` 的 4 个 loader 已改为 API 优先、YAML 回退，
-  视图层无需感知数据来源。
+### 7.3 已关闭的兼容方案（不再适用）
+
+- ~~前端读取 `config/*.yaml` 静态文件~~：YAML fallback 已删除，配置只走 Admin API。
+- ~~`X-API-Key` 直连与持久化~~：已移除，API Key 仅用于登录换 Session。
+- ~~审批请求体 `approver` 字段~~：已由独立审批凭证替代。
+- ~~「内核对账」页签~~：v0.54 内核审批端点已变更，该页签已删除。
+- ~~Go Kernel control token 桥接缺口~~：v0.54 已由 entrypoint token 体系覆盖。
