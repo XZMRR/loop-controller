@@ -1,7 +1,7 @@
 # Loop Controller 前端所需后端接口缺口报告
 
 > 版本：`v0.54.0`
-> 分支：`frontend/r15-port`（基于 `integration/frontend-v054`，v0.54 后端 + R15 前端移植）
+> 分支：`develop`（v0.54 后端 + 前端全部工作；原 frontend/r15-port 已改名合并至此）
 > 更新日期：2026-09-17
 > 用途：为公司展示用前端控制台提供 API 支撑
 > 作者：前端开发规划
@@ -87,8 +87,11 @@
 | GET | `/v1/admin/a2a/tasks/{task_id}/stream` | 任务状态 SSE 转发 | Session |
 | POST | `/v1/admin/a2a/delegations` | 发起委托 | Session |
 | POST | `/v1/admin/govern/evaluate` | Govern 只读评估（dry-run） | Session |
+| POST/DELETE | `/admin/revoke` | 吊销/移除吊销条目（旧版路径，未挂 `/v1`） | Session（经 `_check_api_key` 兼容） |
+| GET | `/admin/revocation-list` | 吊销列表 + Kill Switch 状态（旧版路径） | Session（同上） |
+| POST | `/admin/kill-switch` | Kill Switch（旧版路径） | Session（同上） |
 
-实现文件：`src/loop_controller/server.py`（路由注册于 `build_app()`，约 2934–3080 行）。
+实现文件：`src/loop_controller/server.py`（路由注册于 `build_app()`，约 2934–3081 行）。
 
 ### 2.2 Go A2A Kernel（默认 `http://127.0.0.1:8080`）
 
@@ -513,7 +516,7 @@ Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` �
 
 ---
 
-## 6. 前端当前实现状态（v0.54，frontend/r15-port）
+## 6. 前端当前实现状态（v0.54，develop 分支）
 
 v0.54 前端已全面改为 API 直连，**YAML fallback 与 vite `/config/*` 中间件已移除**：
 

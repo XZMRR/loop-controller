@@ -1,9 +1,9 @@
 # Loop Controller 前端开发规划
 
-> 分支：`frontend/main`
+> 分支：`develop`（原 `frontend/main` → `frontend/r15-port` → 已改名合并为 `develop`）
 > 目录：`frontend/`
 > 目标：为公司展示构建一个干净、简洁、实用的 Loop Controller 管理控制台
-> 版本基线：后端 `v0.48.0`
+> 版本基线：后端 `v0.54.0`
 
 ---
 
@@ -282,6 +282,24 @@ frontend/
 - **冲突解决原则（用户裁定：后端安全优先）**：以整合方设计为准——Login 恢复 session-only 流程（API Key 不预填、换取 session 后即弃），仅保留与之正交的"自定义后端地址"持久化；Approvals 保留独立审批凭证对话框（`@closed="clearForm"`），详情抽屉与轮询叠加其上；client.ts 自动合并结果复核无误。
 - **v0.54 后端变化对 R15-3 的影响**：Task 移除 `execution_mode`、新增 tenant/workload/instance 与 assignment/lease/fence + TaskGraph 调度；lineage/budget 字段保留，契约 types.ts 暂不变，列为核对项。后端仍无任务列表接口，Mock 数据源策略维持。
 - **协调事项**（待与组员确认）：`GET /v1/admin/a2a/tasks` 列表接口、审批详情字段（参数/升级链）、types.ts 与 v0.54 authority 对齐、frontend_api_gaps.md 同步。
+
+#### 进度记录（2026-09-17，第十七轮：分支整理 + 死端点排查结论 + 文档同步）
+
+- **分支整理**（组员裁定：develop / frontend/main / integration/frontend-v054 均已被超越）：
+  - 删除过时分支前做游离提交核查——develop、integration/frontend-v054 内容全部已在主线内；
+    frontend/main 仅 R15 提交本体游离（内容已含于 cherry-pick）；main-legacy 为古早设计，组员确认废弃；
+  - `frontend/r15-port` 改名 **`develop`** 成为唯一开发主线（HEAD `7500fe6`），两库（个人/公司）一致。
+- **死端点排查结论（误报澄清）**：曾判定 Dashboard/Settings 调用的 `/admin/revoke`、
+  `/admin/revocation-list`、`/admin/kill-switch` 为 v0.54 已删除的死端点——**不成立**。
+  实际原因：初轮路由普查只 grep 了 `"/v1/` 前缀，遗漏非 `/v1` 的遗留路由（`server.py:3009-3011`）。
+  三个端点在 v0.54 仍存在，且其鉴权 `_check_api_key`（`server.py:367-381`）明确接受
+  Session Bearer 作为替代凭据，前端登录后调用可正常通过。**无需代码修复**。
+- **文档同步**：
+  - `frontend_api_gaps.md` 更新至 v0.54（头部版本、§2.1 全量路由表含 3 条遗留 `/admin/*`、
+    §2.2 Go 内核 v0.54 路由、§3 兑现状态总览、§6/§7 剩余缺口清单）；
+  - 本文档头部基线从 `frontend/main` / v0.48.0 更新为 `develop` / v0.54.0；
+  - 新增 §7.2 剩余缺口：A2A 任务树列表端点（高）、审批详情字段、Secret 枚举、
+    Agent CRUD、审批转交、Identity/Entrypoints 热更新。
 
 ---
 
