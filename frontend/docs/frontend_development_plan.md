@@ -329,6 +329,33 @@ frontend/
   `npm run test && npm run typecheck && npm run build` 后提交
   `develop` 并 `git push origin develop && git push company develop`。
 
+#### 进度记录（2026-09-17，第十九轮：任务 3 RBAC 绑定管理页）
+
+- **契约层** `api/rbac/types.ts`：字段对齐 Python runtime `_binding_payload` /
+  `_grant_payload`（server.py:1951-1972；路由 server.py:3020-3023）；
+  `RbacBinding{binding_id, principal, tenant_id(null=平台级), role, granted_by, created_at}`、
+  `RbacGrant{grant_id, source_principal, source_tenant, target_tenant, resources[], granted_by, created_at}`；
+  Role 枚举与后端一致（platform_admin/tenant_admin/policy_*/approver 共 7 个）。
+  **关键事实：RBAC 数据 100% 在 Python 侧**（SQLite rbac_role_bindings /
+  rbac_cross_tenant_grants），与 Go 内核无关——Http 实现须走 pythonClient，
+  不复用 a2aClient。
+- **Mock**：`mock.ts` 复现后端语义——列表只回未吊销记录（吊销=软删退出列表）；
+  创建校验对齐 server.py:2004/2007（platform_admin 必须 tenant_id=null、
+  租户角色必须挂租户）；revoke 响应形状 { id, state: "revoked" }。
+- **视图** `RbacBindings.vue`（路由 `/rbac` + 菜单）：角色绑定 / 跨租户授权双 Tab；
+  租户+角色过滤（选项动态推导）、15s 轮询（仅刷新当前 Tab）、
+  新建绑定对话框（platform_admin 时租户选择自动锁定为平台级）、
+  新建授权对话框（resources 逐行输入）、确认式吊销；grants 区标注
+  "仅 platform_admin 可管理"（数据标识，不做前端权限裁剪——enforcement
+  默认关闭，用户裁定）。
+- **测试**：`tests/rbac-mock.test.ts` 13 用例（列表形状/创建成功/两类创建拒绝/
+  吊销退列表/ not_found/深拷贝隔离），vitest 总计 26 passed；typecheck +
+  build 全绿。
+- **当前剩余队列**（按既定顺序）：
+  1. 任务 4：Policy 生命周期页（candidates validate/shadow/publish/rollback，Mock 起步）；
+  2. 任务 6：审批 SSE 推送替代 15s 轮询（`wait-for-approval/sse`，复用 streamA2ATask 模式）；
+  3. 任务 7~9：Playwright E2E 骨架 / 本文档 §4·§6 重写 / 空态与错误态统一。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）
