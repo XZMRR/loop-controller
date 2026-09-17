@@ -63,6 +63,12 @@ const router = createRouter({
           component: () => import('@/views/A2A.vue'),
           meta: { title: 'A2A 治理' },
         },
+        {
+          path: 'dead-letters',
+          name: 'DeadLetters',
+          component: () => import('@/views/DeadLetters.vue'),
+          meta: { title: '死信队列' },
+        },
       ],
     },
     {

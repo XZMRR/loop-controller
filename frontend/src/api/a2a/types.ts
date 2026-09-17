@@ -34,3 +34,41 @@ export interface A2ATaskDataSource {
   listTaskTrees(): Promise<A2ATaskNode[]>
   getTask(taskId: string): Promise<A2ATaskNode>
 }
+
+// Dead-letter（死信）契约层。
+// 字段形状以 Go 内核 models.TaskAssignment 序列化为准
+//（go/internal/models/models.go，GET /a2a/v1/dead-letters 返回 {assignments: [...]}）。
+
+export interface A2ADeadLetterItem {
+  assignment_id: string
+  assignment_kind: string // target_execution | outbound_delegation
+  tenant_id: string
+  task_id: string
+  agent_id: string
+  state: string // 恒为 dead_letter
+  revision: number
+  route_attempt: number
+  attempt: number
+  replay_count: number
+  failure_class: string
+  error_code?: string
+  not_before: string | null
+  deadline: string | null
+  outcome?: Record<string, any> | null
+  execution_receipt?: Record<string, any> | null
+  consumed_budget?: { token_count?: number; payment_amount?: number }
+  created_at: string
+  updated_at: string
+}
+
+/** 对应 POST /a2a/v1/dead-letters/{id}/replay 请求体 */
+export interface A2ADeadLetterReplayParams {
+  tenant_id: string
+  expected_revision: number
+  not_before?: string
+}
+
+export interface A2ADeadLetterDataSource {
+  listDeadLetters(tenantId?: string): Promise<A2ADeadLetterItem[]>
+  replayDeadLetter(assignmentId: string, params: A2ADeadLetterReplayParams): Promise<void>
+}

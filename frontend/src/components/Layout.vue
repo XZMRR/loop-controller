@@ -45,6 +45,10 @@
           <el-icon><Connection /></el-icon>
           <span>A2A 治理</span>
         </el-menu-item>
+        <el-menu-item index="/dead-letters">
+          <el-icon><Warning /></el-icon>
+          <span>死信队列</span>
+        </el-menu-item>
       </el-menu>
     </el-aside>
     <el-container>
