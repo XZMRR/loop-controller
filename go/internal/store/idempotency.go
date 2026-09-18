@@ -50,33 +50,19 @@ func (s *idempotencyStore) TryBegin(ctx context.Context, key, scope, requestHash
 	keyHash := HashKey(key, scope)
 	now := time.Now().UTC()
 
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	insert, err := s.db.ExecContext(ctx, `
+		INSERT INTO idempotency_keys (key_hash, scope, created_at, request_hash, response_body, response_status, locked)
+		VALUES (?, ?, ?, ?, ?, ?, 1)
+		ON CONFLICT(key_hash) DO NOTHING
+	`, keyHash, scope, now.Format(time.RFC3339), requestHash, "", 0)
 	if err != nil {
-		return Result{}, fmt.Errorf("begin idempotency tx: %w", err)
+		return Result{}, fmt.Errorf("insert idempotency key: %w", err)
 	}
-	defer tx.Rollback()
-
-	var existing Result
-	var createdAt, completedAt sql.NullString
-	var responseBody string
-	var locked int
-	err = tx.QueryRowContext(ctx, `
-		SELECT key_hash, scope, created_at, completed_at, request_hash, response_body, response_status, locked
-		FROM idempotency_keys
-		WHERE key_hash = ?
-	`, keyHash).Scan(&existing.Key, &existing.Scope, &createdAt, &completedAt, &existing.RequestHash, &responseBody, &existing.ResponseStatus, &locked)
-
-	switch {
-	case err == sql.ErrNoRows:
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO idempotency_keys (key_hash, scope, created_at, request_hash, response_body, response_status, locked)
-			VALUES (?, ?, ?, ?, ?, ?, 1)
-		`, keyHash, scope, now.Format(time.RFC3339), requestHash, "", 0); err != nil {
-			return Result{}, fmt.Errorf("insert idempotency key: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return Result{}, fmt.Errorf("commit idempotency begin: %w", err)
-		}
+	inserted, err := insert.RowsAffected()
+	if err != nil {
+		return Result{}, fmt.Errorf("inspect idempotency insert: %w", err)
+	}
+	if inserted == 1 {
 		return Result{
 			Key:         keyHash,
 			Scope:       scope,
@@ -84,8 +70,18 @@ func (s *idempotencyStore) TryBegin(ctx context.Context, key, scope, requestHash
 			RequestHash: requestHash,
 			Locked:      true,
 		}, nil
+	}
 
-	case err != nil:
+	var existing Result
+	var createdAt, completedAt sql.NullString
+	var responseBody string
+	var locked int
+	err = s.db.QueryRowContext(ctx, `
+		SELECT key_hash, scope, created_at, completed_at, request_hash, response_body, response_status, locked
+		FROM idempotency_keys
+		WHERE key_hash = ?
+	`, keyHash).Scan(&existing.Key, &existing.Scope, &createdAt, &completedAt, &existing.RequestHash, &responseBody, &existing.ResponseStatus, &locked)
+	if err != nil {
 		return Result{}, fmt.Errorf("select idempotency key: %w", err)
 	}
 
@@ -107,9 +103,6 @@ func (s *idempotencyStore) TryBegin(ctx context.Context, key, scope, requestHash
 		return Result{}, fmt.Errorf("idempotency key reused with different request")
 	}
 
-	if err := tx.Commit(); err != nil {
-		return Result{}, fmt.Errorf("commit idempotency read: %w", err)
-	}
 	return existing, nil
 }
 

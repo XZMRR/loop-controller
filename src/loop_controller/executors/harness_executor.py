@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import secrets
+import ssl
 import subprocess
 import time
 import uuid
@@ -18,8 +19,15 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
+from cryptography import x509
 
-from loop_controller.executors.base import ExecutionContext, ToolExecutor
+from loop_controller.executors.base import (
+    ExecutionContext,
+    ExecutionReceiptType,
+    ExecutionTerminalStatus,
+    ToolExecutor,
+    verify_execution_receipt,
+)
 from loop_controller.executors.harness_models import (
     DockerBackendConfig,
     HarnessBackendConfig,
@@ -73,11 +81,42 @@ class HarnessBackend(Protocol):
     async def check_health(self) -> bool: ...
 
 
+class _HarnessPeerBindingTransport(httpx.AsyncBaseTransport):
+    def __init__(self, ssl_context: ssl.SSLContext, expected_workload: str) -> None:
+        self._transport = httpx.AsyncHTTPTransport(verify=ssl_context)
+        self._expected_workload = expected_workload
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await self._transport.handle_async_request(request)
+        stream = response.extensions.get("network_stream")
+        ssl_object = stream.get_extra_info("ssl_object") if stream is not None else None
+        der = ssl_object.getpeercert(binary_form=True) if ssl_object is not None else None
+        if not der:
+            await response.aclose()
+            raise ssl.SSLError("TLS peer certificate unavailable")
+        certificate = x509.load_der_x509_certificate(der)
+        try:
+            sans = certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value.get_values_for_type(x509.UniformResourceIdentifier)
+        except x509.ExtensionNotFound:
+            sans = []
+        if self._expected_workload not in sans:
+            await response.aclose()
+            raise ssl.SSLError("TLS peer URI SAN workload mismatch")
+        response.extensions["authenticated_workload_id"] = self._expected_workload
+        return response
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
 class _HTTPHarnessClient:
     """通过 HTTP 调用本地或远程 Harness。"""
 
-    def __init__(self, config: HTTPBackendConfig) -> None:
+    def __init__(self, config: HTTPBackendConfig, *, strict: bool = False) -> None:
         self.config = config
+        self._strict = strict
         self._base_url = config.base_url.rstrip("/")
         self._execute_url = f"{self._base_url}{HARNESS_EXECUTE_PATH}"
         self._execute_path = httpx.URL(self._execute_url).path
@@ -98,17 +137,33 @@ class _HTTPHarnessClient:
             return
         self._resolve_key()
         tls = self.config.tls
-        verify: bool | str = tls.ca_file or tls.verify
-        cert = (
-            (tls.client_cert_file, tls.client_key_file)
-            if tls.client_cert_file and tls.client_key_file
-            else None
-        )
-        self._client = httpx.AsyncClient(
-            timeout=self.config.timeout_seconds,
-            verify=verify,
-            cert=cert,
-        )
+        if self._strict:
+            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=tls.ca_file)
+            context.check_hostname = True
+            context.verify_mode = ssl.CERT_REQUIRED
+            assert tls.client_cert_file is not None
+            assert tls.client_key_file is not None
+            context.load_cert_chain(tls.client_cert_file, tls.client_key_file)
+            transport = _HarnessPeerBindingTransport(
+                context, self.config.authenticated_workload_id or ""
+            )
+            self._client = httpx.AsyncClient(
+                timeout=self.config.timeout_seconds,
+                transport=transport,
+                trust_env=False,
+            )
+        else:
+            verify: bool | str = tls.ca_file or tls.verify
+            cert = (
+                (tls.client_cert_file, tls.client_key_file)
+                if tls.client_cert_file and tls.client_key_file
+                else None
+            )
+            self._client = httpx.AsyncClient(
+                timeout=self.config.timeout_seconds,
+                verify=verify,
+                cert=cert,
+            )
 
     async def stop(self) -> None:
         if self._client is not None and not self._client.is_closed:
@@ -180,6 +235,21 @@ class _HTTPHarnessClient:
                 user_id=context.user_id,
                 session_id=context.session_id,
                 tenant_id=context.tenant_id,
+                request_id=context.request_id,
+                interaction_id=context.interaction_id,
+                decision_id=context.decision_id,
+                delegation_jti=context.delegation_jti,
+                workload_id=(
+                    context.workload_identity.workload_id
+                    if context.workload_identity is not None
+                    else None
+                ),
+                authenticated_instance_id=(
+                    context.workload_identity.authenticated_instance_id
+                    if context.workload_identity is not None
+                    else None
+                ),
+                security_capabilities=context.security_capabilities,
             ),
             sandbox=HarnessSandbox(**sandbox.model_dump()),
         )
@@ -191,6 +261,16 @@ class _HTTPHarnessClient:
                 content=body,
             )
             response.raise_for_status()
+            if self._strict and response.extensions.get(
+                "authenticated_workload_id"
+            ) != self.config.authenticated_workload_id:
+                return self._error_result(
+                    context,
+                    tool_name,
+                    "Harness TLS peer workload identity missing or invalid",
+                    "harness_execution_attestation_invalid",
+                    {"critical_security_alert": True},
+                )
             payload = response.json()
         except httpx.TimeoutException:
             return self._error_result(
@@ -227,6 +307,30 @@ class _HTTPHarnessClient:
                 context, tool_name, "Harness 响应格式非法", "harness_invalid_response"
             )
 
+        if self._strict:
+            terminal = ExecutionTerminalStatus(result.status)
+            try:
+                if result.execution_receipt is None:
+                    raise ValueError("missing receipt")
+                verify_execution_receipt(
+                    result.execution_receipt,
+                    expected_type=ExecutionReceiptType.REMOTE_EXECUTION_ATTESTATION,
+                    context=context,
+                    status=terminal,
+                    result=result.content,
+                    attester_workload_id=self.config.authenticated_workload_id,
+                    executor="harness",
+                    backend=self.config.execution_profile,
+                )
+            except ValueError:
+                return self._error_result(
+                    context,
+                    tool_name,
+                    "Harness execution receipt missing or invalid",
+                    "harness_execution_attestation_invalid",
+                    {"critical_security_alert": True},
+                )
+
         if result.status == "success" and result.effective_sandbox is None:
             return self._error_result(
                 context,
@@ -259,9 +363,11 @@ class _HTTPHarnessClient:
             call_id=context.call_id,
             task_id=context.task_id,
             tool_name=tool_name,
-            status=result.status,
+            status="success" if result.status == "success" else "error",
             content=result.content,
+            terminal_status=result.status,
             error_code=result.error_code,
+            execution_receipt=result.execution_receipt,
             metadata=metadata,
         )
 
@@ -411,15 +517,21 @@ class _BackendState:
 class HarnessExecutor(ToolExecutor):
     """Loop Controller 到 Harness 的桥接执行器。"""
 
+    security_egress_type = "remote_harness"
+    security_capabilities = frozenset({"execution_receipt_v1"})
+
     def __init__(
         self,
         tool_specs: dict[str, HarnessToolSpec],
         backends: dict[str, HarnessBackendConfig],
         execution_policy: HarnessExecutionPolicy | None = None,
         alert_store: AlertStore | None = None,
+        *,
+        security_mode: str = "compatibility",
     ) -> None:
         self._tool_specs = tool_specs
         self._backend_configs = dict(backends)
+        self._security_mode = security_mode
         self._backends = {name: self._build_backend(config) for name, config in backends.items()}
         self._states = {name: _BackendState(name, config) for name, config in backends.items()}
         self._health_tasks: dict[str, asyncio.Task[None]] = {}
@@ -431,6 +543,19 @@ class HarnessExecutor(ToolExecutor):
         self._idempotency_cache: OrderedDict[str, ToolResult] = OrderedDict()
         # call_id -> backend_name，用于远程取消。
         self._in_flight_calls: dict[str, str] = {}
+
+    @property
+    def supports_strict_security(self) -> bool:
+        if self._security_mode != "strict":
+            return False
+        return bool(self._backend_configs) and all(
+            isinstance(config, HTTPBackendConfig)
+            and config.base_url.startswith("https://")
+            and config.tls.client_cert_file is not None
+            and config.tls.client_key_file is not None
+            and config.authenticated_workload_id is not None
+            for config in self._backend_configs.values()
+        )
 
     def _cache_result(self, call_id: str, result: ToolResult) -> None:
         """保留最近 1000 条结果，超出时按 LRU 淘汰。"""
@@ -445,7 +570,7 @@ class HarnessExecutor(ToolExecutor):
         if isinstance(config, SubprocessBackendConfig):
             return _SubprocessHarnessBackend(config)
         if isinstance(config, HTTPBackendConfig):
-            return _HTTPHarnessClient(config)
+            return _HTTPHarnessClient(config, strict=self._security_mode == "strict")
         if isinstance(config, DockerBackendConfig):
             from loop_controller.executors.docker_harness_backend import DockerHarnessBackend
             return DockerHarnessBackend(config)
@@ -723,6 +848,13 @@ class HarnessExecutor(ToolExecutor):
         arguments: dict[str, Any],
         context: ExecutionContext,
     ) -> ToolResult:
+        if self._security_mode == "strict" and not self.supports_strict_security:
+            return _HTTPHarnessClient._error_result(
+                context,
+                tool_name,
+                "strict Harness requires remote HTTPS+mTLS authenticated backend",
+                "harness_strict_backend_required",
+            )
         # v0.34.0：按 call_id 返回缓存结果，提供幂等基础。
         cached = self._idempotency_cache.get(context.call_id)
         if cached is not None:
@@ -784,6 +916,7 @@ class HarnessExecutor(ToolExecutor):
             if result.error_code in (
                 "harness_sandbox_attestation_missing",
                 "harness_sandbox_violation",
+                "harness_execution_attestation_invalid",
             ):
                 self._save_sandbox_alert(context, tool_name, result)
             return result

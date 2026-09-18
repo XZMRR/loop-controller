@@ -9,6 +9,7 @@ import (
 	"net/http/httptrace"
 	"testing"
 
+	"github.com/loop-controller/go/internal/entrypointpolicy"
 	"github.com/loop-controller/go/internal/models"
 )
 
@@ -28,7 +29,7 @@ func TestHTTPEntrypointClientDispatch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := &HTTPEntrypointClient{Client: server.Client()}
+	client := &HTTPEntrypointClient{Client: server.Client(), Policy: entrypointpolicy.Development()}
 	req := models.EntrypointTaskRequest{
 		ProtocolVersion:  interactionProtocolVersion,
 		TaskID:           "task-1",
@@ -61,7 +62,7 @@ func TestHTTPEntrypointClientDispatchErrorTracksWhetherRequestWasSent(t *testing
 		{name: "disconnect after send", wrote: true, mayBeSent: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client := &HTTPEntrypointClient{Client: &http.Client{Transport: entrypointRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			client := &HTTPEntrypointClient{Policy: entrypointpolicy.Development(), Client: &http.Client{Transport: entrypointRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 				if tc.wrote {
 					httptrace.ContextClientTrace(req.Context()).WroteRequest(httptrace.WroteRequestInfo{})
 				}
@@ -101,7 +102,7 @@ func TestHTTPEntrypointClientCancel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := &HTTPEntrypointClient{Client: server.Client()}
+	client := &HTTPEntrypointClient{Client: server.Client(), Policy: entrypointpolicy.Development()}
 	confirmed, err := client.Cancel(context.Background(), models.AgentEntrypoint{Type: "http", URL: server.URL}, "task-1", "token")
 	if err != nil {
 		t.Fatalf("cancel: %v", err)

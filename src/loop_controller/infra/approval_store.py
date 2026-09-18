@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os  # noqa: F401  # 保留兼容故障注入：测试通过本模块替换 os.fsync
 import shutil
 import threading
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from loop_controller.infra.alert_store import AlertStore
 from loop_controller.infra.approval_crypto import ApprovalCrypto, ApprovalCryptoError
 from loop_controller.infra.durable_io import DurableIOError, DurableJsonlFile
-from loop_controller.models import ApprovalRecord, ApprovalRequest, AuditAlert
+from loop_controller.infra.state_db import StateDatabase, StateDatabaseError
+from loop_controller.models import (
+    ApprovalHistoryItem,
+    ApprovalRecord,
+    ApprovalRequest,
+    AuditAlert,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +116,22 @@ def _deserialize_record(record: dict) -> ApprovalRecord:
     return ApprovalRecord.model_validate(data)
 
 
+def _approval_summary(
+    request: ApprovalRequest, record: ApprovalRecord | None
+) -> dict[str, Any]:
+    return {
+        "decision_id": request.decision_id,
+        "request_id": request.request_id,
+        "tool_name": request.tool_name,
+        "status": record.verdict if record is not None else "pending",
+        "created_at": request.created_at.isoformat(),
+    }
+
+
+def approval_notification_destination(webhook_enabled: bool) -> str | None:
+    return "webhook" if webhook_enabled else None
+
+
 def migrate_approval_store(
     path: str | Path,
     crypto: ApprovalCrypto,
@@ -164,7 +188,72 @@ class ApprovalStore(Protocol):
     def get_request_by_id(self, request_id: str) -> ApprovalRequest | None: ...
     def record_response(self, record: ApprovalRecord) -> None: ...
     def get_record(self, decision_id: str) -> ApprovalRecord | None: ...
+    def list_recent(self, limit: int = 100) -> list[dict[str, Any]]: ...
     def refresh(self) -> None: ...
+
+
+def list_approval_history(
+    pending_requests: list[ApprovalRequest],
+    completed_records: list[tuple[ApprovalRequest, ApprovalRecord]],
+    *,
+    status: str | None = None,
+    agent_id: str | None = None,
+    tool_name: str | None = None,
+    requester_id: str | None = None,
+    approver_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[ApprovalHistoryItem]:
+    """按统一契约返回审批历史（多 Agent / 多 Profile 场景预留）。"""
+
+    items: list[ApprovalHistoryItem] = []
+    for request in pending_requests:
+        items.append(
+            ApprovalHistoryItem(
+                request_id=request.request_id,
+                decision_id=request.decision_id,
+                agent_id=request.agent_id,
+                tool_name=request.tool_name,
+                requester_id=request.requester_id,
+                approver_id=request.approver_id,
+                reason=request.reason,
+                status="pending",
+                created_at=request.created_at,
+            )
+        )
+    for request, record in completed_records:
+        verdict = getattr(record.verdict, "value", record.verdict)
+        items.append(
+            ApprovalHistoryItem(
+                request_id=request.request_id,
+                decision_id=request.decision_id,
+                agent_id=request.agent_id,
+                tool_name=request.tool_name,
+                requester_id=request.requester_id,
+                approver_id=record.approver_id,
+                reason=request.reason,
+                status=verdict,
+                created_at=request.created_at,
+                decided_at=record.decided_at,
+            )
+        )
+    if status not in (None, "all"):
+        items = [item for item in items if item.status == status]
+    if agent_id:
+        items = [item for item in items if item.agent_id == agent_id]
+    if tool_name:
+        items = [item for item in items if item.tool_name == tool_name]
+    if requester_id:
+        items = [item for item in items if item.requester_id == requester_id]
+    if approver_id:
+        items = [item for item in items if item.approver_id == approver_id]
+    items.sort(
+        key=lambda item: item.created_at or item.decided_at or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    if offset:
+        items = items[offset:]
+    return items[:limit]
 
 
 class JsonlApprovalStore:
@@ -275,11 +364,268 @@ class JsonlApprovalStore:
     def get_record(self, decision_id: str) -> ApprovalRecord | None:
         return self._responses.get(decision_id)
 
+    def list_recent(self, limit: int = 100) -> list[dict[str, Any]]:
+        self.refresh()
+        items = [
+            _approval_summary(request, self._responses.get(decision_id))
+            for decision_id, request in self._requests.items()
+        ]
+        items.sort(key=lambda item: item["created_at"], reverse=True)
+        return items[:limit]
+
+
+class SqliteApprovalStore:
+    """SQLite 审批事实源；状态变更与可靠通知 outbox 在同一事务提交。"""
+
+    def __init__(
+        self,
+        db: StateDatabase | str | Path,
+        *,
+        crypto: ApprovalCrypto | None = None,
+        notification_destination: str | None = None,
+    ) -> None:
+        self._db = db if isinstance(db, StateDatabase) else StateDatabase(db)
+        self._crypto = crypto
+        self._notification_destination = notification_destination
+
+    @staticmethod
+    def _canonical(data: dict[str, Any]) -> str:
+        return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _delivery_id(request_id: str, event_type: str, destination: str) -> str:
+        value = f"approval:{request_id}:{event_type}:{destination}".encode()
+        return hashlib.sha256(value).hexdigest()
+
+    def _request_json(self, request: ApprovalRequest) -> str:
+        return self._canonical(_serialize_request(request, crypto=self._crypto))
+
+    @staticmethod
+    def _response_json(record: ApprovalRecord) -> str:
+        return SqliteApprovalStore._canonical(_serialize_record(record))
+
+    @staticmethod
+    def _request_hash(request: ApprovalRequest) -> str:
+        plain = request.model_dump(mode="json")
+        canonical = json.dumps(plain, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _deserialize_request_json(self, value: str) -> ApprovalRequest:
+        return _deserialize_request(json.loads(value), crypto=self._crypto)
+
+    @staticmethod
+    def _deserialize_response_json(value: str) -> ApprovalRecord:
+        return _deserialize_record(json.loads(value))
+
+    def submit_request(self, request: ApprovalRequest) -> None:
+        self.submit_request_and_enqueue_notification(request)
+
+    def submit_request_and_enqueue_notification(self, request: ApprovalRequest) -> None:
+        event_type = "created"
+        destination = self._notification_destination
+        payload = {
+            "request_id": request.request_id,
+            "decision_id": request.decision_id,
+            "event_type": event_type,
+            "status": "pending",
+            "tool_name": request.tool_name,
+            "approver_id": request.approver_id,
+        }
+        try:
+            self._db.submit_approval_request_and_enqueue_notification(
+                decision_id=request.decision_id,
+                request_id=request.request_id,
+                request_json=self._request_json(request),
+                request_hash=self._request_hash(request),
+                created_at=request.created_at.isoformat(),
+                delivery_id=(
+                    self._delivery_id(request.request_id, event_type, destination)
+                    if destination is not None
+                    else None
+                ),
+                destination=destination,
+                payload_json=self._canonical(payload) if destination is not None else None,
+                tenant_id=request.tenant_id,
+            )
+        except StateDatabaseError as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def get_pending(self) -> list[ApprovalRequest]:
+        try:
+            return [
+                self._deserialize_request_json(value)
+                for value in self._db.list_pending_approval_request_json()
+            ]
+        except (StateDatabaseError, ApprovalStoreCorruptedError, ValueError) as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def get_request(self, decision_id: str) -> ApprovalRequest | None:
+        try:
+            value = self._db.get_approval_request_json(decision_id)
+            return self._deserialize_request_json(value) if value is not None else None
+        except (StateDatabaseError, ApprovalStoreCorruptedError, ValueError) as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def get_request_by_id(self, request_id: str) -> ApprovalRequest | None:
+        try:
+            value = self._db.get_approval_request_json_by_id(request_id)
+            return self._deserialize_request_json(value) if value is not None else None
+        except (StateDatabaseError, ApprovalStoreCorruptedError, ValueError) as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def record_response(self, record: ApprovalRecord) -> None:
+        self.record_response_and_enqueue_notification(record)
+
+    def record_response_and_enqueue_notification(self, record: ApprovalRecord) -> None:
+        status = "approved" if record.verdict == "approve" else "rejected"
+        destination = self._notification_destination
+        payload = {
+            "request_id": record.request_id,
+            "decision_id": record.decision_id,
+            "event_type": status,
+            "status": status,
+            "approver_id": record.approver_id,
+        }
+        try:
+            self._db.record_approval_response_and_enqueue_notification(
+                decision_id=record.decision_id,
+                request_id=record.request_id,
+                response_json=self._response_json(record),
+                status=status,
+                decided_at=record.decided_at.isoformat(),
+                delivery_id=(
+                    self._delivery_id(record.request_id, status, destination)
+                    if destination is not None
+                    else None
+                ),
+                destination=destination,
+                payload_json=self._canonical(payload) if destination is not None else None,
+            )
+        except StateDatabaseError as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def get_record(self, decision_id: str) -> ApprovalRecord | None:
+        try:
+            value = self._db.get_approval_response_json(decision_id)
+            return self._deserialize_response_json(value) if value is not None else None
+        except (StateDatabaseError, ValueError) as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def list_recent(self, limit: int = 100) -> list[dict[str, Any]]:
+        try:
+            return [
+                _approval_summary(
+                    self._deserialize_request_json(row["request_json"] or ""),
+                    (
+                        self._deserialize_response_json(row["response_json"])
+                        if row["response_json"] is not None
+                        else None
+                    ),
+                )
+                for row in self._db.list_recent_approval_json(limit)
+            ]
+        except (StateDatabaseError, ApprovalStoreCorruptedError, ValueError) as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def refresh(self) -> None:
+        pass
+
+    def claim_notifications(
+        self,
+        *,
+        limit: int = 100,
+        lease_seconds: float = 30.0,
+        now: datetime | None = None,
+        claim_token: str | None = None,
+        destination: str | None = None,
+    ) -> list[dict[str, Any]]:
+        current = now or datetime.now(UTC)
+        token = claim_token or uuid.uuid4().hex
+        try:
+            rows = self._db.claim_approval_notifications(
+                now=current.isoformat(),
+                lease_until=(current + timedelta(seconds=lease_seconds)).isoformat(),
+                claim_token=token,
+                limit=limit,
+                destination=destination,
+            )
+            for row in rows:
+                row["payload"] = json.loads(row.pop("payload_json"))
+            return rows
+        except StateDatabaseError as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def ack_notification(
+        self, delivery_id: str, claim_token: str, *, delivered_at: datetime | None = None
+    ) -> bool:
+        try:
+            return self._db.ack_approval_notification(
+                delivery_id=delivery_id,
+                claim_token=claim_token,
+                delivered_at=(delivered_at or datetime.now(UTC)).isoformat(),
+            )
+        except StateDatabaseError as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def fail_notification(
+        self,
+        delivery_id: str,
+        claim_token: str,
+        *,
+        next_attempt_at: datetime,
+        last_error: str,
+    ) -> bool:
+        try:
+            return self._db.fail_approval_notification(
+                delivery_id=delivery_id,
+                claim_token=claim_token,
+                next_attempt_at=next_attempt_at.isoformat(),
+                last_error=last_error,
+            )
+        except StateDatabaseError as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def list_notifications(self) -> list[dict[str, Any]]:
+        try:
+            rows = self._db.list_approval_notifications()
+            for row in rows:
+                row["payload"] = json.loads(row.pop("payload_json"))
+            return rows
+        except StateDatabaseError as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+
+def build_approval_store(
+    path: str | Path,
+    *,
+    alert_store: AlertStore | None = None,
+    crypto: ApprovalCrypto | None = None,
+    state_db: StateDatabase | None = None,
+    notification_destination: str | None = None,
+) -> ApprovalStore:
+    """按配置路径后缀选择唯一审批事实源，不执行双写或隐式迁移。"""
+    value = str(path)
+    if value.lower().endswith((".db", ".sqlite", ".sqlite3")):
+        return SqliteApprovalStore(
+            state_db or StateDatabase(path),
+            crypto=crypto,
+            notification_destination=notification_destination,
+        )
+    return JsonlApprovalStore(path, alert_store=alert_store, crypto=crypto)
+
 
 class InMemoryApprovalStore:
     def __init__(self) -> None:
         self._requests: dict[str, ApprovalRequest] = {}
         self._responses: dict[str, ApprovalRecord] = {}
+
+    @property
+    def requests(self) -> dict[str, ApprovalRequest]:
+        return dict(self._requests)
+
+    @property
+    def responses(self) -> dict[str, ApprovalRecord]:
+        return dict(self._responses)
 
     def refresh(self) -> None:
         pass
@@ -304,3 +650,11 @@ class InMemoryApprovalStore:
 
     def get_record(self, decision_id: str) -> ApprovalRecord | None:
         return self._responses.get(decision_id)
+
+    def list_recent(self, limit: int = 100) -> list[dict[str, Any]]:
+        items = [
+            _approval_summary(request, self._responses.get(decision_id))
+            for decision_id, request in self._requests.items()
+        ]
+        items.sort(key=lambda item: item["created_at"], reverse=True)
+        return items[:limit]

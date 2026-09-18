@@ -14,6 +14,12 @@ class SecretBroker(Protocol):
         """按引用读取 secret；不存在、过期或无权时返回 None。"""
         ...
 
+    async def get_exact(
+        self, ref: SecretRef, scope: SecretScope
+    ) -> SecretValue | None:
+        """只在指定 namespace 精确读取，不执行跨 scope fallback。"""
+        ...
+
     async def list(
         self, scope: SecretScope, tenant_id: str | None = None
     ) -> list[str]:

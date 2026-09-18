@@ -11,12 +11,13 @@ import (
 )
 
 type ApprovalAuditItem struct {
-	ID         int64
-	EventID    string
-	Approval   models.DelegationApproval
-	Event      string
-	Attempts   int
-	ClaimToken string
+	ID          int64
+	EventID     string
+	Approval    models.DelegationApproval
+	Event       string
+	Attempts    int
+	ClaimToken  string
+	DecodeError error
 }
 
 type ApprovalAuditor interface {
@@ -46,7 +47,8 @@ func insertApprovalAuditOutbox(ctx context.Context, executor interface {
 	if err != nil {
 		return err
 	}
-	_, err = executor.ExecContext(ctx, `INSERT INTO approval_audit_outbox(approval_id,event,payload_json,created_at,next_attempt_at) VALUES(?,?,?,?,?) ON CONFLICT(approval_id,event) DO NOTHING`, approval.ApprovalID, event, string(payload), at.Format(time.RFC3339Nano), at.Format(time.RFC3339Nano))
+	deliveryID := fmt.Sprintf("approval-audit:%s:%s", approval.ApprovalID, event)
+	_, err = executor.ExecContext(ctx, `INSERT INTO approval_audit_outbox(delivery_id,approval_id,event,payload_json,created_at,next_attempt_at) VALUES(?,?,?,?,?,?) ON CONFLICT(approval_id,event) DO NOTHING`, deliveryID, approval.ApprovalID, event, string(payload), at.Format(time.RFC3339Nano), at.Format(time.RFC3339Nano))
 	return err
 }
 
@@ -76,20 +78,18 @@ func (d *ApprovalAuditOutboxDispatcher) Run(ctx context.Context) {
 	}
 }
 func (d *ApprovalAuditOutboxDispatcher) RunOnce(ctx context.Context, now time.Time) error {
-	items, err := d.store.ClaimDue(ctx, now, d.lease, 100)
+	items, err := d.store.ClaimDue(ctx, now, d.lease, 1)
 	if err != nil {
 		return err
 	}
 	for _, item := range items {
+		if item.DecodeError != nil {
+			return d.store.MarkFailed(ctx, item.ID, item.ClaimToken, now.Add(retryDelay(item.Attempts+1)), "invalid payload: "+item.DecodeError.Error())
+		}
 		if err := d.auditor.RecordApprovalLifecycle(ctx, item.Approval, item.Event, item.EventID); err != nil {
-			if markErr := d.store.MarkFailed(ctx, item.ID, item.ClaimToken, now.Add(retryDelay(item.Attempts+1)), err.Error()); markErr != nil {
-				return markErr
-			}
-			continue
+			return d.store.MarkFailed(ctx, item.ID, item.ClaimToken, now.Add(retryDelay(item.Attempts+1)), err.Error())
 		}
-		if err := d.store.MarkDelivered(ctx, item.ID, item.ClaimToken, now); err != nil {
-			return err
-		}
+		return d.store.MarkDelivered(ctx, item.ID, item.ClaimToken, time.Now().UTC())
 	}
 	return nil
 }
@@ -101,7 +101,7 @@ func (s *approvalAuditOutboxStore) ClaimDue(ctx context.Context, now time.Time, 
 		limit = 100
 	}
 	claim := fmt.Sprintf("%s:%d", s.owner, now.UnixNano())
-	rows, err := s.db.QueryContext(ctx, `UPDATE approval_audit_outbox SET claimed_by=?,claim_token=?,claim_expires_at=? WHERE outbox_id IN (SELECT outbox_id FROM approval_audit_outbox WHERE delivered_at IS NULL AND next_attempt_at<=? AND (claim_token='' OR claim_expires_at<?) ORDER BY outbox_id LIMIT ?) RETURNING outbox_id,approval_id,event,payload_json,attempts,claim_token`, s.owner, claim, now.Add(lease).UnixNano(), now.Format(time.RFC3339Nano), now.UnixNano(), limit)
+	rows, err := s.db.QueryContext(ctx, `UPDATE approval_audit_outbox SET claimed_by=?,claim_token=?,claim_expires_at=? WHERE outbox_id IN (SELECT outbox_id FROM approval_audit_outbox WHERE delivered_at IS NULL AND next_attempt_at<=? AND (claim_token='' OR claim_expires_at<?) ORDER BY outbox_id LIMIT ?) RETURNING outbox_id,delivery_id,approval_id,event,payload_json,attempts,claim_token`, s.owner, claim, now.Add(lease).UnixNano(), now.Format(time.RFC3339Nano), now.UnixNano(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -110,13 +110,10 @@ func (s *approvalAuditOutboxStore) ClaimDue(ctx context.Context, now time.Time, 
 	for rows.Next() {
 		var item ApprovalAuditItem
 		var payload string
-		if err := rows.Scan(&item.ID, &item.Approval.ApprovalID, &item.Event, &payload, &item.Attempts, &item.ClaimToken); err != nil {
+		if err := rows.Scan(&item.ID, &item.EventID, &item.Approval.ApprovalID, &item.Event, &payload, &item.Attempts, &item.ClaimToken); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(payload), &item.Approval); err != nil {
-			return nil, err
-		}
-		item.EventID = fmt.Sprintf("approval:%s:%s", item.Approval.ApprovalID, item.Event)
+		item.DecodeError = json.Unmarshal([]byte(payload), &item.Approval)
 		items = append(items, item)
 	}
 	return items, rows.Err()

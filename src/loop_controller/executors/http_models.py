@@ -12,7 +12,12 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from loop_controller.models import Tool
-from loop_controller.secrets import SecretBroker, SecretNotFoundError, SecretRef
+from loop_controller.secrets import (
+    SecretBroker,
+    SecretNotFoundError,
+    SecretRef,
+    ToolCredentialRef,
+)
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
@@ -120,6 +125,7 @@ class HTTPToolSpec(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     body_template: dict[str, Any] | str | None = None
     auth: HTTPAuthConfig = Field(default_factory=HTTPAuthConfig)
+    protected_credential_ref: ToolCredentialRef | None = None
     response_mapping: HTTPResponseMapping = Field(default_factory=HTTPResponseMapping)
     default_risk: RiskLevel = "high"
     allowed_hosts: list[str] = Field(default_factory=list)

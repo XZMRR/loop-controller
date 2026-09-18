@@ -51,6 +51,10 @@ func registerExecutorAtURL(t *testing.T, server *httptest.Server, entrypointURL 
 }
 
 func createDelegation(t *testing.T, server *httptest.Server) (models.Task, string) {
+	return createDelegationWithTenant(t, server, "")
+}
+
+func createDelegationWithTenant(t *testing.T, server *httptest.Server, tenant string) (models.Task, string) {
 	t.Helper()
 	req := models.DelegationRequest{
 		RequestID:           "req-entrypoint-1",
@@ -62,6 +66,7 @@ func createDelegation(t *testing.T, server *httptest.Server) (models.Task, strin
 		ProtocolVersion:     currentProtocolVersion,
 		AllowedTools:        []string{"echo"},
 		AllowedCapabilities: []string{"echo_capability"},
+		TenantID:            tenant,
 	}
 	body, _ := json.Marshal(req)
 	resp, err := http.Post(server.URL+"/a2a/v1/delegations", "application/json", bytes.NewReader(body))
@@ -144,6 +149,9 @@ func entrypointRequest(t *testing.T, server *httptest.Server, task models.Task, 
 		DelegationToken:     token,
 		AllowedTools:        []string{"echo"},
 		AllowedCapabilities: []string{"echo_capability"},
+		TenantID:            task.TenantID,
+		TargetWorkloadID:    task.TargetWorkloadID,
+		TargetInstanceID:    task.TargetInstanceID,
 	}
 }
 
@@ -468,6 +476,97 @@ func TestEntrypointStartTransition(t *testing.T) {
 	}
 }
 
+type countingExecutor struct{ starts int }
+
+func (e *countingExecutor) Start(context.Context, execution.Request) (execution.Handle, error) {
+	e.starts++
+	return nil, nil
+}
+
+func TestEntrypointDurableStartOnlyEnqueuesAndIsIdempotent(t *testing.T) {
+	srv, server := newTestServerWithMockR2(t, true)
+	executor := &countingExecutor{}
+	srv.SetTargetExecutor(executor)
+	srv.EnableDurableAssignments(nil)
+	registerExecutor(t, server)
+	task, delegationToken := createDelegation(t, server)
+	body, _ := json.Marshal(entrypointRequest(t, server, task, delegationToken))
+	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks", body, delegationToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	acceptBody, _ := json.Marshal(map[string]string{"protocol_version": currentProtocolVersion})
+	resp, err = postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/accept", acceptBody, delegationToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	for i := 0; i < 2; i++ {
+		resp, err = postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/start", acceptBody, delegationToken)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("start %d status=%v err=%v", i, resp.StatusCode, err)
+		}
+		var got models.Task
+		if err = json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got.ProtocolVersion != currentProtocolVersion || got.Status != "running" {
+			t.Fatalf("task=%+v", got)
+		}
+	}
+	if executor.starts != 0 {
+		t.Fatalf("executor starts=%d", executor.starts)
+	}
+	a, err := srv.db.AssignmentStore().Get(context.Background(), "assignment-"+task.TaskID)
+	if err != nil || a.State != models.AssignmentStateQueued {
+		t.Fatalf("assignment=%+v err=%v", a, err)
+	}
+}
+
+func TestEntrypointSchedulerEnabledStartUsesPinnedAdmission(t *testing.T) {
+	srv, server := newTestServerWithMockR2(t, true)
+	srv.EnableDurableAssignments(nil)
+	srv.EnableScheduling()
+	registerExecutor(t, server)
+	if _, err := srv.db.Exec(`UPDATE agents SET tenant_id=? WHERE agent_id='executor'`, "tenant-entrypoint"); err != nil {
+		t.Fatal(err)
+	}
+	task, delegationToken := createDelegationWithTenant(t, server, "tenant-entrypoint")
+	now := time.Now().UTC()
+	_, err := srv.db.Exec(`UPDATE agents SET tenant_id=?,tools_json='["echo"]',protocol_capabilities_json='["0.54.0"]',security_capabilities_json='[]',expected_workload_id=?,max_concurrency=1,schedulable=1,generation=1,resource_version=1 WHERE agent_id='executor'`, task.TenantID, task.TargetWorkloadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = srv.db.Exec(`INSERT OR REPLACE INTO agent_status(tenant_id,agent_id,observed_generation,health,current_load,available_capacity,draining,last_seen_at,expires_at,status_revision,reported_by) VALUES(?,?,?,?,?,?,0,?,?,1,'test')`, task.TenantID, "executor", 1, models.AgentHealthHealthy, 0, 1, now.Format(time.RFC3339Nano), now.Add(time.Hour).Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(entrypointRequest(t, server, task, delegationToken))
+	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks", body, delegationToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	actionBody, _ := json.Marshal(map[string]string{"protocol_version": currentProtocolVersion})
+	for _, action := range []string{"accept", "start"} {
+		resp, err = postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/"+action, actionBody, delegationToken)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status=%v err=%v", action, resp.StatusCode, err)
+		}
+		resp.Body.Close()
+	}
+	assignment, err := srv.db.AssignmentStore().Get(context.Background(), "assignment-"+task.TaskID)
+	if err != nil || assignment.AgentID != "executor" {
+		t.Fatalf("assignment=%+v err=%v", assignment, err)
+	}
+	var state string
+	if err = srv.db.QueryRow(`SELECT state FROM agent_capacity_reservations WHERE assignment_id=?`, assignment.AssignmentID).Scan(&state); err != nil || state != "held" {
+		t.Fatalf("reservation state=%s err=%v", state, err)
+	}
+}
+
 func TestEntrypointStartExecutesHTTPAndAutomaticallyRecordsResult(t *testing.T) {
 	executorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]any
@@ -635,6 +734,124 @@ type apiRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f apiRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
+type barrierExecutor struct {
+	startEntered chan struct{}
+	releaseStart chan struct{}
+	handle       *barrierHandle
+}
+
+func (e *barrierExecutor) Start(context.Context, execution.Request) (execution.Handle, error) {
+	close(e.startEntered)
+	<-e.releaseStart
+	return e.handle, nil
+}
+
+type barrierHandle struct {
+	done      chan execution.Result
+	cancelled chan struct{}
+	cancelOK  bool
+}
+
+func (h *barrierHandle) Done() <-chan execution.Result { return h.done }
+func (h *barrierHandle) Cancel() bool {
+	select {
+	case <-h.cancelled:
+	default:
+		close(h.cancelled)
+	}
+	return h.cancelOK
+}
+
+func TestEntrypointCancelWhileExecutorStartRegistersHandle(t *testing.T) {
+	handle := &barrierHandle{done: make(chan execution.Result), cancelled: make(chan struct{}), cancelOK: true}
+	executor := &barrierExecutor{startEntered: make(chan struct{}), releaseStart: make(chan struct{}), handle: handle}
+	srv, server := newTestServerWithMockR2(t, true)
+	srv.SetTargetExecutor(executor)
+	registerExecutor(t, server)
+	task, token := createDelegation(t, server)
+	body, _ := json.Marshal(entrypointRequest(t, server, task, token))
+	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks", body, token)
+	if err != nil {
+		t.Fatalf("entrypoint create: %v", err)
+	}
+	resp.Body.Close()
+	for _, action := range []string{"accept"} {
+		actionBody, _ := json.Marshal(map[string]string{"protocol_version": currentProtocolVersion})
+		resp, err = postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/"+action, actionBody, token)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("entrypoint %s: status=%v err=%v", action, resp.StatusCode, err)
+		}
+		resp.Body.Close()
+	}
+
+	startDone := make(chan *http.Response, 1)
+	go func() {
+		startBody, _ := json.Marshal(map[string]string{"protocol_version": currentProtocolVersion})
+		startResp, _ := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/start", startBody, token)
+		startDone <- startResp
+	}()
+	<-executor.startEntered
+	cancelDone := make(chan *http.Response, 1)
+	go func() {
+		cancelResp, _ := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/cancel", cancelRequestBody(), token)
+		cancelDone <- cancelResp
+	}()
+
+	srv.executionsMu.Lock()
+	slot := srv.executions[task.TaskID]
+	var cancelRequested <-chan struct{}
+	if slot != nil {
+		cancelRequested = slot.cancelRequestedC
+	}
+	srv.executionsMu.Unlock()
+	if cancelRequested == nil {
+		t.Fatal("starting execution slot was not registered")
+	}
+	<-cancelRequested
+	close(executor.releaseStart)
+	startResp := <-startDone
+	if startResp == nil {
+		t.Fatal("start request failed")
+	}
+	startResp.Body.Close()
+	cancelResp := <-cancelDone
+	if cancelResp == nil || cancelResp.StatusCode != http.StatusOK {
+		t.Fatalf("cancel status = %v", cancelResp)
+	}
+	cancelResp.Body.Close()
+	select {
+	case <-handle.cancelled:
+	default:
+		t.Fatal("returned execution handle was not cancelled")
+	}
+	got, err := srv.tasks.Get(task.TaskID)
+	if err != nil || got.Status != "cancelled" {
+		t.Fatalf("task = %+v, err=%v", got, err)
+	}
+	srv.executionsMu.Lock()
+	_, active := srv.executions[task.TaskID]
+	srv.executionsMu.Unlock()
+	if active {
+		t.Fatal("cancelled task retained an active execution slot")
+	}
+}
+
+func TestAwaitExecutionCancelsHandleAfterLeaseLost(t *testing.T) {
+	srv, _ := newTestServerWithMockR2(t, true)
+	srv.db.SetExecutionLease(3 * time.Millisecond)
+	handle := &barrierHandle{done: make(chan execution.Result), cancelled: make(chan struct{}), cancelOK: true}
+
+	result := make(chan bool, 1)
+	go func() {
+		_, ok := srv.awaitExecution("missing-task", handle)
+		result <- ok
+	}()
+	<-handle.cancelled
+	if ok := <-result; ok {
+		t.Fatal("awaitExecution reported a result after lease loss")
+	}
+}
+
 func TestEntrypointCancelCancelsActualHTTPContext(t *testing.T) {
 	started := make(chan struct{})
 	cancelled := make(chan struct{})
@@ -762,6 +979,32 @@ func TestEntrypointResultsCompleted(t *testing.T) {
 	}
 	if got.CompletedAt == nil {
 		t.Error("expected completed_at to be set")
+	}
+}
+
+func TestEntrypointResultsStrictRequiresExecutionReceipt(t *testing.T) {
+	srv, server := newTestServerWithMockR2(t, true)
+	registerExecutor(t, server)
+	task, delegationToken := createDelegation(t, server)
+	req := entrypointRequest(t, server, task, delegationToken)
+	body, _ := json.Marshal(req)
+	resp, _ := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks", body, delegationToken)
+	resp.Body.Close()
+	srv.SetTargetExecutor(&execution.HTTPExecutor{Strict: true})
+	_, _ = srv.tasks.UpdateStatus(task.TaskID, "accepted")
+	_, _ = srv.tasks.UpdateStatus(task.TaskID, "running")
+	body, _ = json.Marshal(models.EntrypointResultRequest{ProtocolVersion: currentProtocolVersion, Status: "completed", Outcome: json.RawMessage(`{"result":"ok"}`)})
+	resp, err := postEntrypoint(t, server.URL+"/a2a/v1/entrypoint/tasks/"+task.TaskID+"/results", body, delegationToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("strict result without receipt status=%d, want 403", resp.StatusCode)
+	}
+	got, _ := srv.tasks.Get(task.TaskID)
+	if got.Status == "completed" {
+		t.Fatal("strict result without receipt completed task")
 	}
 }
 
@@ -951,9 +1194,9 @@ func TestDelegationIdempotencyReturnsOriginalResponse(t *testing.T) {
 func TestDelegationIdempotencyEquivalentJSONReturnsOriginalResponse(t *testing.T) {
 	_, server := newTestServerWithMockR2(t, true)
 	registerExecutor(t, server)
-	first := []byte(`{"request_id":"req-idempotency-equivalent","initiator_agent_id":"planner","target_agent_id":"executor","tool_name":"echo","arguments":{"x":"hello","nested":{"a":1,"b":2}},"session_id":"","task_id":"","risk_level":"","protocol_version":"0.48.0"}`)
+	first := []byte(`{"request_id":"req-idempotency-equivalent","initiator_agent_id":"planner","target_agent_id":"executor","tool_name":"echo","arguments":{"x":"hello","nested":{"a":1,"b":2}},"session_id":"","task_id":"","risk_level":"","protocol_version":"0.53.0"}`)
 	second := []byte(`{
-		"protocol_version":"0.48.0", "risk_level":"", "task_id":"", "session_id":"",
+		"protocol_version":"0.53.0", "risk_level":"", "task_id":"", "session_id":"",
 		"arguments":{"nested":{"b":2,"a":1},"x":"hello"}, "tool_name":"echo",
 		"target_agent_id":"executor", "initiator_agent_id":"planner", "request_id":"req-idempotency-equivalent"
 	}`)

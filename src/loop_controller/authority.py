@@ -68,8 +68,8 @@ class AuthorityManager(Protocol):
     def revoke_expired_tokens(self, now: datetime | None = None) -> list[str]: ...
 
 
-class NoopAuthorityManager:
-    """恒拒绝的动态权限占位（迭代 1；v0.11.0 替换为真实现）。"""
+class _DisabledAuthorityManager:
+    """仅供显式降级模式使用的禁用动态权限适配器。"""
 
     def request_authority(
         self,

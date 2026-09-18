@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
 
@@ -241,6 +242,34 @@ def test_refresh_offset_accurate_after_crlf(tmp_path) -> None:
     assert store_a.get_record("d1") == record
 
 
+def test_jsonl_list_recent_includes_pending_and_terminal(tmp_path) -> None:
+    store = JsonlApprovalStore(tmp_path / "approvals.jsonl")
+    older = _make_request("d1", "r1")
+    newer = _make_request("d2", "r2").model_copy(
+        update={"created_at": older.created_at + timedelta(seconds=1)}
+    )
+    store.submit_request(older)
+    store.submit_request(newer)
+    store.record_response(_make_record("d1", "approve", "r1"))
+
+    assert store.list_recent() == [
+        {
+            "decision_id": "d2",
+            "request_id": "r2",
+            "tool_name": "test_tool",
+            "status": "pending",
+            "created_at": newer.created_at.isoformat(),
+        },
+        {
+            "decision_id": "d1",
+            "request_id": "r1",
+            "tool_name": "test_tool",
+            "status": "approve",
+            "created_at": older.created_at.isoformat(),
+        },
+    ]
+
+
 def test_in_memory_store_refresh_noop() -> None:
     store = InMemoryApprovalStore()
     request = _make_request("d1")
@@ -255,3 +284,4 @@ def test_in_memory_store_refresh_noop() -> None:
     store.refresh()
     assert store.get_record("d1") == record
     assert store.get_pending() == []
+    assert store.list_recent()[0]["status"] == "approve"

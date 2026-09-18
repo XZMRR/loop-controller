@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 pytest.importorskip("starlette")
 
@@ -17,19 +18,32 @@ from starlette.testclient import TestClient
 from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
 from loop_controller.identity import ConfigIdentityProvider
-from loop_controller.models import Agent, ApprovalRequest, GovernanceResult
+from loop_controller.models import Agent, ApprovalRequest, AuditEvent, GovernanceResult
 from loop_controller.server import build_app
 
 
 class _MockAuditEvent:
     """极简审计事件 mock。"""
 
-    def __init__(self, session_id: str | None, task_id: str | None):
+    def __init__(
+        self,
+        session_id: str | None,
+        task_id: str | None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+    ):
         self.session_id = session_id
         self.task_id = task_id
+        self.agent_id = agent_id
+        self.tool_name = tool_name
 
-    def model_dump(self) -> dict[str, Any]:
-        return {"session_id": self.session_id, "task_id": self.task_id}
+    def model_dump(self, mode: str | None = None) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "agent_id": self.agent_id,
+            "tool_name": self.tool_name,
+        }
 
 
 class _MockAuditStore:
@@ -73,6 +87,9 @@ class _MockApprovalStore:
         self._pending = pending or []
         self._records: dict[str, Any] = {}
 
+    def submit_request(self, request: Any) -> None:
+        self._pending.append(request)
+
     def get_pending(self) -> list[_MockApprovalRequest]:
         return list(self._pending)
 
@@ -90,6 +107,14 @@ class _MockApprovalStore:
 
     def add_record(self, decision_id: str, record: Any) -> None:
         self._records[decision_id] = record
+
+    @property
+    def requests(self) -> dict[str, Any]:
+        return {req.decision_id: req for req in self._pending}
+
+    @property
+    def responses(self) -> dict[str, Any]:
+        return dict(self._records)
 
     def refresh(self) -> None:
         pass
@@ -196,6 +221,7 @@ def _build_client(
     watcher: ApprovalWatcher | None = None,
     identity_provider: ConfigIdentityProvider | None = None,
     entrypoints_config: dict[str, Any] | None = None,
+    **app_kwargs: Any,
 ) -> tuple[TestClient, _MockController]:
     controller = _MockController()
     app = build_app(
@@ -205,6 +231,7 @@ def _build_client(
         configure_logs=False,
         identity_provider=identity_provider,
         entrypoints_config=entrypoints_config,
+        **app_kwargs,
     )
     return TestClient(app), controller
 
@@ -218,6 +245,8 @@ def test_health() -> None:
     assert "opa_reachable" in data
     assert "gateway_ready" in data
     assert "uptime_seconds" in data
+    assert data["execution_security"]["status"] == "not_strict"
+    assert client.get("/ready").status_code == 200
 
 
 def test_govern_tool_call() -> None:
@@ -244,6 +273,38 @@ def test_govern_tool_call() -> None:
     assert call["arguments"] == {"to": "zhang@company.com"}
     assert call["kwargs"]["task_context"] == "发送摘要"
     assert call["kwargs"]["session_id"] == "s-001"
+
+
+def test_govern_tool_call_returns_real_execution_receipt() -> None:
+    from datetime import UTC, datetime
+
+    from loop_controller.executors.base import ExecutionReceipt
+
+    client, controller = _build_client()
+    receipt = ExecutionReceipt(
+        receipt_id="receipt-1", type="controller_execution_record",
+        attester_workload_id="controller", request_id="request-1", task_id="task-1",
+        call_id="call-1", decision_id="decision-1", executor="http", backend="backend",
+        status="success", result_sha256="0" * 64, media_type="text/plain",
+        encoding="utf-8", issued_at=datetime.now(UTC),
+    )
+    controller._tool_response = controller._tool_response.model_copy(
+        update={"execution_receipt": receipt}
+    )
+    data = client.post(
+        "/v1/govern/tool-call",
+        json={"agent_id": "researcher_001", "tool_name": "send_email", "arguments": {}},
+    ).json()
+    assert data["execution_receipt"]["receipt_id"] == "receipt-1"
+
+
+def test_govern_tool_call_does_not_fabricate_execution_receipt() -> None:
+    client, _controller = _build_client()
+    data = client.post(
+        "/v1/govern/tool-call",
+        json={"agent_id": "researcher_001", "tool_name": "send_email", "arguments": {}},
+    ).json()
+    assert data["execution_receipt"] is None
 
 
 def test_govern_tool_call_enforces_delegated_allowed_tools() -> None:
@@ -413,12 +474,28 @@ def test_govern_tool_call_validation_error() -> None:
 
 
 def test_resume_after_approval() -> None:
+    from datetime import UTC, datetime
+
+    from loop_controller.executors.base import ExecutionReceipt
+
     client, controller = _build_client()
+    receipt = ExecutionReceipt(
+        receipt_id="resume-receipt-1", type="controller_execution_record",
+        attester_workload_id="controller", request_id="req-1", task_id="task-1",
+        call_id="call-1", decision_id="decision-1", executor="http", backend="backend",
+        status="timeout", result_sha256="0" * 64, media_type="text/plain",
+        encoding="utf-8", issued_at=datetime.now(UTC),
+    )
+    controller._resume_response = controller._resume_response.model_copy(
+        update={"status": "error", "terminal_status": "timeout", "execution_receipt": receipt}
+    )
     resp = client.post("/v1/govern/resume-after-approval", json={"request_id": "req-1"})
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "allow"
+    assert data["status"] == "error"
     assert data["result"] == "email resumed"
+    assert data["terminal_status"] == "timeout"
+    assert data["execution_receipt"]["receipt_id"] == "resume-receipt-1"
     assert controller.resume_calls == ["req-1"]
 
 
@@ -565,6 +642,53 @@ def test_metrics_endpoint() -> None:
     assert "loop_controller_requests_total" in resp.text
 
 
+def test_admin_approvals_history_filters_and_pagination() -> None:
+    client, controller = _build_client(
+        api_key="secret",
+        identity_provider=_admin_identity_provider(),
+    )
+    from loop_controller.models import ApprovalRecord
+
+    store = controller._runtime.approval_manager._store
+    request = _pending_approval_request()
+    store.submit_request(request)
+    store.record_response(
+        ApprovalRecord(
+            request_id=request.request_id,
+            decision_id=request.decision_id,
+            verdict="approve",
+            approver_id="zhang_manager",
+            comment="ok",
+        )
+    )
+
+    resp = client.get(
+        "/v1/admin/approvals",
+        params={"status": "approve", "tool_name": "send_email", "limit": 10},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["approvals"]) == 1
+    assert data["approvals"][0]["status"] == "approve"
+    assert data["approvals"][0]["agent_id"] == "researcher_001"
+    assert data["approvals"][0]["tool_name"] == "send_email"
+    assert data["approvals"][0]["approver_id"] == "zhang_manager"
+    assert data["total"] == 1
+    assert data["limit"] == 10
+    assert data["offset"] == 0
+
+
+def test_admin_approvals_rejects_invalid_status() -> None:
+    client, _controller = _build_client(api_key="secret")
+    resp = client.get(
+        "/v1/admin/approvals",
+        params={"status": "weird"},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 400
+
+
 def test_admin_pending_approvals() -> None:
     client, controller = _build_client(api_key="secret")
     store = controller._runtime.approval_manager._store
@@ -583,6 +707,26 @@ def test_admin_pending_approvals() -> None:
     assert len(data["approvals"]) == 1
     assert data["approvals"][0]["request_id"] == "req-1"
     assert data["approvals"][0]["tool_name"] == "send_email"
+
+
+def test_admin_audit_query_by_agent_and_tool() -> None:
+    client, controller = _build_client(api_key="secret")
+    controller._runtime.audit_store = _MockAuditStore(
+        [
+            _MockAuditEvent(session_id="s-1", task_id="t-1", agent_id="a-1", tool_name="send_email"),
+            _MockAuditEvent(session_id="s-2", task_id="t-2", agent_id="a-2", tool_name="web_search"),
+        ]
+    )
+    resp = client.get(
+        "/v1/admin/audit",
+        params={"agent_id": "a-1", "tool_name": "send_email", "limit": 10},
+        headers={"X-API-Key": "secret"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["events"]) == 1
+    assert data["events"][0]["agent_id"] == "a-1"
+    assert data["events"][0]["tool_name"] == "send_email"
 
 
 def test_admin_audit_query() -> None:
@@ -1093,6 +1237,22 @@ def _admin_identity_provider() -> ConfigIdentityProvider:
     )
 
 
+def _approval_auth_config() -> dict[str, Any]:
+    return {
+        "approval_auth": {
+            "allowlist": ["zhang_manager"],
+            "credentials": [
+                {"principal": "zhang_manager", "token_env": "TEST_APPROVER_TOKEN"}
+            ],
+        }
+    }
+
+
+@pytest.fixture(autouse=True)
+def _approver_token(monkeypatch):
+    monkeypatch.setenv("TEST_APPROVER_TOKEN", "approver-secret")
+
+
 def _pending_approval_request(decision_id: str = "d-1") -> ApprovalRequest:
     return ApprovalRequest(
         request_id="req-1",
@@ -1112,14 +1272,15 @@ def test_admin_approvals_approve_success() -> None:
     client, controller = _build_client(
         api_key="secret",
         identity_provider=_admin_identity_provider(),
+        entrypoints_config=_approval_auth_config(),
     )
     store = controller._runtime.approval_manager._store
     store._pending.append(_pending_approval_request())
 
     resp = client.post(
         "/v1/admin/approvals/d-1/approve",
-        json={"approver": "zhang_manager", "comment": "approved"},
-        headers={"X-API-Key": "secret"},
+        json={"approver": "ghost_user", "comment": "approved"},
+        headers={"Authorization": "Bearer approver-secret"},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -1135,20 +1296,33 @@ def test_admin_approvals_approve_success() -> None:
     admin_ops = [e for e in audit if e.action == "admin_operation"]
     assert len(admin_ops) == 1
     assert admin_ops[0].reason == "approval_approve"
+    assert admin_ops[0].actor_id == "zhang_manager"
+    assert admin_ops[0].metadata["principal"] == "zhang_manager"
+    assert admin_ops[0].metadata["request_id"] == "req-1"
+    assert admin_ops[0].metadata["decision_id"] == "d-1"
+    assert admin_ops[0].metadata["action_summary"] == "approval_approve"
+
+
+def test_admin_approvals_requires_independent_credential() -> None:
+    client, controller = _build_client(entrypoints_config=_approval_auth_config())
+    controller._runtime.approval_manager._store._pending.append(_pending_approval_request())
+    resp = client.post("/v1/admin/approvals/d-1/approve", json={"comment": "ok"})
+    assert resp.status_code == 401
 
 
 def test_admin_approvals_deny_success() -> None:
     client, controller = _build_client(
         api_key="secret",
         identity_provider=_admin_identity_provider(),
+        entrypoints_config=_approval_auth_config(),
     )
     store = controller._runtime.approval_manager._store
     store._pending.append(_pending_approval_request())
 
     resp = client.post(
         "/v1/admin/approvals/d-1/deny",
-        json={"approver": "zhang_manager", "comment": "suspicious"},
-        headers={"X-API-Key": "secret"},
+        json={"approver": "ghost_user", "comment": "suspicious"},
+        headers={"Authorization": "Bearer approver-secret"},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -1171,46 +1345,49 @@ def test_admin_approvals_deny_requires_comment() -> None:
     client, controller = _build_client(
         api_key="secret",
         identity_provider=_admin_identity_provider(),
+        entrypoints_config=_approval_auth_config(),
     )
     store = controller._runtime.approval_manager._store
     store._pending.append(_pending_approval_request())
 
     resp = client.post(
         "/v1/admin/approvals/d-1/deny",
-        json={"approver": "zhang_manager"},
-        headers={"X-API-Key": "secret"},
+        json={},
+        headers={"Authorization": "Bearer approver-secret"},
     )
     assert resp.status_code == 422
     assert "deny 必须提供审批意见" in resp.json()["error"]
 
 
-def test_admin_approvals_rejects_non_approver() -> None:
-    client, controller = _build_client(
-        api_key="secret",
-        identity_provider=_admin_identity_provider(),
+def test_admin_approvals_rejects_unauthorized_principal(monkeypatch) -> None:
+    config = _approval_auth_config()
+    config["approval_auth"]["allowlist"].append("auditor")
+    config["approval_auth"]["credentials"].append(
+        {"principal": "auditor", "token_env": "TEST_AUDITOR_TOKEN"}
     )
-    store = controller._runtime.approval_manager._store
-    store._pending.append(_pending_approval_request())
+    monkeypatch.setenv("TEST_AUDITOR_TOKEN", "auditor-secret")
+    client, controller = _build_client(entrypoints_config=config)
+    controller._runtime.approval_manager._store._pending.append(_pending_approval_request())
 
     resp = client.post(
         "/v1/admin/approvals/d-1/approve",
-        json={"approver": "ghost_user", "comment": "ok"},
-        headers={"X-API-Key": "secret"},
+        json={"approver": "zhang_manager", "comment": "ok"},
+        headers={"Authorization": "Bearer auditor-secret"},
     )
-    assert resp.status_code == 422
-    assert "ghost_user" in resp.json()["error"]
+    assert resp.status_code == 403
 
 
 def test_admin_approvals_conflict_when_already_decided() -> None:
     client, controller = _build_client(
         api_key="secret",
         identity_provider=_admin_identity_provider(),
+        entrypoints_config=_approval_auth_config(),
     )
     store = controller._runtime.approval_manager._store
     store._pending.append(_pending_approval_request())
 
-    headers = {"X-API-Key": "secret"}
-    body = {"approver": "zhang_manager", "comment": "approved"}
+    headers = {"Authorization": "Bearer approver-secret"}
+    body = {"approver": "ghost_user", "comment": "approved"}
     assert (
         client.post("/v1/admin/approvals/d-1/approve", json=body, headers=headers).status_code
         == 200
@@ -1293,3 +1470,750 @@ def test_invalid_query_param_returns_400() -> None:
     resp = client.get("/v1/wait-for-approval?request_id=r1&max_wait=abc")
     assert resp.status_code == 400
     assert resp.json()["error"] == "invalid_parameter"
+
+
+# ---------------------------------------------------------------------------
+# 管理控制台最小可行接口（/v1/admin/agents|profiles|identity|entrypoints|govern/evaluate）
+# ---------------------------------------------------------------------------
+
+from datetime import UTC, datetime, timedelta  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from loop_controller.classifier import RuleBasedClassifier  # noqa: E402
+from loop_controller.identity import (  # noqa: E402
+    AgentIdentity,
+    RevocationEntry,
+    RevocationList,
+    RevocationType,
+)
+from loop_controller.identity.revocation import RevocationMatch  # noqa: E402
+from loop_controller.models import (  # noqa: E402
+    CapabilityProfile,
+    Decision,
+    ToolPermission,
+)
+
+
+def _admin_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        agents={
+            "researcher_001": Agent(
+                agent_id="researcher_001",
+                name="Research Assistant",
+                profile_id="research_v1",
+                owner_id="zhang_manager",
+            ),
+            "writer_001": Agent(
+                agent_id="writer_001",
+                name="Writer",
+                profile_id="writer_v1",
+                owner_id="li_manager",
+            ),
+        },
+        users={"zhang_manager": "张经理", "li_manager": "李经理"},
+        identity_config={
+            "provider": "static",
+            "static": {"allowed_tokens": ["tok-secret-1", "tok-secret-2"]},
+        },
+        entrypoints_config={
+            "entrypoints": {"http": {"require_auth": True, "api_key": "super-secret-key"}},
+        },
+    )
+
+
+def _admin_profiles() -> dict[str, CapabilityProfile]:
+    return {
+        "research_v1": CapabilityProfile(
+            profile_id="research_v1",
+            version="abc123",
+            description="研究助手",
+            tools={
+                "send_email": ToolPermission(
+                    tool_name="send_email", allowed=True, require_approval=True
+                )
+            },
+        )
+    }
+
+
+class _AdminMockCheckpoint:
+    """提供吊销检查与判定结果的 Checkpoint mock。"""
+
+    def __init__(self, revoked: bool = False) -> None:
+        self._policy_engine = _MockPolicyEngine("http://127.0.0.1:1")
+        self._revoked = revoked
+        self.evaluated: list[str] = []
+
+    def check_revocation(
+        self, identity: AgentIdentity, tool_name: str, arguments: dict
+    ) -> RevocationMatch:
+        if self._revoked:
+            return RevocationMatch(
+                revoked=True, reason="agent revoked", type=RevocationType.AGENT, id=identity.agent_id
+            )
+        return RevocationMatch(revoked=False)
+
+    async def evaluate(self, task: Any, agent: Any, proposal: Any, **kwargs: Any) -> Decision:
+        self.evaluated.append(proposal.call_id)
+        return Decision(
+            decision_id="d-dryrun",
+            call_id=proposal.call_id,
+            task_id=task.task_id,
+            verdict="allow",
+            reason="allowed by policy",
+            policy_hits=["default_allow"],
+            policy_version="pv1",
+            profile_version="abc123",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+
+
+class _AdminMockRuntime:
+    def __init__(self, revoked: bool = False, with_revocation: bool = True) -> None:
+        self.approval_manager = _MockApprovalManager()
+        self.audit_store = _MockAuditStore()
+        self.checkpoint = _AdminMockCheckpoint(revoked=revoked)
+        self.harness_executor = None
+        self.config = _admin_config()
+        self.profiles = _admin_profiles()
+        self.classifier = RuleBasedClassifier()
+        self.http_tool_names: set[str] = set()
+        revocations = RevocationList()
+        if with_revocation:
+            revocations.add(
+                RevocationEntry(type=RevocationType.AGENT, id="writer_001", reason="测试吊销")
+            )
+        self.revocation_list = revocations
+
+
+class _AdminMockController(_MockController):
+    def __init__(self, revoked: bool = False) -> None:
+        super().__init__()
+        self._runtime = _AdminMockRuntime(revoked=revoked)
+
+
+def _build_admin_client(
+    api_key: str | None = "test-key", revoked: bool = False
+) -> tuple[TestClient, _AdminMockController]:
+    controller = _AdminMockController(revoked=revoked)
+    app = build_app(controller, api_key=api_key, configure_logs=False)
+    return TestClient(app), controller
+
+
+def test_admin_agents_lists_config_with_revocation() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/agents", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    agents = {a["agent_id"]: a for a in resp.json()["agents"]}
+    assert agents["researcher_001"]["name"] == "Research Assistant"
+    assert agents["researcher_001"]["owner_name"] == "张经理"
+    assert agents["researcher_001"]["revoked"] is False
+    assert agents["writer_001"]["revoked"] is True
+
+
+def test_admin_agents_requires_api_key() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/agents")
+    assert resp.status_code == 401
+
+
+def test_admin_agent_detail_returns_full_fields() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/agents/researcher_001", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["agent_id"] == "researcher_001"
+    assert data["name"] == "Research Assistant"
+    assert data["profile_id"] == "research_v1"
+    assert data["owner_id"] == "zhang_manager"
+    assert data["owner_name"] == "张经理"
+    assert data["revoked"] is False
+    assert data["description"] is None
+    assert data["metadata"] == {}
+
+
+def test_admin_agent_detail_unknown_agent_returns_404() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/agents/ghost", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 404
+
+
+def test_admin_agent_detail_revoked_flag() -> None:
+    client, _controller = _build_admin_client(revoked=True)
+    resp = client.get("/v1/admin/agents/writer_001", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    assert resp.json()["revoked"] is True
+
+
+def test_admin_agent_detail_requires_api_key() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/agents/researcher_001")
+    assert resp.status_code == 401
+
+
+def test_admin_profiles_returns_serialized_profiles() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/profiles", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    profiles = {p["profile_id"]: p for p in resp.json()["profiles"]}
+    profile = profiles["research_v1"]
+    assert profile["tools"]["send_email"]["allowed"] is True
+    assert profile["tools"]["send_email"]["require_approval"] is True
+
+
+def _write_profiles_yaml(config_dir: Path, tools: dict[str, Any]) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "profiles.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "profiles": [
+                    {
+                        "profile_id": "research_v1",
+                        "description": "研究助手",
+                        "tools": tools,
+                    }
+                ]
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _build_profile_edit_client(tmp_path: Path) -> tuple[TestClient, Any]:
+    client, controller = _build_admin_client()
+    _write_profiles_yaml(
+        tmp_path,
+        {
+            "send_email": {
+                "allowed": True,
+                "require_approval": True,
+                "allowed_args": {"to": ["*@company.com"]},
+                "max_calls_per_task": 1,
+            },
+            "web_search": {"allowed": True, "max_calls_per_task": 10},
+        },
+    )
+    controller._runtime.config_dir = str(tmp_path)
+    return client, controller
+
+
+def test_admin_profile_tools_update_writes_reloads_and_audits(tmp_path: Path) -> None:
+    client, controller = _build_profile_edit_client(tmp_path)
+    resp = client.put(
+        "/v1/admin/profiles/research_v1/tools",
+        headers={"X-API-Key": "test-key"},
+        json={
+            "tools": {
+                "send_email": {
+                    "allowed": True,
+                    "require_approval": False,
+                    "allowed_args": {"to": ["*@company.com", "*@partner.com"]},
+                },
+                "web_search": {"allowed": True, "max_calls_per_task": 5},
+            }
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["reloaded"] is True
+    send_email = body["profile"]["tools"]["send_email"]
+    assert send_email["require_approval"] is False
+    assert send_email["allowed_args"]["to"] == ["*@company.com", "*@partner.com"]
+
+    # 运行时映射已原地刷新（对象替换为磁盘重载版本）
+    runtime_perm = controller._runtime.profiles["research_v1"].tools["send_email"]
+    assert runtime_perm.require_approval is False
+
+    # 文件确实写回（加载-修改-全量写回，注释不保留）
+    on_disk = yaml.safe_load((tmp_path / "profiles.yaml").read_text(encoding="utf-8"))
+    disk_tools = on_disk["profiles"][0]["tools"]
+    assert disk_tools["send_email"]["allowed_args"]["to"] == ["*@company.com", "*@partner.com"]
+    assert "require_approval" not in disk_tools["send_email"]
+
+    # 审计已记录管理操作
+    actions = [e.reason for e in controller._runtime.audit_store._events]
+    assert "update_profile_tools" in actions
+
+
+def test_admin_profile_tools_update_unknown_profile_returns_400(tmp_path: Path) -> None:
+    client, _controller = _build_profile_edit_client(tmp_path)
+    resp = client.put(
+        "/v1/admin/profiles/ghost/tools",
+        headers={"X-API-Key": "test-key"},
+        json={"tools": {"web_search": {"allowed": True}}},
+    )
+    assert resp.status_code == 400
+
+
+def test_admin_profile_tools_update_invalid_permission_returns_400(tmp_path: Path) -> None:
+    client, controller = _build_profile_edit_client(tmp_path)
+    resp = client.put(
+        "/v1/admin/profiles/research_v1/tools",
+        headers={"X-API-Key": "test-key"},
+        json={"tools": {"web_search": {"allowed": True, "max_calls_per_task": "abc"}}},
+    )
+    assert resp.status_code == 400
+    # 校验失败不写文件：磁盘内容保持初始状态
+    on_disk = yaml.safe_load((tmp_path / "profiles.yaml").read_text(encoding="utf-8"))
+    assert on_disk["profiles"][0]["tools"]["web_search"]["max_calls_per_task"] == 10
+
+
+def test_admin_profiles_reload_syncs_from_disk(tmp_path: Path) -> None:
+    client, controller = _build_profile_edit_client(tmp_path)
+    # 绕过 API 直接改文件（模拟手工编辑），再触发统一 reload
+    _write_profiles_yaml(
+        tmp_path,
+        {"send_email": {"allowed": False}},
+    )
+    resp = client.post("/v1/admin/profiles/reload", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    profiles = {p["profile_id"]: p for p in resp.json()["profiles"]}
+    assert profiles["research_v1"]["tools"]["send_email"]["allowed"] is False
+    assert controller._runtime.profiles["research_v1"].tools["send_email"].allowed is False
+    actions = [e.reason for e in controller._runtime.audit_store._events]
+    assert "reload_profiles" in actions
+
+
+def test_admin_profile_tools_update_requires_config_dir() -> None:
+    client, _controller = _build_admin_client()  # mock runtime 无 config_dir
+    resp = client.put(
+        "/v1/admin/profiles/research_v1/tools",
+        headers={"X-API-Key": "test-key"},
+        json={"tools": {"web_search": {"allowed": True}}},
+    )
+    assert resp.status_code == 503
+
+
+def test_admin_session_login_issues_bearer_token() -> None:
+    client, controller = _build_admin_client()
+    resp = client.post("/v1/admin/session/login", json={"api_key": "test-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["token"]
+    assert body["token_type"] == "bearer"
+
+    # Bearer Session Token 可访问管理端点
+    resp = client.get(
+        "/v1/admin/agents", headers={"Authorization": f"Bearer {body['token']}"}
+    )
+    assert resp.status_code == 200
+
+    reasons = [e.reason for e in controller._runtime.audit_store._events]
+    assert "session_login" in reasons
+
+
+def test_admin_session_login_wrong_key_returns_401() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.post("/v1/admin/session/login", json={"api_key": "wrong-key"})
+    assert resp.status_code == 401
+
+
+def test_admin_session_logout_revokes_token() -> None:
+    client, controller = _build_admin_client()
+    token = client.post("/v1/admin/session/login", json={"api_key": "test-key"}).json()["token"]
+    resp = client.post(
+        "/v1/admin/session/logout", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["revoked"] is True
+    # 吊销后立即失效
+    resp = client.get("/v1/admin/agents", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 401
+    reasons = [e.reason for e in controller._runtime.audit_store._events]
+    assert "session_logout" in reasons
+
+
+def test_admin_session_unknown_token_returns_401() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get(
+        "/v1/admin/agents", headers={"Authorization": "Bearer not-a-real-token"}
+    )
+    assert resp.status_code == 401
+
+
+class _FakeGoKernelBridge:
+    """模拟 GoKernelBridge：reachable 控制 ping/list，tasks 模拟任务存储。"""
+
+    def __init__(self, reachable: bool = True) -> None:
+        self.reachable = reachable
+
+    async def ping(self) -> bool:
+        return self.reachable
+
+    async def list_agents(self) -> list[dict[str, Any]]:
+        if not self.reachable:
+            return []
+        return [{"agent_id": "researcher_001"}, {"agent_id": "loop-controller-local"}]
+
+    async def query_task(self, task_id: str) -> dict[str, Any] | None:
+        if not self.reachable:
+            return None
+        return {"task_id": task_id, "status": "completed"}
+
+    async def cancel_task(
+        self, task_id: str, reason: str = "", delegation_token: str = ""
+    ) -> dict[str, Any] | None:
+        if not self.reachable:
+            return None
+        return {"task_id": task_id, "status": "canceled", "cancel_reason": reason}
+
+    async def stream_task(self, task_id: str, timeout: float = 30.0, *, cursor=None, include_sse=False):
+        self.cursor = cursor
+        for status, event_id in (("running", "opaque:one"), ("completed", "opaque:two")):
+            if cursor == event_id:
+                continue
+            event = {"task_id": task_id, "status": status, "token": "secret"}
+            yield (event, event_id, "task_updated") if include_sse else event
+
+
+def test_admin_a2a_status_without_bridge() -> None:
+    client, _controller = _build_admin_client()  # mock runtime 无 go_kernel_bridge
+    resp = client.get("/v1/admin/a2a/status", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enabled"] is False
+    assert body["reachable"] is False
+
+
+def test_admin_a2a_status_and_agents_with_bridge() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=True)
+    resp = client.get("/v1/admin/a2a/status", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    assert resp.json()["reachable"] is True
+
+    resp = client.get("/v1/admin/a2a/agents", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["kernel_reachable"] is True
+    agents = {a["agent_id"]: a for a in body["agents"]}
+    assert agents["researcher_001"]["registered"] is True
+    assert agents["writer_001"]["registered"] is False
+
+
+def test_admin_a2a_agents_kernel_unreachable() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=False)
+    resp = client.get("/v1/admin/a2a/agents", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["kernel_reachable"] is False
+    assert all(a["registered"] is None for a in body["agents"])
+
+
+def test_admin_a2a_task_query() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=True)
+    resp = client.get("/v1/admin/a2a/tasks/t-1", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"
+
+    # 无 bridge 时 fail-closed
+    client2, _controller2 = _build_admin_client()
+    resp = client2.get("/v1/admin/a2a/tasks/t-1", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 503
+
+
+def test_admin_a2a_task_cancel() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=True)
+    resp = client.post(
+        "/v1/admin/a2a/tasks/t-1/cancel",
+        headers={"X-API-Key": "test-key"},
+        json={"reason": "operator cancel"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "canceled"
+    assert body["cancel_reason"] == "operator cancel"
+
+    # 不可达时查询任务失败，拒绝执行取消；无 bridge 时 503
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=False)
+    resp = client.post(
+        "/v1/admin/a2a/tasks/t-1/cancel", headers={"X-API-Key": "test-key"}
+    )
+    assert resp.status_code == 404
+    client2, _controller2 = _build_admin_client()
+    resp = client2.post(
+        "/v1/admin/a2a/tasks/t-1/cancel", headers={"X-API-Key": "test-key"}
+    )
+    assert resp.status_code == 503
+
+
+def test_admin_a2a_task_stream() -> None:
+    client, controller = _build_admin_client()
+    bridge = _FakeGoKernelBridge(reachable=True)
+    controller._runtime.go_kernel_bridge = bridge
+    resp = client.get("/v1/admin/a2a/tasks/t-1/stream", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert '"status": "running"' in resp.text
+    assert '"status": "completed"' in resp.text
+    assert "id: opaque:one\nevent: task_updated\n" in resp.text
+    assert "id: opaque:two\nevent: task_updated\n" in resp.text
+    assert "secret" not in resp.text
+
+    resp = client.get("/v1/admin/a2a/tasks/t-1/stream", headers={"X-API-Key": "test-key", "Last-Event-ID": "opaque:one"})
+    assert resp.status_code == 200
+    assert bridge.cursor == "opaque:one"
+    assert "id: opaque:one" not in resp.text
+    assert "id: opaque:two" in resp.text
+
+    # 无 bridge 时 fail-closed
+    client2, _controller2 = _build_admin_client()
+    resp = client2.get("/v1/admin/a2a/tasks/t-1/stream", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 503
+
+
+def test_admin_a2a_task_stream_cursor_errors() -> None:
+    from loop_controller.go_kernel_bridge import EventCursorExpiredError, EventCursorFutureError
+
+    class CursorBridge(_FakeGoKernelBridge):
+        async def stream_task(self, task_id, timeout=30.0, *, cursor=None, include_sse=False):
+            if cursor == "expired":
+                raise EventCursorExpiredError()
+            raise EventCursorFutureError()
+            yield  # keep async generator contract
+
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = CursorBridge()
+    for cursor, status, code in (("expired", 410, "event_cursor_expired"), ("future", 400, "event_cursor_future")):
+        resp = client.get("/v1/admin/a2a/tasks/t-1/stream", headers={"X-API-Key": "test-key", "Last-Event-ID": cursor})
+        assert resp.status_code == status
+        assert resp.json() == {"error": code}
+
+
+class _FakeInteractionDecision:
+    def __init__(self, verdict: str, allowed: bool, reason: str = "") -> None:
+        self.verdict = verdict
+        self.allowed = allowed
+        self.reason = reason or verdict
+        self.decision_id = "decision-1"
+        self.interaction_id = "interaction-1"
+        self.escalation_target = "zhang_manager" if verdict == "require_approval" else None
+        self.target_entrypoint = {"type": "http", "url": "http://127.0.0.1:8001"}
+        self.modified_args = None
+        self.effective_args = None
+        self.policy_version = "interaction/v0"
+        self.profile_version = "p1"
+
+
+class _FakeInteractionEngine:
+    """模拟 InteractionGovernanceEngine：返回固定判定，记录提案。"""
+
+    last_proposal: Any = None
+    verdict: str = "allow"
+    allowed: bool = True
+
+    def __init__(self, controller: Any, policy_engine: Any = None) -> None:
+        pass
+
+    async def evaluate(self, proposal: Any) -> Any:
+        _FakeInteractionEngine.last_proposal = proposal
+        return _FakeInteractionDecision(self.verdict, self.allowed)
+
+    def build_audit_event(self, proposal: Any, decision: Any) -> Any:
+        return AuditEvent(
+            schema_version="1.0",
+            event_id="evt-delegation",
+            trace_id="trace-1",
+            session_id="",
+            actor_type="agent",
+            actor_id=proposal.source_agent_id,
+            action="execution_authorized",
+            target=proposal.tool_name,
+            decision="allow" if decision.allowed else "deny",
+            reason=decision.reason,
+            metadata={"interaction_context": proposal.interaction_context},
+        )
+
+
+class _FakeDelegationBridge:
+    def __init__(self, accept: bool = True) -> None:
+        self.accept = accept
+        self.requests: list[Any] = []
+
+    async def ping(self) -> bool:
+        return True
+
+    async def request_delegation(self, req: Any) -> Any:
+        self.requests.append(req)
+
+        class _Resp:
+            def __init__(self, accept: bool) -> None:
+                self.allowed = accept
+                self.task_id = "task-42" if accept else ""
+                self.reason = "" if accept else "go_kernel_rejected"
+
+        return _Resp(self.accept)
+
+
+def _delegation_payload() -> dict[str, Any]:
+    return {
+        "source_agent_id": "researcher_001",
+        "target_agent_id": "writer_001",
+        "tool_name": "send_email",
+        "arguments": {"to": "manager@company.com"},
+    }
+
+
+def test_admin_a2a_delegation_allow_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    _FakeInteractionEngine.verdict = "allow"
+    _FakeInteractionEngine.allowed = True
+    client, controller = _build_admin_client()
+    bridge = _FakeDelegationBridge(accept=True)
+    controller._runtime.go_kernel_bridge = bridge
+
+    resp = client.post(
+        "/v1/admin/a2a/delegations",
+        headers={"X-API-Key": "test-key"},
+        json=_delegation_payload(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verdict"] == "allow"
+    assert body["allowed"] is True
+    assert body["dispatch"]["attempted"] is True
+    assert body["dispatch"]["accepted"] is True
+    assert body["dispatch"]["task_id"] == "task-42"
+    # 治理引擎收到的提案标记了 admin-console 上下文
+    assert _FakeInteractionEngine.last_proposal.interaction_context == "admin-console"
+    # 交互审计已写入
+    reasons = [e.reason for e in controller._runtime.audit_store._events]
+    assert "allow" in reasons
+
+
+def test_admin_a2a_delegation_deny_skips_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    _FakeInteractionEngine.verdict = "deny"
+    _FakeInteractionEngine.allowed = False
+    client, controller = _build_admin_client()
+    bridge = _FakeDelegationBridge(accept=True)
+    controller._runtime.go_kernel_bridge = bridge
+
+    resp = client.post(
+        "/v1/admin/a2a/delegations",
+        headers={"X-API-Key": "test-key"},
+        json=_delegation_payload(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verdict"] == "deny"
+    assert body["allowed"] is False
+    assert body["dispatch"]["attempted"] is False
+    assert bridge.requests == []
+
+
+def test_admin_a2a_delegation_unknown_target_delegated_to_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # target 可以是外部 Agent（仅注册在 Go 内核），不由 handler 预先拒绝，
+    # 而是交给治理引擎通过 Agent Card 查询兜底（假引擎默认 deny）。
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    client, _controller = _build_admin_client()
+    payload = _delegation_payload()
+    payload["target_agent_id"] = "ghost"
+    resp = client.post(
+        "/v1/admin/a2a/delegations",
+        headers={"X-API-Key": "test-key"},
+        json=payload,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["verdict"] == "deny"
+    assert resp.json()["dispatch"]["attempted"] is False
+
+
+def test_admin_a2a_delegation_allow_without_kernel_notes_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "loop_controller.server.InteractionGovernanceEngine", _FakeInteractionEngine
+    )
+    _FakeInteractionEngine.verdict = "allow"
+    _FakeInteractionEngine.allowed = True
+    client, _controller = _build_admin_client()  # 无 go_kernel_bridge
+    resp = client.post(
+        "/v1/admin/a2a/delegations",
+        headers={"X-API-Key": "test-key"},
+        json=_delegation_payload(),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["dispatch"]["reason"] == "go kernel disabled"
+
+
+def test_admin_identity_masks_sensitive_values() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/identity", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["provider"] == "static"
+    tokens = data["config"]["static"]["allowed_tokens"]
+    assert tokens == ["******", "******"]
+    assert "tok-secret-1" not in resp.text
+
+
+def test_admin_entrypoints_masks_api_key() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/entrypoints", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    entrypoints = resp.json()["entrypoints"]
+    assert entrypoints["http"]["require_auth"] is True
+    assert entrypoints["http"]["api_key"] == "******"
+    assert "super-secret-key" not in resp.text
+
+
+def test_admin_govern_evaluate_returns_decision_without_execution() -> None:
+    client, controller = _build_admin_client()
+    resp = client.post(
+        "/v1/admin/govern/evaluate",
+        headers={"X-API-Key": "test-key"},
+        json={
+            "agent_id": "researcher_001",
+            "user_id": "alice",
+            "tool_name": "send_email",
+            "arguments": {"to": "zhang@company.com"},
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["verdict"] == "allow"
+    assert data["dry_run"] is True
+    assert data["risk_level"] == "high"  # RuleBasedClassifier: send_email -> high
+    # 未触发真实执行
+    assert controller.tool_calls == []
+    # 合成 call_id 带 dryrun- 前缀
+    assert controller._runtime.checkpoint.evaluated[0].startswith("dryrun-")
+
+
+def test_admin_govern_evaluate_blocked_by_revocation() -> None:
+    client, controller = _build_admin_client(revoked=True)
+    resp = client.post(
+        "/v1/admin/govern/evaluate",
+        headers={"X-API-Key": "test-key"},
+        json={"agent_id": "researcher_001", "user_id": "alice", "tool_name": "send_email"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["verdict"] == "blocked"
+    assert data["reason"] == "agent revoked"
+    # 被吊销时不进入 R2 判定
+    assert controller._runtime.checkpoint.evaluated == []
+
+
+def test_admin_govern_evaluate_unknown_agent_returns_404() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.post(
+        "/v1/admin/govern/evaluate",
+        headers={"X-API-Key": "test-key"},
+        json={"agent_id": "ghost", "user_id": "alice", "tool_name": "send_email"},
+    )
+    assert resp.status_code == 404

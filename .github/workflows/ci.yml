@@ -33,8 +33,16 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     needs: lint
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
@@ -49,6 +57,21 @@ jobs:
         run: uv run pytest tests/ -q -m "not integration"
         env:
           LOOP_CONTROLLER_AUDIT_HMAC_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+      - name: Validate deployment conformance
+        run: |
+          mkdir -p artifacts
+          uv run python -c "from loop_controller.deployment_conformance import write_conformance_result; r=write_conformance_result('deploy/examples/kubernetes-strict.yaml','artifacts/deployment-conformance.json'); raise SystemExit(r.status != 'conformant')"
+          uv run python -c "from loop_controller.deployment_conformance import validate_docker_compose; r=validate_docker_compose('deploy/examples/docker-compose.strict.yml'); raise SystemExit(r.status != 'conformant')"
+
+      - name: Validate v0.53 compatibility and v0.54 current contracts/OpenAPI
+        run: uv run pytest tests/test_a2a_contract.py -q
+
+      - name: Upload deployment conformance
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-conformance
+          path: artifacts/deployment-conformance.json
 
       - name: Build distributions
         run: uv build
@@ -112,6 +135,10 @@ jobs:
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
+
+      - name: Run go vet
+        working-directory: go
+        run: go vet ./...
 
       - name: Run Go tests with race detector
         working-directory: go

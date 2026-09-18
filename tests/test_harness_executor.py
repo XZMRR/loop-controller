@@ -393,6 +393,7 @@ class TestHarnessSecretRefs:
                 ]
             ),
             audit_store=JsonlAuditStore(audit_path),
+            allow_degraded=True,
         )
         proposal = ActionProposal(
             task_id="task-1",

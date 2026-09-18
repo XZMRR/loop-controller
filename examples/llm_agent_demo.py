@@ -144,7 +144,7 @@ async def main() -> None:
                     result.request_id,
                 )
                 logger.info(
-                    "生产环境请执行：lc approvals approve %s --approver zhang_manager",
+                    "生产环境请先注入 LOOP_CONTROLLER_APPROVER_TOKEN，再执行：lc approvals approve %s",
                     result.decision.decision_id if result.decision else "?",
                 )
                 logger.info("演示模式：自动审批通过...")

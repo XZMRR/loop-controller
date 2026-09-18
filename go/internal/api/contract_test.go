@@ -16,8 +16,8 @@ func loadFixture(t *testing.T) map[string]json.RawMessage {
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
-	// go/internal/api -> project root -> contract
-	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.48.0.json")
+	// This suite intentionally exercises the frozen v0.53 compatibility authority.
+	fixturePath := filepath.Join(root, "..", "..", "..", "contract", "a2a_v0.53.0.json")
 	data, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
@@ -34,15 +34,17 @@ func TestCheckProtocolVersion(t *testing.T) {
 		version string
 		wantErr bool
 	}{
-		{"0.48.0", false},
-		{"0.48.1", false},
-		{"0.48.99", false},
+		{"0.53.0", false},
+		{"0.53.1", false},
+		{"0.53.99", false},
+		{"0.54.0", false},
+		{"0.54.7", false},
 		{"", true},
-		{"0.46", true},
-		{"0.48.0.0", true},
-		{"v0.48.0", true},
-		{"0.44.1", true},
-		{"0.44.0", true},
+		{"0.52", true},
+		{"0.53.0.0", true},
+		{"v0.53.0", true},
+		{"0.51.1", true},
+		{"0.51.0", true},
 		{"not-a-version", true},
 	}
 	for _, c := range cases {
@@ -76,8 +78,8 @@ func TestContractFixture_DecodeMessage(t *testing.T) {
 	if err := json.Unmarshal(fixture["message"], &msg); err != nil {
 		t.Fatalf("unmarshal message: %v", err)
 	}
-	if msg.ProtocolVersion != currentProtocolVersion {
-		t.Errorf("protocol_version = %q, want %s", msg.ProtocolVersion, currentProtocolVersion)
+	if msg.ProtocolVersion != models.CompatibleProtocolVersionV53 {
+		t.Errorf("protocol_version = %q, want %s", msg.ProtocolVersion, models.CompatibleProtocolVersionV53)
 	}
 	if len(msg.Parts) != 2 {
 		t.Fatalf("parts length = %d, want 2", len(msg.Parts))
@@ -135,10 +137,13 @@ func TestContractFixture_DecodeTaskErrorAndSSE(t *testing.T) {
 	if task.TaskID != "task-001" || task.Status != "pending" {
 		t.Errorf("task mismatch: %+v", task)
 	}
-	if task.ProtocolVersion != currentProtocolVersion {
-		t.Errorf("task protocol_version = %q, want %q", task.ProtocolVersion, currentProtocolVersion)
+	if task.ProtocolVersion != models.CompatibleProtocolVersionV53 {
+		t.Errorf("task protocol_version = %q, want %q", task.ProtocolVersion, models.CompatibleProtocolVersionV53)
 	}
 	assertCanonicalRoundTrip(t, fixture["task"], task)
+	if task.RequestID != "req-001" || task.TenantID != "tenant-a" || task.TargetWorkloadID == "" || task.TargetInstanceID == "" {
+		t.Errorf("v0.53 task security binding mismatch: %+v", task)
+	}
 
 	var apiError models.ErrorResponse
 	if err := json.Unmarshal(fixture["error_response"], &apiError); err != nil {
@@ -147,7 +152,9 @@ func TestContractFixture_DecodeTaskErrorAndSSE(t *testing.T) {
 	if apiError.Code != "incompatible_protocol_version" {
 		t.Errorf("error code = %q", apiError.Code)
 	}
-	assertCanonicalRoundTrip(t, fixture["error_response"], apiError)
+	if apiError.ProtocolVersion != "" {
+		t.Errorf("frozen v0.53 error unexpectedly gained protocol_version: %+v", apiError)
+	}
 
 	var event struct {
 		ID    string           `json:"id"`
@@ -160,8 +167,8 @@ func TestContractFixture_DecodeTaskErrorAndSSE(t *testing.T) {
 	if event.ID != event.Data.EventID || event.Event != event.Data.EventType || event.Data.TaskID != task.TaskID {
 		t.Errorf("SSE event mismatch: %+v", event)
 	}
-	if event.Data.ProtocolVersion != currentProtocolVersion {
-		t.Errorf("SSE protocol_version = %q, want %q", event.Data.ProtocolVersion, currentProtocolVersion)
+	if event.Data.ProtocolVersion != models.CompatibleProtocolVersionV53 {
+		t.Errorf("SSE protocol_version = %q, want %q", event.Data.ProtocolVersion, models.CompatibleProtocolVersionV53)
 	}
 	assertCanonicalRoundTrip(t, fixture["sse_event"], event)
 	assertCanonicalRoundTrip(t, fixture["task_event"], event.Data)
@@ -216,11 +223,25 @@ func TestContractFixture_DecodeDelegation(t *testing.T) {
 	if req.RequestID != "req-001" {
 		t.Errorf("request_id = %q, want req-001", req.RequestID)
 	}
-	if req.ProtocolVersion != currentProtocolVersion {
-		t.Errorf("protocol_version = %q, want %s", req.ProtocolVersion, currentProtocolVersion)
+	if req.ProtocolVersion != models.CompatibleProtocolVersionV53 {
+		t.Errorf("protocol_version = %q, want %s", req.ProtocolVersion, models.CompatibleProtocolVersionV53)
 	}
 	if !json.Valid(req.Arguments) {
 		t.Errorf("arguments is not valid JSON: %s", req.Arguments)
+	}
+	if req.TenantID != "tenant-a" || req.TargetWorkloadID == "" || req.TargetInstanceID == "" {
+		t.Errorf("v0.53 delegation security binding mismatch: %+v", req)
+	}
+	var entrypoint models.EntrypointTaskRequest
+	if err := json.Unmarshal(fixture["entrypoint_task_request"], &entrypoint); err != nil {
+		t.Fatalf("unmarshal entrypoint_task_request: %v", err)
+	}
+	if entrypoint.RequestID != req.RequestID || entrypoint.TargetWorkloadID != req.TargetWorkloadID {
+		t.Errorf("entrypoint correlation mismatch: %+v", entrypoint)
+	}
+	var result models.EntrypointResultRequest
+	if err := json.Unmarshal(fixture["entrypoint_result_request"], &result); err != nil || result.Status != "completed" {
+		t.Errorf("entrypoint result mismatch: %+v (%v)", result, err)
 	}
 
 	var approval models.DelegationApproval

@@ -3,8 +3,8 @@
 审批入口：
 
     lc approvals list --config-dir config/
-    lc approvals approve <decision_id> --approver <id> [--comment <text>]
-    lc approvals deny <decision_id> --approver <id> [--comment <text>]
+    lc approvals approve <decision_id> [--comment <text>]
+    lc approvals deny <decision_id> [--comment <text>]
 
 审计分析入口（v0.12.0）：
 
@@ -24,7 +24,7 @@ HTTP 服务入口（v0.17.0）：
 
     lc server [--host 127.0.0.1] [--port 8080] [--opa-url http://127.0.0.1:8181]
 
-CLI 直接读写 ``JsonlApprovalStore``，不经过 Runtime，确保审批人与执行进程解耦。
+CLI 与 Runtime 通过同一配置路径选择审批事实源，但 CLI 不启动 Runtime。
 """
 
 from __future__ import annotations
@@ -37,13 +37,21 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-from loop_controller.approval_service import ApprovalServiceError, build_approval_record
+from loop_controller.approval_service import (
+    ApprovalAuthenticationError,
+    ApprovalAuthorizationError,
+    ApprovalServiceError,
+    build_approval_record,
+    resolve_approver_principal,
+)
 from loop_controller.audit_analyzer import RuleBasedAuditAnalyzer
 from loop_controller.infra.alert_store import JsonlAlertStore
 from loop_controller.infra.approval_crypto import ApprovalCrypto
 from loop_controller.infra.approval_store import (
+    ApprovalStore,
     ApprovalStoreError,
-    JsonlApprovalStore,
+    approval_notification_destination,
+    build_approval_store,
     migrate_approval_store,
 )
 from loop_controller.infra.audit_store import JsonlAuditStore
@@ -80,12 +88,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     approve_cmd = app_sub.add_parser("approve", help="批准一个请求")
     approve_cmd.add_argument("decision_id", help="需要审批的 decision_id")
-    approve_cmd.add_argument("--approver", required=True, help="审批人 ID")
     approve_cmd.add_argument("--comment", default="", help="审批意见")
 
     deny_cmd = app_sub.add_parser("deny", help="拒绝一个请求")
     deny_cmd.add_argument("decision_id", help="需要审批的 decision_id")
-    deny_cmd.add_argument("--approver", required=True, help="审批人 ID")
     deny_cmd.add_argument("--comment", default="", help="审批意见")
 
     migrate_cmd = app_sub.add_parser(
@@ -147,6 +153,48 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SSE 模式要求客户端 mTLS 的 CA 证书路径",
     )
 
+    entrypoint_stub = subparsers.add_parser(
+        "entrypoint-stub",
+        help="启动 target agent entrypoint stub（接收内核任务投递并回调 accept/start）",
+    )
+    entrypoint_stub.add_argument("--host", default="127.0.0.1", help="监听 host（默认 127.0.0.1）")
+    entrypoint_stub.add_argument("--port", type=int, default=8001, help="监听端口（默认 8001）")
+    entrypoint_stub.add_argument("--kernel-url", required=True, help="Go A2A 内核 base URL")
+    entrypoint_stub.add_argument(
+        "--no-auto-accept",
+        action="store_true",
+        help="收到任务后不回调内核 accept",
+    )
+    entrypoint_stub.add_argument(
+        "--no-auto-start",
+        action="store_true",
+        help="收到任务后不回调内核 start（隐含 --no-auto-accept）",
+    )
+    entrypoint_stub.add_argument(
+        "--tool-url",
+        default="",
+        help="remote_results 模式下执行工具调用的治理层 base URL（Python /v1/govern/tool-call）",
+    )
+    entrypoint_stub.add_argument(
+        "--agent-id",
+        default="",
+        help="本实例服务的 Agent 身份（重委托时作为子委托 initiator）",
+    )
+    entrypoint_stub.add_argument(
+        "--redelegate",
+        action="append",
+        default=[],
+        metavar="TOOL=TARGET_AGENT",
+        help="重委托映射（可重复）：命中 TOOL 的任务不本地执行，转发给 TARGET_AGENT",
+    )
+    entrypoint_stub.add_argument(
+        "--redelegate-workload",
+        action="append",
+        default=[],
+        metavar="AGENT=WORKLOAD_ID",
+        help="下游 Agent 的目标 workload 映射（可重复）",
+    )
+
     server = subparsers.add_parser("server", help="启动 HTTP 治理服务（v0.17.0）")
     server.add_argument("--host", default="127.0.0.1", help="监听 host（默认 127.0.0.1）")
     server.add_argument("--port", type=int, default=8080, help="监听端口（默认 8080）")
@@ -180,7 +228,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _cmd_list(store: JsonlApprovalStore, args: argparse.Namespace) -> int:
+def _cmd_list(store: ApprovalStore, args: argparse.Namespace) -> int:
     now = datetime.now(UTC)
     pending = store.get_pending()
     if not pending:
@@ -213,7 +261,7 @@ def _cmd_list(store: JsonlApprovalStore, args: argparse.Namespace) -> int:
 
 
 def _cmd_approve_or_deny(
-    store: JsonlApprovalStore,
+    store: ApprovalStore,
     config: AppConfig,
     args: argparse.Namespace,
     verdict: str,
@@ -223,15 +271,24 @@ def _cmd_approve_or_deny(
     existing_record = store.get_record(decision_id)
 
     try:
+        principal = resolve_approver_principal(
+            os.environ.get("LOOP_CONTROLLER_APPROVER_TOKEN"),
+            config.entrypoints_config.get("approval_auth") or {},
+        )
+    except (ApprovalAuthenticationError, ApprovalAuthorizationError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+
+    try:
         record = build_approval_record(
             request,
             existing_record,
-            args.approver,
+            principal,
             verdict,
             args.comment,
             approver_exists=lambda user_id: user_id in config.users,
         )
-    except ApprovalServiceError as exc:
+    except (ApprovalAuthorizationError, ApprovalServiceError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
 
@@ -297,9 +354,7 @@ def _cmd_audit_list_alerts(config: AppConfig, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_proxy(
-    config: AppConfig, args: argparse.Namespace, *, opa_url: str | None = None
-) -> int:
+def _cmd_proxy(config: AppConfig, args: argparse.Namespace, *, opa_url: str | None = None) -> int:
     """启动 MCP Proxy。"""
     runtime = build_runtime(config, opa_url=opa_url or "http://127.0.0.1:8181")
 
@@ -330,6 +385,59 @@ def _cmd_proxy(
         asyncio.run(start_and_run())
     except KeyboardInterrupt:
         pass
+    return 0
+
+
+def _cmd_entrypoint_stub(args: argparse.Namespace) -> int:
+    """启动 target agent entrypoint stub。"""
+    try:
+        import uvicorn
+
+        from loop_controller.entrypoint_stub import create_app
+    except ImportError:
+        print(
+            "错误：启动 entrypoint-stub 需要安装 server 依赖：uv pip install 'loop-controller[server]'",
+            file=sys.stderr,
+        )
+        return 1
+
+    redelegate: dict[str, str] = {}
+    for entry in args.redelegate:
+        tool, sep, target = entry.partition("=")
+        tool = tool.strip()
+        target = target.strip()
+        if not sep or not tool or not target:
+            print(
+                f"错误：--redelegate 需要 TOOL=TARGET_AGENT 格式，收到：{entry!r}", file=sys.stderr
+            )
+            return 2
+        redelegate[tool] = target
+
+    redelegate_workloads: dict[str, str] = {}
+    for entry in args.redelegate_workload:
+        agent, sep, workload = entry.partition("=")
+        agent = agent.strip()
+        workload = workload.strip()
+        if not sep or not agent or not workload:
+            print(
+                f"错误：--redelegate-workload 需要 AGENT=WORKLOAD_ID 格式，收到：{entry!r}",
+                file=sys.stderr,
+            )
+            return 2
+        redelegate_workloads[agent] = workload
+
+    app = create_app(
+        args.kernel_url,
+        auto_accept=not args.no_auto_accept,
+        auto_start=not args.no_auto_start,
+        tool_url=args.tool_url,
+        tool_token=os.environ.get("LOOP_CONTROLLER_ENTRYPOINT_TOOL_TOKEN", ""),
+        agent_id=args.agent_id,
+        control_token=os.environ.get("LOOP_CONTROLLER_ENTRYPOINT_CONTROL_TOKEN", ""),
+        redelegate=redelegate,
+        redelegate_workloads=redelegate_workloads,
+    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
 
@@ -394,6 +502,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "server":
         return _cmd_server(config_dir, args)
 
+    if args.command == "entrypoint-stub":
+        return _cmd_entrypoint_stub(args)
+
     config = ConfigLoader().load(config_dir)
 
     if args.command == "audit":
@@ -404,9 +515,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
-    store = JsonlApprovalStore(
+    store = build_approval_store(
         config.approval_store_path,
         crypto=ApprovalCrypto.from_env_or_none(),
+        notification_destination=approval_notification_destination(config.approval.webhook.enabled),
     )
 
     if args.approval_cmd == "list":
@@ -416,6 +528,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.approval_cmd == "deny":
         return _cmd_approve_or_deny(store, config, args, "deny")
     if args.approval_cmd == "migrate":
+        if config.approval_store_path.lower().endswith((".db", ".sqlite", ".sqlite3")):
+            print("错误：migrate 仅适用于 JSONL 审批存储", file=sys.stderr)
+            return 1
         crypto = ApprovalCrypto.from_env()
         migrate_approval_store(
             config.approval_store_path,

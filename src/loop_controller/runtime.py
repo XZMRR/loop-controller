@@ -7,14 +7,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import platform
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from loop_controller.approval_manager import AsyncApprovalManager
+from loop_controller.approval_webhook import ApprovalWebhookDispatcher
 from loop_controller.audit.anchor_backends import HTTPAnchorBackend, HTTPAnchorConfig
 from loop_controller.audit.anchors import AnchorReceiptVerifier
 from loop_controller.audit.evidence import Ed25519EvidenceSigner, EvidenceChain, HMACEvidenceSigner
@@ -24,6 +28,12 @@ from loop_controller.authority import EarnedAuthorityManager
 from loop_controller.budget import BudgetLedger, JsonlBudgetLedger
 from loop_controller.checkpoint import Checkpoint, DecisionStore
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
+from loop_controller.deployment_proof import DeploymentProof, DeploymentProofVerifier
+from loop_controller.execution_security import (
+    ExecutionSecurityPolicy,
+    WorkloadRegistration,
+    WorkloadRegistry,
+)
 from loop_controller.executors import (
     ExecutorRegistry,
     HarnessExecutor,
@@ -37,7 +47,11 @@ from loop_controller.identity import ConfigIdentityProvider, IdentityProvider
 from loop_controller.identity.revocation import RevocationList
 from loop_controller.infra.alert_store import AlertStore, JsonlAlertStore
 from loop_controller.infra.approval_crypto import ApprovalCrypto
-from loop_controller.infra.approval_store import JsonlApprovalStore
+from loop_controller.infra.approval_store import (
+    SqliteApprovalStore,
+    approval_notification_destination,
+    build_approval_store,
+)
 from loop_controller.infra.audit_store import AuditStore, JsonlAuditStore
 from loop_controller.infra.authority_store import AuthorityStore, JsonlAuthorityStore
 from loop_controller.infra.config_loader import AppConfig, ConfigLoader
@@ -54,6 +68,7 @@ from loop_controller.infra.persistence_probe import (
     PersistenceStatus,
     PersistenceTarget,
 )
+from loop_controller.infra.policy_delivery import PolicyDelivery
 from loop_controller.infra.policy_store import FilePolicyStore
 from loop_controller.infra.reservation_store import (
     InMemoryReservationStore,
@@ -61,10 +76,10 @@ from loop_controller.infra.reservation_store import (
     ReservationStore,
 )
 from loop_controller.infra.sqlite_alert_store import SqliteAlertStore
-from loop_controller.infra.sqlite_decision_store import SqliteDecisionStore
 from loop_controller.infra.sqlite_authority_store import SqliteAuthorityStore
 from loop_controller.infra.sqlite_budget_ledger import SqliteBudgetLedger
 from loop_controller.infra.sqlite_conversation_store import SqliteConversationStore
+from loop_controller.infra.sqlite_decision_store import SqliteDecisionStore
 from loop_controller.infra.sqlite_reservation_store import SqliteReservationStore
 from loop_controller.infra.sqlite_risk_state_store import SqliteRiskStateStore
 from loop_controller.infra.sqlite_session_backend import SqliteSessionBackend
@@ -80,12 +95,21 @@ from loop_controller.permission_interaction import (
     ConfigPermissionInteractionAnalyzer,
 )
 from loop_controller.policy_engine import OPAPolicyEngine
+from loop_controller.policy_lifecycle import PolicyLifecycleConfig, PolicyLifecycleService
+from loop_controller.policy_shadow import PolicyShadowService
+from loop_controller.policy_validation import (
+    CandidateValidationService,
+    OPACandidateValidator,
+    OPACLIRunner,
+)
+from loop_controller.rbac import RbacEnforcer, SqliteRoleBindingStore, StaticCredentialResolver
 from loop_controller.risk_state import JsonlRiskStateStore, RiskStateManager, RiskStateStore
 from loop_controller.secrets import (
     EncryptedFileSecretBackend,
     FileSecretBackend,
     MemorySecretBackend,
     SecretBroker,
+    ToolCredentialResolver,
 )
 from loop_controller.session import JsonlSessionBackend, Session, SessionManager
 
@@ -95,6 +119,36 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Runtime：运行时依赖容器
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SecurityRuntimeStatus:
+    status: str
+    mode: str
+    runtime_assurance: str
+    enabled_egress_types: tuple[str, ...] = ()
+    ready_egress_types: tuple[str, ...] = ()
+    supported_security_capabilities: tuple[str, ...] = ()
+    runtime_observation: dict[str, object] = field(default_factory=dict)
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def ready(self) -> bool:
+        return self.status == "ready"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "mode": self.mode,
+            "runtime_assurance": self.runtime_assurance,
+            "enabled_egress_types": list(self.enabled_egress_types),
+            "ready_egress_types": list(self.ready_egress_types),
+            "supported_security_capabilities": list(
+                self.supported_security_capabilities
+            ),
+            "runtime_observation": dict(self.runtime_observation),
+            "reasons": list(self.reasons),
+        }
 
 
 @dataclass(frozen=True)
@@ -124,7 +178,32 @@ class Runtime:
     persistence_status: PersistenceStatus = field(default_factory=PersistenceStatus)
     go_kernel_bridge: GoKernelBridge | None = None  # v0.36.0 A2A 交互治理桥接
     local_agent_config: dict[str, Any] = field(default_factory=dict)
+    approval_webhook_dispatcher: ApprovalWebhookDispatcher | None = None
+    policy_delivery: PolicyDelivery | None = None
+    policy_validation: CandidateValidationService | None = None
+    policy_lifecycle: PolicyLifecycleService | None = None
+    policy_shadow: PolicyShadowService | None = None
+    policy_shadow_runner: OPACLIRunner | None = None
+    bundle_reader_token: str | None = None
+    status_writer_token: str | None = None
     config: AppConfig | None = None
+    config_dir: str | None = None  # v0.37.0 Profile 在线编辑/重载定位 profiles.yaml
+    rbac_enforcer: RbacEnforcer | None = None  # v0.52
+    rbac_store: SqliteRoleBindingStore | None = None  # v0.52
+    rbac_credential_resolver: StaticCredentialResolver | None = None  # v0.52
+    execution_security_policy: ExecutionSecurityPolicy = field(
+        default_factory=ExecutionSecurityPolicy
+    )
+    security_status: SecurityRuntimeStatus = field(
+        default_factory=lambda: SecurityRuntimeStatus(
+            status="not_strict", mode="compatibility", runtime_assurance="unknown"
+        )
+    )
+
+    @property
+    def degraded_backends(self) -> tuple[str, ...]:
+        """Runtime 当前显式启用的 Checkpoint 降级后端。"""
+        return self.checkpoint.degraded_backends
 
     def require_execution_ready(self) -> None:
         if self.persistence_status.status not in {"healthy", "tail_repaired"}:
@@ -133,6 +212,8 @@ class Runtime:
             )
         if isinstance(self.audit_store, JsonlAuditStore) and self.audit_store.write_blocked:
             raise RuntimeError("审计完整性状态不允许执行工具")
+        if self.execution_security_policy.strict and not self.security_status.ready:
+            raise RuntimeError("strict execution security runtime 未就绪")
 
     def create_task(
         self,
@@ -223,6 +304,8 @@ class Runtime:
             await self.hot_reloader.start()
         if self.harness_executor is not None:
             await self.harness_executor.start()
+        if self.approval_webhook_dispatcher is not None:
+            await self.approval_webhook_dispatcher.start()
         if self.go_kernel_bridge is not None:
             await self._register_local_agent_card()
 
@@ -241,6 +324,7 @@ class Runtime:
                     entrypoint=AgentEntrypoint("http", entrypoint),
                     capabilities=capabilities if isinstance(capabilities, list) else ["delegate_execution"],
                     version=local.get("version", "0.36.0"),
+                    tenant_id=local.get("tenant_id"),
                 )
             )
         except Exception as exc:
@@ -248,6 +332,8 @@ class Runtime:
 
     async def aclose(self) -> None:
         """关闭 MCP gateway 等异步资源。"""
+        if self.approval_webhook_dispatcher is not None:
+            await self.approval_webhook_dispatcher.stop()
         if self.hot_reloader is not None:
             await self.hot_reloader.stop()
         if self.harness_executor is not None:
@@ -284,6 +370,10 @@ def _build_identity_provider(config: AppConfig) -> IdentityProvider:
             jwks_url=jwt_cfg.get("jwks_url"),
             public_key=jwt_cfg.get("public_key"),
             claim_mappings=jwt_cfg.get("claim_mappings"),
+            allow_claim_tenant=bool(jwt_cfg.get("allow_claim_tenant", False)),
+            jwks_cache_ttl_seconds=float(jwt_cfg.get("jwks_cache_ttl_seconds", 300.0)),
+            jwks_hard_ttl_seconds=float(jwt_cfg.get("jwks_hard_ttl_seconds", 3600.0)),
+            allow_http_jwks=bool(jwt_cfg.get("allow_http_jwks", False)),
         )
 
     if provider_type == "mtls":
@@ -347,7 +437,7 @@ def _build_evidence_chain(config: AppConfig) -> EvidenceChain | None:
 
 
 def _build_evidence_anchor(
-    config: AppConfig, alert_store: JsonlAlertStore | None = None
+    config: AppConfig, alert_store: AlertStore | None = None
 ) -> HTTPAnchorBackend | None:
     evidence = config.evidence_config.get("evidence", {})
     anchor = evidence.get("anchor", {})
@@ -416,6 +506,157 @@ def _build_go_kernel_bridge(config: AppConfig) -> GoKernelBridge | None:
     return GoKernelBridge(base_url=base_url, timeout=timeout)
 
 
+def _observe_runtime() -> tuple[str, dict[str, object]]:
+    if platform.system() == "Windows":
+        return "unknown", {
+            "platform": "windows",
+            "uid": "unknown",
+            "rootfs_read_only": "unknown",
+            "capabilities": "unknown",
+            "no_new_privileges": "unknown",
+        }
+    observation: dict[str, object] = {
+        "platform": platform.system().lower(),
+        "uid": os.getuid() if hasattr(os, "getuid") else "unknown",
+        "rootfs_read_only": "unknown",
+        "capabilities": "unknown",
+        "no_new_privileges": "unknown",
+    }
+    try:
+        status = Path("/proc/self/status").read_text(encoding="utf-8")
+        fields = dict(
+            line.split(":", 1) for line in status.splitlines() if ":" in line
+        )
+        observation["capabilities"] = fields.get("CapEff", "unknown").strip()
+        no_new_privileges = fields.get("NoNewPrivs")
+        observation["no_new_privileges"] = (
+            no_new_privileges.strip() == "1" if no_new_privileges else "unknown"
+        )
+    except OSError:
+        pass
+    try:
+        mounts = Path("/proc/mounts").read_text(encoding="utf-8").splitlines()
+        root = next((line.split() for line in mounts if line.split()[1] == "/"), None)
+        if root:
+            observation["rootfs_read_only"] = "ro" in root[3].split(",")
+    except OSError:
+        pass
+    return "observed", observation
+
+
+def _executor_egress_type(executor: object) -> str | None:
+    value = getattr(executor, "security_egress_type", None)
+    return value if isinstance(value, str) else None
+
+
+def _verify_deployment_proof(config: AppConfig) -> tuple[bool, str | None]:
+    observation = config.execution_security.runtime_observation
+    provider = observation.external_attestation_provider
+    proof_path = observation.deployment_proof_path
+    key_env = observation.deployment_proof_key_env
+    if provider is None or proof_path is None or key_env is None:
+        return False, "external_attestation_unavailable"
+    path = Path(proof_path)
+    if not path.is_absolute():
+        path = Path(config.policy_dir).parent / path
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        proof = DeploymentProof.from_dict(value)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return False, "deployment_proof_missing_or_invalid"
+    verifier = DeploymentProofVerifier(key_env)
+    valid = verifier.verify(
+        proof,
+        provider=provider,
+        workload=observation.workload,
+        instance=observation.instance,
+        profile_sha256=observation.profile_sha256,
+        environment_digest=observation.environment_digest,
+    )
+    return (True, None) if valid else (False, "deployment_proof_verification_failed")
+
+
+def _security_runtime_status(
+    config: AppConfig,
+    executors: dict[str, object],
+) -> SecurityRuntimeStatus:
+    security = config.execution_security
+    assurance, observation = _observe_runtime()
+    if not security.strict:
+        return SecurityRuntimeStatus(
+            status="not_strict",
+            mode=security.mode,
+            runtime_assurance=assurance,
+            supported_security_capabilities=tuple(
+                sorted(security.supported_security_capabilities)
+            ),
+            runtime_observation=observation,
+        )
+    reasons: list[str] = []
+    enabled: set[str] = set()
+    ready: set[str] = set()
+    actual_capabilities = {"deployment_observation_v1"}
+    if security.trusted_workloads:
+        actual_capabilities.update(
+            {
+                "workload_identity_v1",
+                "delegated_subject_binding_v1",
+                "workload_bound_delegation_token_v1",
+            }
+        )
+    proof_requested = (
+        security.require_external_deployment_attestation
+        or "deployment_proof_v1" in security.supported_security_capabilities
+    )
+    proof_valid = False
+    proof_reason: str | None = None
+    if proof_requested:
+        proof_valid, proof_reason = _verify_deployment_proof(config)
+    if proof_valid:
+        actual_capabilities.add("deployment_proof_v1")
+        assurance = "externally_attested"
+    if "http" in executors:
+        actual_capabilities.add("tenant_secret_no_fallback_v1")
+    for executor in executors.values():
+        egress = _executor_egress_type(executor)
+        if egress is not None:
+            enabled.add(egress)
+        if bool(getattr(executor, "supports_strict_security", False)) and egress is not None:
+            ready.add(egress)
+            capabilities: object = getattr(executor, "security_capabilities", frozenset())
+            if isinstance(capabilities, (set, frozenset, tuple, list)):
+                actual_capabilities.update(
+                    item for item in capabilities if isinstance(item, str)
+                )
+        else:
+            reasons.append(f"executor_not_strict:{egress or 'unknown'}")
+    if enabled != set(security.supported_egress_types):
+        reasons.append("configured_egress_mismatch")
+    unsupported_claims = security.supported_security_capabilities - actual_capabilities
+    missing_capabilities = security.required_security_capabilities - actual_capabilities
+    if unsupported_claims:
+        reasons.append("configured_capability_not_implemented")
+    if missing_capabilities:
+        reasons.append("required_capability_unavailable")
+    if platform.system() == "Windows":
+        reasons.append("windows_not_strict")
+    if proof_requested and not proof_valid and proof_reason is not None:
+        reasons.append(proof_reason)
+    status = "ready" if not reasons else ("unknown" if platform.system() == "Windows" else "degraded")
+    return SecurityRuntimeStatus(
+        status=status,
+        mode=security.mode,
+        runtime_assurance=assurance,
+        enabled_egress_types=tuple(sorted(enabled)),
+        ready_egress_types=tuple(sorted(ready)),
+        supported_security_capabilities=tuple(
+            sorted(security.supported_security_capabilities)
+        ),
+        runtime_observation=observation,
+        reasons=tuple(sorted(set(reasons))),
+    )
+
+
 def build_runtime(
     config: AppConfig,
     *,
@@ -470,10 +711,21 @@ def build_runtime(
         env_extra=mcp_env,
         cwd=str(project_root),
     )
-    mcp_executor = MCPExecutor(gateway)
+    security_mode = config.execution_security.mode
+    mcp_executor = MCPExecutor(gateway, security_mode=security_mode)
     secret_broker = _build_secret_broker(config)
     http_client = HTTPClient()
-    http_executor = HTTPExecutor(http_client, config.http_tool_specs, secret_broker=secret_broker)
+    http_executor = HTTPExecutor(
+        http_client,
+        config.http_tool_specs,
+        secret_broker=secret_broker,
+        security_mode=security_mode,
+        credential_resolver=(
+            ToolCredentialResolver(secret_broker)
+            if config.execution_security.strict
+            else None
+        ),
+    )
     local_executor = LocalFunctionExecutor(config.local_function_specs)
     alert_store: AlertStore
     if _is_sqlite_path(config.alert_store_path):
@@ -485,6 +737,7 @@ def build_runtime(
         config.harness_backends,
         execution_policy=config.harness_execution_policy,
         alert_store=alert_store,
+        security_mode=security_mode,
     )
     executor_registry = ExecutorRegistry()
     for canonical_name in config.tool_mapping:
@@ -515,6 +768,7 @@ def build_runtime(
         )
     else:
         session_manager = SessionManager(backend=JsonlSessionBackend(config.session_path))
+    conversation_store: ConversationStore
     risk_manager = RiskStateManager(risk_state_store)
     if _is_sqlite_path(config.conversation_path):
         conversation_store = SqliteConversationStore(
@@ -646,12 +900,24 @@ def build_runtime(
     )
     checkpoint._audit_store = audit_store
     approval_crypto = ApprovalCrypto.from_env_or_none()
-    approval_manager = AsyncApprovalManager(
-        JsonlApprovalStore(
-            config.approval_store_path,
-            alert_store=alert_store,
-            crypto=approval_crypto,
-        )
+    approval_store = build_approval_store(
+        config.approval_store_path,
+        alert_store=alert_store,
+        crypto=approval_crypto,
+        state_db=(
+            _state_db_for(config.approval_store_path)
+            if _is_sqlite_path(config.approval_store_path)
+            else None
+        ),
+        notification_destination=approval_notification_destination(
+            config.approval.webhook.enabled
+        ),
+    )
+    approval_manager = AsyncApprovalManager(approval_store)
+    approval_webhook_dispatcher = (
+        ApprovalWebhookDispatcher(approval_store, config.approval.webhook)
+        if isinstance(approval_store, SqliteApprovalStore) and config.approval.webhook.enabled
+        else None
     )
     audit_analyzer = RuleBasedAuditAnalyzer(
         rules=config.audit_rules,
@@ -678,6 +944,143 @@ def build_runtime(
     )
 
     go_kernel_bridge = _build_go_kernel_bridge(config)
+    if config.execution_security.strict and go_kernel_bridge is not None:
+        go_config = config.go_kernel_config.get("go_kernel", {})
+        go_url = urlparse(str(go_config.get("base_url", "")))
+        mtls = go_config.get("mtls") or {}
+        token_env = go_config.get("token_secret_env")
+        if (
+            go_url.scheme != "https"
+            or not token_env
+            or not os.environ.get(str(token_env))
+            or not mtls.get("client_cert_file")
+            or not mtls.get("client_key_file")
+            or not mtls.get("ca_file")
+        ):
+            raise RuntimeError(
+                "strict Go executor requires independent HTTPS URL, token and mTLS references"
+            )
+    policy_delivery = None
+    policy_validation = None
+    policy_lifecycle = None
+    policy_shadow = None
+    policy_shadow_runner = None
+    bundle_reader_token = None
+    status_writer_token = None
+    if config.policy_delivery.enabled:
+        delivery_config = config.policy_delivery
+        policy_db = _state_db_for(delivery_config.state_db_path)
+        policy_delivery = PolicyDelivery(delivery_config.data_dir, policy_db)
+        policy_validation = CandidateValidationService(
+            policy_delivery,
+            OPACandidateValidator(OPACLIRunner(delivery_config.opa_binary)),
+        )
+        policy_lifecycle = PolicyLifecycleService(
+            policy_db,
+            PolicyLifecycleConfig(
+                bundle_name=delivery_config.bundle_name,
+                required_instance_ids=delivery_config.required_instance_ids,
+                status_ttl_seconds=delivery_config.status_ttl_seconds,
+                max_status_payload_bytes=delivery_config.max_status_payload_bytes,
+            ),
+        )
+        policy_shadow_runner = OPACLIRunner(delivery_config.opa_binary)
+        bundle_reader_token = os.environ[delivery_config.bundle_token_env]
+        status_writer_token = os.environ[delivery_config.status_token_env]
+
+    rbac_enforcer = None
+    rbac_store = None
+    rbac_credential_resolver = None
+    if config.rbac.enforce:
+        from loop_controller.rbac import (
+            CrossTenantGrant,
+            RbacEnforcer,
+            Role,
+            RoleBinding,
+            SqliteRoleBindingStore,
+            StaticCredential,
+            StaticCredentialResolver,
+        )
+
+        rbac_db = _state_db_for(config.rbac.state_db_path)
+        rbac_store = SqliteRoleBindingStore(rbac_db)
+        # 静态凭证的 roles 列表可能含多个角色：逐角色展开为独立绑定。
+        expanded: list[RoleBinding] = []
+        for idx, binding in enumerate(config.rbac.bindings):
+            for role_name in binding.roles or ("tenant_admin",):
+                expanded.append(
+                    RoleBinding(
+                        binding_id=f"static-{binding.principal}-{role_name}-{idx}",
+                        principal=binding.principal,
+                        tenant_id=binding.tenant_id,
+                        role=Role(role_name),
+                        granted_by="static-config",
+                        created_at="",
+                    )
+                )
+        static_bindings = tuple(expanded)
+        static_grants = tuple(
+            CrossTenantGrant(
+                grant_id=f"static-grant-{idx}",
+                source_principal=grant.source_principal,
+                source_tenant=grant.source_tenant,
+                target_tenant=grant.target_tenant,
+                resources=grant.resources,
+                granted_by="static-config",
+                created_at="",
+            )
+            for idx, grant in enumerate(config.rbac.grants)
+        )
+        rbac_enforcer = RbacEnforcer(
+            rbac_store,
+            static_bindings=static_bindings,
+            static_grants=static_grants,
+            allow_self_publish=config.rbac.allow_self_publish,
+        )
+        rbac_credential_resolver = StaticCredentialResolver(
+            tuple(
+                StaticCredential(
+                    principal=binding.principal,
+                    tenant_id=binding.tenant_id,
+                    token_env=binding.token_env,
+                    roles=binding.roles,
+                )
+                for binding in config.rbac.bindings
+            )
+        )
+
+    actual_executors: dict[str, object] = {}
+    if config.tool_mapping:
+        actual_executors["mcp"] = mcp_executor
+    if config.http_tool_specs:
+        actual_executors["http"] = http_executor
+    if config.harness_tool_specs:
+        actual_executors["harness"] = harness_executor
+    if config.local_function_specs:
+        actual_executors["local"] = local_executor
+    security_status = _security_runtime_status(config, actual_executors)
+    if config.execution_security.strict and security_status.status == "degraded":
+        raise RuntimeError(
+            "strict execution security validation failed: "
+            + ", ".join(security_status.reasons)
+        )
+    execution_security_policy = ExecutionSecurityPolicy(
+        mode=config.execution_security.mode,
+        supported_security_capabilities=config.execution_security.supported_security_capabilities,
+        workload_registry=WorkloadRegistry(
+            WorkloadRegistration(
+                workload_id=item.workload_id,
+                service=item.service,
+                principal=item.principal,
+                agent_ids=item.agent_ids,
+                tenant_ids=item.tenant_ids,
+                authenticated_instance_ids=item.authenticated_instance_ids,
+                lifecycle_kernel=item.lifecycle_kernel,
+            )
+            for item in config.execution_security.trusted_workloads
+        ),
+        require_instance_identity=config.execution_security.require_instance_identity,
+    )
 
     return Runtime(
         classifier=RuleBasedClassifier(
@@ -708,5 +1111,19 @@ def build_runtime(
         local_agent_config=dict(
             config.go_kernel_config.get("go_kernel", {}).get("local_agent", {})
         ),
+        approval_webhook_dispatcher=approval_webhook_dispatcher,
+        policy_delivery=policy_delivery,
+        policy_validation=policy_validation,
+        policy_lifecycle=policy_lifecycle,
+        policy_shadow=policy_shadow,
+        policy_shadow_runner=policy_shadow_runner,
+        bundle_reader_token=bundle_reader_token,
+        status_writer_token=status_writer_token,
         config=config,
+        rbac_enforcer=rbac_enforcer,
+        rbac_store=rbac_store,
+        rbac_credential_resolver=rbac_credential_resolver,
+        execution_security_policy=execution_security_policy,
+        security_status=security_status,
+        config_dir=str(config_dir),
     )

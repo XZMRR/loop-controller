@@ -1,6 +1,10 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.36.1）。基于 R0-R3 分层治理模型，让 Agent 的每一次工具调用都经过"申报 → 吊销检查 → 策略判定 → 审批 → 执行前复查 → 授权转发 → 审计"的完整闭环。
+企业级 AI Agent 治理层（v0.54.0）。基于 R0-R3 分层治理模型，让 Agent 的工具调用和多 Agent 委托经过身份、策略、审批、可靠调度、授权执行与审计闭环。
+
+**v0.54.0 可靠调度**：提供 Agent spec/status 与容量路由、durable assignment/outbox、lease/attempt/fence、retry/failover/dead-letter、有界静态 DAG、可恢复 SSE、SQLite migration、readiness 与 Prometheus metrics。dispatch 为 at-least-once；外部副作用不保证 exactly-once，下游必须按 `delivery_id`/幂等键去重并校验 attempt/fence；不确定发送结果进入 `outcome_unknown`。
+
+**strict 边界**：代码级 mTLS、身份绑定、受保护出口、receipt/proof 已验证；Protected MCP 完整拓扑、Go→Python strict、Docker/Kubernetes CNI/Secret 隔离和 external DeploymentProof 仍须支持环境门禁。Windows 仅用于开发，不提供 strict production assurance。
 
 **v0.33.0 战略方向**：在 v0.32.0 接入方式收敛的基础上，本版本聚焦**Python 工具治理层的健壮性加固**：堵住 Agent SDK、MCP Proxy、HTTP REST API 与配置校验中当前最危险的安全、稳定与正确性漏洞，使 `@governed` 主路线和网络接入面达到可生产部署基线。HTTP REST API 与 MCP Proxy 继续作为**网关/强制约束层**保留，用于外部不可控 Agent 或跨语言接入；FastAPI 与 gRPC 接入已从核心包移除，LangChain 集成降级为 `examples/integrations/` 可选示例。
 
@@ -104,7 +108,9 @@ python examples/research_agent.py
 
 # 示例会在 send_email 前暂停并返回 needs_approval；另开终端审批后继续：
 # lc approvals list --config-dir config
-# lc approvals approve <decision_id> --approver zhang_manager --comment "同意发送"
+# 生产审批身份来自受信凭证；token 匹配 config/entrypoints.yaml 的 approval_auth
+# export LOOP_CONTROLLER_APPROVER_TOKEN="$LOOP_CONTROLLER_APPROVER_ZHANG_MANAGER_TOKEN"
+# lc approvals approve <decision_id> --comment "同意发送"
 # （然后调用方用 resume_task 继续执行）
 
 # 6. 跑测试
@@ -127,7 +133,7 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 #      http://localhost:8080/v1/govern/tool-call
 ```
 
-会话上下文持久化路径默认是 `./data/conversations.jsonl`，审批请求/结果持久化路径默认是 `./data/approvals.jsonl`，可在 `config/` 下新增 `conversation.yaml` / `approval_store.yaml`（或环境变量 `LOOP_CONTROLLER_CONVERSATION_PATH` / `LOOP_CONTROLLER_APPROVAL_STORE_PATH`）覆盖；Planner 通过 `UserQuestion` 请求用户补充后，外部调用方写入 `runtime.add_user_message(...)` 并调用 `resume_task` 继续。
+会话上下文持久化路径默认是 `./data/conversations.jsonl`。生产审批请求/结果默认由 `config/approval.yaml` 指向 `./data/approvals.db`，Runtime 与 CLI 使用同一 SQLite 事实源，审批状态与可靠 webhook 通知 outbox 同事务提交；可通过 `LOOP_CONTROLLER_APPROVAL_STORE_PATH` 覆盖。`.jsonl` 仅保留单进程开发/历史兼容，不支持与 SQLite 双写，也不具备状态与通知原子性。Planner 通过 `UserQuestion` 请求用户补充后，外部调用方写入 `runtime.add_user_message(...)` 并调用 `resume_task` 继续。
 
 ## 配置
 
@@ -140,9 +146,9 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 | `mcp_servers.yaml` | MCP server 连接、工具映射、`cost_per_call` |
 | `permission_rules.yaml` | 权限组合规则（deny / require_approval） |
 | `masking_rules.yaml` | 审计/审批的分级掩码规则 |
-| `approval.yaml` | 审批人默认与规则（用于确定 escalation_target） |
+| `approval.yaml` | 审批人路由、SQLite 审批事实源与可靠 webhook 配置 |
 | `identity.yaml` | 身份 Provider 配置（static / jwt / mtls） |
-| `entrypoints.yaml` | HTTP/MCP Proxy 入口认证方式与开关 |
+| `entrypoints.yaml` | HTTP/MCP Proxy 入口认证，以及 `approval_auth` 审批 principal allowlist/凭证环境变量映射 |
 | `harness_tools.yaml` | Harness 后端与工具配置（v0.27.0，默认注释；生产模板为 HTTPS + HMAC + 健康检查） |
 | `revocation.yaml` | 全局吊销列表与 Kill Switch（v0.26.0，支持热更新） |
 | `evidence.yaml` | 本地签名证据链后端与锚点配置（v0.28.0） |
@@ -150,7 +156,12 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 
 ## 已知局限
 
-**本项目当前为 v0.33.0，存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：
+**本项目当前为 v0.54.0（代码级可靠调度已完成，支持环境发布门禁待执行），存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：
+
+- **交付语义**：durable dispatch 是 at-least-once，外部副作用不保证 exactly-once；下游必须按 delivery/idempotency 幂等并校验 fence，无法确认结果时保持 `outcome_unknown`。
+- **规模边界**：SQLite WAL 仅面向单区域、小到中等规模；无跨区域共识、无限水平扩展、federation 或动态 Agent 自助注册。
+- **编排边界**：DAG 是有界静态 DAG，不是通用 workflow，也不提供 Saga/补偿事务。
+- **strict 证据边界**：mTLS 等已有代码级验证，但 Protected MCP 完整拓扑、Go→Python strict、Docker/Kubernetes CNI/Secret 隔离和 external DeploymentProof 仍待支持环境执行；Windows 不提供 strict production assurance。
 
 - **接入方式已收敛**：v0.32.0 已移除 FastAPI 集成与 gRPC 服务，LangChain 集成降级为 `examples/integrations/langchain_example.py` 可选示例；核心包只保留 `@governed`（主路线）、HTTP REST API、MCP Proxy 三种工具接入方式。v0.33.0 对三条接入线都做了健壮性加固，但网关层的限流、请求体限制仍为单进程内存实现，未提供分布式限流。
 - **Harness 默认不启用**：生产仅推荐独立 HTTPS HTTP Harness，参考服务和 subprocess 都不是生产沙箱。
@@ -177,7 +188,8 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `loop_controller_v0.29.0_development.md`——v0.29.0 审批与状态恢复闭环
 - `loop_controller_v0.31.0_development.md`——v0.31.0 外部工具执行沙箱（Harness）
 - `loop_controller_v0.32.0_development.md`——v0.32.0 Agent 接入体验优化与接入方式收敛
-- `loop_controller_v0.33.0_development.md`——v0.33.0 工具治理层健壮性加固：SDK 与 API 入口安全（当前版本依据）
+- `loop_controller_v0.33.0_development.md`——v0.33.0 工具治理层健壮性加固：SDK 与 API 入口安全
+- `loop_controller_v0.54.0_development.md`——v0.54.0 可靠多 Agent 调度与发布门禁（当前版本依据）
 - `development_log.md`——开发记录与决策追溯
 - `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
 - `answer.md`——MVP 审查分析与修复状态追踪

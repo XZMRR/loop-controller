@@ -1,4 +1,4 @@
-"""基于 SQLite 的 AlertStore 实现（v0.48.0）。"""
+"""基于 SQLite 的 AlertStore 实现（v0.49.0）。"""
 
 from __future__ import annotations
 

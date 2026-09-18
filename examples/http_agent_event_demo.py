@@ -52,7 +52,7 @@ async def simulate_admin_approval(request_id: str, delay: float = 3.0) -> None:
         print(f"[admin] approving decision_id={decision_id} for request_id={request_id}")
         # 通过 CLI 审批（也可调用 MCP/admin 扩展接口）
         proc = await asyncio.create_subprocess_shell(
-            f".venv\\Scripts\\lc approvals approve {decision_id} --approver zhang_manager",
+            f".venv\\Scripts\\lc approvals approve {decision_id}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

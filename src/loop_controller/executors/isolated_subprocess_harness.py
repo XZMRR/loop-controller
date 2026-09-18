@@ -182,6 +182,7 @@ class IsolatedSubprocessHarnessBackend:
     ) -> ToolResult:
         from loop_controller.executors.harness_executor import _HTTPHarnessClient
 
+        workload_identity = getattr(context, "workload_identity", None)
         request = HarnessExecuteRequest(
             tool=tool_name,
             arguments=arguments,
@@ -192,6 +193,17 @@ class IsolatedSubprocessHarnessBackend:
                 user_id=context.user_id,
                 session_id=context.session_id,
                 tenant_id=context.tenant_id,
+                request_id=getattr(context, "request_id", None),
+                interaction_id=getattr(context, "interaction_id", None),
+                decision_id=getattr(context, "decision_id", None),
+                delegation_jti=getattr(context, "delegation_jti", None),
+                workload_id=workload_identity.workload_id if workload_identity else None,
+                authenticated_instance_id=(
+                    workload_identity.authenticated_instance_id
+                    if workload_identity
+                    else None
+                ),
+                security_capabilities=getattr(context, "security_capabilities", frozenset()),
             ),
             sandbox=HarnessSandbox.model_validate(sandbox.model_dump()) if sandbox is not None else HarnessSandbox(),
         )
@@ -276,8 +288,9 @@ class IsolatedSubprocessHarnessBackend:
                 call_id=context.call_id,
                 task_id=context.task_id,
                 tool_name=tool_name,
-                status=response.status,
+                status="success" if response.status == "success" else "error",
                 content=response.content,
+                terminal_status=response.status,
                 error_code=response.error_code,
                 metadata=metadata,
             )

@@ -36,6 +36,12 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
+from loop_controller.execution_security_constants import (
+    COMPATIBILITY_MODE,
+    SECURITY_CAPABILITIES,
+    STRICT_EGRESS_TYPES,
+    STRICT_MODE,
+)
 from loop_controller.executors.harness_models import (
     DockerBackendConfig,
     HarnessExecutionPolicy,
@@ -83,8 +89,15 @@ class ConfigValidationError(Exception):
 @dataclass(frozen=True)
 class MCPServerConfig:
     name: str
-    command: list[str]
+    command: list[str] = field(default_factory=list)
     transport: str = "stdio"
+    url: str | None = None
+    ca_cert: str | None = None
+    client_cert: str | None = None
+    client_key: str | None = None
+    expected_workload: str | None = None
+    cert_sha256: str | None = None
+    timeout_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -206,9 +219,118 @@ class ApprovalRule:
 
 
 @dataclass(frozen=True)
+class ApprovalWebhookConfig:
+    enabled: bool = False
+    url: str = ""
+    auth_header_name: str = "Authorization"
+    auth_header_value: str = ""
+    timeout_seconds: float = 10.0
+    poll_interval_seconds: float = 1.0
+    lease_seconds: float = 30.0
+    batch_size: int = 20
+    retry_base_seconds: float = 1.0
+    retry_max_seconds: float = 300.0
+
+
+@dataclass(frozen=True)
 class ApprovalConfig:
     default: str
     rules: list[ApprovalRule] = field(default_factory=list)
+    webhook: ApprovalWebhookConfig = field(default_factory=ApprovalWebhookConfig)
+
+
+@dataclass(frozen=True)
+class PolicyDeliveryConfig:
+    enabled: bool = False
+    data_dir: str = "./data"
+    state_db_path: str = "./data/state.db"
+    opa_binary: str = ""
+    bundle_name: str = "loop-controller"
+    required_instance_ids: tuple[str, ...] = ()
+    status_ttl_seconds: int = 60
+    admin_token_env: str = "LOOP_CONTROLLER_API_KEY"
+    bundle_token_env: str = "LOOP_CONTROLLER_BUNDLE_TOKEN"
+    status_token_env: str = "LOOP_CONTROLLER_OPA_STATUS_TOKEN"
+    shadow_candidate_endpoint: str = ""
+    max_status_payload_bytes: int = 65536
+    shadow_max_samples: int = 1000
+    shadow_max_input_bytes: int = 65536
+
+
+@dataclass(frozen=True)
+class StaticRoleBindingConfig:
+    """rbac.yaml 静态角色绑定（principal + env token，凭证不落盘）。"""
+
+    principal: str
+    tenant_id: str | None
+    token_env: str
+    roles: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StaticCrossTenantGrantConfig:
+    source_principal: str
+    source_tenant: str
+    target_tenant: str
+    resources: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RbacConfig:
+    """统一访问控制平面（v0.52）。enforcement=disabled 时维持 legacy api key 行为。"""
+
+    enforcement: str = "disabled"  # disabled | enforce
+    state_db_path: str = "./data/rbac_state.db"
+    allow_claim_tenant: bool = False
+    dynamic_role_bindings: bool = False
+    allow_self_publish: bool = False
+    legacy_key_role: str = "platform_admin"  # platform_admin | reject
+    role_map: dict[str, str] = field(default_factory=dict)  # claim role -> LC 角色（dynamic 用）
+    bindings: tuple[StaticRoleBindingConfig, ...] = ()
+    grants: tuple[StaticCrossTenantGrantConfig, ...] = ()
+
+    @property
+    def enforce(self) -> bool:
+        return self.enforcement == "enforce"
+
+
+@dataclass(frozen=True)
+class RuntimeObservationConfig:
+    profile: str = "process"
+    external_attestation_provider: str | None = None
+    deployment_proof_path: str | None = None
+    deployment_proof_key_env: str | None = None
+    workload: str = "loop-controller"
+    instance: str = ""
+    profile_sha256: str = ""
+    environment_digest: str = ""
+
+
+@dataclass(frozen=True)
+class TrustedWorkloadConfig:
+    workload_id: str
+    service: str
+    principal: str
+    agent_ids: frozenset[str] = field(default_factory=frozenset)
+    tenant_ids: frozenset[str] = field(default_factory=frozenset)
+    authenticated_instance_ids: frozenset[str] = field(default_factory=frozenset)
+    lifecycle_kernel: bool = False
+
+
+@dataclass(frozen=True)
+class ExecutionSecurityConfig:
+    mode: str = COMPATIBILITY_MODE
+    supported_egress_types: frozenset[str] = field(default_factory=frozenset)
+    required_security_capabilities: frozenset[str] = field(default_factory=frozenset)
+    supported_security_capabilities: frozenset[str] = field(default_factory=frozenset)
+    require_instance_identity: bool = False
+    require_external_deployment_attestation: bool = False
+    trusted_workloads: tuple[TrustedWorkloadConfig, ...] = ()
+    runtime_observation: RuntimeObservationConfig = field(default_factory=RuntimeObservationConfig)
+
+    @property
+    def strict(self) -> bool:
+        return self.mode == STRICT_MODE
 
 
 @dataclass(frozen=True)
@@ -252,7 +374,7 @@ class AppConfig:
     session_path: str = "./data/sessions.jsonl"  # v0.4.0 Session 持久化路径
     conversation_path: str = "./data/conversations.jsonl"  # v0.3.0 会话上下文持久化路径
     conversation_max_messages_per_session: int = 100  # v0.3.0 每个 session 保留消息数
-    approval_store_path: str = "./data/approvals.jsonl"  # v0.3.0 审批请求/结果持久化路径
+    approval_store_path: str = "./data/approvals.db"  # v0.49.0 生产审批 SQLite 事实源
     task_store_path: str = "./data/tasks.jsonl"  # v0.6.0 Task 持久化路径
     budget_ledger_path: str = "./data/budget.jsonl"  # v0.6.0 预算事件持久化路径
     reservation_store_path: str = "./data/reservations.jsonl"  # v0.8.0 reservation 持久化路径
@@ -269,6 +391,9 @@ class AppConfig:
     evidence_config: dict[str, Any] = field(default_factory=dict)  # v0.26.0 证据链配置
     go_kernel_config: dict[str, Any] = field(default_factory=dict)  # v0.36.0 Go 交互治理内核配置
     interaction_config: InteractionConfig = field(default_factory=InteractionConfig)  # v0.38.0
+    policy_delivery: PolicyDeliveryConfig = field(default_factory=PolicyDeliveryConfig)
+    rbac: RbacConfig = field(default_factory=RbacConfig)  # v0.52.0
+    execution_security: ExecutionSecurityConfig = field(default_factory=ExecutionSecurityConfig)
 
 # ---------------------------------------------------------------------------
 # ConfigLoader
@@ -311,6 +436,11 @@ class ConfigLoader:
         identity_config = self._load_identity_config(config_dir / "identity.yaml")
         entrypoints_config = self._load_entrypoints_config(config_dir / "entrypoints.yaml")
         go_kernel_config = self._load_optional_config(config_dir / "go_kernel.yaml")
+        policy_delivery = self._load_policy_delivery(config_dir / "policy_delivery.yaml", root)
+        rbac = self._load_rbac(config_dir / "rbac.yaml")
+        execution_security = self._load_execution_security(
+            config_dir / "execution_security.yaml"
+        )
         try:
             interaction_profiles, interaction_trust, interaction_policies = load_interaction_config(
                 config_dir
@@ -342,8 +472,17 @@ class ConfigLoader:
         conversation_path = os.environ.get(
             "LOOP_CONTROLLER_CONVERSATION_PATH", str(root / "data" / "conversations.jsonl")
         )
+        approval_data = self._read_yaml(config_dir / "approval.yaml")
+        configured_approval_path = approval_data.get("store_path")
+        if configured_approval_path:
+            configured_path = Path(str(configured_approval_path))
+            if not configured_path.is_absolute():
+                configured_path = root / configured_path
+            approval_default_path = str(configured_path)
+        else:
+            approval_default_path = str(root / "data" / "approvals.db")
         approval_store_path = os.environ.get(
-            "LOOP_CONTROLLER_APPROVAL_STORE_PATH", str(root / "data" / "approvals.jsonl")
+            "LOOP_CONTROLLER_APPROVAL_STORE_PATH", approval_default_path
         )
         session_path = os.environ.get(
             "LOOP_CONTROLLER_SESSION_PATH", str(root / "data" / "sessions.jsonl")
@@ -403,6 +542,9 @@ class ConfigLoader:
                 policies=interaction_policies,
                 policy_dir=str(root / "policies"),
             ),
+            policy_delivery=policy_delivery,
+            rbac=rbac,
+            execution_security=execution_security,
         )
 
         self._check_profile_exists(app_config)
@@ -420,7 +562,11 @@ class ConfigLoader:
         self._check_harness_config(app_config)
         self._check_identity_config(app_config)
         self._check_entrypoints_config(app_config)
+        self._check_approval_auth_config(app_config)
         self._check_evidence_config(app_config)
+        self._check_policy_delivery(app_config, opa_base_url)
+        self._check_rbac(app_config)
+        self._check_execution_security(app_config)
         return app_config
 
     # -- 各 YAML 解析 -------------------------------------------------------
@@ -522,9 +668,11 @@ class ConfigLoader:
                     "base_path": str(root / "secrets"),
                 },
                 "hot_reload": {"enabled": True, "poll_interval_seconds": 30},
+                "_explicit": False,
             }
         data = self._read_yaml(path)
         config = cast(dict[str, Any], data)
+        config["_explicit"] = True
         if "backend" not in config:
             config["backend"] = {"type": "file", "base_path": str(root / "secrets")}
         if "hot_reload" not in config:
@@ -641,11 +789,178 @@ class ConfigLoader:
         """热更新：重新加载 revocation.yaml。"""
         return self._load_optional_config(Path(config_dir) / "revocation.yaml")
 
+    def _load_rbac(self, path: Path) -> RbacConfig:
+        """加载 rbac.yaml（v0.52）；文件缺失时 enforcement 默认 disabled。"""
+        if not path.exists():
+            return RbacConfig()
+        data = self._read_yaml(path)
+        raw = data.get("rbac", data)
+        if not isinstance(raw, dict):
+            raise ConfigValidationError("rbac.yaml 的 rbac 段必须是对象")
+
+        def _tuple_str(value: Any) -> tuple[str, ...]:
+            if value is None:
+                return ()
+            if isinstance(value, str):
+                return (value,)
+            if isinstance(value, (list, tuple)):
+                return tuple(str(item) for item in value)
+            raise ConfigValidationError("rbac roles/resources 必须是字符串或列表")
+
+        bindings = []
+        for idx, entry in enumerate(raw.get("bindings") or ()):
+            if not isinstance(entry, dict) or not entry.get("principal") or not entry.get("token_env"):
+                raise ConfigValidationError(
+                    f"rbac.bindings[{idx}] 必须包含 principal 与 token_env"
+                )
+            bindings.append(
+                StaticRoleBindingConfig(
+                    principal=str(entry["principal"]),
+                    tenant_id=str(entry["tenant"]) if entry.get("tenant") else None,
+                    token_env=str(entry["token_env"]),
+                    roles=_tuple_str(entry.get("roles")),
+                )
+            )
+        grants = []
+        for idx, entry in enumerate(raw.get("cross_tenant_grants") or ()):
+            if not isinstance(entry, dict) or not entry.get("source_principal"):
+                raise ConfigValidationError(
+                    f"rbac.cross_tenant_grants[{idx}] 必须包含 source_principal"
+                )
+            grants.append(
+                StaticCrossTenantGrantConfig(
+                    source_principal=str(entry["source_principal"]),
+                    source_tenant=str(entry.get("source_tenant", "")),
+                    target_tenant=str(entry.get("target_tenant", "")),
+                    resources=_tuple_str(entry.get("resources")),
+                )
+            )
+        role_map = raw.get("role_map") or {}
+        if not isinstance(role_map, dict):
+            raise ConfigValidationError("rbac.role_map 必须是对象")
+        return RbacConfig(
+            enforcement=str(raw.get("enforcement", "disabled")),
+            state_db_path=str(raw.get("state_db_path", "./data/rbac_state.db")),
+            allow_claim_tenant=bool(raw.get("allow_claim_tenant", False)),
+            dynamic_role_bindings=bool(raw.get("dynamic_role_bindings", False)),
+            allow_self_publish=bool(raw.get("allow_self_publish", False)),
+            legacy_key_role=str(raw.get("legacy_key_role", "platform_admin")),
+            role_map={str(k): str(v) for k, v in role_map.items()},
+            bindings=tuple(bindings),
+            grants=tuple(grants),
+        )
+
+    def _load_execution_security(self, path: Path) -> ExecutionSecurityConfig:
+        if not path.exists():
+            return ExecutionSecurityConfig()
+        data = self._read_yaml(path)
+        raw = data.get("execution_security", data)
+        if not isinstance(raw, dict):
+            raise ConfigValidationError("execution_security 配置必须是映射")
+
+        def string_set(name: str) -> frozenset[str]:
+            value = raw.get(name, ())
+            if not isinstance(value, (list, tuple, set, frozenset)) or any(
+                not isinstance(item, str) or not item for item in value
+            ):
+                raise ConfigValidationError(f"execution_security.{name} 必须是非空字符串列表")
+            return frozenset(value)
+
+        registrations = []
+        for idx, item in enumerate(raw.get("trusted_workloads") or ()):
+            if not isinstance(item, dict):
+                raise ConfigValidationError(
+                    f"execution_security.trusted_workloads[{idx}] 必须是映射"
+                )
+            try:
+                registrations.append(
+                    TrustedWorkloadConfig(
+                        workload_id=str(item["workload_id"]),
+                        service=str(item["service"]),
+                        principal=str(item["principal"]),
+                        agent_ids=frozenset(item.get("agent_ids") or ()),
+                        tenant_ids=frozenset(item.get("tenant_ids") or ()),
+                        authenticated_instance_ids=frozenset(
+                            item.get("authenticated_instance_ids") or ()
+                        ),
+                        lifecycle_kernel=bool(item.get("lifecycle_kernel", False)),
+                    )
+                )
+            except (KeyError, TypeError) as exc:
+                raise ConfigValidationError(
+                    f"execution_security.trusted_workloads[{idx}] 配置非法"
+                ) from exc
+        observation = raw.get("runtime_observation") or {}
+        if not isinstance(observation, dict):
+            raise ConfigValidationError("execution_security.runtime_observation 必须是映射")
+        try:
+            return ExecutionSecurityConfig(
+                mode=str(raw.get("mode", COMPATIBILITY_MODE)),
+                supported_egress_types=string_set("supported_egress_types"),
+                required_security_capabilities=string_set(
+                    "required_security_capabilities"
+                ),
+                supported_security_capabilities=string_set(
+                    "supported_security_capabilities"
+                ),
+                require_instance_identity=bool(raw.get("require_instance_identity", False)),
+                require_external_deployment_attestation=bool(
+                    raw.get("require_external_deployment_attestation", False)
+                ),
+                trusted_workloads=tuple(registrations),
+                runtime_observation=RuntimeObservationConfig(
+                    profile=str(observation.get("profile", "process")),
+                    external_attestation_provider=(
+                        str(observation["external_attestation_provider"])
+                        if observation.get("external_attestation_provider")
+                        else None
+                    ),
+                    deployment_proof_path=(
+                        str(observation["deployment_proof_path"])
+                        if observation.get("deployment_proof_path")
+                        else None
+                    ),
+                    deployment_proof_key_env=(
+                        str(observation["deployment_proof_key_env"])
+                        if observation.get("deployment_proof_key_env")
+                        else None
+                    ),
+                    workload=str(observation.get("workload", "loop-controller")),
+                    instance=str(observation.get("instance", "")),
+                    profile_sha256=str(observation.get("profile_sha256", "")),
+                    environment_digest=str(observation.get("environment_digest", "")),
+                ),
+            )
+        except TypeError as exc:
+            raise ConfigValidationError(f"execution_security 配置非法：{exc}") from exc
+
+    def reload_profiles(self, config_dir: str | Path) -> dict[str, CapabilityProfile]:
+        """热更新：重新加载 profiles.yaml，返回最新的 CapabilityProfile 映射。"""
+        return self._load_profiles(Path(config_dir) / "profiles.yaml")
+
     def _load_optional_config(self, path: Path) -> dict[str, Any]:
         """加载可选 YAML 配置；文件缺失时保持旧版本行为。"""
         if not path.exists():
             return {}
         return self._read_yaml(path)
+
+    def _load_policy_delivery(self, path: Path, root: Path) -> PolicyDeliveryConfig:
+        if not path.exists():
+            return PolicyDeliveryConfig(data_dir=str(root / "data"), state_db_path=str(root / "data" / "state.db"))
+        data = self._read_yaml(path)
+        raw = data.get("policy_delivery", data)
+        if not isinstance(raw, dict):
+            raise ConfigValidationError("policy_delivery 配置必须是映射")
+        for field_name in ("data_dir", "state_db_path", "opa_binary"):
+            value = raw.get(field_name)
+            if value and not Path(value).is_absolute():
+                raw[field_name] = str(root / value)
+        if "required_instance_ids" in raw:
+            raw["required_instance_ids"] = tuple(raw["required_instance_ids"])
+        try:
+            return PolicyDeliveryConfig(**raw)
+        except TypeError as exc:
+            raise ConfigValidationError(f"policy_delivery 配置非法：{exc}") from exc
 
     def _load_persistence(self, path: Path) -> PersistenceConfig:
         if not path.exists():
@@ -868,6 +1183,23 @@ class ConfigLoader:
             )
             for r in data.get("rules", [])
         ]
+        webhook_data = data.get("webhook", {})
+        if not isinstance(webhook_data, dict):
+            raise ConfigValidationError(f"{path}: Approval webhook config 必须是映射")
+        webhook_data = resolve_env_refs(webhook_data)
+        webhook = self._construct(
+            path,
+            "Approval webhook config",
+            partial(ApprovalWebhookConfig, **webhook_data),
+        )
+        if webhook.enabled and not webhook.url.strip():
+            raise ConfigValidationError(f"{path}: 启用审批 webhook 时 url 不能为空")
+        if webhook.timeout_seconds <= 0 or webhook.poll_interval_seconds <= 0:
+            raise ConfigValidationError(f"{path}: webhook timeout/poll interval 必须大于 0")
+        if webhook.lease_seconds <= 0 or webhook.batch_size <= 0:
+            raise ConfigValidationError(f"{path}: webhook lease/batch size 必须大于 0")
+        if webhook.retry_base_seconds <= 0 or webhook.retry_max_seconds < webhook.retry_base_seconds:
+            raise ConfigValidationError(f"{path}: webhook 重试区间配置无效")
         return self._construct(
             path,
             "Approval config",
@@ -875,6 +1207,7 @@ class ConfigLoader:
                 ApprovalConfig,
                 default=data.get("approvers", {}).get("default", ""),
                 rules=rules,
+                webhook=webhook,
             ),
         )
 
@@ -1360,6 +1693,31 @@ class ConfigLoader:
                 "evidence.anchor.startup.conflict_policy 当前只能是 block_writes"
             )
 
+    def _check_policy_delivery(self, config: AppConfig, opa_base_url: str | None) -> None:
+        delivery = config.policy_delivery
+        if not delivery.enabled:
+            return
+        if not delivery.required_instance_ids or delivery.status_ttl_seconds <= 0:
+            raise ConfigValidationError("policy_delivery required_instance_ids 不能为空且 TTL 必须为正数")
+        binary = Path(delivery.opa_binary)
+        if not binary.is_absolute() or not binary.is_file():
+            raise ConfigValidationError("policy_delivery.opa_binary 必须是存在的绝对文件")
+        tokens: list[str] = []
+        for field_name in ("admin_token_env", "bundle_token_env", "status_token_env"):
+            env_name = getattr(delivery, field_name)
+            token = os.environ.get(env_name, "")
+            if not token:
+                raise ConfigValidationError(f"policy_delivery credential 环境变量 {env_name!r} 未设置")
+            tokens.append(token)
+        if len(set(tokens)) != 3:
+            raise ConfigValidationError("policy_delivery 三类 credential 必须互不相同")
+        if delivery.shadow_candidate_endpoint and opa_base_url:
+            def normalized(url: str) -> tuple[str, str | None, int | None]:
+                parsed = urlparse(url)
+                return parsed.scheme.lower(), parsed.hostname, parsed.port
+            if normalized(delivery.shadow_candidate_endpoint) == normalized(opa_base_url):
+                raise ConfigValidationError("shadow candidate endpoint 必须与 production OPA 隔离")
+
     @staticmethod
     def resolve_anchor_public_key(config: AppConfig) -> Ed25519PublicKey:
         receipt = config.evidence_config["evidence"]["anchor"]["receipt"]
@@ -1400,6 +1758,29 @@ class ConfigLoader:
                 raise ConfigValidationError(
                     "identity.provider=jwt 时必须配置 jwt.jwks_url 或 jwt.public_key"
                 )
+            for ttl_key in ("jwks_cache_ttl_seconds", "jwks_hard_ttl_seconds"):
+                value = jwt_cfg.get(ttl_key)
+                if value is not None and (
+                    not isinstance(value, (int, float)) or value <= 0
+                ):
+                    raise ConfigValidationError(
+                        f"identity.jwt.{ttl_key} 必须是正数，当前值：{value!r}"
+                    )
+            cache_ttl = float(jwt_cfg.get("jwks_cache_ttl_seconds", 300.0))
+            hard_ttl = float(jwt_cfg.get("jwks_hard_ttl_seconds", 3600.0))
+            if hard_ttl < cache_ttl:
+                raise ConfigValidationError(
+                    "identity.jwt.jwks_hard_ttl_seconds 不得小于 jwks_cache_ttl_seconds"
+                )
+            jwks_url = jwt_cfg.get("jwks_url")
+            if (
+                isinstance(jwks_url, str)
+                and jwks_url.startswith("http://")
+                and not jwt_cfg.get("allow_http_jwks")
+            ):
+                raise ConfigValidationError(
+                    "identity.jwt.jwks_url 必须使用 https（或显式 allow_http_jwks=true）"
+                )
 
         if provider == "mtls":
             mtls_cfg = identity.get("mtls", {})
@@ -1423,6 +1804,147 @@ class ConfigLoader:
                         raise ConfigValidationError(
                             f"identity.static.allowed_tokens[{idx}] 缺少或空字段 {field}"
                         )
+
+    def _check_execution_security(self, config: AppConfig) -> None:
+        security = config.execution_security
+        if security.mode not in {COMPATIBILITY_MODE, STRICT_MODE}:
+            raise ConfigValidationError("execution_security.mode 必须是 compatibility / strict")
+        unknown_egress = security.supported_egress_types - STRICT_EGRESS_TYPES
+        if unknown_egress:
+            raise ConfigValidationError(
+                f"execution_security 包含未知出口：{sorted(unknown_egress)}"
+            )
+        unknown_capabilities = security.supported_security_capabilities - SECURITY_CAPABILITIES
+        if unknown_capabilities:
+            raise ConfigValidationError(
+                f"execution_security 包含未知 capability：{sorted(unknown_capabilities)}"
+            )
+        missing = (
+            security.required_security_capabilities
+            - security.supported_security_capabilities
+        )
+        if missing:
+            raise ConfigValidationError(
+                f"required security capabilities 不受支持：{sorted(missing)}"
+            )
+        if not security.strict:
+            return
+        if config.local_function_specs:
+            raise ConfigValidationError("strict 禁止 local function executor")
+        if config.tool_mapping:
+            referenced_servers = {entry.server for entry in config.tool_mapping.values()}
+            if len(referenced_servers) != 1:
+                raise ConfigValidationError("strict MCP 工具必须统一经单个 protected proxy")
+            server_name = next(iter(referenced_servers))
+            server = config.mcp_servers.get(server_name)
+            if server is None:
+                raise ConfigValidationError(f"strict MCP server {server_name!r} 不存在")
+            if server.transport == "sse":
+                raise ConfigValidationError("strict 禁止旧 SSE MCP transport")
+            if server.transport != "streamable_http":
+                raise ConfigValidationError("strict MCP 必须使用 streamable_http")
+            parsed = urlparse(server.url or "")
+            if parsed.scheme != "https" or not parsed.hostname:
+                raise ConfigValidationError("strict MCP URL 必须是 HTTPS")
+            if not all((server.ca_cert, server.client_cert, server.client_key)):
+                raise ConfigValidationError("strict MCP 必须完整配置 CA/client cert/client key")
+            if not server.expected_workload and not server.cert_sha256:
+                raise ConfigValidationError("strict MCP 必须配置 expected_workload 或 cert_sha256")
+            if server.cert_sha256 and not re.fullmatch(r"(?:[0-9a-fA-F]{2}:?){32}", server.cert_sha256):
+                raise ConfigValidationError("strict MCP cert_sha256 必须是 SHA-256 指纹")
+            root = Path(config.policy_dir).parent
+            for field_name in ("ca_cert", "client_cert", "client_key"):
+                configured = Path(cast(str, getattr(server, field_name)))
+                path = configured if configured.is_absolute() else root / configured
+                if not path.is_file() or not os.access(path, os.R_OK):
+                    raise ConfigValidationError(
+                        f"strict MCP TLS 文件 {field_name} 不存在或不可读"
+                    )
+            if "protected_mcp_network" not in security.supported_egress_types:
+                raise ConfigValidationError("strict MCP 未声明 protected_mcp_network 出口")
+            if "protected_mcp_network_v1" not in security.supported_security_capabilities:
+                raise ConfigValidationError("strict MCP 未声明 protected_mcp_network_v1")
+        if config.harness_execution_policy.allow_fallback_to_local:
+            raise ConfigValidationError("strict 禁止 Harness local fallback")
+        if config.harness_execution_policy.default_mode in {
+            "trusted_local",
+            "harness_preferred",
+        } or config.harness_execution_policy.trusted_local_tools:
+            raise ConfigValidationError("strict 禁止 default/local/fallback 执行策略")
+        if any(
+            policy.mode in {"trusted_local", "harness_preferred"}
+            for policy in config.harness_execution_policy.tools.values()
+        ):
+            raise ConfigValidationError("strict 禁止工具级 local/fallback 执行策略")
+        for name, backend in config.harness_backends.items():
+            if not isinstance(backend, HTTPBackendConfig):
+                raise ConfigValidationError(
+                    f"strict Harness 后端 {name} 必须是 remote HTTP"
+                )
+            if (
+                urlparse(backend.base_url).scheme != "https"
+                or not backend.tls.verify
+                or not backend.tls.client_cert_file
+                or not backend.tls.client_key_file
+                or not backend.authenticated_workload_id
+            ):
+                raise ConfigValidationError(
+                    f"strict Harness 后端 {name} 必须使用 HTTPS+mTLS+workload"
+                )
+        if config.http_tool_specs and "protected_http" not in security.supported_egress_types:
+            raise ConfigValidationError("strict HTTP 工具未声明 protected_http 出口")
+        if config.harness_tool_specs and "remote_harness" not in security.supported_egress_types:
+            raise ConfigValidationError("strict Harness 工具未声明 remote_harness 出口")
+        for name, spec in config.http_tool_specs.items():
+            if spec.protected_credential_ref is None:
+                raise ConfigValidationError(
+                    f"strict HTTP 工具 {name} 缺少 protected_credential_ref"
+                )
+        if config.http_tool_specs and not config.secrets_config.get("_explicit", False):
+            raise ConfigValidationError("strict 必须显式配置 secrets.yaml")
+        if security.require_instance_identity and not any(
+            item.authenticated_instance_ids for item in security.trusted_workloads
+        ):
+            raise ConfigValidationError("strict require_instance_identity 缺少可信实例绑定")
+        if security.require_external_deployment_attestation:
+            observation = security.runtime_observation
+            if not all(
+                (
+                    observation.external_attestation_provider,
+                    observation.deployment_proof_path,
+                    observation.deployment_proof_key_env,
+                    observation.workload,
+                    observation.instance,
+                    observation.profile_sha256,
+                    observation.environment_digest,
+                )
+            ):
+                raise ConfigValidationError("strict 要求完整且可验证的 external deployment proof 配置")
+
+    def _check_rbac(self, config: AppConfig) -> None:
+        """校验 v0.52 RBAC 配置，避免 enforcement 开启后因配置错误锁死或裸奔。"""
+        rbac = config.rbac
+        if rbac.enforcement not in {"disabled", "enforce"}:
+            raise ConfigValidationError(
+                f"rbac.enforcement 必须是 disabled / enforce，当前值：{rbac.enforcement!r}"
+            )
+        if rbac.legacy_key_role not in {"platform_admin", "reject"}:
+            raise ConfigValidationError(
+                f"rbac.legacy_key_role 必须是 platform_admin / reject，当前值：{rbac.legacy_key_role!r}"
+            )
+        if rbac.enforcement != "enforce":
+            return
+        # enforce 模式下必须存在至少一条可用凭证路径，否则全部管理面锁死。
+        if not rbac.bindings and not rbac.dynamic_role_bindings:
+            raise ConfigValidationError(
+                "rbac.enforcement=enforce 时必须配置 bindings 或启用 dynamic_role_bindings，"
+                "否则没有任何主体可访问管理面"
+            )
+        for binding in rbac.bindings:
+            if not os.environ.get(binding.token_env):
+                raise ConfigValidationError(
+                    f"rbac 静态凭证 {binding.principal!r} 的环境变量 {binding.token_env} 未设置"
+                )
 
     def _check_entrypoints_config(self, config: AppConfig) -> None:
         """校验入口认证配置，避免未知的 auth 类型或格式错误。"""
@@ -1461,6 +1983,38 @@ class ConfigLoader:
             or any(not isinstance(p, str) or not p for p in profiles)
         ):
             raise ConfigValidationError("admin.agent_profiles 必须是非空字符串列表")
+
+    def _check_approval_auth_config(self, config: AppConfig) -> None:
+        auth = config.entrypoints_config.get("approval_auth")
+        if auth is None:
+            return
+        if not isinstance(auth, dict):
+            raise ConfigValidationError("approval_auth 必须是对象")
+        allowlist = auth.get("allowlist")
+        credentials = auth.get("credentials")
+        if not isinstance(allowlist, list) or not allowlist or any(
+            not isinstance(value, str) or not value.strip() for value in allowlist
+        ):
+            raise ConfigValidationError("approval_auth.allowlist 必须是非空 principal 列表")
+        if not isinstance(credentials, list) or not credentials:
+            raise ConfigValidationError("approval_auth.credentials 必须是非空列表")
+        principals: set[str] = set()
+        token_envs: set[str] = set()
+        for idx, entry in enumerate(credentials):
+            if not isinstance(entry, dict):
+                raise ConfigValidationError(f"approval_auth.credentials[{idx}] 必须是对象")
+            principal = entry.get("principal")
+            token_env = entry.get("token_env")
+            if not isinstance(principal, str) or not principal.strip():
+                raise ConfigValidationError(f"approval_auth.credentials[{idx}].principal 不能为空")
+            if not isinstance(token_env, str) or not token_env.strip():
+                raise ConfigValidationError(f"approval_auth.credentials[{idx}].token_env 不能为空")
+            if principal in principals or token_env in token_envs:
+                raise ConfigValidationError("approval_auth principal 和 token_env 必须唯一")
+            principals.add(principal)
+            token_envs.add(token_env)
+        if not set(allowlist).issubset(principals):
+            raise ConfigValidationError("approval_auth.allowlist principal 必须配置对应凭证")
 
     # -- 工具 ---------------------------------------------------------------
 

@@ -85,6 +85,29 @@ async def test_small_response_decoded_ok() -> None:
 
 
 @pytest.mark.asyncio
+async def test_strict_cross_origin_redirect_strips_sensitive_headers() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "first.example.com":
+            return httpx.Response(302, headers={"Location": "https://second.example.com/end"})
+        return httpx.Response(200, content=b"ok")
+
+    client = HTTPClient(transport=httpx.MockTransport(handler))
+    async with client:
+        await client.request(
+            "GET",
+            "https://first.example.com/start",
+            headers={"Authorization": "Bearer secret", "X-Trace": "safe"},
+            protect_sensitive_headers=True,
+        )
+    assert "authorization" in seen[0].headers
+    assert "authorization" not in seen[1].headers
+    assert seen[1].headers["x-trace"] == "safe"
+
+
+@pytest.mark.asyncio
 async def test_invalid_content_length_falls_back_to_streaming() -> None:
     """v0.23.2：非法 Content-Length 不应导致 ValueError，应降级为流式读取。"""
     client = HTTPClient(

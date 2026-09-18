@@ -1,7 +1,7 @@
 # Loop Controller — 企业内部 Agent 工具调用治理基础设施
 
-> **当前版本**：v0.48.0（委托审批持久化与可靠恢复派发）
-> **项目阶段**：双治理平面已落地——Python 工具调用治理层（R1 风险评估 → R2 Checkpoint 判定 → R3 审计证据链，`@governed` SDK / MCP Proxy / HTTP REST 三种接入，可信身份、全局吊销、可插拔执行器、受治理的 Harness 出口）+ Agent 交互治理平面（Go A2A 内核 + Python IIGE，含可信单跳/递归委托、委托审批状态机、分布式可靠性、SQLite 统一状态层）。
+> **当前版本**：v0.54.0（可靠多 Agent 调度与执行编排基线）
+> **项目阶段**：可靠调度代码与代码级门禁已完成；真实双独立 OS 进程/容器崩溃接管，以及 Protected MCP 完整拓扑、Go→Python strict、Docker/Kubernetes CNI 与 Secret 隔离等支持环境发布门禁仍待执行。`compatibility` 为默认模式，`strict` 必须显式启用。
 > **首选语言**：Python（Agent 生态最丰富，社区传播友好）
 > **文档语言**：中文为主，代码与核心 API 文档以英文为主，便于国际化开源
 
@@ -95,17 +95,17 @@ tests/legacy/security_experiments/  # 早期实验（已归档，pytest 忽略�
 
 ---
 
-## 5. v0.27.0 安全边界摘要
+## 5. v0.54.0 可靠调度与安全边界摘要
 
-v0.27.0 为远程 HTTP Harness 补齐启动期配置校验、HMAC/API Key 认证、timestamp + nonce 防重放、每后端进程内并发门控、健康检查、TLS/可选 mTLS 客户端配置、Secret 吊销接线、稳定失败语义，以及 `default_risk` 风险下限接线。生产环境应由部署层运行独立 HTTPS Harness Service；Loop Controller 不直接执行 Shell/SQL/Browser，也不编排 Docker/Kubernetes。
+v0.54.0 提供可靠多 Agent 调度：Agent spec/status 与容量路由、durable assignment/outbox、lease/attempt/fence、预算感知 retry/failover/dead-letter、有界静态 DAG、可恢复 SSE、正式 SQLite migration，以及 readiness 与低基数 Prometheus metrics。dispatch 是 **at-least-once**；外部副作用不保证 exactly-once。下游必须按稳定 `delivery_id`/幂等键去重，并拒绝旧 attempt/fence；发送后无法确认结果时进入 `outcome_unknown`，不得盲目重放。
 
-参考 Harness 是协议与安全失败语义示例，不是生产沙箱。网络/文件系统/进程/资源隔离依赖容器、Kubernetes、VM 或专用主机；多副本全局防重放、分布式并发配额、远程取消与长期幂等均未提供。Harness 后端状态可通过受现有 Admin API key 保护的只读端点查询，执行、排队、过载、in-flight 与健康指标已接入 Prometheus。完整说明见 [`src/KNOWN_LIMITATIONS.md`](./src/KNOWN_LIMITATIONS.md)，配置说明见 [`src/README.md`](./src/README.md#配置)。
+调度状态基于 SQLite WAL，范围是单区域、小到中等规模部署，不提供跨区域共识或无限水平扩展；不提供 federation、动态 Agent 自助注册、通用 workflow 或 Saga/补偿事务引擎。mTLS、身份绑定、受保护出口和 proof 已有代码级验证，但 Protected MCP 完整拓扑、Go→Python strict、Docker/Kubernetes CNI/NetworkPolicy、Secret 隔离及 external DeploymentProof 的生产环境门禁尚未完成。Windows 仅支持开发，不提供 strict production assurance。完整说明见 [`src/KNOWN_LIMITATIONS.md`](./src/KNOWN_LIMITATIONS.md)。
 
-## 5. 快速开始
+## 6. 快速开始
 
 ### 环境要求
 
-- Python >= 3.12
+- Python 3.12 或 3.13（正式测试版本）
 - Git
 - OPA（Open Policy Agent）二进制，用于策略引擎
 
@@ -198,7 +198,7 @@ v0.9.0 引入了两个基于 Python 的真实 MCP server（fetch / sqlite），�
 
 ```powershell
 # 1. 启动 OPA
-.venv\Scripts\lc opa-start
+opa run --server --addr localhost:8181 policies/
 
 # 2. 初始化演示数据库
 .venv\Scripts\python.exe scripts\init_demo_db.py
@@ -237,7 +237,7 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 
 ---
 
-## 6. 验收清单（A1-A14）
+## 7. 验收清单（A1-A14）
 
 | ID | 验收项 | 自动化用例位置 |
 |---|---|---|
@@ -298,6 +298,11 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 - [x] v0.46.0：可信单跳 A2A 委托闭环（Bearer 身份绑定、独立工作负载凭证）
 - [x] v0.47.0：可信递归委托、权限与预算衰减
 - [x] v0.48.0：委托审批持久化与可靠恢复派发
+- [x] v0.49.0：审批可靠性收敛与治理默认硬化（SQLite 工具审批主路径、双平面可靠 webhook、认证审批 principal、Checkpoint 显式降级）
+- [x] v0.50.0：OPA Bundle 策略交付、加载确认、shadow 模拟与变更审计
+- [x] v0.52.0：多租户、企业身份与 RBAC
+- [x] v0.53.0：workload/delegated identity、Secret 引用、受保护出口、ExecutionReceipt、能力协商与静态部署 conformance
+- [x] v0.54.0：可靠多 Agent 调度、durable assignment/lease/fence、retry/failover/dead-letter、有界静态 DAG、可靠 SSE、migration、readiness 与 metrics（支持环境门禁仍待执行）
 - [ ] T3.5（可选）：LLMPlanner JSON Schema 契约实现
 - [ ] 补充更多示例与文档
 - [ ] 建立完整 CI/CD、代码规范、贡献指南
@@ -325,6 +330,6 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 
 ---
 
-## 10. 许可证
+## 11. 许可证
 
 Apache-2.0，详见 [LICENSE](./LICENSE)。

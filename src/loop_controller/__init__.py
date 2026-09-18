@@ -11,7 +11,7 @@ from loop_controller.agent_sdk import (
     launch_agent,
 )
 from loop_controller.approval_manager import AsyncApprovalManager
-from loop_controller.checkpoint import Checkpoint, CheckpointError
+from loop_controller.checkpoint import Checkpoint, CheckpointConfigurationError, CheckpointError
 from loop_controller.classifier import LightweightClassifier, RuleBasedClassifier
 from loop_controller.controller import LoopController, build_controller
 from loop_controller.executors import ExecutionContext, ExecutorRegistry, MCPExecutor, ToolExecutor
@@ -56,6 +56,7 @@ __all__ = [
     "build_controller",
     "CapabilityProfile",
     "Checkpoint",
+    "CheckpointConfigurationError",
     "CheckpointError",
     "ConfigIdentityProvider",
     "Decision",

@@ -156,7 +156,11 @@ def _validate_request_shape(payload: Any) -> None:
     _validate_keys(payload, {"tool", "arguments", "context", "sandbox"}, "请求")
     _validate_keys(
         payload.get("context"),
-        {"call_id", "task_id", "agent_id", "user_id", "session_id", "tenant_id"},
+        {
+            "call_id", "task_id", "agent_id", "user_id", "session_id", "tenant_id",
+            "request_id", "interaction_id", "decision_id", "delegation_jti",
+            "workload_id", "authenticated_instance_id", "security_capabilities",
+        },
         "context",
     )
     _validate_keys(

@@ -1,0 +1,10 @@
+rbac:
+  enforcement: disabled
+  state_db_path: ./data/rbac_state.db
+  allow_claim_tenant: false
+  dynamic_role_bindings: false
+  allow_self_publish: false
+  legacy_key_role: platform_admin
+  role_map: {}
+  bindings: []
+  cross_tenant_grants: []

@@ -45,6 +45,22 @@ func TestCreateAndGet(t *testing.T) {
 	}
 }
 
+func TestCreateWithDelegationPersistsSecurityBindings(t *testing.T) {
+	m := New(openTestStore(t))
+	created, err := m.CreateWithDelegation("task-bound", "session-1", "agent-a", "agent-b", "interaction-1", "decision-1", "interaction-1", "", "", "", 0, nil,
+		[]string{"echo"}, []string{"read"}, false, models.DelegationBudget{}, "request-1", "tenant-1", "spiffe://example/executor", "instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Get(created.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RequestID != "request-1" || got.TenantID != "tenant-1" || got.TargetWorkloadID != "spiffe://example/executor" || got.TargetInstanceID != "instance-1" {
+		t.Fatalf("delegation security bindings not persisted: %+v", got)
+	}
+}
+
 func TestGetNotFound(t *testing.T) {
 	m := New(openTestStore(t))
 	_, err := m.Get("missing")

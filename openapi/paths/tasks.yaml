@@ -97,7 +97,7 @@
             example: |
               id: ev-001
               event: task_created
-              data: {"protocol_version":"0.48.0","event_id":"ev-001","task_id":"task-001","event_type":"task_created","payload":{},"published_at":"2026-09-01T12:00:00Z"}
+              data: {"protocol_version":"0.53.0","event_id":"ev-001","task_id":"task-001","event_type":"task_created","payload":{},"published_at":"2026-09-01T12:00:00Z"}
 
 /a2a/v1/tasks/{id}/cancel:
   post:
@@ -218,6 +218,12 @@
               deadline:
                 type: string
                 format: date-time
+              budget:
+                type: object
+                properties:
+                  token_count: {type: integer, minimum: 0}
+                  payment_amount: {type: number, minimum: 0}
+                  currency: {type: string}
     responses:
       '201':
         description: Task received

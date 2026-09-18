@@ -6,17 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	"github.com/loop-controller/go/internal/models"
 )
 
 var (
-	ErrStatusConflict    = errors.New("task status conflict")
-	ErrInvalidTransition = errors.New("invalid task status transition")
-	ErrBudgetExceeded    = errors.New("parent task budget exceeded")
-	ErrInvalidParent     = errors.New("invalid parent task")
+	ErrStatusConflict     = errors.New("task status conflict")
+	ErrInvalidTransition  = errors.New("invalid task status transition")
+	ErrBudgetExceeded     = errors.New("parent task budget exceeded")
+	ErrInvalidParent      = errors.New("invalid parent task")
+	ErrExecutionLeaseLost = errors.New("execution lease lost")
 )
 
 var validStatusTransitions = map[string]map[string]bool{
@@ -34,6 +34,7 @@ type TaskStore interface {
 	Create(ctx context.Context, t models.Task) error
 	CreateWithEvent(ctx context.Context, t models.Task) (models.TaskEvent, error)
 	Get(ctx context.Context, taskID string) (models.Task, error)
+	GetForTenant(ctx context.Context, tenantID, taskID string) (models.Task, error)
 	UpdateStatus(ctx context.Context, taskID, expectedStatus, status string, outcome []byte, errorCode string) (models.Task, models.TaskEvent, error)
 	UpdateStatusWithConsumption(ctx context.Context, taskID, expectedStatus, status string, outcome []byte, errorCode string, consumed models.DelegationBudget) (models.Task, models.TaskEvent, error)
 	RecordLifecycle(ctx context.Context, task models.Task, event string) error
@@ -43,7 +44,8 @@ type TaskStore interface {
 	ListDescendants(ctx context.Context, taskID string) ([]models.Task, error)
 	CancelDescendants(ctx context.Context, taskID string) ([]models.Task, error)
 	// RenewExecutionLease extends the lease of a running task owned by this
-	// instance, preventing another instance from reclaiming a still-alive run.
+	// instance. It returns ErrExecutionLeaseLost if the task is missing, is no
+	// longer running, or is owned by another instance.
 	RenewExecutionLease(ctx context.Context, taskID string) error
 	// RecoverExpiredRunning transitions running tasks whose lease expired to
 	// outcome_unknown. Each transition is an atomic compare-and-set guarded by
@@ -53,10 +55,9 @@ type TaskStore interface {
 }
 
 type taskStore struct {
-	db      *sql.DB
-	owner   string
-	lease   *time.Duration
-	counter uint64
+	db    *sql.DB
+	owner string
+	lease *time.Duration
 }
 
 func (s *taskStore) DelegationApprovalStore() DelegationApprovalStore {
@@ -88,7 +89,7 @@ func (s *taskStore) CreateWithEvent(ctx context.Context, t models.Task) (models.
 	}
 	event := models.TaskEvent{
 		ProtocolVersion: models.CurrentProtocolVersion,
-		EventID:         fmt.Sprintf("ev-%s-%s-%d-%d", s.owner, t.TaskID, t.CreatedAt.UnixNano(), atomic.AddUint64(&s.counter, 1)),
+		EventID:         newEventID(s.owner, t.TaskID, t.CreatedAt),
 		TaskID:          t.TaskID,
 		EventType:       "task_created",
 		Payload:         payload,
@@ -103,10 +104,7 @@ func (s *taskStore) CreateWithEvent(ctx context.Context, t models.Task) (models.
 	if _, err := insertTask(ctx, tx, t); err != nil {
 		return models.TaskEvent{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO events (event_id, task_id, event_type, payload_json, published_at, published)
-		VALUES (?, ?, ?, ?, ?, 0)
-	`, event.EventID, event.TaskID, event.EventType, string(event.Payload), event.PublishedAt.Format(time.RFC3339)); err != nil {
+	if err := appendEvent(ctx, tx, &event); err != nil {
 		return models.TaskEvent{}, fmt.Errorf("insert task event: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -130,7 +128,7 @@ func (s *taskStore) CreateChildWithBudget(ctx context.Context, child models.Task
 	}
 	event := models.TaskEvent{
 		ProtocolVersion: models.CurrentProtocolVersion,
-		EventID:         fmt.Sprintf("ev-%s-%s-%d-%d", s.owner, child.TaskID, child.CreatedAt.UnixNano(), atomic.AddUint64(&s.counter, 1)),
+		EventID:         newEventID(s.owner, child.TaskID, child.CreatedAt),
 		TaskID:          child.TaskID, EventType: "task_created", Payload: payload, PublishedAt: child.CreatedAt,
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -159,10 +157,7 @@ func (s *taskStore) CreateChildWithBudget(ctx context.Context, child models.Task
 	if _, err := insertTask(ctx, tx, child); err != nil {
 		return models.TaskEvent{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO events (event_id, task_id, event_type, payload_json, published_at, published)
-		VALUES (?, ?, ?, ?, ?, 0)
-	`, event.EventID, event.TaskID, event.EventType, string(event.Payload), event.PublishedAt.Format(time.RFC3339)); err != nil {
+	if err := appendEvent(ctx, tx, &event); err != nil {
 		return models.TaskEvent{}, fmt.Errorf("insert task event: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -194,8 +189,8 @@ func insertTask(ctx context.Context, execer taskExecer, t models.Task) (sql.Resu
 	allowedTools, _ := json.Marshal(t.AllowedTools)
 	allowedCapabilities, _ := json.Marshal(t.AllowedCapabilities)
 	res, err := execer.ExecContext(ctx, `
-		INSERT INTO tasks (task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO tasks (task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token, tenant_id, request_id, target_workload_id, target_instance_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, t.TaskID, t.SessionID, t.InteractionID, t.DecisionID, t.RootInteractionID, t.ParentInteractionID,
 		t.RootTaskID, t.ParentTaskID, t.DelegationDepth, deadline,
 		t.Budget.TokenCount, t.Budget.PaymentAmount, t.Budget.Currency,
@@ -203,7 +198,7 @@ func insertTask(ctx context.Context, execer taskExecer, t models.Task) (sql.Resu
 		t.ConsumedBudget.TokenCount, t.ConsumedBudget.PaymentAmount,
 		string(allowedTools), string(allowedCapabilities), t.AllowRedelegation,
 		t.InitiatorAgentID, t.TargetAgentID, t.Status, t.CreatedAt.Format(time.RFC3339), t.UpdatedAt.Format(time.RFC3339),
-		completedAt, outcome, t.ErrorCode, t.DelegationToken)
+		completedAt, outcome, t.ErrorCode, t.DelegationToken, t.TenantID, t.RequestID, t.TargetWorkloadID, t.TargetInstanceID)
 	if err != nil {
 		return nil, fmt.Errorf("insert task: %w", err)
 	}
@@ -211,11 +206,19 @@ func insertTask(ctx context.Context, execer taskExecer, t models.Task) (sql.Resu
 }
 
 func (s *taskStore) Get(ctx context.Context, taskID string) (models.Task, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token
-		FROM tasks
-		WHERE task_id = ?
-	`, taskID)
+	return getTask(ctx, s.db, "task_id = ?", taskID)
+}
+
+func (s *taskStore) GetForTenant(ctx context.Context, tenantID, taskID string) (models.Task, error) {
+	return getTask(ctx, s.db, "tenant_id = ? AND task_id = ?", tenantID, taskID)
+}
+
+func getTask(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, where string, args ...any) (models.Task, error) {
+	row := q.QueryRowContext(ctx, `
+		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token, tenant_id, request_id, target_workload_id, target_instance_id
+		FROM tasks WHERE `+where, args...)
 	return scanTask(row)
 }
 
@@ -265,36 +268,19 @@ func (s *taskStore) UpdateStatusWithConsumption(ctx context.Context, taskID, exp
 		return models.Task{}, models.TaskEvent{}, ErrStatusConflict
 	}
 	if isFinalStatus(status) {
-		res, err := tx.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, `
 			UPDATE tasks
-			SET reserved_token_count = reserved_token_count - (SELECT budget_token_count FROM tasks WHERE task_id = ?),
-			    reserved_payment_amount = reserved_payment_amount - (SELECT budget_payment_amount FROM tasks WHERE task_id = ?),
-			    consumed_token_count = consumed_token_count + ?,
-			    consumed_payment_amount = consumed_payment_amount + ?
-			WHERE task_id = (SELECT parent_task_id FROM tasks WHERE task_id = ?)
-			  AND reserved_token_count >= (SELECT budget_token_count FROM tasks WHERE task_id = ?)
-			  AND reserved_payment_amount >= (SELECT budget_payment_amount FROM tasks WHERE task_id = ?)
-			  AND ? <= (SELECT budget_token_count FROM tasks WHERE task_id = ?)
-			  AND ? <= (SELECT budget_payment_amount FROM tasks WHERE task_id = ?)
-		`, taskID, taskID, consumed.TokenCount, consumed.PaymentAmount, taskID,
-			taskID, taskID, consumed.TokenCount, taskID, consumed.PaymentAmount, taskID)
-		if err != nil {
-			return models.Task{}, models.TaskEvent{}, fmt.Errorf("settle parent budget: %w", err)
-		}
-		if parentID, err := childParentID(ctx, tx, taskID); err != nil {
-			return models.Task{}, models.TaskEvent{}, err
-		} else if parentID != "" {
-			n, err := res.RowsAffected()
-			if err != nil {
-				return models.Task{}, models.TaskEvent{}, fmt.Errorf("settle parent budget rows affected: %w", err)
-			}
-			if n != 1 {
-				return models.Task{}, models.TaskEvent{}, ErrBudgetExceeded
-			}
+			SET exec_owner = '', exec_lease_expires_at = 0
+			WHERE task_id = ?
+		`, taskID); err != nil {
+			return models.Task{}, models.TaskEvent{}, fmt.Errorf("clear execution lease: %w", err)
 		}
 	}
+	if err := settleTaskBudgetTx(ctx, tx, taskID, status, consumed, now); err != nil {
+		return models.Task{}, models.TaskEvent{}, err
+	}
 	updated, err := scanTask(tx.QueryRowContext(ctx, `
-		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token
+		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token, tenant_id, request_id, target_workload_id, target_instance_id
 		FROM tasks WHERE task_id = ?
 	`, taskID))
 	if err != nil {
@@ -306,16 +292,13 @@ func (s *taskStore) UpdateStatusWithConsumption(ctx context.Context, taskID, exp
 	}
 	event := models.TaskEvent{
 		ProtocolVersion: models.CurrentProtocolVersion,
-		EventID:         fmt.Sprintf("ev-%s-%s-%d-%d", s.owner, taskID, now.UnixNano(), atomic.AddUint64(&s.counter, 1)),
+		EventID:         newEventID(s.owner, taskID, now),
 		TaskID:          taskID,
 		EventType:       eventTypeForStatus(status),
 		Payload:         payload,
 		PublishedAt:     now,
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO events (event_id, task_id, event_type, payload_json, published_at, published)
-		VALUES (?, ?, ?, ?, ?, 0)
-	`, event.EventID, event.TaskID, event.EventType, string(event.Payload), event.PublishedAt.Format(time.RFC3339)); err != nil {
+	if err := appendEvent(ctx, tx, &event); err != nil {
 		return models.Task{}, models.TaskEvent{}, fmt.Errorf("insert task event: %w", err)
 	}
 	if err := insertLifecycleOutbox(ctx, tx, updated, status, now); err != nil {
@@ -366,17 +349,25 @@ func (s *taskStore) SetDelegationToken(ctx context.Context, taskID, delegationTo
 	return nil
 }
 
-// RenewExecutionLease extends this instance's lease on a running task. It is a
-// no-op when the task is no longer running or is owned by another instance.
+// RenewExecutionLease extends this instance's lease on a running task. It
+// returns ErrExecutionLeaseLost when the guarded update no longer matches.
 func (s *taskStore) RenewExecutionLease(ctx context.Context, taskID string) error {
 	now := time.Now().UTC()
 	leaseExpiresAt := now.Add(s.leaseDuration()).UnixNano()
-	if _, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE tasks
 		SET exec_lease_expires_at = ?, updated_at = ?
 		WHERE task_id = ? AND status = 'running' AND exec_owner = ?
-	`, leaseExpiresAt, now.Format(time.RFC3339), taskID, s.owner); err != nil {
+	`, leaseExpiresAt, now.Format(time.RFC3339), taskID, s.owner)
+	if err != nil {
 		return fmt.Errorf("renew execution lease: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("renew execution lease rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: task %s", ErrExecutionLeaseLost, taskID)
 	}
 	return nil
 }
@@ -456,7 +447,7 @@ func (s *taskStore) recoverOne(ctx context.Context, taskID string, now time.Time
 	}
 
 	updated, err := scanTask(tx.QueryRowContext(ctx, `
-		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token
+		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token, tenant_id, request_id, target_workload_id, target_instance_id
 		FROM tasks WHERE task_id = ?
 	`, taskID))
 	if err != nil {
@@ -468,16 +459,13 @@ func (s *taskStore) recoverOne(ctx context.Context, taskID string, now time.Time
 	}
 	event := models.TaskEvent{
 		ProtocolVersion: models.CurrentProtocolVersion,
-		EventID:         fmt.Sprintf("ev-%s-%s-%d-%d", s.owner, taskID, now.UnixNano(), atomic.AddUint64(&s.counter, 1)),
+		EventID:         newEventID(s.owner, taskID, now),
 		TaskID:          taskID,
 		EventType:       eventTypeForStatus("outcome_unknown"),
 		Payload:         payload,
 		PublishedAt:     now,
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO events (event_id, task_id, event_type, payload_json, published_at, published)
-		VALUES (?, ?, ?, ?, ?, 0)
-	`, event.EventID, event.TaskID, event.EventType, string(event.Payload), event.PublishedAt.Format(time.RFC3339)); err != nil {
+	if err := appendEvent(ctx, tx, &event); err != nil {
 		return nil, fmt.Errorf("insert recovery event: %w", err)
 	}
 	if err := insertLifecycleOutbox(ctx, tx, updated, "outcome_unknown", now); err != nil {
@@ -491,7 +479,7 @@ func (s *taskStore) recoverOne(ctx context.Context, taskID string, now time.Time
 
 func (s *taskStore) ListBySession(ctx context.Context, sessionID string) ([]models.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token
+		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token, tenant_id, request_id, target_workload_id, target_instance_id
 		FROM tasks
 		WHERE session_id = ?
 		ORDER BY created_at DESC
@@ -505,7 +493,7 @@ func (s *taskStore) ListBySession(ctx context.Context, sessionID string) ([]mode
 
 func (s *taskStore) ListByTarget(ctx context.Context, targetAgentID string) ([]models.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token
+		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token, tenant_id, request_id, target_workload_id, target_instance_id
 		FROM tasks
 		WHERE target_agent_id = ?
 		ORDER BY created_at DESC
@@ -524,7 +512,7 @@ func (s *taskStore) ListDescendants(ctx context.Context, taskID string) ([]model
 			UNION ALL
 			SELECT t.task_id, d.depth + 1 FROM tasks t JOIN descendants d ON t.parent_task_id = d.task_id
 		)
-		SELECT t.task_id, t.session_id, t.interaction_id, t.decision_id, t.root_interaction_id, t.parent_interaction_id, t.root_task_id, t.parent_task_id, t.delegation_depth, t.deadline, t.budget_token_count, t.budget_payment_amount, t.budget_currency, t.reserved_token_count, t.reserved_payment_amount, t.consumed_token_count, t.consumed_payment_amount, t.allowed_tools_json, t.allowed_capabilities_json, t.allow_redelegation, t.initiator_agent_id, t.target_agent_id, t.status, t.created_at, t.updated_at, t.completed_at, t.outcome, t.error_code, t.delegation_token
+		SELECT t.task_id, t.session_id, t.interaction_id, t.decision_id, t.root_interaction_id, t.parent_interaction_id, t.root_task_id, t.parent_task_id, t.delegation_depth, t.deadline, t.budget_token_count, t.budget_payment_amount, t.budget_currency, t.reserved_token_count, t.reserved_payment_amount, t.consumed_token_count, t.consumed_payment_amount, t.allowed_tools_json, t.allowed_capabilities_json, t.allow_redelegation, t.initiator_agent_id, t.target_agent_id, t.status, t.created_at, t.updated_at, t.completed_at, t.outcome, t.error_code, t.delegation_token, t.tenant_id, t.request_id, t.target_workload_id, t.target_instance_id
 		FROM tasks t JOIN descendants d ON t.task_id = d.task_id
 		ORDER BY d.depth DESC, t.created_at DESC
 	`, taskID)
@@ -584,7 +572,7 @@ func (s *taskStore) CancelDescendants(ctx context.Context, taskID string) ([]mod
 			return nil, fmt.Errorf("refund cancelled descendant budget: %w", err)
 		}
 		t, err := scanTask(tx.QueryRowContext(ctx, `
-			SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token FROM tasks WHERE task_id = ?`, id))
+			SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token, tenant_id, request_id, target_workload_id, target_instance_id FROM tasks WHERE task_id = ?`, id))
 		if err != nil {
 			return nil, err
 		}
@@ -592,8 +580,8 @@ func (s *taskStore) CancelDescendants(ctx context.Context, taskID string) ([]mod
 		if err != nil {
 			return nil, err
 		}
-		event := models.TaskEvent{ProtocolVersion: models.CurrentProtocolVersion, EventID: fmt.Sprintf("ev-%s-%s-%d-%d", s.owner, id, now.UnixNano(), atomic.AddUint64(&s.counter, 1)), TaskID: id, EventType: "task_cancelled", Payload: payload, PublishedAt: now}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO events (event_id, task_id, event_type, payload_json, published_at, published) VALUES (?, ?, ?, ?, ?, 0)`, event.EventID, id, event.EventType, string(payload), now.Format(time.RFC3339)); err != nil {
+		event := models.TaskEvent{ProtocolVersion: models.CurrentProtocolVersion, EventID: newEventID(s.owner, id, now), TaskID: id, EventType: "task_cancelled", Payload: payload, PublishedAt: now}
+		if err := appendEvent(ctx, tx, &event); err != nil {
 			return nil, err
 		}
 		if err := insertLifecycleOutbox(ctx, tx, t, "cancelled", now); err != nil {
@@ -615,7 +603,7 @@ func scanTask(row *sql.Row) (models.Task, error) {
 	err := row.Scan(&t.TaskID, &t.SessionID, &t.InteractionID, &t.DecisionID, &t.RootInteractionID, &t.ParentInteractionID,
 		&t.RootTaskID, &t.ParentTaskID, &t.DelegationDepth, &deadline, &t.Budget.TokenCount, &t.Budget.PaymentAmount, &t.Budget.Currency, &t.ReservedBudget.TokenCount, &t.ReservedBudget.PaymentAmount,
 		&t.ConsumedBudget.TokenCount, &t.ConsumedBudget.PaymentAmount, &allowedTools, &allowedCapabilities, &t.AllowRedelegation,
-		&t.InitiatorAgentID, &t.TargetAgentID, &t.Status, &createdAt, &updatedAt, &completedAt, &outcome, &t.ErrorCode, &t.DelegationToken)
+		&t.InitiatorAgentID, &t.TargetAgentID, &t.Status, &createdAt, &updatedAt, &completedAt, &outcome, &t.ErrorCode, &t.DelegationToken, &t.TenantID, &t.RequestID, &t.TargetWorkloadID, &t.TargetInstanceID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return models.Task{}, err
@@ -682,7 +670,7 @@ func scanTaskFromRows(rows *sql.Rows) (models.Task, error) {
 	err := rows.Scan(&t.TaskID, &t.SessionID, &t.InteractionID, &t.DecisionID, &t.RootInteractionID, &t.ParentInteractionID,
 		&t.RootTaskID, &t.ParentTaskID, &t.DelegationDepth, &deadline, &t.Budget.TokenCount, &t.Budget.PaymentAmount, &t.Budget.Currency, &t.ReservedBudget.TokenCount, &t.ReservedBudget.PaymentAmount,
 		&t.ConsumedBudget.TokenCount, &t.ConsumedBudget.PaymentAmount, &allowedTools, &allowedCapabilities, &t.AllowRedelegation,
-		&t.InitiatorAgentID, &t.TargetAgentID, &t.Status, &createdAt, &updatedAt, &completedAt, &outcome, &t.ErrorCode, &t.DelegationToken)
+		&t.InitiatorAgentID, &t.TargetAgentID, &t.Status, &createdAt, &updatedAt, &completedAt, &outcome, &t.ErrorCode, &t.DelegationToken, &t.TenantID, &t.RequestID, &t.TargetWorkloadID, &t.TargetInstanceID)
 	if err != nil {
 		return models.Task{}, fmt.Errorf("scan task row: %w", err)
 	}

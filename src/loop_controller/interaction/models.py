@@ -102,6 +102,7 @@ class InteractionProposal(BaseModel):
     budget: dict[str, Any] = Field(default_factory=dict)
     deadline: datetime | None = None
     parent_allow_redelegation: bool = False
+    tenant_id: str = ""
     interaction_context: str = ""
 
 

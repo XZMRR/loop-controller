@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from loop_controller.infra.config_loader import ConfigLoader
+from loop_controller.models import ApprovalRecord, ApprovalRequest
 from loop_controller.proxy_server import LoopControllerProxyServer, ProxyIdentity
 from loop_controller.runtime import build_runtime
 
@@ -196,28 +197,45 @@ async def test_admin_harness_drain_missing_backend_errors(
 async def test_admin_recent_decisions_and_status(
     admin_proxy_ctx: LoopControllerProxyServer,
 ) -> None:
-    # 先触发一次 require_approval 调用以产生 decision
-    result = await admin_proxy_ctx._handle_call_tool_impl(
-        "harness_echo", {"message": "hello"}
+    store = admin_proxy_ctx._runtime.approval_manager._store
+    request = ApprovalRequest(
+        request_id="mcp-r1",
+        decision_id="mcp-d1",
+        call_id="mcp-c1",
+        task_id="mcp-t1",
+        agent_id="researcher_001",
+        tool_name="harness_echo",
+        arguments_masked={"message": "***"},
+        reason="test",
+        requester_id="alice",
+        approver_id="zhang_manager",
     )
-    # harness_echo 在 trusted_local 模式下未声明 trusted，会被 deny
-    assert result.isError
+    store.submit_request(request)
+    store.record_response(
+        ApprovalRecord(
+            request_id=request.request_id,
+            decision_id=request.decision_id,
+            verdict="approve",
+            approver_id=request.approver_id,
+            comment="ok",
+        )
+    )
 
     recent = await admin_proxy_ctx._handle_call_tool_impl(
         "list_recent_decisions", {"limit": 5}
     )
     assert not recent.isError
     items = json.loads(recent.content[0].text)
-    assert isinstance(items, list)
+    assert items[0]["decision_id"] == "mcp-d1"
+    assert items[0]["status"] == "approve"
 
-    if items:
-        decision_id = items[0]["decision_id"]
-        status = await admin_proxy_ctx._handle_call_tool_impl(
-            "get_decision_status", {"decision_id": decision_id}
-        )
-        assert not status.isError
-        payload = json.loads(status.content[0].text)
-        assert payload["decision_id"] == decision_id
+    status = await admin_proxy_ctx._handle_call_tool_impl(
+        "get_decision_status", {"decision_id": "mcp-d1"}
+    )
+    assert not status.isError
+    payload = json.loads(status.content[0].text)
+    assert payload["decision_id"] == "mcp-d1"
+    assert payload["status"] == "approve"
 
 
 @pytest.mark.asyncio

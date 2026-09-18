@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from loop_controller.cli import main
-from loop_controller.infra.approval_store import ApprovalStoreError, JsonlApprovalStore
+from loop_controller.infra.approval_store import (
+    ApprovalStoreError,
+    SqliteApprovalStore,
+    approval_notification_destination,
+    build_approval_store,
+)
 from loop_controller.models import ApprovalRequest, Decision
 
 
 @pytest.fixture
-def config_dir(tmp_path) -> str:
+def config_dir(tmp_path, monkeypatch) -> str:
     """构造一个最小可用配置目录，供 ConfigLoader 加载。"""
+    monkeypatch.setenv("TEST_APPROVER_TOKEN", "trusted-secret")
+    monkeypatch.setenv("LOOP_CONTROLLER_APPROVER_TOKEN", "trusted-secret")
     base = tmp_path / "project"
     base.mkdir()
     (base / "agents.yaml").write_text(
@@ -56,6 +64,16 @@ def config_dir(tmp_path) -> str:
         encoding="utf-8",
     )
     (base / "llm_planner.yaml").write_text("enabled: false\n", encoding="utf-8")
+    (base / "entrypoints.yaml").write_text(
+        "approval_auth:\n"
+        "  allowlist: [zhang_manager, auditor]\n"
+        "  credentials:\n"
+        "    - principal: zhang_manager\n"
+        "      token_env: TEST_APPROVER_TOKEN\n"
+        "    - principal: auditor\n"
+        "      token_env: TEST_AUDITOR_TOKEN\n",
+        encoding="utf-8",
+    )
     (base / "harness_tools.yaml").write_text(
         "execution:\n"
         "  default_mode: trusted_local\n"
@@ -67,11 +85,26 @@ def config_dir(tmp_path) -> str:
     return str(base)
 
 
+def test_default_approval_store_is_sqlite(config_dir: str) -> None:
+    from loop_controller.infra.config_loader import ConfigLoader
+
+    cfg = ConfigLoader().load(config_dir)
+    store = build_approval_store(cfg.approval_store_path)
+
+    assert isinstance(store, SqliteApprovalStore)
+    assert Path(cfg.approval_store_path).read_bytes().startswith(b"SQLite format 3\x00")
+
+
 def _put_pending_request(config_dir: str, decision_id: str) -> None:
     from loop_controller.infra.config_loader import ConfigLoader
 
     cfg = ConfigLoader().load(config_dir)
-    store = JsonlApprovalStore(cfg.approval_store_path)
+    store = build_approval_store(
+        cfg.approval_store_path,
+        notification_destination=approval_notification_destination(
+            cfg.approval.webhook.enabled
+        ),
+    )
     store.submit_request(
         ApprovalRequest(
             request_id="req-1",
@@ -93,7 +126,7 @@ def _load_record(config_dir: str, decision_id: str):
     from loop_controller.infra.config_loader import ConfigLoader
 
     cfg = ConfigLoader().load(config_dir)
-    return JsonlApprovalStore(cfg.approval_store_path).get_record(decision_id)
+    return build_approval_store(cfg.approval_store_path).get_record(decision_id)
 
 
 def test_approvals_list_empty(config_dir: str, capsys) -> None:
@@ -115,7 +148,7 @@ def test_approvals_list_pending(config_dir: str, capsys) -> None:
 def test_approvals_approve(config_dir: str) -> None:
     _put_pending_request(config_dir, "d1")
     rc = main(
-        ["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "zhang_manager"]
+        ["--config-dir", config_dir, "approvals", "approve", "d1"]
     )
     assert rc == 0
 
@@ -123,6 +156,30 @@ def test_approvals_approve(config_dir: str) -> None:
     assert record is not None
     assert record.verdict == "approve"
     assert record.approver_id == "zhang_manager"
+
+
+def test_cli_approval_uses_webhook_destination_when_enabled(
+    config_dir: str, monkeypatch
+) -> None:
+    from loop_controller.infra.config_loader import ConfigLoader
+
+    approval_path = Path(config_dir) / "approval.yaml"
+    approval_path.write_text(
+        "approvers:\n  default: zhang_manager\n"
+        "store_path: ./data/approvals.db\n"
+        "webhook:\n  enabled: true\n  url: https://notify.example/approvals\n"
+        "rules: []\n",
+        encoding="utf-8",
+    )
+    _put_pending_request(config_dir, "d1")
+
+    assert main(["--config-dir", config_dir, "approvals", "approve", "d1"]) == 0
+
+    cfg = ConfigLoader().load(config_dir)
+    store = SqliteApprovalStore(cfg.approval_store_path, notification_destination=None)
+    notifications = store.list_notifications()
+    assert [row["destination"] for row in notifications] == ["webhook", "webhook"]
+    assert [row["event_type"] for row in notifications] == ["created", "approved"]
 
 
 def test_approvals_deny(config_dir: str) -> None:
@@ -134,8 +191,6 @@ def test_approvals_deny(config_dir: str) -> None:
             "approvals",
             "deny",
             "d1",
-            "--approver",
-            "zhang_manager",
             "--comment",
             "suspicious",
         ]
@@ -156,8 +211,6 @@ def test_approvals_unknown_decision(config_dir: str, capsys) -> None:
             "approvals",
             "approve",
             "no-such",
-            "--approver",
-            "zhang_manager",
         ]
     )
     assert rc == 1
@@ -167,10 +220,8 @@ def test_approvals_unknown_decision(config_dir: str, capsys) -> None:
 
 def test_approvals_double_approval(config_dir: str, capsys) -> None:
     _put_pending_request(config_dir, "d1")
-    main(["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "zhang_manager"])
-    rc = main(
-        ["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "zhang_manager"]
-    )
+    main(["--config-dir", config_dir, "approvals", "approve", "d1"])
+    rc = main(["--config-dir", config_dir, "approvals", "approve", "d1"])
     assert rc == 1
     captured = capsys.readouterr()
     assert "已有审批结果" in captured.err
@@ -179,43 +230,47 @@ def test_approvals_double_approval(config_dir: str, capsys) -> None:
 def test_approvals_deny_requires_comment(config_dir: str, capsys) -> None:
     """A9：deny 必须提供审批意见。"""
     _put_pending_request(config_dir, "d1")
-    rc = main(
-        ["--config-dir", config_dir, "approvals", "deny", "d1", "--approver", "zhang_manager"]
-    )
+    rc = main(["--config-dir", config_dir, "approvals", "deny", "d1"])
     assert rc == 1
     captured = capsys.readouterr()
     assert "deny 必须提供审批意见" in captured.err
 
 
-def test_approvals_approver_cannot_be_requester(config_dir: str, capsys) -> None:
-    """A7：审批人不能是请求者本人。"""
+def test_approvals_requires_trusted_credential(config_dir: str, capsys, monkeypatch) -> None:
     _put_pending_request(config_dir, "d1")
-    rc = main(["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "alice"])
+    monkeypatch.delenv("LOOP_CONTROLLER_APPROVER_TOKEN")
+    rc = main(["--config-dir", config_dir, "approvals", "approve", "d1"])
     assert rc == 1
-    captured = capsys.readouterr()
-    assert "审批人不能是请求者本人" in captured.err
+    assert "审批凭证缺失" in capsys.readouterr().err
 
 
-def test_approvals_approver_cannot_be_agent(config_dir: str, capsys) -> None:
-    """A8：审批人不能是执行 Agent。"""
+def test_approvals_rejects_other_allowlisted_approver(
+    config_dir: str, capsys, monkeypatch
+) -> None:
     _put_pending_request(config_dir, "d1")
-    rc = main(
-        ["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "researcher_001"]
-    )
+    monkeypatch.setenv("TEST_AUDITOR_TOKEN", "auditor-secret")
+    monkeypatch.setenv("LOOP_CONTROLLER_APPROVER_TOKEN", "auditor-secret")
+
+    rc = main(["--config-dir", config_dir, "approvals", "approve", "d1"])
+
     assert rc == 1
-    captured = capsys.readouterr()
-    assert "审批人不能是执行 Agent" in captured.err
+    assert "无权审批指定给 zhang_manager" in capsys.readouterr().err
+    assert _load_record(config_dir, "d1") is None
 
 
-def test_approvals_approver_must_exist(config_dir: str, capsys) -> None:
-    """审批人必须存在于用户列表。"""
-    _put_pending_request(config_dir, "d1")
-    rc = main(
-        ["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "ghost_user"]
-    )
-    assert rc == 1
-    captured = capsys.readouterr()
-    assert "审批人 ghost_user 不存在" in captured.err
+def test_approvals_rejects_legacy_approver_flag(config_dir: str) -> None:
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--config-dir",
+                config_dir,
+                "approvals",
+                "approve",
+                "d1",
+                "--approver",
+                "ghost_user",
+            ]
+        )
 
 
 def test_proxy_rejects_identity_token_flag(config_dir: str) -> None:
@@ -241,7 +296,7 @@ def _put_expired_request(config_dir: str, decision_id: str) -> None:
     from loop_controller.infra.config_loader import ConfigLoader
 
     cfg = ConfigLoader().load(config_dir)
-    store = JsonlApprovalStore(cfg.approval_store_path)
+    store = build_approval_store(cfg.approval_store_path)
     expired_decision = Decision(
         decision_id=decision_id,
         call_id="c1",
@@ -271,9 +326,7 @@ def _put_expired_request(config_dir: str, decision_id: str) -> None:
 def test_approve_rejects_expired_decision(config_dir: str, capsys) -> None:
     """A10：approve 时若 Decision 已过期，应拒绝审批。"""
     _put_expired_request(config_dir, "d1")
-    rc = main(
-        ["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "zhang_manager"]
-    )
+    rc = main(["--config-dir", config_dir, "approvals", "approve", "d1"])
     assert rc == 1
     captured = capsys.readouterr()
     assert "过期" in captured.err
@@ -296,10 +349,8 @@ def test_approve_store_error_friendly_message(config_dir: str, capsys, monkeypat
     def _raise_store_error(self, record) -> None:
         raise ApprovalStoreError("simulated write failure")
 
-    monkeypatch.setattr(JsonlApprovalStore, "record_response", _raise_store_error)
-    rc = main(
-        ["--config-dir", config_dir, "approvals", "approve", "d1", "--approver", "zhang_manager"]
-    )
+    monkeypatch.setattr(SqliteApprovalStore, "record_response", _raise_store_error)
+    rc = main(["--config-dir", config_dir, "approvals", "approve", "d1"])
 
     assert rc == 1
     captured = capsys.readouterr()

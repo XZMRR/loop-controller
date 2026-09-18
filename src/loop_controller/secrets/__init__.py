@@ -5,16 +5,30 @@ from loop_controller.secrets.encrypted_file_backend import EncryptedFileSecretBa
 from loop_controller.secrets.exceptions import SecretError, SecretNotFoundError
 from loop_controller.secrets.file_backend import FileSecretBackend
 from loop_controller.secrets.memory_backend import MemorySecretBackend
-from loop_controller.secrets.models import SecretRef, SecretScope, SecretValue
+from loop_controller.secrets.models import (
+    CredentialInjection,
+    CredentialVersionMode,
+    ResolvedToolCredentialRef,
+    SecretRef,
+    SecretScope,
+    SecretValue,
+    ToolCredentialRef,
+)
+from loop_controller.secrets.resolver import ToolCredentialResolver
 
 __all__ = [
+    "CredentialInjection",
+    "CredentialVersionMode",
     "EncryptedFileSecretBackend",
     "FileSecretBackend",
     "MemorySecretBackend",
+    "ResolvedToolCredentialRef",
     "SecretBroker",
     "SecretError",
     "SecretNotFoundError",
     "SecretRef",
     "SecretScope",
     "SecretValue",
+    "ToolCredentialRef",
+    "ToolCredentialResolver",
 ]

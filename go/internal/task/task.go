@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/loop-controller/go/internal/models"
@@ -16,6 +17,8 @@ var (
 	ErrTaskNotFound  = errors.New("task not found")
 	ErrInvalidStatus = errors.New("invalid status transition")
 )
+
+var taskIDSequence atomic.Uint64
 
 var validTransitions = map[string]map[string]bool{
 	"pending":         {"accepted": true, "failed": true, "cancelled": true, "outcome_unknown": true},
@@ -112,14 +115,20 @@ func (m *Manager) CreateInteraction(sessionID, initiatorAgentID, targetAgentID, 
 	})
 }
 
-// CreateInteractionTask creates a task with kernel-derived delegation linkage.
-func (m *Manager) CreateInteractionTask(task models.Task) (models.Task, error) {
+// PrepareInteractionTask derives a task identity and initial state without persisting it.
+func (m *Manager) PrepareInteractionTask(task models.Task) models.Task {
 	now := time.Now().UTC()
 	task.ProtocolVersion = models.CurrentProtocolVersion
 	task.TaskID = m.generateID()
 	task.Status = "pending"
 	task.CreatedAt = now
 	task.UpdatedAt = now
+	return task
+}
+
+// CreateInteractionTask creates a task with kernel-derived delegation linkage.
+func (m *Manager) CreateInteractionTask(task models.Task) (models.Task, error) {
+	task = m.PrepareInteractionTask(task)
 	var event models.TaskEvent
 	var err error
 	if task.ParentTaskID == "" {
@@ -214,7 +223,8 @@ func (m *Manager) SetDelegationToken(taskID, delegationToken string) error {
 }
 
 // RenewExecutionLease extends the execution lease of a running task owned by
-// this instance so a still-alive run is not reclaimed by a sibling instance.
+// this instance. It returns store.ErrExecutionLeaseLost when ownership or the
+// running state no longer matches.
 func (m *Manager) RenewExecutionLease(ctx context.Context, taskID string) error {
 	return m.store.RenewExecutionLease(ctx, taskID)
 }
@@ -281,6 +291,12 @@ func (m *Manager) CreateWithDelegation(taskID, sessionID, initiatorAgentID, targ
 	if len(scope) >= 4 {
 		task.Budget, _ = scope[3].(models.DelegationBudget)
 	}
+	if len(scope) >= 8 {
+		task.RequestID, _ = scope[4].(string)
+		task.TenantID, _ = scope[5].(string)
+		task.TargetWorkloadID, _ = scope[6].(string)
+		task.TargetInstanceID, _ = scope[7].(string)
+	}
 	event, err := m.store.CreateWithEvent(context.Background(), task)
 	if err != nil {
 		return models.Task{}, err
@@ -345,8 +361,9 @@ func expectedStatusFor(status string) (string, bool) {
 
 func (m *Manager) generateID() string {
 	now := time.Now().UTC()
+	sequence := taskIDSequence.Add(1)
 	if m.instanceID == "" {
-		return fmt.Sprintf("task-%s-%d", now.Format("20060102-150405"), now.UnixNano())
+		return fmt.Sprintf("task-%s-%d-%d", now.Format("20060102-150405"), now.UnixNano(), sequence)
 	}
-	return fmt.Sprintf("task-%s-%s-%d", m.instanceID, now.Format("20060102-150405"), now.UnixNano())
+	return fmt.Sprintf("task-%s-%s-%d-%d", m.instanceID, now.Format("20060102-150405"), now.UnixNano(), sequence)
 }

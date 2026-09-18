@@ -13,8 +13,24 @@ from typing import Any
 
 import pytest
 
+from loop_controller.authority import EarnedAuthorityManager
 from loop_controller.budget import InMemoryBudgetLedger
-from loop_controller.checkpoint import Checkpoint, CheckpointError
+from loop_controller.checkpoint import (
+    Checkpoint,
+    CheckpointConfigurationError,
+    CheckpointError,
+    InMemoryDecisionStore,
+)
+from loop_controller.execution_security import ExecutionRequestContext, current_execution_request
+from loop_controller.executors.base import (
+    ExecutionContext,
+    ExecutionReceiptType,
+    ExecutionTerminalStatus,
+    ExecutorRegistry,
+    WorkloadAuthMethod,
+    WorkloadIdentity,
+    issue_execution_receipt,
+)
 from loop_controller.infra.config_loader import (
     MaskingRules,
     PermissionCondition,
@@ -22,12 +38,14 @@ from loop_controller.infra.config_loader import (
     ValuePattern,
 )
 from loop_controller.infra.identity import ConfigIdentityProvider
+from loop_controller.infra.reservation_store import InMemoryReservationStore
 from loop_controller.masker import Masker
 from loop_controller.models import (
     ActionProposal,
     Agent,
     ApprovalRecord,
     ApprovalRequest,
+    AuthorityRules,
     AuthorityToken,
     BudgetCost,
     BudgetReservation,
@@ -114,6 +132,51 @@ class FakeAuthorityManager:
         )
 
 
+class ReceiptExecutor:
+    supports_strict_security = True
+    security_egress_type = "protected_http"
+    security_capabilities = frozenset({"execution_receipt_v1"})
+
+    def __init__(
+        self,
+        terminal: ExecutionTerminalStatus,
+        *,
+        result_status: str = "error",
+        receipt_status: ExecutionTerminalStatus | None = None,
+    ) -> None:
+        self.terminal = terminal
+        self.result_status = result_status
+        self.receipt_status = receipt_status or terminal
+
+    def secret_refs_for(self, tool_name: str) -> list[str]:
+        return []
+
+    async def execute(self, tool_name: str, arguments: dict, context: ExecutionContext) -> ToolResult:
+        content = {"terminal": self.terminal.value}
+        receipt = issue_execution_receipt(
+            receipt_type=ExecutionReceiptType.CONTROLLER_EXECUTION_RECORD,
+            context=context,
+            attester_workload_id="executor",
+            executor="http",
+            backend="protected",
+            status=self.receipt_status,
+            result=content,
+        )
+        return ToolResult(
+            call_id=context.call_id,
+            task_id=context.task_id,
+            tool_name=tool_name,
+            status=self.result_status,
+            content=content,
+            terminal_status=self.terminal.value,
+            error_code=f"http_{self.terminal.value}",
+            execution_receipt=receipt,
+        )
+
+    async def list_tools(self, profile: CapabilityProfile) -> list[Any]:
+        return []
+
+
 class FakeGateway:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
@@ -134,6 +197,86 @@ class FakeGateway:
             status="success",
             content="ok",
         )
+
+
+# ---------------------------------------------------------------------------
+# 构造安全
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_missing_critical_dependencies_fails_closed(
+    profile: CapabilityProfile,
+    identity: ConfigIdentityProvider,
+) -> None:
+    with pytest.raises(CheckpointConfigurationError) as exc_info:
+        Checkpoint(
+            profiles={profile.profile_id: profile},
+            policy_engine=FakePolicyEngine(),
+            policy_store=StubPolicyStore(),
+            gateway=FakeGateway(),
+            identity=identity,
+        )
+
+    message = str(exc_info.value)
+    for dependency in (
+        "decision_store",
+        "budget_ledger",
+        "reservation_store",
+        "permission_analyzer",
+        "authority_manager",
+    ):
+        assert dependency in message
+
+
+def test_checkpoint_explicit_degraded_mode_is_observable_and_warns(
+    profile: CapabilityProfile,
+    identity: ConfigIdentityProvider,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="loop_controller.checkpoint"):
+        checkpoint = Checkpoint(
+            profiles={profile.profile_id: profile},
+            policy_engine=FakePolicyEngine(),
+            policy_store=StubPolicyStore(),
+            gateway=FakeGateway(),
+            identity=identity,
+            allow_degraded=True,
+        )
+
+    assert checkpoint.degraded_backends == (
+        "decision_store",
+        "budget_ledger",
+        "reservation_store",
+        "permission_analyzer",
+        "authority_manager",
+    )
+    record = next(record for record in caplog.records if record.msg == "checkpoint_degraded_backends")
+    assert record.event == "checkpoint_degraded_backends"
+    assert record.degraded_backends == list(checkpoint.degraded_backends)
+
+
+def test_explicit_test_adapters_do_not_require_degraded_mode(
+    profile: CapabilityProfile,
+    identity: ConfigIdentityProvider,
+) -> None:
+    checkpoint = Checkpoint(
+        profiles={profile.profile_id: profile},
+        policy_engine=FakePolicyEngine(),
+        policy_store=StubPolicyStore(),
+        gateway=FakeGateway(),
+        identity=identity,
+        decision_store=InMemoryDecisionStore(),
+        budget_ledger=InMemoryBudgetLedger(),
+        reservation_store=InMemoryReservationStore(),
+        permission_analyzer=ConfigPermissionInteractionAnalyzer([]),
+        authority_manager=EarnedAuthorityManager(AuthorityRules(enabled=False)),
+    )
+
+    assert checkpoint.degraded_backends == (
+        "decision_store",
+        "budget_ledger",
+        "reservation_store",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +360,7 @@ def make_checkpoint(
     reservation_store=None,
     audit_store=None,
     authority_manager=None,
+    executor_registry=None,
 ) -> tuple[Checkpoint, FakePolicyEngine, FakeGateway]:
     engine = FakePolicyEngine(
         decision=engine_decision,
@@ -230,6 +374,7 @@ def make_checkpoint(
         policy_engine=engine,
         policy_store=StubPolicyStore(),
         gateway=gw,
+        executor_registry=executor_registry,
         identity=identity,
         session_manager=session_manager,
         risk_manager=risk_manager or RiskStateManager(),
@@ -240,6 +385,7 @@ def make_checkpoint(
         tool_costs=tool_costs,
         masker=masker,
         audit_store=audit_store,
+        allow_degraded=True,
         now=(lambda: now) if now is not None else None,
     )
     return cp, engine, gw
@@ -298,6 +444,99 @@ async def test_evaluate_allow_full_path(
     assert gw.calls == [(proposal.tool_name, proposal.arguments, proposal.call_id, task.task_id)]
     # 成功执行后记入 per-task 历史
     assert len(cp._history[task.task_id]) == 1
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    [ExecutionTerminalStatus.TIMEOUT, ExecutionTerminalStatus.CANCELLED],
+)
+async def test_strict_receipt_preserves_non_error_terminal_status(
+    terminal: ExecutionTerminalStatus,
+    task: Task,
+    agent: Agent,
+    profile: CapabilityProfile,
+    identity: ConfigIdentityProvider,
+) -> None:
+    registry = ExecutorRegistry()
+    registry.register("web_search", ReceiptExecutor(terminal))
+    cp, _, _ = make_checkpoint(profile, identity, executor_registry=registry)
+    proposal = make_proposal(task, agent)
+    decision = await cp.evaluate(task, agent, proposal)
+    context = ExecutionRequestContext(
+        workload_identity=WorkloadIdentity(
+            workload_id="kernel",
+            service="go-kernel",
+            principal="kernel",
+            tenant_id="tenant",
+            authenticated_at=datetime.now(UTC),
+            auth_method=WorkloadAuthMethod.MTLS,
+        ),
+        request_id="request-1",
+        interaction_id="interaction-1",
+        decision_id=decision.decision_id,
+        task_id=task.task_id,
+        call_id=proposal.call_id,
+        delegation_jti="jti-1",
+        tenant_id="tenant",
+        security_capabilities=frozenset({"execution_receipt_v1"}),
+    )
+
+    token = current_execution_request.set(context)
+    try:
+        result = await cp.forward(proposal, decision, tenant_id="tenant")
+    finally:
+        current_execution_request.reset(token)
+
+    assert result.status == "error"
+    assert result.terminal_status == terminal.value
+    assert result.execution_receipt.status == terminal
+    assert result.error_code == f"http_{terminal.value}"
+
+
+async def test_strict_receipt_rejects_tool_result_and_receipt_terminal_mismatch(
+    task: Task,
+    agent: Agent,
+    profile: CapabilityProfile,
+    identity: ConfigIdentityProvider,
+) -> None:
+    registry = ExecutorRegistry()
+    registry.register(
+        "web_search",
+        ReceiptExecutor(
+            ExecutionTerminalStatus.TIMEOUT,
+            receipt_status=ExecutionTerminalStatus.CANCELLED,
+        ),
+    )
+    cp, _, _ = make_checkpoint(profile, identity, executor_registry=registry)
+    proposal = make_proposal(task, agent)
+    decision = await cp.evaluate(task, agent, proposal)
+    context = ExecutionRequestContext(
+        workload_identity=WorkloadIdentity(
+            workload_id="kernel",
+            service="go-kernel",
+            principal="kernel",
+            tenant_id="tenant",
+            authenticated_at=datetime.now(UTC),
+            auth_method=WorkloadAuthMethod.MTLS,
+        ),
+        request_id="request-1",
+        interaction_id="interaction-1",
+        decision_id=decision.decision_id,
+        task_id=task.task_id,
+        call_id=proposal.call_id,
+        delegation_jti="jti-1",
+        tenant_id="tenant",
+        security_capabilities=frozenset({"execution_receipt_v1"}),
+    )
+
+    token = current_execution_request.set(context)
+    try:
+        result = await cp.forward(proposal, decision, tenant_id="tenant")
+    finally:
+        current_execution_request.reset(token)
+
+    assert result.status == "error"
+    assert result.error_code == "execution_receipt_invalid"
 
 
 # ---------------------------------------------------------------------------

@@ -1,11 +1,13 @@
-"""Python bridge to the Go interaction governance kernel (v0.48.0)."""
+"""Python bridge to the Go interaction governance kernel (v0.54.0)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
-from typing import Any
+from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import dataclass
+from typing import Any, cast
 
 import httpx
 
@@ -13,7 +15,110 @@ logger = logging.getLogger(__name__)
 
 # Current A2A HTTP/JSON protocol version. Patch differences are tolerated;
 # major/minor differences are fail-closed.
-CURRENT_PROTOCOL_VERSION = "0.48.0"
+CURRENT_PROTOCOL_VERSION = "0.54.0"
+COMPATIBLE_PROTOCOL_VERSIONS = frozenset({"0.53.0", CURRENT_PROTOCOL_VERSION})
+CURRENT_EVENT_SCHEMA_VERSION = 1
+RETRYABLE_STREAM_STATUS_CODES = frozenset({500, 502, 503, 504})
+
+
+class GoKernelBridgeError(RuntimeError):
+    """Stable base error for Go kernel failures."""
+
+    code = "go_kernel_bridge_error"
+
+    def __init__(self, message: str = "", *, response_code: str = "") -> None:
+        super().__init__(message or response_code or self.code)
+        self.response_code = response_code or self.code
+
+
+class GoKernelAuthenticationError(GoKernelBridgeError):
+    code = "authentication_error"
+
+
+class GoKernelAuthorizationError(GoKernelBridgeError):
+    code = "authorization_error"
+
+
+class GoKernelNotFoundError(GoKernelBridgeError):
+    code = "not_found"
+
+
+class GoKernelConflictError(GoKernelBridgeError):
+    code = "conflict"
+
+
+class GoKernelProtocolError(GoKernelBridgeError):
+    code = "protocol_error"
+
+
+class GoKernelServerError(GoKernelBridgeError):
+    code = "server_error"
+
+
+class GoKernelClosedError(GoKernelBridgeError):
+    code = "bridge_closed"
+
+
+class EventCursorExpiredError(GoKernelBridgeError):
+    code = "event_cursor_expired"
+
+
+class EventCursorInvalidError(GoKernelBridgeError):
+    code = "event_cursor_invalid"
+
+
+class EventCursorFutureError(EventCursorInvalidError):
+    code = "event_cursor_future"
+
+
+class EventSequenceGapError(GoKernelBridgeError):
+    code = "event_sequence_gap"
+
+
+class EventSequenceOutOfOrderError(GoKernelBridgeError):
+    code = "event_sequence_out_of_order"
+
+
+class UnsupportedEventSchemaError(GoKernelBridgeError):
+    code = "unsupported_event_schema"
+
+
+class InvalidTaskEventError(GoKernelBridgeError):
+    code = "invalid_task_event"
+
+
+@dataclass
+class _SSEEvent:
+    data: str
+    event_id: str | None
+    event: str | None
+
+
+async def _iter_sse(response: httpx.Response, retry_ms: list[int]) -> AsyncIterator[_SSEEvent]:
+    data: list[str] = []
+    event_id: str | None = None
+    event: str | None = None
+    async for line in response.aiter_lines():
+        if line == "":
+            if data:
+                yield _SSEEvent("\n".join(data), event_id, event)
+            data, event_id, event = [], None, None
+            continue
+        if line.startswith(":"):
+            continue
+        field, separator, value = line.partition(":")
+        if separator and value.startswith(" "):
+            value = value[1:]
+        if field == "data":
+            data.append(value)
+        elif field == "id" and "\x00" not in value:
+            event_id = value
+        elif field == "event":
+            event = value
+        elif field == "retry" and value.isdigit():
+            retry_ms[0] = int(value)
+    if data:
+        yield _SSEEvent("\n".join(data), event_id, event)
 
 
 def check_protocol_version(version: str) -> None:
@@ -25,12 +130,13 @@ def check_protocol_version(version: str) -> None:
     current = CURRENT_PROTOCOL_VERSION.split(".")
     if len(parts) != 3 or any(not part.isdigit() for part in parts):
         raise ValueError(f"invalid protocol version {version!r}")
-    if version == CURRENT_PROTOCOL_VERSION:
+    if version in COMPATIBLE_PROTOCOL_VERSIONS:
         return
-    if parts[0] != current[0] or parts[1] != current[1]:
-        raise ValueError(
-            f"incompatible protocol version {version!r}, expected {CURRENT_PROTOCOL_VERSION}"
-        )
+    if parts[0] == current[0] and parts[1] == current[1]:
+        return
+    if parts[0] == "0" and parts[1] == "53":
+        return
+    raise ValueError(f"incompatible protocol version {version!r}, expected 0.53.x or 0.54.x")
 
 
 class AgentEntrypoint:
@@ -57,7 +163,9 @@ class AgentCard:
         entrypoint: AgentEntrypoint | None = None,
         capabilities: list[str] | None = None,
         trust_domain: str = "",
-        version: str = CURRENT_PROTOCOL_VERSION,
+        version: str = "",
+        tenant_id: str | None = None,
+        protocol_version: str | None = CURRENT_PROTOCOL_VERSION,
     ) -> None:
         self.agent_id = agent_id
         self.name = name
@@ -66,6 +174,8 @@ class AgentCard:
         self.capabilities = capabilities or []
         self.trust_domain = trust_domain
         self.version = version
+        self.tenant_id = tenant_id
+        self.protocol_version = protocol_version
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AgentCard:
@@ -77,11 +187,13 @@ class AgentCard:
             entrypoint=AgentEntrypoint.from_dict(ep) if isinstance(ep, dict) else None,
             capabilities=data.get("capabilities") or [],
             trust_domain=data.get("trust_domain", ""),
-            version=data.get("version", CURRENT_PROTOCOL_VERSION),
+            version=data.get("version", ""),
+            tenant_id=data.get("tenant_id"),
+            protocol_version=data.get("protocol_version"),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "agent_id": self.agent_id,
             "name": self.name,
             "description": self.description,
@@ -90,6 +202,11 @@ class AgentCard:
             "trust_domain": self.trust_domain,
             "version": self.version,
         }
+        if self.tenant_id is not None:
+            data["tenant_id"] = self.tenant_id
+        if self.protocol_version is not None:
+            data["protocol_version"] = self.protocol_version
+        return data
 
 
 class A2AMessage:
@@ -152,6 +269,9 @@ class DelegationRequest:
         budget: dict[str, Any] | None = None,
         deadline: str | None = None,
         protocol_version: str = CURRENT_PROTOCOL_VERSION,
+        tenant_id: str | None = None,
+        target_workload_id: str | None = None,
+        target_instance_id: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.initiator_agent_id = initiator_agent_id
@@ -168,9 +288,12 @@ class DelegationRequest:
         self.budget = dict(budget or {})
         self.deadline = deadline
         self.protocol_version = protocol_version
+        self.tenant_id = tenant_id
+        self.target_workload_id = target_workload_id
+        self.target_instance_id = target_instance_id
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "request_id": self.request_id,
             "initiator_agent_id": self.initiator_agent_id,
             "target_agent_id": self.target_agent_id,
@@ -187,6 +310,13 @@ class DelegationRequest:
             "deadline": self.deadline,
             "protocol_version": self.protocol_version,
         }
+        if self.tenant_id is not None:
+            data["tenant_id"] = self.tenant_id
+        if self.target_workload_id is not None:
+            data["target_workload_id"] = self.target_workload_id
+        if self.target_instance_id is not None:
+            data["target_instance_id"] = self.target_instance_id
+        return data
 
 
 class DelegationApproval:
@@ -202,6 +332,9 @@ class DelegationApproval:
         initiator_agent_id: str,
         target_agent_id: str,
         session_id: str = "",
+        tenant_id: str = "",
+        target_workload_id: str = "",
+        target_instance_id: str = "",
         root_task_id: str = "",
         parent_task_id: str = "",
         delegation_depth: int = 0,
@@ -233,7 +366,16 @@ class DelegationApproval:
 
     def to_dict(self) -> dict[str, Any]:
         data = dict(self.__dict__)
-        for key in ("root_task_id", "parent_task_id", "approver_id", "reason", "task_id"):
+        for key in (
+            "tenant_id",
+            "target_workload_id",
+            "target_instance_id",
+            "root_task_id",
+            "parent_task_id",
+            "approver_id",
+            "reason",
+            "task_id",
+        ):
             if not data[key]:
                 data.pop(key)
         for key in ("task_deadline", "decided_at"):
@@ -265,6 +407,7 @@ class DelegationResponse:
         allowed: bool,
         verdict: str = "",
         approval_id: str = "",
+        interaction_id: str = "",
         decision_id: str = "",
         task_id: str = "",
         target_entrypoint: AgentEntrypoint | None = None,
@@ -278,6 +421,7 @@ class DelegationResponse:
         self.allowed = allowed
         self.verdict = verdict
         self.approval_id = approval_id
+        self.interaction_id = interaction_id
         self.decision_id = decision_id
         self.task_id = task_id
         self.target_entrypoint = target_entrypoint
@@ -294,6 +438,8 @@ class DelegationResponse:
         return cls(
             allowed=data.get("allowed", False),
             verdict=data.get("verdict", ""),
+            approval_id=data.get("approval_id", ""),
+            interaction_id=data.get("interaction_id", ""),
             decision_id=data.get("decision_id", ""),
             task_id=data.get("task_id", ""),
             target_entrypoint=AgentEntrypoint.from_dict(ep) if ep else None,
@@ -316,6 +462,8 @@ class DelegationResponse:
             data["verdict"] = self.verdict
         if self.approval_id:
             data["approval_id"] = self.approval_id
+        if self.interaction_id:
+            data["interaction_id"] = self.interaction_id
         if self.decision_id:
             data["decision_id"] = self.decision_id
         if self.target_entrypoint is not None:
@@ -346,29 +494,167 @@ class GoKernelBridge:
         *,
         timeout: float = 5.0,
         client: httpx.AsyncClient | None = None,
+        headers: dict[str, str] | None = None,
+        control_token: str = "",
+        approver_token: str = "",
+        token: str = "",
+        approval_token: str = "",
+        verify: Any = True,
+        cert: Any = None,
+        min_reconnect_delay: float = 0.05,
+        max_reconnect_delay: float = 5.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._client = client
         self._owned_client = client is None
+        self._headers = {
+            key: value for key, value in (headers or {}).items() if key.lower() != "authorization"
+        }
+        control_token = control_token or token
+        approver_token = approver_token or approval_token
+        self._control_headers = dict(self._headers)
+        if control_token:
+            self._control_headers["Authorization"] = f"Bearer {control_token}"
+        self._approver_headers = dict(self._headers)
+        if approver_token:
+            self._approver_headers["Authorization"] = f"Bearer {approver_token}"
+        self._verify = verify
+        self._cert = cert
+        self._min_reconnect_delay = max(0.001, min_reconnect_delay)
+        self._max_reconnect_delay = max(self._min_reconnect_delay, max_reconnect_delay)
+        self._closed = False
 
     async def _client_context(self) -> httpx.AsyncClient:
+        if self._closed:
+            raise GoKernelClosedError()
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self._timeout))
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self._timeout),
+                verify=self._verify,
+                cert=self._cert,
+            )
         return self._client
 
+    def _auth_headers(self, *, approver: bool = False) -> dict[str, str]:
+        return dict(self._approver_headers if approver else self._control_headers)
+
+    @staticmethod
+    def _decode_object(response: httpx.Response) -> dict[str, Any]:
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise GoKernelProtocolError("invalid JSON response") from exc
+        if not isinstance(result, dict):
+            raise GoKernelProtocolError("response must be a JSON object")
+        version = str(result.get("protocol_version", ""))
+        try:
+            check_protocol_version(version)
+        except ValueError as exc:
+            raise GoKernelProtocolError(str(exc)) from exc
+        return result
+
+    @classmethod
+    def _raise_response_error(cls, response: httpx.Response) -> None:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        code = str(payload.get("code", "")) if isinstance(payload, dict) else ""
+        message = (
+            str(payload.get("error") or payload.get("reason") or "")
+            if isinstance(payload, dict)
+            else ""
+        )
+        error_type: type[GoKernelBridgeError]
+        if response.status_code == 401:
+            error_type = GoKernelAuthenticationError
+        elif response.status_code == 403:
+            error_type = GoKernelAuthorizationError
+        elif response.status_code == 404:
+            error_type = GoKernelNotFoundError
+        elif response.status_code == 409:
+            error_type = GoKernelConflictError
+        elif response.status_code >= 500:
+            error_type = GoKernelServerError
+        else:
+            error_type = GoKernelProtocolError
+        raise error_type(message, response_code=code)
+
+    async def _request_object(
+        self, method: str, url: str, *, approver: bool = False, **kwargs: Any
+    ) -> dict[str, Any]:
+        client = await self._client_context()
+        supplied = kwargs.pop("headers", {}) or {}
+        headers = self._auth_headers(approver=approver)
+        headers.update(
+            (key, value) for key, value in supplied.items() if key.lower() != "authorization"
+        )
+        response = await client.request(method, url, headers=headers, **kwargs)
+        if response.is_error:
+            self._raise_response_error(response)
+        return self._decode_object(response)
+
     async def aclose(self) -> None:
+        self._closed = True
         if self._owned_client and self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    async def readiness(self) -> dict[str, Any]:
+        """查询 Go 内核结构化 readiness；非 ready 响应仍稳定解析。"""
+        client = await self._client_context()
+        response = await client.get(f"{self._base_url}/ready", headers=self._auth_headers())
+        if response.status_code not in {200, 503}:
+            self._raise_response_error(response)
+        data = self._decode_object(response)
+        if data.get("schema_version") != "p54-09.v1":
+            raise GoKernelProtocolError("unsupported readiness schema_version")
+        if data.get("status") not in {"ready", "not_ready"}:
+            raise GoKernelProtocolError("invalid readiness status")
+        if not isinstance(data.get("checks"), dict) or not isinstance(data.get("reasons"), list):
+            raise GoKernelProtocolError("invalid readiness response")
+        return data
+
+    async def ping(self) -> bool:
+        """探测 Go 内核可达性（GET /a2a/v1/agents 期望 200）。"""
+        url = f"{self._base_url}/a2a/v1/agents"
+        try:
+            client = await self._client_context()
+            response = await client.get(url)
+            return response.status_code == 200
+        except httpx.RequestError as exc:
+            logger.warning("Go kernel ping unreachable: %s", exc)
+            return False
+
+    async def list_agents(self) -> list[dict[str, Any]]:
+        """列出已注册 Agent Card；不可达或响应非法时返回空列表。"""
+        url = f"{self._base_url}/a2a/v1/agents"
+        try:
+            client = await self._client_context()
+            response = await client.get(url)
+            response.raise_for_status()
+            result = response.json()
+            if isinstance(result, list):
+                return [item for item in result if isinstance(item, dict)]
+            if isinstance(result, dict):
+                agents = result.get("agents")
+                if isinstance(agents, list):
+                    return [item for item in agents if isinstance(item, dict)]
+            logger.warning("Go kernel list_agents returned unexpected payload")
+            return []
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            logger.warning("Go kernel list_agents unreachable: %s", exc)
+            return []
 
     async def register_agent(self, card: AgentCard) -> bool:
         """向 Go 内核注册 Agent Card。"""
         url = f"{self._base_url}/a2a/v1/agents"
         try:
-            client = await self._client_context()
-            response = await client.post(url, json=card.to_dict())
-            return response.status_code in (200, 201)
+            data = await self._request_object("POST", url, json=card.to_dict())
+            return data.get("agent_id") == card.agent_id
+        except GoKernelBridgeError:
+            return False
         except httpx.RequestError as exc:
             logger.warning("Go kernel register_agent unreachable: %s", exc)
             return False
@@ -378,19 +664,24 @@ class GoKernelBridge:
         url = f"{self._base_url}/a2a/v1/delegations"
         try:
             client = await self._client_context()
-            response = await client.post(url, json=req.to_dict())
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, dict):
-                raise ValueError("invalid Go kernel delegation response")
-            check_protocol_version(str(data.get("protocol_version", "")))
-            return DelegationResponse.from_dict(data)
-        except ValueError as exc:
+            response = await client.post(url, json=req.to_dict(), headers=self._auth_headers())
+            # A policy denial is a successful DelegationResponse, not an error envelope.
+            if response.status_code == 403:
+                try:
+                    data = self._decode_object(response)
+                except GoKernelProtocolError:
+                    self._raise_response_error(response)
+                if "allowed" in data:
+                    return DelegationResponse.from_dict(data)
+                self._raise_response_error(response)
+            if response.is_error:
+                self._raise_response_error(response)
+            return DelegationResponse.from_dict(self._decode_object(response))
+        except GoKernelProtocolError as exc:
             logger.warning("Go kernel protocol rejected, fail-closed: %s", exc)
             return DelegationResponse(allowed=False, reason="incompatible_protocol_version")
-        except httpx.HTTPStatusError as exc:
-            logger.warning("Go kernel delegation rejected: %s", exc)
-            return DelegationResponse(allowed=False, reason="go_kernel_rejected")
+        except GoKernelBridgeError as exc:
+            return DelegationResponse(allowed=False, reason=str(exc) or exc.response_code)
         except httpx.RequestError as exc:
             logger.warning("Go kernel unreachable, fail-closed: %s", exc)
             return DelegationResponse(
@@ -402,12 +693,10 @@ class GoKernelBridge:
         """向目标 Agent 路由一条消息。"""
         url = f"{self._base_url}/a2a/v1/messages"
         try:
-            client = await self._client_context()
-            response = await client.post(url, json=msg.to_dict())
-            if response.status_code != 200:
-                return False
-            data = response.json()
-            return bool(isinstance(data, dict) and data.get("accepted", False))
+            data = await self._request_object("POST", url, json=msg.to_dict())
+            return bool(data.get("accepted", False))
+        except GoKernelBridgeError:
+            return False
         except httpx.RequestError as exc:
             logger.warning("Go kernel route_message unreachable: %s", exc)
             return False
@@ -416,15 +705,10 @@ class GoKernelBridge:
         """查询已注册 Agent Card；不可达时返回 None。"""
         url = f"{self._base_url}/a2a/v1/agents/{agent_id}"
         try:
-            client = await self._client_context()
-            response = await client.get(url)
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            result = response.json()
-            if isinstance(result, dict):
-                return AgentCard.from_dict(result)
-            logger.warning("Go kernel get_agent returned non-object: %s", type(result))
+            return AgentCard.from_dict(await self._request_object("GET", url))
+        except GoKernelNotFoundError:
+            return None
+        except GoKernelBridgeError:
             return None
         except httpx.RequestError as exc:
             logger.warning("Go kernel get_agent unreachable: %s", exc)
@@ -434,15 +718,10 @@ class GoKernelBridge:
         """查询任务状态。"""
         url = f"{self._base_url}/a2a/v1/tasks/{task_id}"
         try:
-            client = await self._client_context()
-            response = await client.get(url)
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            result = response.json()
-            if isinstance(result, dict):
-                return result
-            logger.warning("Go kernel query_task returned non-object: %s", type(result))
+            return await self._request_object("GET", url)
+        except GoKernelNotFoundError:
+            return None
+        except GoKernelBridgeError:
             return None
         except httpx.RequestError as exc:
             logger.warning("Go kernel query_task unreachable: %s", exc)
@@ -454,43 +733,207 @@ class GoKernelBridge:
         reason: str = "",
         delegation_token: str = "",
     ) -> dict[str, Any] | None:
-        """请求取消委托任务；内核不可达或拒绝时返回 None。"""
+        """请求取消控制面任务；始终使用 control credential。"""
+        del delegation_token  # Kept only for source compatibility; never used as control auth.
         url = f"{self._base_url}/a2a/v1/tasks/{task_id}/cancel"
-        headers = {"Authorization": f"Bearer {delegation_token}"} if delegation_token else None
         try:
-            client = await self._client_context()
-            response = await client.post(
+            return await self._request_object(
+                "POST",
                 url,
-                json={
-                    "protocol_version": CURRENT_PROTOCOL_VERSION,
-                    "reason": reason,
-                },
-                headers=headers,
+                json={"protocol_version": CURRENT_PROTOCOL_VERSION, "reason": reason},
             )
-            response.raise_for_status()
-            result = response.json()
-            return result if isinstance(result, dict) else None
-        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+        except (httpx.RequestError, GoKernelBridgeError) as exc:
             logger.warning("Go kernel cancel_task failed: %s", exc)
             return None
 
-    async def stream_task(
-        self, task_id: str, timeout: float = 30.0
-    ) -> AsyncIterator[dict[str, Any]]:
-        """订阅任务 SSE 流式更新。"""
-        url = f"{self._base_url}/a2a/v1/tasks/{task_id}/stream"
+    async def list_delegation_approvals(
+        self, *, status: str = "", limit: int = 0
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        if limit > 0:
+            params["limit"] = limit
         try:
-            client = await self._client_context()
-            async with client.stream("GET", url, timeout=timeout) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        payload = line[len("data: "):]
+            data = await self._request_object(
+                "GET",
+                f"{self._base_url}/a2a/v1/delegation-approvals",
+                params=params,
+            )
+        except (httpx.RequestError, GoKernelBridgeError):
+            return []
+        approvals = data.get("approvals")
+        if not isinstance(approvals, list):
+            return []
+        return [item for item in approvals if isinstance(item, dict)]
+
+    async def get_delegation_approval(self, approval_id: str) -> DelegationApproval:
+        data = await self._request_object(
+            "GET", f"{self._base_url}/a2a/v1/delegation-approvals/{approval_id}"
+        )
+        return DelegationApproval.from_dict(data)
+
+    async def get_approval(self, approval_id: str) -> DelegationApproval:
+        return await self.get_delegation_approval(approval_id)
+
+    async def approve_delegation(
+        self, approval_id: str, request_id: str, reason: str = ""
+    ) -> DelegationApproval:
+        return cast(
+            DelegationApproval,
+            await self._approval_action(approval_id, "approve", request_id, reason, True),
+        )
+
+    async def approve_approval(
+        self, approval_id: str, request_id: str, reason: str = ""
+    ) -> DelegationApproval:
+        return await self.approve_delegation(approval_id, request_id, reason)
+
+    async def reject_delegation(
+        self, approval_id: str, request_id: str, reason: str = ""
+    ) -> DelegationApproval:
+        return cast(
+            DelegationApproval,
+            await self._approval_action(approval_id, "reject", request_id, reason, True),
+        )
+
+    async def reject_approval(
+        self, approval_id: str, request_id: str, reason: str = ""
+    ) -> DelegationApproval:
+        return await self.reject_delegation(approval_id, request_id, reason)
+
+    async def cancel_delegation_approval(
+        self, approval_id: str, request_id: str, reason: str = ""
+    ) -> DelegationApproval | dict[str, Any]:
+        return await self._approval_action(approval_id, "cancel", request_id, reason, False)
+
+    async def cancel_approval(
+        self, approval_id: str, request_id: str, reason: str = ""
+    ) -> DelegationApproval | dict[str, Any]:
+        return await self.cancel_delegation_approval(approval_id, request_id, reason)
+
+    async def _approval_action(
+        self, approval_id: str, action: str, request_id: str, reason: str, approver: bool
+    ) -> DelegationApproval | dict[str, Any]:
+        data = await self._request_object(
+            "POST",
+            f"{self._base_url}/a2a/v1/delegation-approvals/{approval_id}/{action}",
+            approver=approver,
+            json=ApprovalActionRequest(request_id, reason).to_dict(),
+        )
+        if "approval_id" in data:
+            return DelegationApproval.from_dict(data)
+        return data
+
+    async def stream_task(
+        self,
+        task_id: str,
+        timeout: float = 30.0,
+        *,
+        cursor: str | None = None,
+        include_sse: bool = False,
+    ) -> AsyncGenerator[dict[str, Any] | tuple[dict[str, Any], str | None, str | None], None]:
+        """订阅任务 SSE 更新；游标在本 generator 内保存，同任务可并发独立订阅。"""
+        url = f"{self._base_url}/a2a/v1/tasks/{task_id}/stream"
+        last_sequence: int | None = None
+        seen_identities: set[str] = set()
+        retry_ms = [int(self._min_reconnect_delay * 1000)]
+        local_delay = self._min_reconnect_delay
+
+        if self._closed:
+            raise GoKernelClosedError()
+        while not self._closed:
+            headers = self._auth_headers()
+            headers["Accept"] = "text/event-stream"
+            if cursor is not None:
+                headers["Last-Event-ID"] = cursor
+            try:
+                client = await self._client_context()
+                async with client.stream("GET", url, headers=headers, timeout=timeout) as response:
+                    if response.status_code in (400, 410):
+                        await self._raise_cursor_error(response)
+                    response.raise_for_status()
+                    local_delay = self._min_reconnect_delay
+                    async for frame in _iter_sse(response, retry_ms):
                         try:
-                            yield json.loads(payload)
+                            decoded = json.loads(frame.data)
                         except json.JSONDecodeError:
                             continue
-        except httpx.RequestError as exc:
-            logger.warning("Go kernel stream_task unreachable: %s", exc)
-        except httpx.HTTPStatusError as exc:
-            logger.warning("Go kernel stream_task rejected: %s", exc)
+                        if not isinstance(decoded, dict):
+                            raise InvalidTaskEventError("task stream event must be a JSON object")
+
+                        identity_value = decoded.get("event_id") or frame.event_id
+                        identity = str(identity_value) if identity_value else ""
+                        sequence_value = decoded.get("sequence")
+                        schema_value = decoded.get("schema_version")
+                        if identity and identity in seen_identities:
+                            continue
+                        if sequence_value is not None or schema_value is not None:
+                            if (
+                                not isinstance(sequence_value, int)
+                                or isinstance(sequence_value, bool)
+                                or sequence_value < 1
+                            ):
+                                raise InvalidTaskEventError("invalid task event sequence")
+                            if (
+                                not isinstance(schema_value, int)
+                                or isinstance(schema_value, bool)
+                                or schema_value != CURRENT_EVENT_SCHEMA_VERSION
+                            ):
+                                raise UnsupportedEventSchemaError(
+                                    f"unsupported task event schema {schema_value!r}"
+                                )
+                            if last_sequence is not None:
+                                if sequence_value <= last_sequence:
+                                    raise EventSequenceOutOfOrderError(
+                                        f"task event sequence {sequence_value} follows {last_sequence}"
+                                    )
+                                if sequence_value != last_sequence + 1:
+                                    raise EventSequenceGapError(
+                                        f"task event sequence gap: expected {last_sequence + 1}, "
+                                        f"got {sequence_value}"
+                                    )
+
+                        # Commit stream state only after the complete frame and JSON contract are valid.
+                        if sequence_value is not None:
+                            last_sequence = sequence_value
+                        if identity:
+                            seen_identities.add(identity)
+                        if frame.event_id is not None:
+                            cursor = frame.event_id
+                        yield (decoded, frame.event_id, frame.event) if include_sse else decoded
+            except asyncio.CancelledError:
+                raise
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in RETRYABLE_STREAM_STATUS_CODES:
+                    raise
+                logger.warning(
+                    "Go kernel stream_task reconnecting after HTTP %s",
+                    exc.response.status_code,
+                )
+            except httpx.RequestError as exc:
+                logger.warning("Go kernel stream_task reconnecting after transport error: %s", exc)
+
+            if self._closed:
+                return
+            server_delay = max(0.0, retry_ms[0] / 1000)
+            delay = min(self._max_reconnect_delay, max(local_delay, server_delay))
+            await asyncio.sleep(delay)
+            local_delay = min(self._max_reconnect_delay, local_delay * 2)
+
+    @staticmethod
+    async def _raise_cursor_error(response: httpx.Response) -> None:
+        try:
+            body = await response.aread()
+            payload = json.loads(body)
+            code = payload.get("code") if isinstance(payload, dict) else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            code = None
+        errors: dict[str, type[GoKernelBridgeError]] = {
+            "event_cursor_expired": EventCursorExpiredError,
+            "event_cursor_invalid": EventCursorInvalidError,
+            "event_cursor_future": EventCursorFutureError,
+        }
+        error_type = errors.get(str(code))
+        if error_type is not None:
+            raise error_type()

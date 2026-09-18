@@ -14,12 +14,15 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/loop-controller/go/internal/delegation"
 	"github.com/loop-controller/go/internal/discovery"
+	"github.com/loop-controller/go/internal/entrypointpolicy"
 	"github.com/loop-controller/go/internal/execution"
 	"github.com/loop-controller/go/internal/models"
+	"github.com/loop-controller/go/internal/observability"
 	"github.com/loop-controller/go/internal/registry"
 	"github.com/loop-controller/go/internal/router"
 	"github.com/loop-controller/go/internal/store"
@@ -29,27 +32,59 @@ import (
 )
 
 // Server holds the kernel state.
+type executionSlot struct {
+	starting         bool
+	handle           execution.Handle
+	cancelRequested  bool
+	cancelRequestedC chan struct{}
+	ready            chan struct{}
+}
+
+type DurableAssignmentCanceler interface {
+	Cancel(taskID string) bool
+}
+
 type Server struct {
-	registry           *registry.Registry
-	tasks              *task.Manager
-	router             *router.Router
-	delegation         *delegation.Delegator
-	publisher          stream.TaskEventPublisher
-	discovery          *discovery.Manager
-	db                 *store.DB
-	issuer             *token.HMACIssuer
-	messages           store.MessageStore
-	idempotency        store.IdempotencyStore
-	entrypointClient   delegation.EntrypointClient
-	executor           execution.TargetExecutor
-	autoAcceptTarget   bool
-	autoStartTarget    bool
-	executionsMu       sync.Mutex
-	executions         map[string]execution.Handle
-	outboxCancel       context.CancelFunc
-	recoveryCancel     context.CancelFunc
-	controlToken       string
-	controlInitiatorID string
+	registry            *registry.Registry
+	tasks               *task.Manager
+	router              *router.Router
+	delegation          *delegation.Delegator
+	publisher           stream.TaskEventPublisher
+	discovery           *discovery.Manager
+	db                  *store.DB
+	issuer              *token.HMACIssuer
+	messages            store.MessageStore
+	idempotency         store.IdempotencyStore
+	entrypointClient    delegation.EntrypointClient
+	executor            execution.TargetExecutor
+	strictExecution     bool
+	entrypointPolicy    entrypointpolicy.Policy
+	receiptValidator    *execution.HTTPExecutor
+	autoAcceptTarget    bool
+	autoStartTarget     bool
+	durableAssignments  bool
+	schedulingEnabled   bool
+	dagEnabled          bool
+	durableCanceler     DurableAssignmentCanceler
+	executionsMu        sync.Mutex
+	executions          map[string]*executionSlot
+	outboxCancel        context.CancelFunc
+	approvalAuditCancel context.CancelFunc
+	notificationCancel  context.CancelFunc
+	recoveryCancel      context.CancelFunc
+	backgroundWG        sync.WaitGroup
+	controlToken        string
+	controlInitiatorID  string
+	controlTenantID     string
+	approvalAuth        approvalAuthConfig
+	streamConfig        stream.Config
+	readiness           ReadinessConfig
+	assignmentWorker    observability.StateProvider
+	outboundWorker      observability.StateProvider
+	recoveryState       observability.State
+	closed              atomic.Bool
+	closeOnce           sync.Once
+	closeErr            error
 }
 
 // currentProtocolVersion is the A2A HTTP/JSON protocol version implemented by
@@ -68,15 +103,11 @@ func checkProtocolVersion(v string) error {
 	if !strictSemverPattern.MatchString(v) {
 		return fmt.Errorf("invalid protocol version %q: expected major.minor.patch", v)
 	}
-	if v == currentProtocolVersion {
-		return nil
-	}
 	parts := strings.Split(v, ".")
-	current := strings.Split(currentProtocolVersion, ".")
-	if parts[0] != current[0] || parts[1] != current[1] {
-		return fmt.Errorf("incompatible protocol version %q, expected %s", v, currentProtocolVersion)
+	minor := parts[0] + "." + parts[1]
+	if minor != "0.53" && minor != "0.54" {
+		return fmt.Errorf("incompatible protocol version %q, expected 0.53.x or 0.54.x", v)
 	}
-	// patch-level drift is tolerated
 	return nil
 }
 
@@ -112,17 +143,20 @@ func NewServer(secret []byte, dbPath string, providers ...discovery.AgentDiscove
 	d := delegation.New(reg, tasks, issuer, pub, 5*time.Minute)
 	mgr := discovery.NewManager(reg, providers...)
 	srv := &Server{
-		registry:    reg,
-		tasks:       tasks,
-		router:      r,
-		delegation:  d,
-		publisher:   pub,
-		discovery:   mgr,
-		db:          db,
-		issuer:      issuer,
-		messages:    db.MessageStore(),
-		idempotency: db.IdempotencyStore(),
-		executions:  make(map[string]execution.Handle),
+		registry:         reg,
+		tasks:            tasks,
+		router:           r,
+		delegation:       d,
+		publisher:        pub,
+		discovery:        mgr,
+		db:               db,
+		issuer:           issuer,
+		messages:         db.MessageStore(),
+		idempotency:      db.IdempotencyStore(),
+		executions:       make(map[string]*executionSlot),
+		streamConfig:     stream.DefaultConfig(),
+		readiness:        DefaultReadinessConfig(),
+		entrypointPolicy: entrypointpolicy.Development(),
 	}
 	srv.startRecoveryLoop()
 	return srv, nil
@@ -131,27 +165,42 @@ func NewServer(secret []byte, dbPath string, providers ...discovery.AgentDiscove
 // startRecoveryLoop periodically reclaims running tasks whose execution lease
 // expired, which typically means the owning instance crashed or lost contact.
 func (s *Server) startRecoveryLoop() {
+	s.recoveryState.Start()
 	interval := s.db.ExecutionLease() / 3
 	if interval <= 0 {
 		interval = time.Second
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.recoveryCancel = cancel
-	go s.runRecoveryLoop(ctx, interval)
+	s.backgroundWG.Add(1)
+	go func() {
+		defer s.backgroundWG.Done()
+		s.runRecoveryLoop(ctx, interval)
+	}()
 }
 
 func (s *Server) runRecoveryLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	recover := func() {
+		now := time.Now().UTC()
+		_, recoverErr := s.tasks.RecoverExpiredRunning(ctx, now, 100)
+		s.recoveryState.Recovery(now, recoverErr)
+		if recoverErr != nil {
+			observability.Default.Add("assignment_recovery_errors_total", 1, "task_execution")
+		} else {
+			observability.Default.Set("assignment_recovery_last_success_unixtime", float64(now.Unix()), "task_execution")
+		}
+		_, _ = s.db.DelegationApprovalStore().ExpireDue(ctx, now, 100)
+	}
+	recover()
 	for {
 		select {
 		case <-ctx.Done():
+			s.recoveryState.Stop()
 			return
 		case <-ticker.C:
-			// Recovery is best-effort; transient errors are retried next tick.
-			now := time.Now().UTC()
-			_, _ = s.tasks.RecoverExpiredRunning(ctx, now, 100)
-			_, _ = s.db.DelegationApprovalStore().ExpireDue(ctx, now, 100)
+			recover()
 		}
 	}
 }
@@ -167,26 +216,85 @@ func (s *Server) SetR2Authorizer(a delegation.R2Authorizer) {
 		ctx, cancel := context.WithCancel(context.Background())
 		s.outboxCancel = cancel
 		dispatcher := store.NewLifecycleOutboxDispatcher(s.db.LifecycleOutboxStore(), auditor, time.Second)
-		go dispatcher.Run(ctx)
+		s.backgroundWG.Add(1)
+		go func() {
+			defer s.backgroundWG.Done()
+			dispatcher.Run(ctx)
+		}()
+	}
+	if s.approvalAuditCancel != nil {
+		s.approvalAuditCancel()
+		s.approvalAuditCancel = nil
+	}
+	if auditor, ok := a.(store.ApprovalAuditor); ok {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.approvalAuditCancel = cancel
+		dispatcher := store.NewApprovalAuditOutboxDispatcher(s.db.ApprovalAuditOutboxStore(), auditor, time.Second)
+		s.backgroundWG.Add(1)
+		go func() {
+			defer s.backgroundWG.Done()
+			dispatcher.Run(ctx)
+		}()
+	}
+}
+
+// SetApprovalNotifier enables or pauses webhook delivery. Pausing preserves existing queued rows.
+func (s *Server) SetApprovalNotifier(notifier store.ApprovalNotifier) {
+	if s.notificationCancel != nil {
+		s.notificationCancel()
+		s.notificationCancel = nil
+	}
+	destination := ""
+	if notifier != nil {
+		destination = notifier.DestinationURL()
+	}
+	s.db.SetApprovalNotificationDestination(destination)
+	if notifier != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.notificationCancel = cancel
+		dispatcher := store.NewApprovalNotificationDispatcher(s.db.ApprovalNotificationOutboxStore(), notifier, time.Second)
+		s.backgroundWG.Add(1)
+		go func() {
+			defer s.backgroundWG.Done()
+			dispatcher.Run(ctx)
+		}()
 	}
 }
 
 // SetEntrypointClient enables delivery of authorized tasks to target Agents.
 func (s *Server) SetEntrypointClient(client delegation.EntrypointClient) {
+	if httpClient, ok := client.(*delegation.HTTPEntrypointClient); ok {
+		httpClient.Policy = s.entrypointPolicy
+	}
 	s.entrypointClient = client
 	s.delegation.WithEntrypointClient(client)
+}
+
+func (s *Server) EnableDurableOutboundDelegation() {
+	s.delegation.WithOutboundQueue(s.db.DelegationDispatchOutboxStore())
 }
 
 // SetTargetExecutor configures execution of accepted target-side tasks.
 func (s *Server) SetTargetExecutor(executor execution.TargetExecutor) {
 	s.executor = executor
+	if httpExecutor, ok := executor.(*execution.HTTPExecutor); ok {
+		s.strictExecution = httpExecutor.Strict
+		s.delegation.WithStrict(httpExecutor.Strict)
+		s.receiptValidator = httpExecutor
+	}
 }
 
 // SetControlAuth enables Bearer authentication on initiator-facing task APIs.
 // Empty values keep authentication disabled for tests and local embedding.
 func (s *Server) SetControlAuth(controlToken, initiatorAgentID string) {
+	s.SetControlAuthForTenant(controlToken, initiatorAgentID, "")
+}
+
+// SetControlAuthForTenant binds the authenticated control principal to a tenant.
+func (s *Server) SetControlAuthForTenant(controlToken, initiatorAgentID, tenantID string) {
 	s.controlToken = strings.TrimSpace(controlToken)
 	s.controlInitiatorID = strings.TrimSpace(initiatorAgentID)
+	s.controlTenantID = strings.TrimSpace(tenantID)
 }
 
 // SetTargetTaskAutomation configures automatic target-side acceptance and execution.
@@ -195,20 +303,60 @@ func (s *Server) SetTargetTaskAutomation(autoAccept, autoStart bool) {
 	s.autoStartTarget = autoStart
 }
 
-// Close releases database resources held by the server.
+func (s *Server) EnableDurableAssignments(canceler DurableAssignmentCanceler) {
+	s.durableAssignments = true
+	s.durableCanceler = canceler
+}
+
+func (s *Server) SetEntrypointPolicy(policy entrypointpolicy.Policy) { s.entrypointPolicy = policy }
+func (s *Server) EnableScheduling()                                  { s.schedulingEnabled = true }
+func (s *Server) EnableDAG()                                         { s.dagEnabled = true }
+
+func (s *Server) SetStreamConfig(cfg stream.Config) {
+	s.streamConfig = cfg
+	if publisher, ok := s.publisher.(*stream.SQLitePublisher); ok {
+		publisher.WithConfig(cfg)
+	}
+}
+
+func (s *Server) Store() *store.DB { return s.db }
+
+func (s *Server) ExecutionLoader() func(context.Context, models.Task) (execution.Request, error) {
+	return s.executionRequest
+}
+
+// Close releases streaming, background, and database resources held by the server.
 func (s *Server) Close() error {
-	if s.recoveryCancel != nil {
-		s.recoveryCancel()
-		s.recoveryCancel = nil
-	}
-	if s.outboxCancel != nil {
-		s.outboxCancel()
-		s.outboxCancel = nil
-	}
-	if s.db != nil {
-		return s.db.Close()
-	}
-	return nil
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		s.recoveryState.Stop()
+		if s.discovery != nil {
+			s.discovery.Close()
+		}
+		if publisher, ok := s.publisher.(*stream.SQLitePublisher); ok {
+			_ = publisher.Close()
+			publisher.Wait()
+		}
+		if s.recoveryCancel != nil {
+			s.recoveryCancel()
+		}
+		if s.outboxCancel != nil {
+			s.outboxCancel()
+		}
+		if s.approvalAuditCancel != nil {
+			s.approvalAuditCancel()
+		}
+		if s.notificationCancel != nil {
+			s.notificationCancel()
+		}
+		s.backgroundWG.Wait()
+		s.approvalAuth = approvalAuthConfig{}
+		s.controlToken = ""
+		if s.db != nil {
+			s.closeErr = s.db.Close()
+		}
+	})
+	return s.closeErr
 }
 
 // SyncDiscovery runs a one-time sync of all discovery providers.
@@ -221,11 +369,12 @@ func (s *Server) SyncDiscovery(ctx context.Context) error {
 
 // RegisterRoutes attaches handlers to the given mux.
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /a2a/v1/agents", s.handleRegisterAgent)
-	mux.HandleFunc("GET /a2a/v1/agents", s.handleListAgents)
-	mux.HandleFunc("GET /a2a/v1/agents/{id}", s.handleGetAgent)
+	mux.HandleFunc("POST /a2a/v1/agents", s.withControlAuth(true, s.handleRegisterAgent))
+	mux.HandleFunc("GET /a2a/v1/agents", s.withControlAuth(true, s.handleListAgents))
+	mux.HandleFunc("GET /a2a/v1/agents/{id}", s.withControlAuth(true, s.handleGetAgent))
 	mux.HandleFunc("POST /a2a/v1/tasks", s.withControlAuth(true, s.handleCreateTask))
 	mux.HandleFunc("GET /a2a/v1/tasks/{id}", s.withControlAuth(false, s.handleGetTask))
+	mux.HandleFunc("GET /a2a/v1/tasks/{id}/snapshot", s.withControlAuth(false, s.handleTaskSnapshot))
 	mux.HandleFunc("GET /a2a/v1/tasks/{id}/stream", s.withControlAuth(false, s.handleTaskStream))
 	mux.HandleFunc("POST /a2a/v1/messages", s.handleSendMessage)
 	mux.HandleFunc("POST /a2a/v1/delegations", s.withControlAuth(true, s.handleDelegation))
@@ -234,6 +383,13 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /a2a/v1/delegation-approvals/{id}/reject", s.withApproverAuth(s.handleRejectDelegation))
 	mux.HandleFunc("POST /a2a/v1/delegation-approvals/{id}/cancel", s.withInitiatorApprovalAuth(s.handleCancelDelegation))
 	mux.HandleFunc("POST /a2a/v1/tasks/{id}/cancel", s.withControlAuth(false, s.handleCancelTask))
+	mux.HandleFunc("GET /a2a/v1/dead-letters", s.withControlAuth(true, s.handleListDeadLetters))
+	mux.HandleFunc("POST /a2a/v1/dead-letters/{id}/replay", s.withControlAuth(true, s.handleReplayDeadLetter))
+	if s.dagEnabled {
+		mux.HandleFunc("POST /a2a/v1/task-graphs", s.withControlAuth(true, s.handleCreateGraph))
+		mux.HandleFunc("GET /a2a/v1/task-graphs/{id}", s.withControlAuth(true, s.handleGetGraph))
+		mux.HandleFunc("POST /a2a/v1/task-graphs/{id}/cancel", s.withControlAuth(true, s.handleCancelGraph))
+	}
 	mux.HandleFunc("POST /a2a/v1/entrypoint/tasks", s.withEntrypointToken("create", true, s.handleEntrypointCreate))
 	mux.HandleFunc("POST /a2a/v1/entrypoint/tasks/{id}/accept", s.withEntrypointToken("accept", true, s.handleEntrypointAccept))
 	mux.HandleFunc("POST /a2a/v1/entrypoint/tasks/{id}/start", s.withEntrypointToken("start", true, s.handleEntrypointStart))
@@ -241,6 +397,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /a2a/v1/entrypoint/tasks/{id}", s.withEntrypointToken("get", false, s.handleEntrypointGet))
 	mux.HandleFunc("POST /a2a/v1/entrypoint/tasks/{id}/results", s.withEntrypointToken("results", true, s.handleEntrypointResults))
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /ready", s.handleReady)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 }
 
 func (s *Server) withControlAuth(bindRequestInitiator bool, next http.HandlerFunc) http.HandlerFunc {
@@ -259,18 +417,82 @@ func (s *Server) withControlAuth(bindRequestInitiator bool, next http.HandlerFun
 			return
 		}
 		if !bindRequestInitiator {
-			t, err := s.tasks.Get(r.PathValue("id"))
+			var t models.Task
+			if s.controlTenantID != "" {
+				t, err = s.db.TaskStore().GetForTenant(r.Context(), s.controlTenantID, r.PathValue("id"))
+			} else {
+				t, err = s.tasks.Get(r.PathValue("id"))
+			}
 			if err != nil {
-				writeError(w, http.StatusNotFound, "task_not_found", err.Error())
+				writeError(w, http.StatusNotFound, "task_not_found", "task not found")
 				return
 			}
 			if t.InitiatorAgentID != s.controlInitiatorID {
-				writeError(w, http.StatusForbidden, "task_access_denied", "task is owned by another initiator")
+				if s.controlTenantID != "" {
+					writeError(w, http.StatusNotFound, "task_not_found", "task not found")
+				} else {
+					writeError(w, http.StatusForbidden, "task_access_denied", "task is owned by another initiator")
+				}
 				return
 			}
 		}
 		next(w, r)
 	}
+}
+
+func (s *Server) controlTenant(requestTenant string) (string, bool) {
+	requestTenant = strings.TrimSpace(requestTenant)
+	if s.controlTenantID != "" {
+		return s.controlTenantID, requestTenant == "" || requestTenant == s.controlTenantID
+	}
+	// An unscoped control principal is an explicitly configured global/development authority.
+	return requestTenant, true
+}
+
+func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.controlTenant(r.URL.Query().Get("tenant_id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "resource_not_found", "resource not found")
+		return
+	}
+	items, err := s.db.AssignmentStore().ListDeadLetters(r.Context(), tenant, 100)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "dead_letter_query_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"assignments": items})
+}
+
+func (s *Server) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TenantID         string     `json:"tenant_id"`
+		ExpectedRevision int64      `json:"expected_revision"`
+		NotBefore        *time.Time `json:"not_before,omitempty"`
+	}
+	if !decodeJSONPost(w, r, &req) {
+		return
+	}
+	var ok bool
+	req.TenantID, ok = s.controlTenant(req.TenantID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "resource_not_found", "resource not found")
+		return
+	}
+	if req.ExpectedRevision <= 0 {
+		writeError(w, http.StatusBadRequest, "dead_letter_replay_invalid", "positive expected_revision is required")
+		return
+	}
+	correlationID := strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
+	assignment, err := s.db.AssignmentStore().ReplayDeadLetter(r.Context(), store.DeadLetterReplayParams{TenantID: req.TenantID, AssignmentID: r.PathValue("id"), ExpectedRevision: req.ExpectedRevision, NotBefore: req.NotBefore, Actor: s.controlInitiatorID, CorrelationID: correlationID, Now: time.Now().UTC()})
+	if err != nil {
+		status := http.StatusConflict
+		if errors.Is(err, store.ErrAssignmentNotFound) {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, "dead_letter_replay_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, assignment)
 }
 
 func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
@@ -283,7 +505,9 @@ func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "task_not_found", err.Error())
 		return
 	}
-	_ = stream.ServeTaskStream(s.publisher, w, r, taskID)
+	if err := stream.ServeTaskStreamWithConfig(s.publisher, w, r, taskID, s.streamConfig); err != nil {
+		return
+	}
 }
 
 func decodeJSONPost(w http.ResponseWriter, r *http.Request, dst any) bool {
@@ -315,25 +539,63 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONPost(w, r, &card) {
 		return
 	}
+	if card.ProtocolVersion == "" {
+		card.ProtocolVersion = currentProtocolVersion
+	}
+	if err := checkProtocolVersion(card.ProtocolVersion); err != nil {
+		writeError(w, http.StatusBadRequest, "incompatible_protocol_version", err.Error())
+		return
+	}
+	var ok bool
+	card.TenantID, ok = s.controlTenant(card.TenantID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "resource_not_found", "resource not found")
+		return
+	}
+	if card.Entrypoint.URL != "" {
+		if err := s.entrypointPolicy.ValidateRegistration(r.Context(), card.Entrypoint.URL); err != nil {
+			writeError(w, http.StatusBadRequest, "entrypoint_url_rejected", "entrypoint URL is not approved")
+			return
+		}
+	}
 	if err := s.registry.Register(card); err != nil {
 		writeError(w, http.StatusBadRequest, "register_failed", err.Error())
 		return
 	}
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"agent_id": card.AgentID})
+	writeJSON(w, http.StatusCreated, models.AgentRegistrationResponse{ProtocolVersion: currentProtocolVersion, AgentID: card.AgentID})
 }
 
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
-	agents := s.registry.List()
-	writeJSON(w, http.StatusOK, models.AgentList{Agents: agents})
+	tenant := ""
+	if s.controlToken != "" {
+		tenant = s.controlTenantID
+	}
+	agents, err := s.registry.ListContext(r.Context(), tenant)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "agent_list_failed", "failed to list agents")
+		return
+	}
+	for i := range agents {
+		if agents[i].ProtocolVersion == "" {
+			agents[i].ProtocolVersion = currentProtocolVersion
+		}
+	}
+	writeJSON(w, http.StatusOK, models.AgentList{ProtocolVersion: currentProtocolVersion, Agents: agents})
 }
 
 func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 	agentID := r.PathValue("id")
-	card, err := s.registry.Get(agentID)
+	tenant := ""
+	if s.controlToken != "" {
+		tenant = s.controlTenantID
+	}
+	card, err := s.registry.GetContext(r.Context(), tenant, agentID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "agent_not_found", err.Error())
+		writeError(w, http.StatusNotFound, "agent_not_found", "agent not found")
 		return
+	}
+	if card.ProtocolVersion == "" {
+		card.ProtocolVersion = currentProtocolVersion
 	}
 	writeJSON(w, http.StatusOK, card)
 }
@@ -366,12 +628,32 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
-	t, err := s.tasks.Get(taskID)
+	var t models.Task
+	var err error
+	if s.controlToken != "" && s.controlTenantID != "" {
+		t, err = s.db.TaskStore().GetForTenant(r.Context(), s.controlTenantID, taskID)
+	} else {
+		t, err = s.tasks.Get(taskID)
+	}
 	if err != nil {
-		writeError(w, http.StatusNotFound, "task_not_found", err.Error())
+		writeError(w, http.StatusNotFound, "task_not_found", "task not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
+}
+
+func (s *Server) handleTaskSnapshot(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.controlTenant(r.URL.Query().Get("tenant_id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "task_not_found", "task not found")
+		return
+	}
+	snapshot, err := s.db.SnapshotStore().GetTaskSnapshot(r.Context(), tenant, r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "task_not_found", "task not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
 }
 
 func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
@@ -388,16 +670,12 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := s.router.Route(msg)
+	resp.ProtocolVersion = currentProtocolVersion
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "route_failed", err.Error())
+		writeJSON(w, http.StatusBadRequest, resp)
 		return
 	}
-	resp.ProtocolVersion = currentProtocolVersion
-	status := http.StatusOK
-	if !resp.Accepted {
-		status = http.StatusBadRequest
-	}
-	writeJSON(w, status, resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleDelegation(w http.ResponseWriter, r *http.Request) {
@@ -411,6 +689,16 @@ func (s *Server) handleDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.controlToken != "" && req.InitiatorAgentID != s.controlInitiatorID {
 		writeError(w, http.StatusForbidden, "initiator_mismatch", "initiator_agent_id does not match authenticated principal")
+		return
+	}
+	var tenantOK bool
+	req.TenantID, tenantOK = s.controlTenant(req.TenantID)
+	if !tenantOK {
+		writeError(w, http.StatusNotFound, "resource_not_found", "resource not found")
+		return
+	}
+	if s.strictExecution && (req.TenantID == "" || req.TargetWorkloadID == "") {
+		writeError(w, http.StatusBadRequest, "delegation_binding_required", "strict delegation requires tenant_id and target_workload_id")
 		return
 	}
 	scope := "delegation:" + req.InitiatorAgentID
@@ -436,9 +724,10 @@ func (s *Server) handleDelegation(w http.ResponseWriter, r *http.Request) {
 
 	resp, delegationErr := s.delegation.Request(r.Context(), req)
 	if delegationErr != nil {
-		body, _ := json.Marshal(models.ErrorResponse{Error: delegationErr.Error(), Code: "delegation_failed"})
+		errorResponse := models.ErrorResponse{ProtocolVersion: currentProtocolVersion, Error: delegationErr.Error(), Code: "delegation_failed"}
+		body, _ := json.Marshal(errorResponse)
 		_ = s.idempotency.Complete(r.Context(), req.RequestID, scope, http.StatusBadRequest, body)
-		writeJSON(w, http.StatusBadRequest, models.ErrorResponse{Error: delegationErr.Error(), Code: "delegation_failed"})
+		writeJSON(w, http.StatusBadRequest, errorResponse)
 		return
 	}
 	resp.ProtocolVersion = currentProtocolVersion
@@ -528,6 +817,18 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cancelTaskExecution(ctx context.Context, t models.Task) (models.Task, error) {
+	if a, err := s.db.AssignmentStore().Get(ctx, "outbound-assignment-"+t.TaskID); err == nil && a.Kind == models.AssignmentKindOutboundDelegation {
+		updated, _, cancelErr := s.db.ExecutionQueueStore().CancelAssignmentAndRelease(ctx, store.CancelAssignmentParams{Kind: a.Kind, AssignmentID: a.AssignmentID, ExpectedRevision: a.Revision, ExpectedAttempt: a.Attempt, ExpectedFence: a.ExecutionFence, Now: time.Now().UTC()})
+		if cancelErr != nil {
+			return models.Task{}, cancelErr
+		}
+		if s.entrypointClient != nil && (a.State == models.AssignmentStateDispatched || a.State == models.AssignmentStateSettled) {
+			_, _ = s.delegation.Cancel(ctx, t.TargetAgentID, t.TaskID, t.DelegationToken)
+		}
+		return updated, nil
+	} else if err != nil && !errors.Is(err, store.ErrAssignmentNotFound) {
+		return models.Task{}, err
+	}
 	confirmed := true
 	if s.entrypointClient != nil {
 		var cancelErr error
@@ -672,6 +973,7 @@ func (s *Server) handleEntrypointCreate(w http.ResponseWriter, r *http.Request) 
 			req.InteractionID, req.DecisionID, req.RootInteractionID, req.ParentInteractionID,
 			req.RootTaskID, req.ParentTaskID, req.DelegationDepth, req.Deadline,
 			req.AllowedTools, req.AllowedCapabilities, req.AllowRedelegation, req.Budget,
+			req.RequestID, req.TenantID, req.TargetWorkloadID, req.TargetInstanceID,
 		)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "task_create_failed", err.Error())
@@ -682,6 +984,7 @@ func (s *Server) handleEntrypointCreate(w http.ResponseWriter, r *http.Request) 
 		t.RootInteractionID != req.RootInteractionID || t.ParentInteractionID != req.ParentInteractionID ||
 		t.RootTaskID != req.RootTaskID || t.ParentTaskID != req.ParentTaskID || t.DelegationDepth != req.DelegationDepth ||
 		t.InitiatorAgentID != req.InitiatorAgentID || t.TargetAgentID != req.TargetAgentID ||
+		t.RequestID != req.RequestID || t.TenantID != req.TenantID || t.TargetWorkloadID != req.TargetWorkloadID || t.TargetInstanceID != req.TargetInstanceID ||
 		!sameScope(t.AllowedTools, req.AllowedTools) || !sameScope(t.AllowedCapabilities, req.AllowedCapabilities) ||
 		t.AllowRedelegation != req.AllowRedelegation || t.Budget != req.Budget || !sameDeadline(t.Deadline, req.Deadline) {
 		writeError(w, http.StatusForbidden, "entrypoint_task_mismatch", "existing task does not match entrypoint request")
@@ -770,7 +1073,7 @@ func (s *Server) handleEntrypointStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "task_not_found", err.Error())
 		return
 	}
-	if current.Status != "accepted" {
+	if current.Status != "accepted" && !(s.durableAssignments && current.Status == "running") {
 		writeError(w, http.StatusConflict, "invalid_status_transition", fmt.Sprintf("task is %s, expected accepted", current.Status))
 		return
 	}
@@ -791,6 +1094,9 @@ func (s *Server) startTargetExecution(ctx context.Context, current models.Task) 
 	if current.Deadline != nil && !current.Deadline.After(time.Now().UTC()) {
 		return models.Task{}, errors.New("task deadline has expired")
 	}
+	if s.durableAssignments {
+		return s.enqueueTargetExecution(ctx, current)
+	}
 	if s.executor == nil {
 		return models.Task{}, errors.New("target executor is not configured")
 	}
@@ -798,20 +1104,96 @@ func (s *Server) startTargetExecution(ctx context.Context, current models.Task) 
 	if err != nil {
 		return models.Task{}, err
 	}
+	slot := &executionSlot{starting: true, cancelRequestedC: make(chan struct{}), ready: make(chan struct{})}
+	s.executionsMu.Lock()
+	if _, exists := s.executions[current.TaskID]; exists {
+		s.executionsMu.Unlock()
+		return models.Task{}, errors.New("target execution is already starting or running")
+	}
+	s.executions[current.TaskID] = slot
+	s.executionsMu.Unlock()
 	updated, err := s.tasks.UpdateStatus(current.TaskID, "running")
 	if err != nil {
+		s.executionsMu.Lock()
+		if s.executions[current.TaskID] == slot {
+			delete(s.executions, current.TaskID)
+		}
+		slot.starting = false
+		close(slot.ready)
+		s.executionsMu.Unlock()
 		return models.Task{}, err
 	}
+
 	handle, err := s.executor.Start(ctx, executionReq)
 	if err != nil {
-		_, _ = s.tasks.Complete(current.TaskID, "failed", nil, "execution_start_failed")
+		s.executionsMu.Lock()
+		if s.executions[current.TaskID] == slot {
+			delete(s.executions, current.TaskID)
+		}
+		cancelRequested := slot.cancelRequested
+		s.executionsMu.Unlock()
+		if cancelRequested {
+			_, _ = s.tasks.UpdateStatusFrom(current.TaskID, "running", "cancelled")
+		} else {
+			_, _ = s.tasks.Complete(current.TaskID, "failed", nil, "execution_start_failed")
+		}
+		s.executionsMu.Lock()
+		slot.starting = false
+		close(slot.ready)
+		s.executionsMu.Unlock()
 		return models.Task{}, err
 	}
+
 	s.executionsMu.Lock()
-	s.executions[current.TaskID] = handle
+	cancelRequested := slot.cancelRequested
+	if cancelRequested {
+		delete(s.executions, current.TaskID)
+	} else {
+		slot.starting = false
+		slot.handle = handle
+		close(slot.ready)
+	}
 	s.executionsMu.Unlock()
-	go s.finishExecution(current.TaskID, handle)
+	if cancelRequested {
+		confirmed := handle.Cancel()
+		status := "cancelled"
+		if !confirmed {
+			status = "outcome_unknown"
+		}
+		cancelled, transitionErr := s.tasks.UpdateStatusFrom(current.TaskID, "running", status)
+		s.executionsMu.Lock()
+		slot.starting = false
+		close(slot.ready)
+		s.executionsMu.Unlock()
+		if transitionErr != nil {
+			return models.Task{}, transitionErr
+		}
+		return cancelled, nil
+	}
+	go s.finishExecution(current.TaskID, slot, handle)
 	return updated, nil
+}
+
+func (s *Server) enqueueTargetExecution(ctx context.Context, current models.Task) (models.Task, error) {
+	assignmentID := "assignment-" + current.TaskID
+	if s.schedulingEnabled {
+		_, err := s.db.SchedulingStore().ScheduleAndReserve(ctx, store.ScheduleAndReserveParams{
+			Request:       models.SchedulingRequest{RequestID: "execution-" + current.TaskID, TenantID: current.TenantID, TaskID: current.TaskID, RequiredAgentCapabilities: current.AllowedCapabilities, RequiredTools: current.AllowedTools, Deadline: current.Deadline, BudgetEnvelope: current.Budget},
+			PinnedAgentID: current.TargetAgentID, ProtocolVersion: currentProtocolVersion, WorkloadID: current.TargetWorkloadID,
+			AssignmentID: assignmentID, DeliveryID: "delivery-" + current.TaskID, CapacityUnits: 1,
+		})
+		if err != nil {
+			return models.Task{}, err
+		}
+		return s.tasks.Get(current.TaskID)
+	}
+	updated, _, err := s.db.ExecutionQueueStore().EnqueueAcceptedTask(ctx, store.EnqueueAcceptedTaskParams{
+		Kind:         models.AssignmentKindTargetExecution,
+		AssignmentID: assignmentID, DeliveryID: "delivery-" + current.TaskID,
+		IdempotencyKey: "execution-" + current.TaskID, TaskID: current.TaskID,
+		TenantID: current.TenantID, TargetAgentID: current.TargetAgentID, Deadline: current.Deadline,
+	})
+	return updated, err
 }
 
 func (s *Server) handleEntrypointCancel(w http.ResponseWriter, r *http.Request) {
@@ -833,9 +1215,49 @@ func (s *Server) handleEntrypointCancel(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, t)
 		return
 	}
+	if s.durableAssignments && t.Status == "running" {
+		a, getErr := s.db.AssignmentStore().Get(r.Context(), "assignment-"+taskID)
+		if getErr == nil {
+			if s.durableCanceler != nil {
+				s.durableCanceler.Cancel(taskID)
+			}
+			updated, _, cancelErr := s.db.ExecutionQueueStore().CancelAssignmentAndRelease(r.Context(), store.CancelAssignmentParams{Kind: models.AssignmentKindTargetExecution, AssignmentID: a.AssignmentID, ExpectedRevision: a.Revision, ExpectedAttempt: a.Attempt, ExpectedFence: a.ExecutionFence, Now: time.Now().UTC()})
+			if cancelErr != nil {
+				writeError(w, http.StatusConflict, "invalid_status_transition", cancelErr.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, updated)
+			return
+		}
+	}
 	s.executionsMu.Lock()
-	handle := s.executions[taskID]
-	delete(s.executions, taskID)
+	slot := s.executions[taskID]
+	if slot != nil && slot.starting {
+		if !slot.cancelRequested {
+			slot.cancelRequested = true
+			close(slot.cancelRequestedC)
+		}
+		ready := slot.ready
+		s.executionsMu.Unlock()
+		select {
+		case <-ready:
+		case <-r.Context().Done():
+			writeError(w, http.StatusRequestTimeout, "cancel_interrupted", r.Context().Err().Error())
+			return
+		}
+		updated, getErr := s.tasks.Get(taskID)
+		if getErr != nil {
+			writeError(w, http.StatusNotFound, "task_not_found", getErr.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, updated)
+		return
+	}
+	var handle execution.Handle
+	if slot != nil {
+		handle = slot.handle
+		delete(s.executions, taskID)
+	}
 	s.executionsMu.Unlock()
 	confirmed := handle == nil || handle.Cancel()
 	status := "cancelled"
@@ -865,6 +1287,15 @@ func (s *Server) executionRequest(ctx context.Context, t models.Task) (execution
 			continue
 		}
 		return execution.Request{
+			RequestID:           t.RequestID,
+			InteractionID:       t.InteractionID,
+			DecisionID:          t.DecisionID,
+			CallID:              "call-" + t.TaskID,
+			DelegationJTI:       claims.TokenID,
+			DelegationToken:     t.DelegationToken,
+			TenantID:            t.TenantID,
+			TargetWorkloadID:    t.TargetWorkloadID,
+			TargetInstanceID:    t.TargetInstanceID,
 			TaskID:              t.TaskID,
 			SessionID:           t.SessionID,
 			InitiatorAgentID:    t.InitiatorAgentID,
@@ -880,14 +1311,15 @@ func (s *Server) executionRequest(ctx context.Context, t models.Task) (execution
 	return execution.Request{}, errors.New("delegated execution request not found")
 }
 
-func (s *Server) finishExecution(taskID string, handle execution.Handle) {
+func (s *Server) finishExecution(taskID string, slot *executionSlot, handle execution.Handle) {
 	result, ok := s.awaitExecution(taskID, handle)
 	s.executionsMu.Lock()
-	if s.executions[taskID] == handle {
+	ownsExecution := s.executions[taskID] == slot && slot.handle == handle
+	if ownsExecution {
 		delete(s.executions, taskID)
 	}
 	s.executionsMu.Unlock()
-	if !ok {
+	if !ok || !ownsExecution {
 		return
 	}
 	if result.MayBeSent {
@@ -913,6 +1345,7 @@ func (s *Server) awaitExecution(taskID string, handle execution.Handle) (executi
 			return result, ok
 		case <-ticker.C:
 			if err := s.tasks.RenewExecutionLease(context.Background(), taskID); err != nil {
+				handle.Cancel()
 				return execution.Result{}, false
 			}
 		}
@@ -956,7 +1389,43 @@ func (s *Server) handleEntrypointResults(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusConflict, "invalid_status_transition", fmt.Sprintf("task is %s, expected running or outcome_unknown", current.Status))
 		return
 	}
-	updated, err := s.tasks.CompleteWithConsumption(taskID, req.Status, req.Outcome, req.ErrorCode, req.ConsumedBudget)
+	if s.strictExecution {
+		if s.receiptValidator == nil {
+			writeError(w, http.StatusServiceUnavailable, "execution_receipt_validation_unavailable", "strict receipt validator is not configured")
+			return
+		}
+		claims, claimErr := s.validateDelegationToken(current.DelegationToken)
+		if claimErr != nil {
+			writeError(w, http.StatusForbidden, "invalid_delegation_token", claimErr.Error())
+			return
+		}
+		responseStatus := "deny"
+		if req.Status == "completed" {
+			responseStatus = "allow"
+		}
+		result := req.Outcome
+		var envelope struct {
+			Result json.RawMessage `json:"result"`
+		}
+		if json.Unmarshal(req.Outcome, &envelope) == nil && len(envelope.Result) > 0 {
+			result = envelope.Result
+		}
+		executionReq := execution.Request{RequestID: current.RequestID, InteractionID: current.InteractionID, DecisionID: current.DecisionID, CallID: "call-" + current.TaskID, DelegationJTI: claims.TokenID, TaskID: current.TaskID}
+		terminalStatus := "error"
+		if req.Status == "completed" {
+			terminalStatus = "success"
+		} else if req.Status == "cancelled" {
+			terminalStatus = "cancelled"
+		}
+		if err := s.receiptValidator.ValidateExecutionReceipt(req.ExecutionReceipt, responseStatus, terminalStatus, result, executionReq); err != nil {
+			writeError(w, http.StatusForbidden, "execution_receipt_invalid", err.Error())
+			return
+		}
+	}
+	updated, err := s.db.DelegationDispatchOutboxStore().CommitOutboundTaskResult(r.Context(), taskID, req.Status, req.Outcome, req.ErrorCode, req.ConsumedBudget, time.Now().UTC())
+	if errors.Is(err, store.ErrAssignmentNotFound) {
+		updated, err = s.tasks.CompleteWithConsumption(taskID, req.Status, req.Outcome, req.ErrorCode, req.ConsumedBudget)
+	}
 	if err != nil {
 		writeError(w, http.StatusConflict, "invalid_status_transition", err.Error())
 		return
@@ -988,6 +1457,9 @@ func (s *Server) verifyTokenMatchesTask(ctx context.Context, claims token.Delega
 	}
 	if claims.TargetAgentID == "" || claims.TargetAgentID != t.TargetAgentID {
 		return fmt.Errorf("token target mismatch")
+	}
+	if (t.RequestID != "" && claims.RequestID != t.RequestID) || claims.TenantID != t.TenantID || claims.TargetWorkloadID != t.TargetWorkloadID || claims.TargetInstanceID != t.TargetInstanceID {
+		return fmt.Errorf("token task/request/workload binding mismatch")
 	}
 	if claims.Audience != t.TargetAgentID {
 		return fmt.Errorf("token audience mismatch")
@@ -1039,6 +1511,9 @@ func (s *Server) verifyTokenMatchesRequest(claims token.DelegationClaims, req mo
 	}
 	if claims.TargetAgentID == "" || claims.TargetAgentID != req.TargetAgentID {
 		return fmt.Errorf("token target mismatch")
+	}
+	if claims.TenantID != req.TenantID || claims.TargetWorkloadID != req.TargetWorkloadID || claims.TargetInstanceID != req.TargetInstanceID {
+		return fmt.Errorf("token request workload binding mismatch")
 	}
 	if claims.ToolName == "" || claims.ToolName != req.ToolName {
 		return fmt.Errorf("token tool_name mismatch")
@@ -1132,9 +1607,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(models.ErrorResponse{Error: message, Code: code})
+	if status >= http.StatusInternalServerError {
+		message = "service unavailable"
+	}
+	writeJSON(w, status, models.ErrorResponse{ProtocolVersion: currentProtocolVersion, Error: message, Code: code})
 }
 
 // ListenAndServe starts the HTTP server on the given address.

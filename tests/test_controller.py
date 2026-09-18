@@ -6,16 +6,72 @@
 from __future__ import annotations
 
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from loop_controller.controller import build_controller
+from loop_controller.execution_security import ExecutionRequestContext, current_execution_request
+from loop_controller.executors.base import (
+    ExecutionContext,
+    ExecutionReceiptType,
+    ExecutionTerminalStatus,
+    WorkloadAuthMethod,
+    WorkloadIdentity,
+    issue_execution_receipt,
+)
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.config_loader import ConfigLoader
-from loop_controller.models import ActionProposal, ApprovalRecord
+from loop_controller.models import ActionProposal, ApprovalRecord, CapabilityProfile, ToolResult
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+class _StrictReceiptExecutor:
+    supports_strict_security = True
+    security_egress_type = "protected_http"
+    security_capabilities = frozenset({"execution_receipt_v1"})
+
+    def __init__(self, terminal: ExecutionTerminalStatus) -> None:
+        self.terminal = terminal
+        self.calls = 0
+
+    def secret_refs_for(self, tool_name: str) -> list[str]:
+        return []
+
+    async def execute(
+        self, tool_name: str, arguments: dict[str, Any], context: ExecutionContext
+    ) -> ToolResult:
+        self.calls += 1
+        content = {"terminal": self.terminal.value}
+        receipt = issue_execution_receipt(
+            receipt_type=ExecutionReceiptType.CONTROLLER_EXECUTION_RECORD,
+            context=context,
+            attester_workload_id="executor",
+            executor="http",
+            backend="protected",
+            status=self.terminal,
+            result=content,
+        )
+        return ToolResult(
+            call_id=context.call_id,
+            task_id=context.task_id,
+            tool_name=tool_name,
+            status="success" if self.terminal == ExecutionTerminalStatus.SUCCESS else "error",
+            content=content,
+            terminal_status=self.terminal.value,
+            error_code=(
+                None
+                if self.terminal == ExecutionTerminalStatus.SUCCESS
+                else f"http_{self.terminal.value}"
+            ),
+            execution_receipt=receipt,
+        )
+
+    async def list_tools(self, profile: CapabilityProfile) -> list[Any]:
+        return []
 
 
 def _env_extra() -> dict[str, str]:
@@ -209,6 +265,117 @@ tool_mapping:
         final = await controller.resume_after_approval(request_id)
         assert final.status == "allow"
         assert final.content is not None
+    finally:
+        await controller.aclose()
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        ExecutionTerminalStatus.SUCCESS,
+        ExecutionTerminalStatus.TIMEOUT,
+        ExecutionTerminalStatus.CANCELLED,
+    ],
+)
+@pytest.mark.asyncio
+async def test_strict_approval_resume_preserves_terminal_status_and_receipt_without_bypass(
+    terminal: ExecutionTerminalStatus,
+    workdir: Path,
+    opa_server: str,
+    approvals_path: Path,
+) -> None:
+    (workdir / "config" / "profiles.yaml").write_text(
+        """
+profiles:
+  - profile_id: research_assistant_v1
+    description: 研究助手岗位说明书
+    max_budget_token: 100000
+    max_budget_payment: 0.0
+    session_block_threshold: 10
+    session_risk_threshold: 0.95
+    tools:
+      send_email:
+        allowed: true
+        require_approval: true
+        allowed_args:
+          to: ["*@company.com"]
+        max_calls_per_task: 1
+""",
+        encoding="utf-8",
+    )
+    (workdir / "config" / "mcp_servers.yaml").write_text(
+        """
+servers:
+  email_mock:
+    command: ["python", "-m", "loop_controller.mocks.email_server"]
+    transport: stdio
+
+tool_mapping:
+  web_search: {server: email_mock, mcp_name: web_search, cost_per_call: 200}
+  send_email: {server: email_mock, mcp_name: send_email, cost_per_call: 800}
+""",
+        encoding="utf-8",
+    )
+    config = ConfigLoader().load(workdir / "config", opa_base_url=opa_server)
+    controller = await build_controller(config, opa_url=opa_server, env_extra=_env_extra())
+    controller._runtime.approval_manager._store = JsonlApprovalStore(str(approvals_path))
+    executor = _StrictReceiptExecutor(terminal)
+    controller._runtime.checkpoint._executor_registry.register("send_email", executor)
+
+    await controller.start()
+    try:
+        pending = await controller.evaluate_and_execute(
+            agent_id="researcher_001",
+            user_id="alice",
+            tool_name="send_email",
+            arguments={"to": "zhang@company.com"},
+            task_context="发送报告",
+        )
+        assert pending.status == "require_approval"
+        assert pending.request_id is not None
+        assert pending.decision is not None
+        assert executor.calls == 0
+
+        request = controller._runtime.approval_manager.get_request_by_id(pending.request_id)
+        controller._runtime.approval_manager._store.record_response(
+            ApprovalRecord(
+                request_id=request.request_id,
+                decision_id=request.decision_id,
+                verdict="approve",
+                approver_id=request.approver_id,
+                comment="approved for strict execution",
+            )
+        )
+        context = ExecutionRequestContext(
+            workload_identity=WorkloadIdentity(
+                workload_id="kernel",
+                service="go-kernel",
+                principal="kernel",
+                tenant_id="tenant",
+                authenticated_at=datetime.now(UTC),
+                auth_method=WorkloadAuthMethod.MTLS,
+            ),
+            request_id=pending.request_id,
+            interaction_id="interaction-1",
+            decision_id=pending.decision.decision_id,
+            task_id=pending.decision.task_id,
+            call_id=pending.decision.call_id,
+            delegation_jti="jti-1",
+            tenant_id="tenant",
+            security_capabilities=frozenset({"execution_receipt_v1"}),
+        )
+        token = current_execution_request.set(context)
+        try:
+            final = await controller.resume_after_approval(pending.request_id)
+        finally:
+            current_execution_request.reset(token)
+
+        assert executor.calls == 1
+        assert final.status == ("allow" if terminal == ExecutionTerminalStatus.SUCCESS else "error")
+        assert final.terminal_status == terminal.value
+        assert final.execution_receipt is not None
+        assert final.execution_receipt.status == terminal
+        assert final.execution_receipt.receipt_id
     finally:
         await controller.aclose()
 
