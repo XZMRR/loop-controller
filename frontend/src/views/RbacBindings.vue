@@ -48,6 +48,11 @@
             </div>
           </div>
 
+          <ErrorState
+            v-if="!bindingsLoading && bindingsError"
+            :message="bindingsError"
+            @retry="refreshBindings()"
+          />
           <el-table v-loading="bindingsLoading" :data="filteredBindings" style="width: 100%">
             <el-table-column prop="binding_id" label="Binding ID" min-width="130" show-overflow-tooltip />
             <el-table-column prop="principal" label="主体" min-width="150" show-overflow-tooltip />
@@ -98,6 +103,11 @@
             </div>
           </div>
 
+          <ErrorState
+            v-if="!grantsLoading && grantsError"
+            :message="grantsError"
+            @retry="refreshGrants()"
+          />
           <el-table v-loading="grantsLoading" :data="filteredGrants" style="width: 100%">
             <el-table-column prop="grant_id" label="Grant ID" min-width="130" show-overflow-tooltip />
             <el-table-column prop="source_principal" label="主体" min-width="140" show-overflow-tooltip />
@@ -243,6 +253,7 @@ import {
   type RbacRole,
 } from '@/api/rbac'
 import { useAsyncData, usePolling } from '@/composables/useAsyncData'
+import ErrorState from '@/components/ErrorState.vue'
 
 const ROLE_OPTIONS: RbacRole[] = [
   'platform_admin',
@@ -260,18 +271,23 @@ const activeTab = ref('bindings')
 const {
   data: bindings,
   loading: bindingsLoading,
+  error: bindingsError,
   refresh: refreshBindings,
 } = useAsyncData(() => rbacBindingSource.listBindings(), {
   defaultErrorMessage: '角色绑定列表加载失败',
+  // 加载失败由 ErrorState 持久展示，不再弹 toast
+  showError: false,
 })
 
 // ---------- 跨租户授权 ----------
 const {
   data: grants,
   loading: grantsLoading,
+  error: grantsError,
   refresh: refreshGrants,
 } = useAsyncData(() => rbacGrantSource.listGrants(), {
   defaultErrorMessage: '跨租户授权列表加载失败',
+  showError: false,
 })
 
 usePolling(async () => {

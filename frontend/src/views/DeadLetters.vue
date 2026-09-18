@@ -27,6 +27,11 @@
         </el-button>
       </div>
 
+      <ErrorState
+        v-if="!loading && error"
+        :message="error"
+        @retry="refresh()"
+      />
       <el-table v-loading="loading" :data="filteredList" style="width: 100%">
         <el-table-column prop="assignment_id" label="Assignment ID" min-width="170" show-overflow-tooltip />
         <el-table-column prop="task_id" label="任务" min-width="160" show-overflow-tooltip />
@@ -123,13 +128,17 @@ import { Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { a2aDeadLetterSource, type A2ADeadLetterItem } from '@/api/a2a'
 import { useAsyncData, usePolling } from '@/composables/useAsyncData'
+import ErrorState from '@/components/ErrorState.vue'
 
 const {
   data,
   loading,
+  error,
   refresh,
 } = useAsyncData(() => a2aDeadLetterSource.listDeadLetters(), {
   defaultErrorMessage: '死信列表加载失败',
+  // 加载失败由 ErrorState 持久展示，不再弹 toast
+  showError: false,
 })
 
 usePolling(() => refresh(true), 15000)

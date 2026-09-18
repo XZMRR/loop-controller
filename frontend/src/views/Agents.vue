@@ -7,7 +7,12 @@
           <el-button size="small" @click="loadData">刷新</el-button>
         </div>
       </template>
-      <el-table :data="agents" stripe>
+      <ErrorState
+        v-if="!loading && loadError"
+        :message="loadError"
+        @retry="loadData"
+      />
+      <el-table :data="agents" v-loading="loading" stripe>
         <el-table-column prop="agent_id" label="Agent ID" width="180" />
         <el-table-column prop="name" label="名称" width="180" />
         <el-table-column prop="profile_id" label="Profile" width="180" />
@@ -24,6 +29,9 @@
             <el-button size="small" link type="primary" @click="openDetail(row)">详情</el-button>
           </template>
         </el-table-column>
+        <template #empty>
+          <el-empty description="暂无已注册 Agent" />
+        </template>
       </el-table>
     </el-card>
 
@@ -57,22 +65,29 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
 import { loadAgentsConfig } from '@/api/config'
 import { getAdminAgentDetail, type AdminAgentDetail } from '@/api/python'
+import ErrorState from '@/components/ErrorState.vue'
 
 const agents = ref<any[]>([])
+const loading = ref(false)
+// 加载失败的持久错误态（由 ErrorState 展示，含重试）
+const loadError = ref('')
 
 const detailVisible = ref(false)
 const detailLoading = ref(false)
 const detail = ref<AdminAgentDetail | null>(null)
 
 async function loadData() {
+  loading.value = true
   try {
     const config = await loadAgentsConfig()
     agents.value = config.agents
+    loadError.value = ''
   } catch (error: any) {
-    ElMessage.error(error.message || '加载 Agent 配置失败')
+    loadError.value = error.message || '加载 Agent 配置失败'
+  } finally {
+    loading.value = false
   }
 }
 

@@ -46,6 +46,11 @@
             </el-button>
           </div>
 
+          <ErrorState
+            v-if="!candidatesLoading && candidatesError"
+            :message="candidatesError"
+            @retry="refreshCandidates()"
+          />
           <el-table v-loading="candidatesLoading" :data="filteredCandidates" style="width: 100%">
             <el-table-column prop="candidate_id" label="Candidate ID" min-width="120" show-overflow-tooltip />
             <el-table-column prop="revision" label="Revision" min-width="100" />
@@ -121,6 +126,11 @@
               刷新
             </el-button>
           </div>
+          <ErrorState
+            v-if="!auditLoading && auditError"
+            :message="auditError"
+            @retry="refreshAudit()"
+          />
           <el-table v-loading="auditLoading" :data="auditEvents ?? []" style="width: 100%">
             <el-table-column prop="action" label="动作" min-width="180" />
             <el-table-column prop="target" label="目标" min-width="130" show-overflow-tooltip />
@@ -262,6 +272,7 @@ import {
   type PolicyValidationResult,
 } from '@/api/policy'
 import { useAsyncData, usePolling } from '@/composables/useAsyncData'
+import ErrorState from '@/components/ErrorState.vue'
 
 const activeTab = ref('candidates')
 
@@ -284,18 +295,23 @@ async function loadStatus(silent = false) {
 const {
   data: candidates,
   loading: candidatesLoading,
+  error: candidatesError,
   refresh: refreshCandidates,
 } = useAsyncData(() => policySource.listCandidates(), {
   defaultErrorMessage: '候选列表加载失败',
+  // 加载失败由 ErrorState 持久展示，不再弹 toast
+  showError: false,
 })
 
 // ---------- 审计 ----------
 const {
   data: auditEvents,
   loading: auditLoading,
+  error: auditError,
   refresh: refreshAudit,
 } = useAsyncData(() => policySource.listAudit(), {
   defaultErrorMessage: '审计列表加载失败',
+  showError: false,
 })
 
 usePolling(async () => {

@@ -43,7 +43,12 @@
       <template #header>
         <span>Agent 注册状态</span>
       </template>
-      <el-table :data="agents" stripe>
+      <ErrorState
+        v-if="!loading && loadError"
+        :message="loadError"
+        @retry="loadData"
+      />
+      <el-table :data="agents" v-loading="loading" stripe>
         <el-table-column prop="agent_id" label="Agent ID" width="200" />
         <el-table-column prop="name" label="名称" width="200" />
         <el-table-column prop="profile_id" label="Profile" width="180" />
@@ -55,6 +60,9 @@
             <el-tag v-else type="info">未知</el-tag>
           </template>
         </el-table-column>
+        <template #empty>
+          <el-empty description="暂无 Agent 注册信息" />
+        </template>
       </el-table>
     </el-card>
 
@@ -218,10 +226,13 @@ import {
 } from '@/api/python'
 import { a2aTaskSource, type A2ATaskNode } from '@/api/a2a'
 import TaskTree from '@/components/TaskTree.vue'
+import ErrorState from '@/components/ErrorState.vue'
 
 const status = ref<A2AStatus | null>(null)
 const agents = ref<A2AAgent[]>([])
 const loading = ref(false)
+// 加载失败的持久错误态（由 ErrorState 展示，含重试）
+const loadError = ref('')
 
 const taskTrees = ref<A2ATaskNode[]>([])
 const treesLoading = ref(false)
@@ -290,8 +301,9 @@ async function loadData() {
     status.value = await getA2AStatus()
     const data = await getA2AAgents()
     agents.value = data.agents
+    loadError.value = ''
   } catch (error: any) {
-    ElMessage.error(error.message || '加载 A2A 状态失败')
+    loadError.value = error.message || '加载 A2A 状态失败'
   } finally {
     loading.value = false
   }

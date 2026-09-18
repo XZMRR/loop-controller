@@ -442,6 +442,24 @@ frontend/
   用户视图），并给出实施顺序。
 - 删除已被取代的"第一/二/三阶段"陈旧小节（内容分别并入了 §4 与 §6）。
 
+### 进度记录（第二十四轮：任务 9 空态与错误态统一——三态规范落地）
+
+- **规范**：数据区统一三态——Loading（v-loading / el-skeleton）、
+  Empty（el-table #empty / el-empty）、Error（共享组件 ErrorState 持久块
+  + 重试按钮，不再弹 toast）；操作类反馈（保存/审批/重放）仍用 ElMessage。
+- **共享组件** `src/components/ErrorState.vue`：el-alert + 重试，
+  约定注释写进组件文档。
+- **接入页面（9 个）**：Approvals（pending/history 双 Tab + history 补空态）、
+  Audit、Agents、Tools（新增 loading；API 与 YAML 回退均失败才出错误态）、
+  A2A（Agent 注册表）、DeadLetters、RbacBindings（双 Tab）、
+  Policies（候选 + 审计）；useAsyncData 页签 `showError: false` 防与
+  ErrorState 双重提示。
+- **E2E 扩面**：`error-state.spec.ts` 2 用例（500 故障展示错误块与重试、
+  解除故障重试后恢复空态），E2E 总计 10 passed。
+- **回归**：vitest 55 passed；typecheck + build 全绿。
+- **当前剩余队列**：E2E 扩面（审批操作流：通过/拒绝/吊销/Kill Switch）；
+  随后端契约冻结替换 Mock 数据源（§6.2）。
+
 ---
 
 ## 5. 当前已完成工作
@@ -465,9 +483,8 @@ frontend/
 
 ### 6.1 当前活跃队列（质量收口）
 
-- [ ] **任务 9：空态与错误态统一**——Loading / Empty / Error 三态规范，
-      各列表页统一空态文案与错误提示（部分页面已有 `el-empty`，
-      规范后全站对齐）
+- [x] **任务 9：空态与错误态统一**——Loading / Empty / Error 三态规范，
+      各列表页统一空态文案与错误提示（R24 已落地，见 §4 进度记录）
 - [ ] E2E 扩面：审批操作（通过/拒绝/吊销/Kill Switch）、RBAC 与 Policy
       页面冒烟用例
 - [ ] 工具策略页参数可视化编辑（当前为 JSON 编辑器）

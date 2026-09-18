@@ -18,7 +18,17 @@
         class="mb-4"
         title="保存后会写回 profiles.yaml 并立即热更新到运行时；文件中的注释在首次写回后不保留。"
       />
-      <el-collapse v-model="activeProfiles">
+      <ErrorState
+        v-if="!loading && loadError"
+        :message="loadError"
+        @retry="loadData"
+      />
+      <el-skeleton v-if="loading && profiles.length === 0" :rows="4" animated />
+      <el-empty
+        v-else-if="!loading && !loadError && profiles.length === 0"
+        description="暂无 Profile 配置"
+      />
+      <el-collapse v-else v-model="activeProfiles">
         <el-collapse-item
           v-for="profile in profiles"
           :key="profile.profile_id"
@@ -125,6 +135,7 @@
 import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { loadProfilesConfig } from '@/api/config'
+import ErrorState from '@/components/ErrorState.vue'
 import {
   getAdminProfiles,
   updateProfileTools,
@@ -135,6 +146,9 @@ import {
 const profiles = ref<any[]>([])
 const activeProfiles = ref<string[]>([])
 const reloading = ref(false)
+const loading = ref(false)
+// 加载失败的持久错误态（由 ErrorState 展示，含重试；API 与 YAML 回退均失败才出现）
+const loadError = ref('')
 
 const editVisible = ref(false)
 const editProfileId = ref('')
@@ -165,6 +179,7 @@ function argsSummary(row: any) {
 }
 
 async function loadData() {
+  loading.value = true
   try {
     // 优先在线 API（含热更新后的最新版本），失败回退静态 YAML
     try {
@@ -174,8 +189,11 @@ async function loadData() {
       profiles.value = config.profiles || []
     }
     activeProfiles.value = profiles.value.map((p: any) => p.profile_id)
+    loadError.value = ''
   } catch (error: any) {
-    ElMessage.error(error.message || '加载工具策略失败')
+    loadError.value = error.message || '加载工具策略失败（在线 API 与本地配置均不可用）'
+  } finally {
+    loading.value = false
   }
 }
 

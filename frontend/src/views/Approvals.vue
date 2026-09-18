@@ -36,6 +36,11 @@
       </template>
 
       <template v-if="activeTab === 'pending'">
+        <ErrorState
+          v-if="!loading && pendingError"
+          :message="pendingError"
+          @retry="loadApprovals()"
+        />
         <el-table :data="approvals" v-loading="loading" stripe>
           <el-table-column prop="decision_id" label="Decision ID" width="220" show-overflow-tooltip />
           <el-table-column prop="tool_name" label="工具" width="160" />
@@ -76,6 +81,11 @@
           </el-form-item>
         </el-form>
 
+        <ErrorState
+          v-if="!loading && historyError"
+          :message="historyError"
+          @retry="loadHistory()"
+        />
         <el-table :data="history" v-loading="loading" stripe>
           <el-table-column prop="created_at" label="发起时间" width="180" />
           <el-table-column prop="decision_id" label="Decision ID" width="220" show-overflow-tooltip />
@@ -89,6 +99,9 @@
             </template>
           </el-table-column>
           <el-table-column prop="reason" label="原因" show-overflow-tooltip />
+          <template #empty>
+            <el-empty description="暂无审批历史" />
+          </template>
         </el-table>
         <div style="display: flex; justify-content: flex-end; margin-top: 16px">
           <el-pagination
@@ -181,12 +194,16 @@ import {
   streamAdminApprovals,
 } from '@/api/python'
 import { usePolling } from '@/composables/useAsyncData'
+import ErrorState from '@/components/ErrorState.vue'
 import type { PendingApproval, ApprovalHistoryItem } from '@/api/python'
 
 const activeTab = ref<'pending' | 'history'>('pending')
 const approvals = ref<PendingApproval[]>([])
 const history = ref<ApprovalHistoryItem[]>([])
 const historyTotal = ref(0)
+// 加载失败的持久错误态（由 ErrorState 展示，含重试）
+const pendingError = ref('')
+const historyError = ref('')
 const historyPage = ref(1)
 const historyQuery = ref({
   status: '',
@@ -269,13 +286,14 @@ function statusTagType(status: string) {
 }
 
 async function loadApprovals(silent = false) {
+  // silent 参数保留（轮询/推送兜底调用），加载失败统一由 ErrorState 持久展示
+  void silent
   loading.value = true
   try {
     approvals.value = await getPendingApprovals()
+    pendingError.value = ''
   } catch (error: any) {
-    if (!silent) {
-      ElMessage.error(error.message || '加载审批失败')
-    }
+    pendingError.value = error.message || '加载审批失败'
   } finally {
     loading.value = false
   }
@@ -293,8 +311,9 @@ async function loadHistory() {
     })
     history.value = data.approvals
     historyTotal.value = data.total
+    historyError.value = ''
   } catch (error: any) {
-    ElMessage.error(error.message || '加载审批历史失败')
+    historyError.value = error.message || '加载审批历史失败'
   } finally {
     loading.value = false
   }
