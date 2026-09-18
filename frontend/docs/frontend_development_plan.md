@@ -384,6 +384,33 @@ frontend/
   1. 任务 6：审批 SSE 推送替代 15s 轮询（`wait-for-approval/sse`，复用 streamA2ATask 模式）；
   2. 任务 7~9：Playwright E2E 骨架 / 本文档 §4·§6 重写 / 空态与错误态统一。
 
+#### 进度记录（第二十一轮：任务 6 审批推送——SSE 基础模块 + 推送优先轮询兜底）
+
+- **后端核实结论**：管理台审批推送**无可用 SSE 端点**——
+  `/v1/wait-for-approval/sse`（server.py:1208-1274）走 `_check_agent_auth`
+  （Agent 身份）且校验 request 归属（server.py:1225-1229），是 Agent 等待
+  自身审批结果的通道，管理台不可用。后端落地管理台推送端点前，
+  前端按未定契约推进。
+- **SSE 基础模块** `api/sse.ts`：抽取 `createEventStream`（fetch + AbortController
+  携带 Authorization、Last-Event-ID 游标续传、指数退避 1s→10s、401 登出跳
+  登录、400/410 游标失效致命错误、204 结束、shouldStop 终态取消、流尾残帧处理）；
+  `streamA2ATask` 重构为薄封装复用之，对外签名与语义不变。
+- **纯函数拆分** `api/sse-parse.ts`：`parseSseFrame` / `drainSseBuffer` /
+  `nextBackoffDelay` 独立成模块（node 环境可测，不依赖 auth store / router）。
+- **未定契约**：`streamAdminApprovals`（python.ts）指向
+  `GET /v1/admin/approvals/stream`（暂定路径，事件形状暂定
+  `{type: 'pending'|'decided', ...}`）；后端落地后仅需对齐 url 与 payload。
+- **Approvals.vue 推送优先、轮询兜底**：连接失败（当前环境即如此）自动降级
+  15s 轮询，头部标识"已降级轮询"；推送正常时轮询不产生请求，收到事件即时
+  刷新待审批列表。
+- **测试**：`tests/sse.test.ts` 12 用例（帧解析/多行合并/事件名/注释跳过/
+  \0 id/非法 JSON/CRLF/缓冲切分/退避封顶），vitest 总计 55 passed；
+  typecheck + build 全绿。
+- **当前剩余队列**（按既定顺序）：
+  1. 任务 7：Playwright E2E 骨架（登录 → Dashboard → 审批/A2A 冒烟）；
+  2. 任务 8：本文档 §4·§6 重写；
+  3. 任务 9：空态与错误态统一（Loading / Empty / Error 三态规范）。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）
