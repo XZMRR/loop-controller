@@ -499,6 +499,17 @@ frontend/
 - **当前剩余队列**：不变——随后端契约冻结替换 Mock 数据源（§6.2）；
   可选增量：RBAC/Policy 治理页操作流 E2E、Dashboard 增强区块断言。
 
+### 进度记录（第二十七轮：develop 同步至 main，双库完成）
+
+- main 此前停在 v0.48 基线（仅含两个历史 merge commit，无实质内容分叉）；
+  本次 merge develop → main（合并提交 `46f9078`，262 文件，零冲突），
+  已推送 origin 与 company 两库。
+- 后续协作约定：后端从 main 切分支开发（缺口清单见
+  `frontend_api_gaps.md` §7.2），前端从 main 切分支继续；
+  main 与 develop 当前内容一致，前端日常推进仍在 develop 上滚动。
+- 注意：本机两远端均为单分支 refspec（仅 fetch develop），操作 main 需用
+  `git fetch <remote> main` + FETCH_HEAD 或显式 refspec。
+
 ---
 
 ## 5. 当前已完成工作
