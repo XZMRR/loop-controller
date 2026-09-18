@@ -460,6 +460,22 @@ frontend/
 - **当前剩余队列**：E2E 扩面（审批操作流：通过/拒绝/吊销/Kill Switch）；
   随后端契约冻结替换 Mock 数据源（§6.2）。
 
+### 进度记录（第二十五轮：E2E 扩面——审批操作流与吊销/Kill Switch）
+
+- **新增 `tests/e2e/approvals-actions.spec.ts`（5 用例，E2E 总计 15 passed）**：
+  - 通过审批：空凭证校验拦截 → 凭证/意见提交 → 断言 approve 请求体与
+    独立 Bearer 凭证（审批鉴权不经 session 注入）→ 待办退出队列；
+  - 拒绝审批：意见必填校验 → 提交后列表清空；
+  - 审批提交失败（403）：错误提示保留对话框，待办不消失；
+  - 吊销 Agent：表单完整性校验 → 请求体 {type,id,reason} 断言 → 表单清空；
+  - Kill Switch：触发必须填原因 → 触发/解除请求体断言 → 状态标签切换。
+- **stub 技巧沉淀**：审批相关端点用单一 route 处理器按 URL 分发——
+  Playwright 路由后注册者优先匹配，宽泛的 `**/approvals**` 会拦截
+  `/pending`；状态标签断言需 `exact: true` 避免与 toast 文案歧义匹配。
+- **回归**：vitest 55 passed；typecheck + build 全绿。
+- **当前剩余队列**：随后端契约冻结替换 Mock 数据源（§6.2）；
+  可选增量：RBAC/Policy 治理页操作流 E2E、Dashboard 增强区块断言。
+
 ---
 
 ## 5. 当前已完成工作
