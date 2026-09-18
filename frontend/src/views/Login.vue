@@ -100,7 +100,11 @@ async function handleLogin() {
     ElMessage.success('连接成功')
   } catch (error: any) {
     auth.logout()
-    ElMessage.error(error.message || '登录失败，请检查 API Key')
+    const message =
+      error?.response?.status === 401
+        ? '登录失败，请检查 API Key'
+        : error?.message || '登录失败，请检查 API Key'
+    ElMessage.error(message)
   } finally {
     form.apiKey = ''
     loading.value = false

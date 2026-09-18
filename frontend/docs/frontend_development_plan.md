@@ -411,6 +411,24 @@ frontend/
   2. 任务 8：本文档 §4·§6 重写；
   3. 任务 9：空态与错误态统一（Loading / Empty / Error 三态规范）。
 
+#### 进度记录（第二十二轮：任务 7 Playwright E2E 骨架）
+
+- **基建**：`@playwright/test` 入 devDependencies + chromium；`playwright.config.ts`
+  自动拉起 vite dev server（5173，可复用已有实例）；`npm run test:e2e` 脚本；
+  `.gitignore` 补 test-results/playwright-report。
+- **stub 策略**（tests/e2e/helpers.ts）：全部后端依赖经 `page.route` 拦截替换
+  （session 登录、health、审批、revocation-list、metrics 文本、agents），
+  E2E 不依赖 Python runtime / Go 内核进程；有后端进程时取消 stub 即联调模式。
+  审批推送流 stub 404，顺带验证 R21 的轮询兜底路径。
+- **用例 8 个全绿**（chromium）：登录表单渲染 / 守卫重定向 / 空 Key 提示 /
+  401 失败提示与停留 / 登录成功进仪表盘 / 仪表盘四卡片渲染 /
+  侧边栏导航四治理页（审批/死信/RBAC/策略）/ 未认证直达受保护页重定向。
+- **顺手修复**：Login.vue 对 401 显示友好文案（此前透传 axios 英文报错）。
+- **回归**：vitest 55 passed；typecheck + build 全绿；E2E 8 passed。
+- **当前剩余队列**（按既定顺序）：
+  1. 任务 8：本文档 §4·§6 重写；
+  2. 任务 9：空态与错误态统一（Loading / Empty / Error 三态规范）。
+
 ---
 
 ### 第一阶段：核心控制台（当前已完成脚手架 + 基础页面）
