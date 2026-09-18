@@ -517,7 +517,7 @@ Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` �
 
 ## 6. 前端当前实现状态（v0.54，develop 分支）
 
-v0.54 前端已全面改为 API 直连，**YAML fallback 与 vite `/config/*` 中间件已移除**：
+v0.54 前端已全面改为 API 直连，**YAML fallback 与 vite `/config/*` 中间件已移除**（Tools 页读取仍保留 YAML→在线 API 的单一回退）：
 
 1. **认证**：`Login.vue` 通过 `POST /v1/admin/session/login` 换取 Session；
    `client.ts` 请求拦截器统一携带 `Authorization: Bearer <session>`，401 自动登出跳登录；
@@ -531,6 +531,16 @@ v0.54 前端已全面改为 API 直连，**YAML fallback 与 vite `/config/*` �
 5. **SSE 硬化**：cursor/Last-Event-ID、指数退避重连、generation 防串扰。
 6. **A2A 任务树**：`TaskTree.vue` 通过 `A2ATaskDataSource` 接口消费数据，当前为
    Mock 实现（`api/a2a/mock.ts`），待后端提供任务树列表端点后切换 HTTP 实现，视图零改动。
+7. **治理页面**（Mock 数据源先行）：死信队列、RBAC 绑定、Policy 生命周期三页均按
+   `契约层 types.ts + Mock 数据源 + 视图 + vitest 用例` 模式交付，Mock 语义对齐
+   后端源码；契约冻结后新增 Http 实现替换单例即可，视图与测试零改动。
+8. **SSE 基础设施**：`api/sse.ts createEventStream`（游标续传/退避重连/401 处理）
+   统一服务 A2A 任务流与审批推送；管理台审批推送端点未定，前端推送优先 +
+   15s 轮询兜底。
+9. **三态规范**：全站列表数据区统一 Loading/Empty/Error（共享组件
+   `ErrorState.vue` 持久错误块 + 重试）；操作反馈仍用 ElMessage。
+10. **测试资产**：vitest 55 用例 + Playwright E2E 15 用例（全部后端依赖
+    `page.route` stub，不依赖 Python/Go 进程）。
 
 ---
 
@@ -562,6 +572,9 @@ stream/delegations，`b20a9b5`~`e1a6677`）、Session 认证（`1948248`）、RB
 | Agent CRUD | `POST/PUT/DELETE /v1/admin/agents[/{id}]` | Agent 管理在线增改 | 低 |
 | 审批转交 | `POST /v1/admin/approvals/{id}/reassign` | 审批人繁忙时转交 | 低 |
 | Identity/Entrypoints 热更新 | `PUT /v1/admin/identity` `PUT /v1/admin/entrypoints`（或统一 reload 目标） | 配置在线生效范围确认 | 低 |
+| 管理台审批 SSE 端点 | `GET /v1/admin/approvals/stream` 类（暂定形状） | 审批推送（前端 `streamAdminApprovals` 已就绪，推送优先+轮询兜底；`/v1/wait-for-approval/sse` 为 Agent 侧通道，管理台不可用——v0.54 代码核实） | 中 |
+| 审计时间范围参数 | `GET /v1/admin/audit` 扩展 `start_time`/`end_time` | 审计查询服务端时间过滤（当前为前端本地过滤，数据量大时不可扩展） | 中 |
+| 用户视图 | `GET /v1/admin/users` | Agents 页合并用户数据源（当前前端用 `users: []` 占位） | 低 |
 
 ### 7.3 已关闭的兼容方案（不再适用）
 

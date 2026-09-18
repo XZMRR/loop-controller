@@ -476,6 +476,29 @@ frontend/
 - **当前剩余队列**：随后端契约冻结替换 Mock 数据源（§6.2）；
   可选增量：RBAC/Policy 治理页操作流 E2E、Dashboard 增强区块断言。
 
+### 进度记录（第二十六轮：总体状态核对与文档更新）
+
+- **版本基线**：develop 三端一致（HEAD = origin = company）；
+  单仓库结构：Python runtime（src/loop_controller）+ Go A2A 内核（go/）
+  + 前端（frontend/），契约基线 v0.54。
+- **健康检查（全绿）**：
+  - Python：`server.py` 语法编译通过；
+  - Go 内核：`go build ./...` 通过；
+  - 前端：vitest 55 passed + typecheck 零错误 + build 通过 + E2E 15 passed。
+- **后端缺口复核（与 gaps 文档 §7.2 对齐，代码核实）**：
+  - `GET /v1/admin/audit` 仍无时间范围参数（前端本地过滤）；
+  - `/v1/admin/users` 仍不存在；
+  - 管理台审批 SSE 端点仍不存在（`/v1/wait-for-approval/sse`
+    为 Agent 侧通道）；
+  - RBAC（1928-2070）/ Policy（1699-1950）端点面已就绪，Mock 语义对齐。
+- **文档更新**：
+  - `frontend_api_gaps.md` §6 刷新为当前实现状态（治理页面 Mock 架构、
+    SSE 基础设施、三态规范、测试资产）；§7.2 缺口表新增三项
+    （管理台审批 SSE、审计时间范围参数、用户视图）；
+  - `.gitignore` 补 data/ SQLite 运行时产物（*.db-shm / *.db-wal / *.bak-*）。
+- **当前剩余队列**：不变——随后端契约冻结替换 Mock 数据源（§6.2）；
+  可选增量：RBAC/Policy 治理页操作流 E2E、Dashboard 增强区块断言。
+
 ---
 
 ## 5. 当前已完成工作
