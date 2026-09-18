@@ -3,7 +3,26 @@
     <el-card shadow="hover">
       <template #header>
         <div class="card-header">
-          <span>审批中心</span>
+          <span>
+            审批中心
+            <el-tag
+              v-if="pushState === 'active'"
+              type="success"
+              effect="plain"
+              style="margin-left: 10px"
+            >
+              SSE 推送中
+            </el-tag>
+            <el-tooltip
+              v-else-if="pushState === 'fallback'"
+              content="后端推送端点未开放，已降级为 15s 轮询"
+              placement="top"
+            >
+              <el-tag type="info" effect="plain" style="margin-left: 10px">
+                已降级轮询
+              </el-tag>
+            </el-tooltip>
+          </span>
           <div>
             <el-radio-group v-model="activeTab" style="margin-right: 12px">
               <el-radio-button value="pending">待审批</el-radio-button>
@@ -159,6 +178,7 @@ import {
   getApprovalHistory,
   approveDecision,
   denyDecision,
+  streamAdminApprovals,
 } from '@/api/python'
 import { usePolling } from '@/composables/useAsyncData'
 import type { PendingApproval, ApprovalHistoryItem } from '@/api/python'
@@ -185,13 +205,40 @@ const form = ref({ credential: '', comment: '' })
 const detailVisible = ref(false)
 const detailRow = ref<PendingApproval | null>(null)
 
-// 后端 SSE 端点是"Agent 等待自己的审批结果"通道（按 request_id + agent 鉴权），
-// 不适合管理台推送；审批台采用静默轮询实现准实时刷新。
+// 推送优先、轮询兜底：streamAdminApprovals 指向的端点为未定契约（后端尚无管理台
+// SSE），连接失败（当前环境即如此）自动降级为 15s 轮询并显示标识。
 const APPROVALS_POLL_INTERVAL = 15000
+const pushState = ref<'connecting' | 'active' | 'fallback'>('connecting')
+let stopPushStream: (() => void) | null = null
+
+function switchToPolling() {
+  if (pushState.value === 'fallback') return
+  pushState.value = 'fallback'
+  stopPushStream?.()
+  stopPushStream = null
+  void loadApprovals(true)
+}
+
+function startPush() {
+  stopPushStream = streamAdminApprovals(
+    () => {
+      pushState.value = 'active'
+      void loadApprovals(true)
+    },
+    () => switchToPolling(),
+    () => {
+      // 流正常结束且未曾收到事件：视为推送不可用
+      if (pushState.value !== 'active') switchToPolling()
+    },
+  )
+}
 
 const dialogTitle = computed(() => (currentAction.value === 'approve' ? '通过审批' : '拒绝审批'))
 
-usePolling(() => loadApprovals(true), APPROVALS_POLL_INTERVAL)
+// 轮询仅在降级状态下生效；推送正常时不产生轮询请求
+usePolling(async () => {
+  if (pushState.value === 'fallback') await loadApprovals(true)
+}, APPROVALS_POLL_INTERVAL)
 
 function openDetail(row: PendingApproval) {
   detailRow.value = row
@@ -312,6 +359,7 @@ async function submitAction() {
 onMounted(() => {
   loadApprovals()
   loadHistory()
+  startPush()
 })
 </script>
 

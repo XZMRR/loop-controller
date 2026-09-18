@@ -1,6 +1,5 @@
 import { pythonClient } from './client'
-import { useAuthStore } from '@/stores/auth'
-import router from '@/router'
+import { createEventStream } from './sse'
 
 export interface HealthStatus {
   status: string
@@ -287,7 +286,7 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'canceled', 'cancelled
 
 /**
  * 订阅任务 SSE 状态流；返回停止函数。收到终态事件自动停止并回调。
- * 使用 fetch 而非 EventSource 以便携带 Authorization 头。
+ * 硬化连接语义（游标续传/退避重连/401 跳登录）见 sse.ts createEventStream。
  */
 export function streamA2ATask(
   taskId: string,
@@ -295,98 +294,34 @@ export function streamA2ATask(
   onError?: (error: Error) => void,
   onEnd?: () => void,
 ): () => void {
-  const abort = new AbortController()
-  let cursor: string | null = null
-  const run = async () => {
-    let delay = 1000
-    try {
-      while (!abort.signal.aborted) {
-        const auth = useAuthStore()
-        if (!auth.sessionValid) {
-          auth.logout()
-          await router.replace('/login')
-          throw new Error('登录已失效，请重新登录')
-        }
-        const headers: Record<string, string> = { Authorization: `Bearer ${auth.sessionToken}` }
-        if (cursor !== null) headers['Last-Event-ID'] = cursor
-        const resp = await fetch(`/api/python/v1/admin/a2a/tasks/${encodeURIComponent(taskId)}/stream`, {
-          headers,
-          signal: abort.signal,
-        })
-        if (resp.status === 401) {
-          auth.logout()
-          await router.replace('/login')
-          throw new Error('登录已失效，请重新登录')
-        }
-        if (resp.status === 400 || resp.status === 410) {
-          throw new Error(resp.status === 410 ? '续传游标已过期，请重新查询任务' : '续传游标无效，请重新查询任务')
-        }
-        if (resp.status === 204) return
-        if (!resp.ok || !resp.body) throw new Error(`状态流请求失败：HTTP ${resp.status}`)
-        const reader = resp.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
-        const consume = (frame: string): boolean => {
-          const data: string[] = []
-          let id: string | null = null
-          for (const line of frame.split('\n')) {
-            if (line.startsWith(':')) continue
-            const index = line.indexOf(':')
-            const field = index < 0 ? line : line.slice(0, index)
-            const value = index < 0 ? '' : line.slice(index + 1).replace(/^ /, '')
-            if (field === 'data') data.push(value)
-            if (field === 'id' && !value.includes('\0')) id = value
-          }
-          if (!data.length) return false
-          let raw: Record<string, any>
-          try {
-            raw = JSON.parse(data.join('\n'))
-          } catch {
-            return false
-          }
-          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
-          const event = raw.payload && raw.event_type ? raw.payload : raw
-          if (id !== null) cursor = id
-          onEvent(event)
-          return TERMINAL_STATUSES.has(String(event?.status ?? ''))
-        }
-        while (!abort.signal.aborted) {
-          const { done, value } = await reader.read()
-          if (done) {
-            buffer += decoder.decode()
-          } else {
-            buffer += decoder.decode(value, { stream: true })
-          }
-          buffer = buffer.replace(/\r\n/g, '\n').replace(/\r(?!$)/g, '\n')
-          let end: number
-          while ((end = buffer.indexOf('\n\n')) !== -1) {
-            const frame = buffer.slice(0, end)
-            buffer = buffer.slice(end + 2)
-            if (consume(frame)) {
-              await reader.cancel()
-              return
-            }
-          }
-          if (done) {
-            if (buffer && consume(buffer)) return
-            break
-          }
-        }
-        if (abort.signal.aborted) return
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, delay)
-          abort.signal.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
-        })
-        delay = Math.min(delay * 2, 10000)
-      }
-    } catch (error) {
-      if (!abort.signal.aborted) onError?.(error instanceof Error ? error : new Error('状态流中断'))
-    } finally {
-      onEnd?.()
-    }
-  }
-  void run()
-  return () => abort.abort()
+  return createEventStream({
+    url: `/api/python/v1/admin/a2a/tasks/${encodeURIComponent(taskId)}/stream`,
+    onEvent,
+    onError,
+    onEnd,
+    shouldStop: (event) => TERMINAL_STATUSES.has(String(event?.status ?? '')),
+  })
+}
+
+/**
+ * 订阅审批台推送流；返回停止函数。
+ * **未定契约**：后端尚无管理台 SSE 端点（/v1/wait-for-approval/sse 是 Agent 侧通道，
+ * 按 request_id + agent 鉴权，管理台不可用）。本函数指向的
+ * `GET /v1/admin/approvals/stream` 为前端暂定路径，事件形状暂定
+ * `{type: 'pending'|'decided', ...}`；后端落地后仅需对齐 url 与 payload。
+ * 当前环境连接将失败，调用方必须降级为轮询兜底。
+ */
+export function streamAdminApprovals(
+  onEvent: (event: Record<string, any>) => void,
+  onError?: (error: Error) => void,
+  onEnd?: () => void,
+): () => void {
+  return createEventStream({
+    url: '/api/python/v1/admin/approvals/stream',
+    onEvent,
+    onError,
+    onEnd,
+  })
 }
 
 export interface AdminDelegationResult {
