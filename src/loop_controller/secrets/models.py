@@ -131,3 +131,13 @@ class SecretRef(BaseModel):
     key: str | None = None
     version: str | None = None
     tenant_id: str | None = None
+
+
+class SecretRefMetadata(BaseModel):
+    """不含 SecretValue 的引用加载元数据。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    ref: str
+    tenant_id: str | None = None
+    has_value: bool

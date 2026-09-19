@@ -29,6 +29,7 @@ from loop_controller.go_kernel_bridge import (
     EventSequenceGapError,
     EventSequenceOutOfOrderError,
     GoKernelBridge,
+    GoKernelProtocolError,
     UnsupportedEventSchemaError,
 )
 
@@ -435,6 +436,43 @@ async def test_list_delegation_approvals_uses_control_token() -> None:
 
     assert captured["auth"] == "Bearer control-token"
     assert approvals == [{"approval_id": "a1", "status": "pending"}]
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_strictly_validates_tasks_array() -> None:
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers.get("Authorization", "")
+        captured["root_only"] = request.url.params.get("root_only")
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": CURRENT_PROTOCOL_VERSION,
+                "tasks": [{"task_id": "task-1", "tenant_id": "tenant-a"}],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bridge = GoKernelBridge(base_url="http://kernel", client=client, token="control-token")
+        tasks = await bridge.list_tasks(root_only=True)
+
+    assert captured == {"auth": "Bearer control-token", "root_only": "true"}
+    assert tasks == [{"task_id": "task-1", "tenant_id": "tenant-a"}]
+
+    for invalid in (None, {}, ["not-an-object"]):
+        async def invalid_handler(
+            request: httpx.Request, payload: Any = invalid
+        ) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"protocol_version": CURRENT_PROTOCOL_VERSION, "tasks": payload},
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(invalid_handler)) as client:
+            bridge = GoKernelBridge(base_url="http://kernel", client=client)
+            with pytest.raises(GoKernelProtocolError):
+                await bridge.list_tasks()
 
 
 @pytest.mark.asyncio

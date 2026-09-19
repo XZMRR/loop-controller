@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from loop_controller.secrets.exceptions import SecretError, SecretNotFoundError
-from loop_controller.secrets.models import SecretRef, SecretScope, SecretValue
+from loop_controller.secrets.models import SecretRef, SecretRefMetadata, SecretScope, SecretValue
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,18 @@ class FileSecretBackend:
                 return []
             return sorted(self._tenant_cache.get(tenant_id, {}).keys())
         return sorted(self._cache.keys())
+
+    async def list_refs(self) -> builtins.list[SecretRefMetadata]:
+        refs = [
+            SecretRefMetadata(ref=name, has_value=True)
+            for name in self._cache
+        ]
+        refs.extend(
+            SecretRefMetadata(ref=name, tenant_id=tenant_id, has_value=True)
+            for tenant_id, cache in self._tenant_cache.items()
+            for name in cache
+        )
+        return sorted(refs, key=lambda item: (item.tenant_id or "", item.ref))
 
     async def reload(self) -> None:
         """重新扫描文件系统并刷新缓存。"""

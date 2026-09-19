@@ -20,6 +20,26 @@
     </el-row>
     <el-card class="mt-4" shadow="hover">
       <template #header>
+        <span>Secret 引用（仅元数据）</span>
+      </template>
+      <el-table :data="secrets" stripe>
+        <el-table-column prop="ref" label="引用" min-width="220" />
+        <el-table-column prop="tenant_id" label="租户" min-width="160">
+          <template #default="{ row }">{{ row.tenant_id || '平台级' }}</template>
+        </el-table-column>
+        <el-table-column prop="backend" label="后端" width="150" />
+        <el-table-column label="状态" width="120">
+          <template #default="{ row }">
+            <el-tag :type="row.has_value ? 'success' : 'warning'">
+              {{ row.has_value ? '已配置' : '未配置' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <template #empty><el-empty description="暂无 Secret 引用" /></template>
+      </el-table>
+    </el-card>
+    <el-card class="mt-4" shadow="hover">
+      <template #header>
         <div class="card-header">
           <span>Kill Switch</span>
           <el-tag :type="killSwitchActive ? 'danger' : 'info'">
@@ -74,10 +94,12 @@
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { loadEntrypointsConfig, loadIdentityConfig } from '@/api/config'
-import { revoke, setKillSwitch, getRevocationList } from '@/api/python'
+import { revoke, setKillSwitch, getRevocationList, getAdminSecrets } from '@/api/python'
+import type { AdminSecret } from '@/api/python'
 
 const entrypoints = ref<any>(null)
 const identity = ref<any>(null)
+const secrets = ref<AdminSecret[]>([])
 const revoking = ref(false)
 const revokeForm = reactive({
   type: 'agent' as const,
@@ -90,13 +112,15 @@ const killSwitchLoading = ref(false)
 
 async function loadData() {
   try {
-    const [ep, id, revocation] = await Promise.all([
+    const [ep, id, revocation, secretItems] = await Promise.all([
       loadEntrypointsConfig(),
       loadIdentityConfig(),
       getRevocationList(),
+      getAdminSecrets(),
     ])
     entrypoints.value = ep
     identity.value = id
+    secrets.value = secretItems
     killSwitchActive.value = revocation.kill_switch?.enabled || false
   } catch (error: any) {
     ElMessage.error(error.message || '加载配置失败')

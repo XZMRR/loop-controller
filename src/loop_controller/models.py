@@ -393,16 +393,24 @@ class ApprovalRecord(BaseModel):
 
 
 class ApprovalHistoryItem(BaseModel):
-    """审批历史列表项（兼容 JSONL / 未来数据库分页查询）。"""
+    """不包含原始工具参数与完整 Decision 的安全审批历史项。"""
 
     request_id: str
     decision_id: str
+    call_id: str
+    task_id: str
+    tenant_id: str | None = None
     agent_id: str
     tool_name: str
     requester_id: str
     approver_id: str
+    arguments_masked: dict[str, Any] = Field(default_factory=dict)
     reason: str = ""
     status: str
+    comment: str | None = None
+    principal: str | None = None
+    action_summary: str | None = None
+    original_decision: dict[str, Any] | None = None
     decided_at: datetime | None = None
     created_at: datetime | None = None
 

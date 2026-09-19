@@ -22,6 +22,7 @@ CLI：
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -71,7 +72,7 @@ from loop_controller.identity import (
     RevocationType,
 )
 from loop_controller.infra.admin_session import AdminSessionStore
-from loop_controller.infra.approval_store import ApprovalStoreError, list_approval_history
+from loop_controller.infra.approval_store import ApprovalStoreError
 from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.infra.policy_delivery import (
     ArtifactConflictError,
@@ -122,6 +123,11 @@ from loop_controller.rbac.models import (
     PERM_VALIDATE_RUN,
     RESOURCE_PUBLISH_GLOBAL,
 )
+from loop_controller.secrets import (
+    EncryptedFileSecretBackend,
+    FileSecretBackend,
+    MemorySecretBackend,
+)
 from loop_controller.server_models import (
     AdminA2AAgentItem,
     AdminA2AStatusResponse,
@@ -137,6 +143,8 @@ from loop_controller.server_models import (
     AdminProfilesResponse,
     AdminProfileToolsUpdateRequest,
     AdminProfileUpdateResponse,
+    AdminSecretItem,
+    AdminSecretsResponse,
     AdminSessionLoginRequest,
     AdminSessionLoginResponse,
     AuditQueryResponse,
@@ -172,6 +180,30 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 logger = logging.getLogger("loop_controller.server")
+
+_ISO8601_AWARE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _parse_audit_time(
+    value: str | None, name: str
+) -> tuple[datetime | None, JSONResponse | None]:
+    if value is None:
+        return None, None
+    if len(value) > 64 or not value or _ISO8601_AWARE_RE.fullmatch(value) is None:
+        return None, JSONResponse(
+            {"error": "invalid_parameter", "message": f"invalid {name}"},
+            status_code=400,
+        )
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None, JSONResponse(
+            {"error": "invalid_parameter", "message": f"invalid {name}"},
+            status_code=400,
+        )
+    return parsed, None
 
 
 def _extract_identity_provider(controller: LoopController) -> IdentityProvider | None:
@@ -1304,12 +1336,16 @@ class ToolGovernServer:
         return await self._controller.resume_after_approval(request_id)
 
     async def _handle_admin_pending_approvals(self, request: Request) -> JSONResponse:
-        if not self._check_api_key(request):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        principal, error = await self._require_self(request, PERM_APPROVAL_DECIDE)
+        if error is not None:
+            return error
+        assert principal is not None
 
         store = self._controller._runtime.approval_manager._store
         store.refresh()
         pending = store.get_pending()
+        if not self._is_platform_admin(principal):
+            pending = [req for req in pending if req.tenant_id == principal.tenant_id]
         items = [
             PendingApprovalItem(
                 request_id=req.request_id,
@@ -1548,38 +1584,114 @@ class ToolGovernServer:
         limit = max(1, min(limit, 1000))
         offset = max(0, offset)
         store = self._controller._runtime.approval_manager._store
-        requests = getattr(store, "requests", {})
-        responses = getattr(store, "responses", {})
-        pending = [request for decision_id, request in requests.items() if decision_id not in responses]
-        completed = [
-            (request, responses[decision_id])
-            for decision_id, request in requests.items()
-            if decision_id in responses
-        ]
-        if not self._is_platform_admin(principal):
-            pending = [item for item in pending if getattr(item, "tenant_id", None) == principal.tenant_id]
-            completed = [
-                (item, response) for item, response in completed
-                if getattr(item, "tenant_id", None) == principal.tenant_id
-            ]
-        items = list_approval_history(
-            pending,
-            completed,
+        items, total = store.list_history(
             status=status,
             agent_id=request.query_params.get("agent_id"),
             tool_name=request.query_params.get("tool_name"),
             requester_id=request.query_params.get("requester_id"),
             approver_id=request.query_params.get("approver_id"),
+            tenant_id=principal.tenant_id,
+            all_tenants=self._is_platform_admin(principal),
             limit=limit,
             offset=offset,
         )
         return JSONResponse(
             AdminApprovalsResponse(
                 approvals=items,
-                total=len(items),
+                total=total,
                 limit=limit,
                 offset=offset,
             ).model_dump(mode="json")
+        )
+
+    def _approval_cursor(self, event_id: int, scope: str) -> str:
+        payload = json.dumps(
+            {"v": 1, "id": event_id, "scope": scope},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()
+        key = (self._api_key or "loop-controller-approval-stream").encode()
+        signature = hmac.new(key, payload, hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(payload + signature).decode().rstrip("=")
+
+    def _decode_approval_cursor(self, cursor: str, scope: str) -> int:
+        if not cursor or any(char in cursor for char in "\r\n\x00"):
+            raise ValueError("invalid")
+        try:
+            raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+            payload, signature = raw[:-32], raw[-32:]
+            key = (self._api_key or "loop-controller-approval-stream").encode()
+            if not hmac.compare_digest(signature, hmac.new(key, payload, hashlib.sha256).digest()):
+                raise ValueError("invalid")
+            data = json.loads(payload)
+            if data != {"v": 1, "id": data.get("id"), "scope": scope}:
+                raise ValueError("invalid")
+            event_id = data["id"]
+            if not isinstance(event_id, int) or event_id < 0:
+                raise ValueError("invalid")
+            return event_id
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid") from exc
+
+    async def _handle_admin_approvals_stream(self, request: Request) -> Response:
+        principal, error = await self._require_self(request, PERM_APPROVAL_DECIDE)
+        if error is not None:
+            return error
+        assert principal is not None
+        all_tenants = self._is_platform_admin(principal)
+        scope = "platform" if all_tenants else f"tenant:{principal.tenant_id}"
+        store = self._controller._runtime.approval_manager._store
+        oldest, latest = store.event_bounds(
+            tenant_id=principal.tenant_id, all_tenants=all_tenants
+        )
+        raw_cursor = request.headers.get("last-event-id")
+        if raw_cursor is None:
+            after_id = latest
+        else:
+            try:
+                after_id = self._decode_approval_cursor(raw_cursor, scope)
+            except ValueError:
+                return JSONResponse({"error": "approval_cursor_invalid"}, status_code=400)
+            if after_id > latest:
+                return JSONResponse({"error": "approval_cursor_future"}, status_code=400)
+            if oldest is not None and after_id < oldest - 1:
+                return JSONResponse({"error": "approval_cursor_expired"}, status_code=410)
+        try:
+            max_wait = max(0.1, min(float(request.query_params.get("max_wait", "60")), 300.0))
+        except ValueError:
+            return JSONResponse({"error": "invalid_parameter"}, status_code=400)
+
+        async def events() -> AsyncIterator[str]:
+            nonlocal after_id
+            deadline = time.monotonic() + max_wait
+            yield "retry: 1000\n\n"
+            heartbeat_at = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                rows = store.list_events(
+                    after_id=after_id,
+                    tenant_id=principal.tenant_id,
+                    all_tenants=all_tenants,
+                    limit=100,
+                )
+                if rows:
+                    for row in rows:
+                        after_id = row["event_id"]
+                        cursor = self._approval_cursor(after_id, scope)
+                        data = row["item"].model_dump(mode="json")
+                        yield (
+                            f"id: {cursor}\n"
+                            f"event: {row['event_type']}\n"
+                            f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                        )
+                    heartbeat_at = time.monotonic() + 10.0
+                    continue
+                if time.monotonic() >= heartbeat_at:
+                    yield ": heartbeat\n\n"
+                    heartbeat_at = time.monotonic() + 10.0
+                await self._sleep(0.25)
+
+        return StreamingResponse(
+            events(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     async def _handle_admin_approval(self, request: Request, *, verdict: str) -> JSONResponse:
@@ -2186,6 +2298,21 @@ class ToolGovernServer:
         source_agent_id = request.query_params.get("source_agent_id")
         target_agent_id = request.query_params.get("target_agent_id")
         verdict = request.query_params.get("verdict")
+        start_time, error = _parse_audit_time(
+            request.query_params.get("start_time"), "start_time"
+        )
+        if error is not None:
+            return error
+        end_time, error = _parse_audit_time(
+            request.query_params.get("end_time"), "end_time"
+        )
+        if error is not None:
+            return error
+        if start_time is not None and end_time is not None and start_time > end_time:
+            return JSONResponse(
+                {"error": "invalid_parameter", "message": "start_time must not exceed end_time"},
+                status_code=400,
+            )
         for name, value in (("session_id", session_id), ("task_id", task_id), ("correlation_id", correlation_id), ("interaction_id", interaction_id)):
             if value is not None and (not value.strip() or len(value) > 256):
                 return JSONResponse(
@@ -2208,26 +2335,47 @@ class ToolGovernServer:
         limit = max(1, min(limit, 1000))
 
         audit_store = self._controller._runtime.audit_store
+        tenant_id = None if self._is_platform_admin(principal) else principal.tenant_id
         interaction_filters = any(
             value is not None
             for value in (interaction_id, source_agent_id, target_agent_id, verdict)
         )
         if correlation_id is not None:
-            selected = audit_store.query_by_correlation(correlation_id, limit=limit)
+            selected = audit_store.query_by_correlation(
+                correlation_id, limit=limit, tenant_id=tenant_id,
+                start_time=start_time, end_time=end_time,
+                agent_id=agent_id, tool_name=tool_name,
+            )
         elif interaction_filters:
             selected = audit_store.query_interactions(
                 interaction_id=interaction_id,
                 source_agent_id=source_agent_id,
                 target_agent_id=target_agent_id,
                 verdict=verdict,
+                tenant_id=tenant_id,
+                start_time=start_time,
+                end_time=end_time,
+                agent_id=agent_id,
+                tool_name=tool_name,
                 limit=limit,
             )
         elif task_id and hasattr(audit_store, "query_by_task"):
-            selected = audit_store.query_by_task(task_id)[-limit:]
+            selected = audit_store.query_by_task(
+                task_id, tenant_id=tenant_id, start_time=start_time,
+                end_time=end_time, agent_id=agent_id, tool_name=tool_name,
+                limit=limit,
+            )
         elif session_id and hasattr(audit_store, "query_by_session"):
-            selected = audit_store.query_by_session(session_id)[-limit:]
+            selected = audit_store.query_by_session(
+                session_id, tenant_id=tenant_id, start_time=start_time,
+                end_time=end_time, agent_id=agent_id, tool_name=tool_name,
+                limit=limit,
+            )
         elif not session_id and hasattr(audit_store, "list_recent"):
-            selected = audit_store.list_recent(limit)
+            selected = audit_store.list_recent(
+                limit, tenant_id=tenant_id, start_time=start_time, end_time=end_time,
+                agent_id=agent_id, tool_name=tool_name,
+            )
         else:
             selected = []
             async for event in audit_store.iter_events():
@@ -2235,16 +2383,30 @@ class ToolGovernServer:
                     continue
                 if task_id and event.task_id != task_id:
                     continue
+                if tenant_id is not None and event.tenant_id != tenant_id:
+                    continue
+                if start_time is not None and event.timestamp < start_time:
+                    continue
+                if end_time is not None and event.timestamp > end_time:
+                    continue
+                if agent_id is not None and event.actor_id != agent_id:
+                    continue
+                if tool_name is not None and event.target != tool_name:
+                    continue
                 selected.append(event)
             selected = selected[-limit:]
-        if not self._is_platform_admin(principal):
-            assert principal.tenant_id is not None
-            selected = [event for event in selected if event.tenant_id == principal.tenant_id]
-        events = [event.model_dump(mode="json") for event in selected]
-        if agent_id:
-            events = [event for event in events if event.get("agent_id") == agent_id]
-        if tool_name:
-            events = [event for event in events if event.get("tool_name") == tool_name]
+        selected = [
+            event for event in selected
+            if (tenant_id is None or event.tenant_id == tenant_id)
+            and (start_time is None or event.timestamp >= start_time)
+            and (end_time is None or event.timestamp <= end_time)
+        ][:limit]
+        events = []
+        for event in selected:
+            item = event.model_dump(mode="json")
+            item["agent_id"] = event.actor_id
+            item["tool_name"] = event.target
+            events.append(item)
         return JSONResponse(AuditQueryResponse(events=events).model_dump())
 
     async def _require_console_admin(self, request: Request) -> JSONResponse | None:
@@ -2274,6 +2436,35 @@ class ToolGovernServer:
             for entry in revocations.entries
             if entry.type == entry_type and (entry.expires_at is None or entry.expires_at > now)
         }
+
+    async def _handle_admin_secrets(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/secrets：列出不含明文的 Secret 引用元数据。"""
+        error = await self._require_console_admin(request)
+        if error is not None:
+            return error
+        broker = getattr(self._controller._runtime, "secret_broker", None)
+        if broker is None:
+            return JSONResponse({"error": "secret_broker_unavailable"}, status_code=503)
+        if isinstance(broker, EncryptedFileSecretBackend):
+            backend = "encrypted_file"
+        elif isinstance(broker, FileSecretBackend):
+            backend = "file"
+        elif isinstance(broker, MemorySecretBackend):
+            backend = "memory"
+        else:
+            return JSONResponse({"error": "secret_broker_unavailable"}, status_code=503)
+        refs = await broker.list_refs()
+        items = [
+            AdminSecretItem(
+                ref=item.ref,
+                tenant_id=item.tenant_id,
+                backend=backend,
+                has_value=item.has_value,
+            )
+            for item in refs
+        ]
+        items.sort(key=lambda item: (item.tenant_id or "", item.ref))
+        return JSONResponse(AdminSecretsResponse(secrets=items).model_dump(mode="json"))
 
     async def _handle_admin_agents(self, request: Request) -> JSONResponse:
         """GET /v1/admin/agents：列出已配置 Agent 及其吊销状态。"""
@@ -2474,6 +2665,34 @@ class ToolGovernServer:
         if not isinstance(task, dict) or not isinstance(task.get("tenant_id"), str) or not task["tenant_id"]:
             return JSONResponse({"error": "forbidden"}, status_code=403)
         return self._authorize(request, principal, PERM_RBAC_MANAGE, task["tenant_id"])
+
+    async def _handle_admin_a2a_tasks(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/a2a/tasks：列出当前可信 control scope 内任务。"""
+        principal, error = await self._authenticate_only(request)
+        if error is not None:
+            return error
+        assert principal is not None
+        root_only_values = request.query_params.getlist("root_only")
+        if len(root_only_values) > 1:
+            return JSONResponse({"error": "invalid_root_only"}, status_code=400)
+        raw_root_only = root_only_values[0] if root_only_values else "false"
+        if raw_root_only not in {"true", "false"}:
+            return JSONResponse({"error": "invalid_root_only"}, status_code=400)
+        bridge, _gk = self._go_kernel_view()
+        if bridge is None:
+            return JSONResponse({"error": "go kernel disabled"}, status_code=503)
+        try:
+            tasks = await bridge.list_tasks(root_only=raw_root_only == "true")
+        except Exception as exc:
+            logger.warning("Go kernel task list failed: %s", exc)
+            return JSONResponse({"error": "go kernel task list failed"}, status_code=502)
+        visible: list[dict[str, Any]] = []
+        for task in tasks:
+            error = self._authorize_admin_a2a_task(request, principal, task)
+            if error is not None:
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            visible.append(self._sanitize_kernel_payload(task))
+        return JSONResponse({"tasks": visible})
 
     async def _handle_admin_a2a_task_query(self, request: Request) -> JSONResponse:
         """GET /v1/admin/a2a/tasks/{task_id}：经 Go 内核查询任务状态。"""
@@ -2966,6 +3185,11 @@ def build_app(
             ),
             Route("/v1/admin/approvals", server._handle_admin_approvals, methods=["GET"]),
             Route(
+                "/v1/admin/approvals/stream",
+                server._handle_admin_approvals_stream,
+                methods=["GET"],
+            ),
+            Route(
                 "/v1/admin/harness/backends", server._handle_admin_harness_backends, methods=["GET"]
             ),
             Route(
@@ -3025,6 +3249,7 @@ def build_app(
             Route("/v1/opa/bundles/{revision}", server._handle_opa_bundle, methods=["GET", "HEAD"]),
             Route("/v1/opa/status", server._handle_opa_status, methods=["POST"]),
             Route("/v1/admin/audit", server._handle_admin_audit, methods=["GET"]),
+            Route("/v1/admin/secrets", server._handle_admin_secrets, methods=["GET"]),
             Route("/v1/admin/agents", server._handle_admin_agents, methods=["GET"]),
             Route(
                 "/v1/admin/agents/{agent_id}",
@@ -3054,6 +3279,7 @@ def build_app(
             ),
             Route("/v1/admin/a2a/status", server._handle_admin_a2a_status, methods=["GET"]),
             Route("/v1/admin/a2a/agents", server._handle_admin_a2a_agents, methods=["GET"]),
+            Route("/v1/admin/a2a/tasks", server._handle_admin_a2a_tasks, methods=["GET"]),
             Route(
                 "/v1/admin/a2a/tasks/{task_id}",
                 server._handle_admin_a2a_task_query,
@@ -3104,6 +3330,7 @@ def build_app(
 
     app.add_exception_handler(HTTPException, _http_exception_handler)
     app.add_exception_handler(Exception, _generic_exception_handler)
+    app.state.server = server
     return app
 
 

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from loop_controller.approval_watcher import ApprovalWatcher
 from loop_controller.controller import LoopController
 from loop_controller.identity import ConfigIdentityProvider
 from loop_controller.models import Agent, ApprovalRequest, AuditEvent, GovernanceResult
+from loop_controller.secrets import MemorySecretBackend
 from loop_controller.server import build_app
 
 
@@ -31,18 +33,33 @@ class _MockAuditEvent:
         task_id: str | None,
         agent_id: str | None = None,
         tool_name: str | None = None,
+        *,
+        tenant_id: str | None = None,
+        timestamp: datetime | None = None,
+        correlation_id: str = "correlation",
+        interaction_id: str = "interaction",
     ):
         self.session_id = session_id
         self.task_id = task_id
+        self.actor_id = agent_id
+        self.target = tool_name
         self.agent_id = agent_id
         self.tool_name = tool_name
+        self.tenant_id = tenant_id
+        self.timestamp = timestamp or datetime(2026, 9, 19, tzinfo=UTC)
+        self.correlation_id = correlation_id
+        self.interaction_id = interaction_id
 
     def model_dump(self, mode: str | None = None) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
             "task_id": self.task_id,
+            "actor_id": self.actor_id,
+            "target": self.target,
             "agent_id": self.agent_id,
             "tool_name": self.tool_name,
+            "tenant_id": self.tenant_id,
+            "timestamp": self.timestamp.isoformat(),
         }
 
 
@@ -54,6 +71,60 @@ class _MockAuditStore:
 
     async def append_async(self, event: Any) -> None:
         self._events.append(event)
+
+    @staticmethod
+    def _filter(
+        events: list[_MockAuditEvent], *, tenant_id: str | None,
+        start_time: datetime | None, end_time: datetime | None,
+        agent_id: str | None = None, tool_name: str | None = None,
+    ) -> list[_MockAuditEvent]:
+        return [
+            event for event in events
+            if (tenant_id is None or event.tenant_id == tenant_id)
+            and (start_time is None or event.timestamp >= start_time)
+            and (end_time is None or event.timestamp <= end_time)
+            and (agent_id is None or event.actor_id == agent_id)
+            and (tool_name is None or event.target == tool_name)
+        ]
+
+    def list_recent(self, limit: int = 100, **scope: Any) -> list[_MockAuditEvent]:
+        return list(reversed(self._filter(self._events, **scope)[-limit:]))
+
+    def query_by_session(
+        self, session_id: str, *, limit: int | None = None, **scope: Any
+    ) -> list[_MockAuditEvent]:
+        events = self._filter(
+            [event for event in self._events if event.session_id == session_id], **scope
+        )
+        return events[-limit:] if limit is not None else events
+
+    def query_by_task(
+        self, task_id: str, *, limit: int | None = None, **scope: Any
+    ) -> list[_MockAuditEvent]:
+        events = self._filter(
+            [event for event in self._events if event.task_id == task_id], **scope
+        )
+        return events[-limit:] if limit is not None else events
+
+    def query_by_correlation(
+        self, correlation_id: str, limit: int = 100, **scope: Any
+    ) -> list[_MockAuditEvent]:
+        return self._filter(
+            [event for event in self._events if event.correlation_id == correlation_id],
+            **scope,
+        )[:limit]
+
+    def query_interactions(
+        self, *, interaction_id: str | None = None, limit: int = 100, **scope: Any
+    ) -> list[_MockAuditEvent]:
+        scope.pop("source_agent_id", None)
+        scope.pop("target_agent_id", None)
+        scope.pop("verdict", None)
+        events = [
+            event for event in self._events
+            if interaction_id is None or event.interaction_id == interaction_id
+        ]
+        return list(reversed(self._filter(events, **scope)[-limit:]))
 
     async def iter_events(self):
         for event in self._events:
@@ -115,6 +186,45 @@ class _MockApprovalStore:
     @property
     def responses(self) -> dict[str, Any]:
         return dict(self._records)
+
+    def list_history(self, **filters: Any) -> tuple[list[Any], int]:
+        from loop_controller.infra.approval_store import list_approval_history
+
+        pairs = [
+            (request, self._records.get(request.decision_id)) for request in self._pending
+        ]
+        return list_approval_history(pairs, **filters)  # type: ignore[arg-type]
+
+    def list_events(
+        self, *, after_id: int, tenant_id: str | None, all_tenants: bool, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        from loop_controller.infra.approval_store import _history_item
+
+        events = []
+        event_id = 0
+        for approval in self._pending:
+            if not all_tenants and getattr(approval, "tenant_id", None) != tenant_id:
+                continue
+            event_id += 1
+            if event_id > after_id:
+                events.append({"event_id": event_id, "event_type": "pending",
+                               "item": _history_item(approval, None)})  # type: ignore[arg-type]
+            record = self._records.get(approval.decision_id)
+            if record is not None:
+                event_id += 1
+                if event_id > after_id:
+                    events.append({"event_id": event_id, "event_type": "decided",
+                                   "item": _history_item(approval, record)})  # type: ignore[arg-type]
+        return events[:limit]
+
+    def event_bounds(
+        self, *, tenant_id: str | None, all_tenants: bool
+    ) -> tuple[int | None, int]:
+        events = self.list_events(
+            after_id=0, tenant_id=tenant_id, all_tenants=all_tenants, limit=10000
+        )
+        ids = [event["event_id"] for event in events]
+        return (min(ids) if ids else None, max(ids) if ids else 0)
 
     def refresh(self) -> None:
         pass
@@ -679,6 +789,52 @@ def test_admin_approvals_history_filters_and_pagination() -> None:
     assert data["offset"] == 0
 
 
+def test_admin_approvals_total_is_before_pagination_and_payload_is_safe() -> None:
+    client, controller = _build_client(api_key="secret")
+    store = controller._runtime.approval_manager._store
+    first = _pending_approval_request()
+    second = first.model_copy(update={"request_id": "r-2", "decision_id": "d-2"})
+    store.submit_request(first)
+    store.submit_request(second)
+
+    resp = client.get(
+        "/v1/admin/approvals", params={"limit": 1}, headers={"X-API-Key": "secret"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 2
+    assert len(body["approvals"]) == 1
+    assert "tool_arguments" not in body["approvals"][0]
+
+
+def test_admin_approvals_stream_replays_with_opaque_cursor() -> None:
+    client, controller = _build_client(api_key="secret")
+    store = controller._runtime.approval_manager._store
+    request = _pending_approval_request()
+    store.submit_request(request)
+    cursor = client.app.state.server._approval_cursor(0, "platform")  # type: ignore[attr-defined]
+
+    response = client.get(
+        "/v1/admin/approvals/stream?max_wait=0.1",
+        headers={"X-API-Key": "secret", "Last-Event-ID": cursor},
+    )
+    assert response.status_code == 200
+    assert "retry: 1000" in response.text
+    assert "event: pending" in response.text
+    assert "id: " in response.text
+
+
+def test_admin_approvals_stream_rejects_invalid_and_future_cursor() -> None:
+    client, _controller = _build_client(api_key="secret")
+    headers = {"X-API-Key": "secret", "Last-Event-ID": "not-a-cursor"}
+    assert client.get("/v1/admin/approvals/stream", headers=headers).status_code == 400
+    future = client.app.state.server._approval_cursor(1, "platform")  # type: ignore[attr-defined]
+    headers["Last-Event-ID"] = future
+    response = client.get("/v1/admin/approvals/stream", headers=headers)
+    assert response.status_code == 400
+    assert response.json()["error"] == "approval_cursor_future"
+
+
 def test_admin_approvals_rejects_invalid_status() -> None:
     client, _controller = _build_client(api_key="secret")
     resp = client.get(
@@ -713,13 +869,21 @@ def test_admin_audit_query_by_agent_and_tool() -> None:
     client, controller = _build_client(api_key="secret")
     controller._runtime.audit_store = _MockAuditStore(
         [
-            _MockAuditEvent(session_id="s-1", task_id="t-1", agent_id="a-1", tool_name="send_email"),
-            _MockAuditEvent(session_id="s-2", task_id="t-2", agent_id="a-2", tool_name="web_search"),
+            AuditEvent(
+                event_id="e-1", trace_id="t-1", session_id="s-1",
+                actor_type="agent", actor_id="a-1", action="execute",
+                target="send_email",
+            ),
+            AuditEvent(
+                event_id="e-2", trace_id="t-2", session_id="s-2",
+                actor_type="agent", actor_id="a-2", action="execute",
+                target="web_search",
+            ),
         ]
     )
     resp = client.get(
         "/v1/admin/audit",
-        params={"agent_id": "a-1", "tool_name": "send_email", "limit": 10},
+        params={"agent_id": "a-1", "tool_name": "send_email", "limit": 1},
         headers={"X-API-Key": "secret"},
     )
     assert resp.status_code == 200
@@ -746,6 +910,51 @@ def test_admin_audit_query() -> None:
     data = resp.json()
     assert len(data["events"]) == 1
     assert data["events"][0]["session_id"] == "s-1"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "2026-09-19T10:00:00", "not-a-time", "x" * 65],
+)
+def test_admin_audit_rejects_invalid_or_naive_time(value: str) -> None:
+    client, _controller = _build_client(api_key="secret")
+    response = client.get(
+        "/v1/admin/audit", params={"start_time": value},
+        headers={"X-API-Key": "secret"},
+    )
+    assert response.status_code == 400
+
+
+def test_admin_audit_rejects_reversed_time_range() -> None:
+    client, _controller = _build_client(api_key="secret")
+    response = client.get(
+        "/v1/admin/audit",
+        params={
+            "start_time": "2026-09-19T12:00:00Z",
+            "end_time": "2026-09-19T13:00:00+02:00",
+        },
+        headers={"X-API-Key": "secret"},
+    )
+    assert response.status_code == 400
+
+
+def test_admin_audit_accepts_offset_and_uses_closed_interval() -> None:
+    client, controller = _build_client(api_key="secret")
+    controller._runtime.audit_store = _MockAuditStore([
+        _MockAuditEvent("s", "t", timestamp=datetime(2026, 9, 19, 9, tzinfo=UTC)),
+        _MockAuditEvent("s", "t", timestamp=datetime(2026, 9, 19, 10, tzinfo=UTC)),
+        _MockAuditEvent("s", "t", timestamp=datetime(2026, 9, 19, 11, tzinfo=UTC)),
+    ])
+    response = client.get(
+        "/v1/admin/audit",
+        params={
+            "start_time": "2026-09-19T12:00:00+02:00",
+            "end_time": "2026-09-19T13:00:00+02:00",
+        },
+        headers={"X-API-Key": "secret"},
+    )
+    assert response.status_code == 200
+    assert len(response.json()["events"]) == 2
 
 
 def test_admin_pending_requires_configured_api_key() -> None:
@@ -1476,7 +1685,7 @@ def test_invalid_query_param_returns_400() -> None:
 # 管理控制台最小可行接口（/v1/admin/agents|profiles|identity|entrypoints|govern/evaluate）
 # ---------------------------------------------------------------------------
 
-from datetime import UTC, datetime, timedelta  # noqa: E402
+from datetime import timedelta  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
 from loop_controller.classifier import RuleBasedClassifier  # noqa: E402
@@ -1578,6 +1787,7 @@ class _AdminMockRuntime:
         self.profiles = _admin_profiles()
         self.classifier = RuleBasedClassifier()
         self.http_tool_names: set[str] = set()
+        self.secret_broker = MemorySecretBackend()
         revocations = RevocationList()
         if with_revocation:
             revocations.add(
@@ -1598,6 +1808,52 @@ def _build_admin_client(
     controller = _AdminMockController(revoked=revoked)
     app = build_app(controller, api_key=api_key, configure_logs=False)
     return TestClient(app), controller
+
+
+def test_admin_secrets_returns_only_allowlisted_metadata(monkeypatch) -> None:
+    client, controller = _build_admin_client()
+    broker = controller._runtime.secret_broker
+    broker.put("z-global", "GLOBAL-CANARY-PLAINTEXT")
+    broker.put("a-tenant", "TENANT-CANARY-PLAINTEXT", tenant_id="tenant-a")
+
+    async def fail_lookup(*args, **kwargs):
+        raise AssertionError("endpoint must not call get/get_exact")
+
+    monkeypatch.setattr(broker, "get", fail_lookup)
+    monkeypatch.setattr(broker, "get_exact", fail_lookup)
+
+    response = client.get("/v1/admin/secrets", headers={"X-API-Key": "test-key"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "secrets": [
+            {
+                "ref": "z-global",
+                "tenant_id": None,
+                "backend": "memory",
+                "has_value": True,
+            },
+            {
+                "ref": "a-tenant",
+                "tenant_id": "tenant-a",
+                "backend": "memory",
+                "has_value": True,
+            },
+        ]
+    }
+    assert "CANARY" not in response.text
+    assert set(response.json()["secrets"][0]) == {
+        "ref", "tenant_id", "backend", "has_value"
+    }
+
+
+def test_admin_secrets_missing_broker_returns_503() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.secret_broker = None
+
+    response = client.get("/v1/admin/secrets", headers={"X-API-Key": "test-key"})
+
+    assert response.status_code == 503
 
 
 def test_admin_agents_lists_config_with_revocation() -> None:
@@ -1847,6 +2103,12 @@ class _FakeGoKernelBridge:
             return []
         return [{"agent_id": "researcher_001"}, {"agent_id": "loop-controller-local"}]
 
+    async def list_tasks(self, *, root_only: bool = False) -> list[dict[str, Any]]:
+        if not self.reachable:
+            return []
+        self.root_only = root_only
+        return [{"task_id": "t-1", "status": "completed", "token": "secret"}]
+
     async def query_task(self, task_id: str) -> dict[str, Any] | None:
         if not self.reachable:
             return None
@@ -1901,6 +2163,27 @@ def test_admin_a2a_agents_kernel_unreachable() -> None:
     body = resp.json()
     assert body["kernel_reachable"] is False
     assert all(a["registered"] is None for a in body["agents"])
+
+
+def test_admin_a2a_task_list_strict_root_only_and_sanitizes() -> None:
+    client, controller = _build_admin_client()
+    bridge = _FakeGoKernelBridge(reachable=True)
+    controller._runtime.go_kernel_bridge = bridge
+    resp = client.get(
+        "/v1/admin/a2a/tasks?root_only=true", headers={"X-API-Key": "test-key"}
+    )
+    assert resp.status_code == 200
+    assert bridge.root_only is True
+    assert resp.json() == {"tasks": [{"task_id": "t-1", "status": "completed"}]}
+    for value in ("1", "TRUE", ""):
+        resp = client.get(
+            f"/v1/admin/a2a/tasks?root_only={value}", headers={"X-API-Key": "test-key"}
+        )
+        assert resp.status_code == 400
+    assert client.get(
+        "/v1/admin/a2a/tasks?root_only=true&root_only=false",
+        headers={"X-API-Key": "test-key"},
+    ).status_code == 400
 
 
 def test_admin_a2a_task_query() -> None:

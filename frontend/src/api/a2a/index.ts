@@ -1,16 +1,10 @@
 import type { A2ADeadLetterDataSource, A2ATaskDataSource } from './types'
-import { MockA2ADeadLetterDataSource, MockA2ATaskDataSource } from './mock'
+import { MockA2ADeadLetterDataSource } from './mock'
+import { HttpA2ATaskDataSource } from './http'
 import { a2aClient } from '@/api/client'
 
-/**
- * 当前数据源：Mock（演示）。
- * 后端 v0.54 推送、任务列表接口就绪后，替换为 Http 实现：
- *   class HttpA2ATaskDataSource implements A2ATaskDataSource {
- *     // 经 pythonClient /a2a/v1/tasks 拉取并按 parent_task_id 组树
- *   }
- * 视图层（TaskTree.vue / A2A.vue）无需任何改动。
- */
-export const a2aTaskSource: A2ATaskDataSource = new MockA2ATaskDataSource()
+/** 任务列表统一经 Python Admin 代理，避免浏览器直连 Go 内核。 */
+export const a2aTaskSource: A2ATaskDataSource = new HttpA2ATaskDataSource()
 
 /**
  * 死信队列数据源：Mock（演示）。

@@ -714,6 +714,18 @@ class GoKernelBridge:
             logger.warning("Go kernel get_agent unreachable: %s", exc)
             return None
 
+    async def list_tasks(self, *, root_only: bool = False) -> list[dict[str, Any]]:
+        """列出当前 control principal 可见的任务。"""
+        data = await self._request_object(
+            "GET",
+            f"{self._base_url}/a2a/v1/tasks",
+            params={"root_only": "true" if root_only else "false"},
+        )
+        tasks = data.get("tasks")
+        if not isinstance(tasks, list) or any(not isinstance(item, dict) for item in tasks):
+            raise GoKernelProtocolError("tasks must be an array of objects")
+        return tasks
+
     async def query_task(self, task_id: str) -> dict[str, Any] | None:
         """查询任务状态。"""
         url = f"{self._base_url}/a2a/v1/tasks/{task_id}"

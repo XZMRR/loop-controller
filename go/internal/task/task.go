@@ -145,6 +145,10 @@ func (m *Manager) CreateInteractionTask(task models.Task) (models.Task, error) {
 	return task, nil
 }
 
+func (m *Manager) ListForTenantInitiator(ctx context.Context, tenantID, initiatorAgentID string, rootOnly bool) ([]models.Task, error) {
+	return m.store.ListForTenantInitiator(ctx, tenantID, initiatorAgentID, rootOnly)
+}
+
 // Get returns a task by id.
 func (m *Manager) Get(taskID string) (models.Task, error) {
 	task, err := m.store.Get(context.Background(), taskID)

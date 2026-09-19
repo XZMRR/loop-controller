@@ -61,6 +61,32 @@ def test_missing_key_raises(base_path: Path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_refs_does_not_decrypt_again(
+    base_path: Path, key: bytes, monkeypatch
+) -> None:
+    _write_encrypted(base_path, "api_key", json.dumps("canary-plaintext"), key)
+    monkeypatch.setenv("LC_SECRET_ENCRYPTION_KEY", key.hex())
+    decrypt_calls = 0
+    original_decrypt = EncryptedFileSecretBackend._decrypt
+
+    def count_decrypt(self, ciphertext_b64: str) -> str:
+        nonlocal decrypt_calls
+        decrypt_calls += 1
+        return original_decrypt(self, ciphertext_b64)
+
+    monkeypatch.setattr(EncryptedFileSecretBackend, "_decrypt", count_decrypt)
+    backend = EncryptedFileSecretBackend(base_path)
+    assert decrypt_calls == 1
+
+    refs = await backend.list_refs()
+
+    assert decrypt_calls == 1
+    assert [item.model_dump() for item in refs] == [
+        {"ref": "api_key", "tenant_id": None, "has_value": True}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_plaintext_secret_still_works(base_path: Path, monkeypatch) -> None:
     global_dir = base_path / "global"
     global_dir.mkdir(parents=True)

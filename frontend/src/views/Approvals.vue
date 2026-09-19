@@ -99,6 +99,11 @@
             </template>
           </el-table-column>
           <el-table-column prop="reason" label="原因" show-overflow-tooltip />
+          <el-table-column label="操作" width="90" fixed="right">
+            <template #default="{ row }">
+              <el-button size="small" @click="openDetail(row)">详情</el-button>
+            </template>
+          </el-table-column>
           <template #empty>
             <el-empty description="暂无审批历史" />
           </template>
@@ -121,6 +126,15 @@
         <el-descriptions :column="1" border>
           <el-descriptions-item label="工具">{{ detailRow.tool_name }}</el-descriptions-item>
           <el-descriptions-item label="申请人">{{ detailRow.requester_id }}</el-descriptions-item>
+          <el-descriptions-item v-if="'tenant_id' in detailRow" label="Tenant ID">
+            {{ detailRow.tenant_id || '平台级' }}
+          </el-descriptions-item>
+          <el-descriptions-item v-if="'task_id' in detailRow" label="Task ID">
+            <span class="mono">{{ detailRow.task_id || '-' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item v-if="'call_id' in detailRow" label="Call ID">
+            <span class="mono">{{ detailRow.call_id || '-' }}</span>
+          </el-descriptions-item>
           <el-descriptions-item label="原因">
             <span style="white-space: pre-wrap">{{ detailRow.reason || '-' }}</span>
           </el-descriptions-item>
@@ -140,14 +154,17 @@
               </el-button>
             </div>
           </el-descriptions-item>
+          <template v-if="'arguments_masked' in detailRow">
+            <el-descriptions-item label="脱敏参数">
+              <pre class="detail-json">{{ JSON.stringify(detailRow.arguments_masked, null, 2) }}</pre>
+            </el-descriptions-item>
+            <el-descriptions-item label="审批意见">{{ detailRow.comment || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="Decision 摘要">
+              <span style="white-space: pre-wrap">{{ decisionSummary(detailRow) }}</span>
+            </el-descriptions-item>
+          </template>
         </el-descriptions>
-        <el-alert
-          type="info"
-          :closable="false"
-          style="margin-top: 16px"
-          title="参数与升级链字段待后端审批详情接口补齐后展示"
-        />
-        <div style="margin-top: 16px; display: flex; gap: 12px">
+        <div v-if="!('arguments_masked' in detailRow)" style="margin-top: 16px; display: flex; gap: 12px">
           <el-button type="success" style="flex: 1" @click="openAction(detailRow, 'approve')">
             通过
           </el-button>
@@ -220,10 +237,9 @@ const currentAction = ref<'approve' | 'deny'>('approve')
 // v0.54 安全边界：独立审批凭证，用后即焚，不持久化
 const form = ref({ credential: '', comment: '' })
 const detailVisible = ref(false)
-const detailRow = ref<PendingApproval | null>(null)
+const detailRow = ref<PendingApproval | ApprovalHistoryItem | null>(null)
 
-// 推送优先、轮询兜底：streamAdminApprovals 指向的端点为未定契约（后端尚无管理台
-// SSE），连接失败（当前环境即如此）自动降级为 15s 轮询并显示标识。
+// 推送优先、轮询兜底：管理台 SSE 连接失败时自动降级为 15s 轮询。
 const APPROVALS_POLL_INTERVAL = 15000
 const pushState = ref<'connecting' | 'active' | 'fallback'>('connecting')
 let stopPushStream: (() => void) | null = null
@@ -257,9 +273,15 @@ usePolling(async () => {
   if (pushState.value === 'fallback') await loadApprovals(true)
 }, APPROVALS_POLL_INTERVAL)
 
-function openDetail(row: PendingApproval) {
+function openDetail(row: PendingApproval | ApprovalHistoryItem) {
   detailRow.value = row
   detailVisible.value = true
+}
+
+function decisionSummary(row: ApprovalHistoryItem) {
+  if (row.action_summary) return row.action_summary
+  if (row.original_decision) return JSON.stringify(row.original_decision, null, 2)
+  return '-'
 }
 
 async function copyText(text: string) {
@@ -399,6 +421,12 @@ onMounted(() => {
 .mono {
   font-family: 'Courier New', monospace;
   font-size: 12px;
+  word-break: break-all;
+}
+
+.detail-json {
+  margin: 0;
+  white-space: pre-wrap;
   word-break: break-all;
 }
 </style>

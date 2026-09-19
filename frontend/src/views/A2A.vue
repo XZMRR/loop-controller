@@ -143,21 +143,15 @@
     <el-card class="mt-4" shadow="hover">
       <template #header>
         <div class="card-header">
-          <span>多跳委托链路（演示数据）</span>
+          <span>多跳委托链路</span>
           <div>
-            <el-tag type="warning" effect="plain" style="margin-right: 12px">
-              Mock 数据源
+            <el-tag type="success" effect="plain" style="margin-right: 12px">
+              实时数据
             </el-tag>
             <el-button size="small" :loading="treesLoading" @click="loadTaskTrees">刷新</el-button>
           </div>
         </div>
       </template>
-      <el-alert
-        type="info"
-        :closable="false"
-        style="margin-bottom: 12px"
-        title="当前为演示数据源：复现 planner → research-agent → specialist-agent 两跳链路。后端 v0.54 推送后切换为真实内核数据，视图无需改动。"
-      />
       <div v-loading="treesLoading">
         <TaskTree v-if="taskTrees.length > 0" :trees="taskTrees" />
         <el-empty v-else-if="!treesLoading" description="暂无委托链路" />

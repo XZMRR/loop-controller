@@ -225,6 +225,17 @@ CREATE TABLE IF NOT EXISTS approval_notification_outbox (
 CREATE INDEX IF NOT EXISTS idx_approval_outbox_ready
     ON approval_notification_outbox(delivered_at, next_attempt_at, lease_until);
 
+CREATE TABLE IF NOT EXISTS approval_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL CHECK (event_type IN ('pending', 'decided')),
+    decision_id TEXT NOT NULL,
+    tenant_id TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(decision_id) REFERENCES approval_requests(decision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_approval_events_tenant_id
+    ON approval_events(tenant_id, event_id);
+
 CREATE TABLE IF NOT EXISTS policy_candidates (
     candidate_id TEXT PRIMARY KEY,
     revision TEXT,
@@ -1801,6 +1812,15 @@ class StateDatabase:
                         "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
                         (decision_id, request_id, request_json, request_hash, created_at, tenant_id),
                     )
+                    conn.execute(
+                        "INSERT INTO approval_events "
+                        "(event_type, decision_id, tenant_id, created_at) VALUES ('pending', ?, ?, ?)",
+                        (decision_id, tenant_id, created_at),
+                    )
+                    conn.execute(
+                        "DELETE FROM approval_events WHERE event_id <= "
+                        "(SELECT COALESCE(MAX(event_id), 0) - 10000 FROM approval_events)"
+                    )
                     if delivery_id is not None:
                         conn.execute(
                             "INSERT INTO approval_notification_outbox "
@@ -1840,7 +1860,7 @@ class StateDatabase:
             with self._connect() as conn:
                 with self._immediate(conn):
                     request = conn.execute(
-                        "SELECT request_id FROM approval_requests WHERE decision_id = ?",
+                        "SELECT request_id, tenant_id FROM approval_requests WHERE decision_id = ?",
                         (decision_id,),
                     ).fetchone()
                     if request is None or request["request_id"] != request_id:
@@ -1863,6 +1883,15 @@ class StateDatabase:
                     conn.execute(
                         "UPDATE approval_requests SET status = ? WHERE decision_id = ?",
                         (status, decision_id),
+                    )
+                    conn.execute(
+                        "INSERT INTO approval_events "
+                        "(event_type, decision_id, tenant_id, created_at) VALUES ('decided', ?, ?, ?)",
+                        (decision_id, request["tenant_id"], decided_at),
+                    )
+                    conn.execute(
+                        "DELETE FROM approval_events WHERE event_id <= "
+                        "(SELECT COALESCE(MAX(event_id), 0) - 10000 FROM approval_events)"
                     )
                     if delivery_id is not None:
                         conn.execute(
@@ -1943,6 +1972,60 @@ class StateDatabase:
                 return row["response_json"] if row else None
         except sqlite3.Error as exc:
             raise StateDatabaseError(f"查询审批响应失败: {exc}") from exc
+
+    def list_approval_history_json(
+        self, *, tenant_id: str | None, all_tenants: bool
+    ) -> list[dict[str, str | None]]:
+        try:
+            with self._connect() as conn:
+                where = "" if all_tenants else "WHERE r.tenant_id IS ?"
+                params: tuple[Any, ...] = () if all_tenants else (tenant_id,)
+                rows = conn.execute(
+                    "SELECT r.request_json, p.response_json FROM approval_requests AS r "
+                    "LEFT JOIN approval_responses AS p ON p.decision_id = r.decision_id "
+                    f"{where} ORDER BY r.created_at DESC, r.rowid DESC",
+                    params,
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举审批历史失败: {exc}") from exc
+
+    def list_approval_events(
+        self, *, after_id: int, tenant_id: str | None, all_tenants: bool, limit: int
+    ) -> list[dict[str, Any]]:
+        try:
+            with self._connect() as conn:
+                scope = "" if all_tenants else "AND e.tenant_id IS ?"
+                params: tuple[Any, ...] = (
+                    (after_id, limit) if all_tenants else (after_id, tenant_id, limit)
+                )
+                rows = conn.execute(
+                    "SELECT e.event_id, e.event_type, e.tenant_id, e.created_at, "
+                    "r.request_json, p.response_json FROM approval_events AS e "
+                    "JOIN approval_requests AS r ON r.decision_id = e.decision_id "
+                    "LEFT JOIN approval_responses AS p ON p.decision_id = e.decision_id "
+                    f"WHERE e.event_id > ? {scope} ORDER BY e.event_id LIMIT ?",
+                    params,
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"枚举审批事件失败: {exc}") from exc
+
+    def approval_event_bounds(
+        self, *, tenant_id: str | None, all_tenants: bool
+    ) -> tuple[int | None, int]:
+        try:
+            with self._connect() as conn:
+                where = "" if all_tenants else "WHERE tenant_id IS ?"
+                params: tuple[Any, ...] = () if all_tenants else (tenant_id,)
+                row = conn.execute(
+                    "SELECT MIN(event_id) AS oldest, COALESCE(MAX(event_id), 0) AS latest "
+                    f"FROM approval_events {where}",
+                    params,
+                ).fetchone()
+                return row["oldest"], row["latest"]
+        except sqlite3.Error as exc:
+            raise StateDatabaseError(f"查询审批事件边界失败: {exc}") from exc
 
     def claim_approval_notifications(
         self,

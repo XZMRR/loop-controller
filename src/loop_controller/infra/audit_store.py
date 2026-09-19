@@ -22,6 +22,7 @@ import threading
 import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -51,9 +52,39 @@ class AuditStore(Protocol):
     async def append_async(self, event: AuditEvent) -> None: ...
     def verify_chain(self) -> bool: ...
     def query_by_trace(self, trace_id: str) -> list[AuditEvent]: ...
-    def query_by_session(self, session_id: str) -> list[AuditEvent]: ...  # v0.12.0
-    def query_by_task(self, task_id: str) -> list[AuditEvent]: ...  # v0.12.0
-    def query_by_correlation(self, correlation_id: str, limit: int = 100) -> list[AuditEvent]: ...
+    def query_by_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+    ) -> list[AuditEvent]: ...
+    def query_by_task(
+        self,
+        task_id: str,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+    ) -> list[AuditEvent]: ...
+    def query_by_correlation(
+        self,
+        correlation_id: str,
+        limit: int = 100,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+    ) -> list[AuditEvent]: ...
     def query_interactions(
         self,
         *,
@@ -61,10 +92,24 @@ class AuditStore(Protocol):
         source_agent_id: str | None = None,
         target_agent_id: str | None = None,
         verdict: str | None = None,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
         limit: int = 100,
     ) -> list[AuditEvent]: ...
     def iter_events(self) -> AsyncIterator[AuditEvent]: ...  # v0.18.0
-    def list_recent(self, limit: int = 100) -> list[AuditEvent]: ...  # v0.32.0
+    def list_recent(
+        self,
+        limit: int = 100,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+    ) -> list[AuditEvent]: ...
 
 
 def _derive_key(root_key: bytes, label: bytes) -> bytes:
@@ -911,24 +956,95 @@ class JsonlAuditStore:
         """按 trace_id 全文件扫描并返回 AuditEvent 列表（MVP 数据量小，可接受）。"""
         return self._query_by_field("trace_id", trace_id)
 
-    def query_by_session(self, session_id: str) -> list[AuditEvent]:
-        """按 session_id 全文件扫描并返回 AuditEvent 列表（v0.12.0）。"""
-        return self._query_by_field("session_id", session_id)
+    @staticmethod
+    def _in_scope(
+        event: AuditEvent, *, tenant_id: str | None,
+        start_time: datetime | None, end_time: datetime | None,
+        agent_id: str | None = None, tool_name: str | None = None,
+    ) -> bool:
+        return (
+            (tenant_id is None or event.tenant_id == tenant_id)
+            and (start_time is None or event.timestamp >= start_time)
+            and (end_time is None or event.timestamp <= end_time)
+            and (agent_id is None or event.actor_id == agent_id)
+            and (tool_name is None or event.target == tool_name)
+        )
 
-    def query_by_task(self, task_id: str) -> list[AuditEvent]:
+    def query_by_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+    ) -> list[AuditEvent]:
+        """按 session_id 查询。"""
+        if self._audit_index is not None and not self._audit_index.degraded:
+            try:
+                return self._audit_index.query_by_session(
+                    session_id, tenant_id=tenant_id, start_time=start_time,
+                    end_time=end_time, agent_id=agent_id, tool_name=tool_name,
+                    limit=limit,
+                )
+            except AuditIndexError as exc:
+                logger.warning("审计索引查询失败，回退 JSONL 扫描: %s", exc)
+        results = self._scan_correlations(session_id, 1_000_000, fields=("session_id",))
+        results = [event for event in results if self._in_scope(
+            event, tenant_id=tenant_id, start_time=start_time, end_time=end_time,
+            agent_id=agent_id, tool_name=tool_name,
+        )]
+        return results[-limit:] if limit is not None else results
+
+    def query_by_task(
+        self,
+        task_id: str,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+    ) -> list[AuditEvent]:
         """按 task_id 查询；旧日志以 trace_id 作为 task_id。"""
         if self._audit_index is not None and not self._audit_index.degraded:
             try:
-                return self._audit_index.query_by_task(task_id)
+                return self._audit_index.query_by_task(
+                    task_id, tenant_id=tenant_id, start_time=start_time,
+                    end_time=end_time, agent_id=agent_id, tool_name=tool_name,
+                    limit=limit,
+                )
             except AuditIndexError as exc:
                 logger.warning("审计索引查询失败，回退 JSONL 扫描: %s", exc)
-        return self._scan_correlations(task_id, 1_000_000, fields=("task_id", "trace_id"))
+        results = self._scan_correlations(task_id, 1_000_000, fields=("task_id", "trace_id"))
+        results = [event for event in results if self._in_scope(
+            event, tenant_id=tenant_id, start_time=start_time, end_time=end_time,
+            agent_id=agent_id, tool_name=tool_name,
+        )]
+        return results[-limit:] if limit is not None else results
 
-    def query_by_correlation(self, correlation_id: str, limit: int = 100) -> list[AuditEvent]:
+    def query_by_correlation(
+        self,
+        correlation_id: str,
+        limit: int = 100,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+    ) -> list[AuditEvent]:
         """沿主要 correlation 字段的关联闭包返回有序完整链。"""
         if self._audit_index is not None and not self._audit_index.degraded:
             try:
-                return self._audit_index.query_by_correlation(correlation_id, limit)
+                return self._audit_index.query_by_correlation(
+                    correlation_id, limit, tenant_id=tenant_id,
+                    start_time=start_time, end_time=end_time,
+                    agent_id=agent_id, tool_name=tool_name,
+                )
             except AuditIndexError as exc:
                 logger.warning("审计索引查询失败，回退 JSONL 扫描: %s", exc)
         fields = ("request_id", "interaction_id", "decision_id", "task_id", "call_id", "delegation_jti", "receipt_id")
@@ -948,6 +1064,10 @@ class JsonlAuditStore:
                     identifiers.update(values)
                     changed = changed or len(identifiers) != before
         selected.sort(key=lambda event: event.seq)
+        selected = [event for event in selected if self._in_scope(
+            event, tenant_id=tenant_id, start_time=start_time, end_time=end_time,
+            agent_id=agent_id, tool_name=tool_name,
+        )]
         return selected[:limit]
 
     def _scan_correlations(self, value: str | None, limit: int, *, fields: tuple[str, ...]) -> list[AuditEvent]:
@@ -982,6 +1102,11 @@ class JsonlAuditStore:
         source_agent_id: str | None = None,
         target_agent_id: str | None = None,
         verdict: str | None = None,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
         limit: int = 100,
     ) -> list[AuditEvent]:
         """按交互治理字段查询；索引不可用时回退 JSONL。"""
@@ -992,6 +1117,11 @@ class JsonlAuditStore:
                     source_agent_id=source_agent_id,
                     target_agent_id=target_agent_id,
                     verdict=verdict,
+                    tenant_id=tenant_id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    agent_id=agent_id,
+                    tool_name=tool_name,
                     limit=limit,
                 )
             except AuditIndexError as exc:
@@ -1018,14 +1148,31 @@ class JsonlAuditStore:
                 event_verdict = metadata.get("verdict") or event.decision
                 if verdict is not None and event_verdict != verdict:
                     continue
+                if not self._in_scope(
+                    event, tenant_id=tenant_id, start_time=start_time, end_time=end_time,
+                    agent_id=agent_id, tool_name=tool_name,
+                ):
+                    continue
                 results.append(event)
         return list(reversed(results[-limit:]))
 
-    def list_recent(self, limit: int = 100) -> list[AuditEvent]:
+    def list_recent(
+        self,
+        limit: int = 100,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+    ) -> list[AuditEvent]:
         """返回最近的审计事件列表（v0.32.0）；v0.34.0 优先使用 SQLite 索引。"""
         if self._audit_index is not None and not self._audit_index.degraded:
             try:
-                return self._audit_index.list_recent(limit)
+                return self._audit_index.list_recent(
+                    limit, tenant_id=tenant_id, start_time=start_time, end_time=end_time,
+                    agent_id=agent_id, tool_name=tool_name,
+                )
             except AuditIndexError as exc:
                 logger.warning("审计索引查询失败，回退 JSONL 扫描: %s", exc)
         results: list[AuditEvent] = []
@@ -1039,7 +1186,13 @@ class JsonlAuditStore:
                 try:
                     record = json.loads(line)
                     event_data = record.get("event") or record
-                    results.append(AuditEvent(**event_data))
+                    event = AuditEvent(**event_data)
+                    if self._in_scope(
+                        event, tenant_id=tenant_id,
+                        start_time=start_time, end_time=end_time,
+                        agent_id=agent_id, tool_name=tool_name,
+                    ):
+                        results.append(event)
                 except (json.JSONDecodeError, ValidationError):
                     continue
         return results[-limit:]

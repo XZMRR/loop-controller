@@ -373,6 +373,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /a2a/v1/agents", s.withControlAuth(true, s.handleListAgents))
 	mux.HandleFunc("GET /a2a/v1/agents/{id}", s.withControlAuth(true, s.handleGetAgent))
 	mux.HandleFunc("POST /a2a/v1/tasks", s.withControlAuth(true, s.handleCreateTask))
+	mux.HandleFunc("GET /a2a/v1/tasks", s.withControlAuth(true, s.handleListTasks))
 	mux.HandleFunc("GET /a2a/v1/tasks/{id}", s.withControlAuth(false, s.handleGetTask))
 	mux.HandleFunc("GET /a2a/v1/tasks/{id}/snapshot", s.withControlAuth(false, s.handleTaskSnapshot))
 	mux.HandleFunc("GET /a2a/v1/tasks/{id}/stream", s.withControlAuth(false, s.handleTaskStream))
@@ -618,12 +619,37 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "initiator_mismatch", "initiator_agent_id does not match authenticated principal")
 		return
 	}
-	t, err := s.tasks.CreateReliable(req.SessionID, req.InitiatorAgentID, req.TargetAgentID)
+	t, err := s.tasks.CreateInteractionTask(models.Task{
+		SessionID:        req.SessionID,
+		TenantID:         s.controlTenantID,
+		InitiatorAgentID: req.InitiatorAgentID,
+		TargetAgentID:    req.TargetAgentID,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "task_create_failed", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusCreated, t)
+}
+
+func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
+	rootOnly := false
+	if values, present := r.URL.Query()["root_only"]; present {
+		if len(values) != 1 || (values[0] != "true" && values[0] != "false") {
+			writeError(w, http.StatusBadRequest, "invalid_root_only", "root_only must be true or false")
+			return
+		}
+		rootOnly = values[0] == "true"
+	}
+	tasks, err := s.tasks.ListForTenantInitiator(r.Context(), s.controlTenantID, s.controlInitiatorID, rootOnly)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "task_list_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"protocol_version": models.CurrentProtocolVersion,
+		"tasks":            tasks,
+	})
 }
 
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {

@@ -60,7 +60,25 @@ async function stubApprovalBackend(page: Page, approveStatus = 200) {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({ approvals: [], total: 0 }),
+      body: JSON.stringify({
+        approvals: [{
+          ...PENDING_ITEM,
+          call_id: 'call-e2e-001',
+          task_id: 'task-e2e-001',
+          tenant_id: 'tenant-e2e',
+          approver_id: 'approver-e2e',
+          arguments_masked: { token: '***', recipient: 'safe@example.com' },
+          comment: '已核验',
+          principal: 'approver-e2e',
+          action_summary: '允许发送脱敏邮件',
+          original_decision: null,
+          status: 'approve',
+          decided_at: '2026-09-17T10:01:00Z',
+        }],
+        total: 1,
+        limit: 10,
+        offset: 0,
+      }),
     })
   })
 
@@ -141,6 +159,20 @@ test.describe('审批操作流', () => {
     // 失败不退出对话框，待办仍在列表中
     await expect(page.getByText('通过审批')).toBeVisible()
     await expect(page.getByText('dec-e2e-001')).toBeVisible()
+  })
+
+  test('历史详情展示安全字段，不回显原始敏感值', async ({ page }) => {
+    await stubApprovalBackend(page)
+    await loginAndOpenApprovals(page)
+
+    await page.getByRole('radio', { name: '历史' }).click()
+    await page.getByRole('button', { name: '详情' }).last().click()
+
+    await expect(page.getByText('tenant-e2e')).toBeVisible()
+    await expect(page.getByText('task-e2e-001')).toBeVisible()
+    await expect(page.getByText('call-e2e-001')).toBeVisible()
+    await expect(page.getByText('允许发送脱敏邮件')).toBeVisible()
+    await expect(page.getByText('***')).toBeVisible()
   })
 })
 

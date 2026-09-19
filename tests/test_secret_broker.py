@@ -80,6 +80,26 @@ class TestMemorySecretBackend:
         names = await backend.list(SecretScope.GLOBAL)
         assert names == ["a", "b"]
 
+    async def test_list_refs_enumerates_namespaces_without_lookup(self, monkeypatch) -> None:
+        backend = MemorySecretBackend()
+        backend.put("z-global", "global-canary")
+        backend.put("a-global", "global-canary")
+        backend.put("tenant-secret", "tenant-canary", tenant_id="tenant-b")
+        backend.put("tenant-secret", "tenant-canary", tenant_id="tenant-a")
+
+        async def fail_lookup(*args, **kwargs):
+            raise AssertionError("list_refs must not call get/get_exact")
+
+        monkeypatch.setattr(backend, "get", fail_lookup)
+        monkeypatch.setattr(backend, "get_exact", fail_lookup)
+
+        assert [item.model_dump() for item in await backend.list_refs()] == [
+            {"ref": "a-global", "tenant_id": None, "has_value": True},
+            {"ref": "z-global", "tenant_id": None, "has_value": True},
+            {"ref": "tenant-secret", "tenant_id": "tenant-a", "has_value": True},
+            {"ref": "tenant-secret", "tenant_id": "tenant-b", "has_value": True},
+        ]
+
     async def test_exact_scope_never_falls_back(self) -> None:
         backend = MemorySecretBackend()
         backend.put("api_key", "global")
@@ -157,6 +177,33 @@ class TestFileSecretBackend:
         value = backend._get_global("api_key", None)  # 同步方法可直接测
         assert value is not None
         assert value.value == "global-secret"
+
+    async def test_list_refs_uses_loaded_namespaces_without_lookup(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        base = tmp_path / "secrets"
+        global_dir = base / "global"
+        tenant_dir = base / "tenants" / "tenant-a"
+        global_dir.mkdir(parents=True)
+        tenant_dir.mkdir(parents=True)
+        (global_dir / "global-ref.json").write_text(
+            json.dumps({"value": "global-canary"}), encoding="utf-8"
+        )
+        (tenant_dir / "tenant-ref.json").write_text(
+            json.dumps({"value": "tenant-canary"}), encoding="utf-8"
+        )
+        backend = FileSecretBackend(base)
+
+        async def fail_lookup(*args, **kwargs):
+            raise AssertionError("list_refs must not call get/get_exact")
+
+        monkeypatch.setattr(backend, "get", fail_lookup)
+        monkeypatch.setattr(backend, "get_exact", fail_lookup)
+
+        assert [item.model_dump() for item in await backend.list_refs()] == [
+            {"ref": "global-ref", "tenant_id": None, "has_value": True},
+            {"ref": "tenant-ref", "tenant_id": "tenant-a", "has_value": True},
+        ]
 
     def test_tenant_fallback_to_global(self, tmp_path: Path) -> None:
         base = tmp_path / "secrets"

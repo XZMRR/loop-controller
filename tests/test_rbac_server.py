@@ -8,6 +8,7 @@ publish_scope 叠加检查、双人复核 409/waiver、rbac_denials 拒绝审计
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from loop_controller.rbac.credentials import StaticCredential, StaticCredentialR
 from loop_controller.rbac.enforcer import RbacEnforcer
 from loop_controller.rbac.models import Role, RoleBinding
 from loop_controller.rbac.store import SqliteRoleBindingStore
+from loop_controller.secrets import MemorySecretBackend
 from loop_controller.server import build_app
 
 TOKENS = {
@@ -44,6 +46,9 @@ class AuditEvent:
         task_id: str = "task-shared",
         correlation_id: str = "correlation-shared",
         interaction_id: str = "interaction-shared",
+        actor_id: str = "agent-shared",
+        target: str = "tool-shared",
+        timestamp: datetime | None = None,
     ) -> None:
         self.event_id = event_id
         self.tenant_id = tenant_id
@@ -51,6 +56,9 @@ class AuditEvent:
         self.task_id = task_id
         self.correlation_id = correlation_id
         self.interaction_id = interaction_id
+        self.actor_id = actor_id
+        self.target = target
+        self.timestamp = timestamp or datetime(2026, 9, 19, tzinfo=UTC)
 
     def model_dump(self, mode: str | None = None) -> dict[str, Any]:
         return {
@@ -60,6 +68,9 @@ class AuditEvent:
             "task_id": self.task_id,
             "correlation_id": self.correlation_id,
             "interaction_id": self.interaction_id,
+            "actor_id": self.actor_id,
+            "target": self.target,
+            "timestamp": self.timestamp.isoformat(),
         }
 
 
@@ -70,19 +81,40 @@ class Audit:
     async def append_async(self, event: Any) -> None:
         self.events.append(event)
 
-    def list_recent(self, limit: int) -> list[Any]:
-        return self.events[-limit:]
-
-    def query_by_session(self, session_id: str) -> list[Any]:
-        return [event for event in self.events if event.session_id == session_id]
-
-    def query_by_task(self, task_id: str) -> list[Any]:
-        return [event for event in self.events if event.task_id == task_id]
-
-    def query_by_correlation(self, correlation_id: str, limit: int = 100) -> list[Any]:
+    @staticmethod
+    def _scope(events: list[Any], **filters: Any) -> list[Any]:
+        tenant_id = filters.get("tenant_id")
+        start_time = filters.get("start_time")
+        end_time = filters.get("end_time")
         return [
-            event for event in self.events if event.correlation_id == correlation_id
-        ][-limit:]
+            event
+            for event in events
+            if (tenant_id is None or event.tenant_id == tenant_id)
+            and (start_time is None or event.timestamp >= start_time)
+            and (end_time is None or event.timestamp <= end_time)
+        ]
+
+    def list_recent(self, limit: int, **scope: Any) -> list[Any]:
+        return self._scope(self.events, **scope)[-limit:]
+
+    def query_by_session(
+        self, session_id: str, *, limit: int | None = None, **scope: Any
+    ) -> list[Any]:
+        events = self._scope(
+            [event for event in self.events if event.session_id == session_id], **scope
+        )
+        return events[-limit:] if limit is not None else events
+
+    def query_by_task(self, task_id: str, *, limit: int | None = None, **scope: Any) -> list[Any]:
+        events = self._scope([event for event in self.events if event.task_id == task_id], **scope)
+        return events[-limit:] if limit is not None else events
+
+    def query_by_correlation(
+        self, correlation_id: str, limit: int = 100, **scope: Any
+    ) -> list[Any]:
+        return self._scope(
+            [event for event in self.events if event.correlation_id == correlation_id], **scope
+        )[-limit:]
 
     def query_interactions(
         self,
@@ -92,13 +124,17 @@ class Audit:
         target_agent_id: str | None = None,
         verdict: str | None = None,
         limit: int = 100,
+        **scope: Any,
     ) -> list[Any]:
         del source_agent_id, target_agent_id, verdict
-        return [
-            event
-            for event in self.events
-            if interaction_id is None or event.interaction_id == interaction_id
-        ][-limit:]
+        return self._scope(
+            [
+                event
+                for event in self.events
+                if interaction_id is None or event.interaction_id == interaction_id
+            ],
+            **scope,
+        )[-limit:]
 
 
 class Controller:
@@ -139,10 +175,14 @@ class Runtime:
         self.audit_store = Audit()
         self.harness_executor = None
         self.evidence_anchor = None
-        self.checkpoint = type("Checkpoint", (), {"_policy_engine": None, "degraded_backends": ()})()
+        self.checkpoint = type(
+            "Checkpoint", (), {"_policy_engine": None, "degraded_backends": ()}
+        )()
         self.rbac_store = store
         self.rbac_enforcer = enforcer
         self.rbac_credential_resolver = resolver
+        self.secret_broker = MemorySecretBackend()
+        self.secret_broker.put("platform-ref", "RBAC-CANARY")
         self.config = _Config()
 
 
@@ -168,13 +208,18 @@ def _environ() -> dict[str, str]:
     return {f"LC_TOK_{name.upper().replace('-', '_')}": token for name, token in TOKENS.items()}
 
 
-def _setup(tmp_path: Path, *, allow_self_publish: bool = False) -> tuple[TestClient, SqliteRoleBindingStore, Runtime]:
+def _setup(
+    tmp_path: Path, *, allow_self_publish: bool = False
+) -> tuple[TestClient, SqliteRoleBindingStore, Runtime]:
     db = StateDatabase(tmp_path / "state.db")
     db.init_schema()
     store = SqliteRoleBindingStore(db)
     delivery = PolicyDelivery(tmp_path, db)
     lifecycle = PolicyLifecycleService(
-        db, PolicyLifecycleConfig(bundle_name="lc", required_instance_ids=("opa-a",), status_ttl_seconds=60)
+        db,
+        PolicyLifecycleConfig(
+            bundle_name="lc", required_instance_ids=("opa-a",), status_ttl_seconds=60
+        ),
     )
     credentials = _credentials()
     resolver = StaticCredentialResolver(credentials, environ=_environ())
@@ -216,7 +261,9 @@ def _create_candidate(client: TestClient, who: str) -> dict[str, Any]:
     return response.json()
 
 
-def _validated_candidate(client: TestClient, runtime: Runtime, who: str = "creator-a") -> dict[str, Any]:
+def _validated_candidate(
+    client: TestClient, runtime: Runtime, who: str = "creator-a"
+) -> dict[str, Any]:
     """经 HTTP 创建，用 validate_without_opa 以 validator-a 身份写入双人复核证据。"""
     payload = _create_candidate(client, who)
     runtime.policy_delivery.validate_without_opa(payload["candidate_id"], actor="validator-a")
@@ -235,7 +282,10 @@ class TestDisabledZeroBehaviorChange:
         store = SqliteRoleBindingStore(db)
         delivery = PolicyDelivery(tmp_path, db)
         lifecycle = PolicyLifecycleService(
-            db, PolicyLifecycleConfig(bundle_name="lc", required_instance_ids=("opa-a",), status_ttl_seconds=60)
+            db,
+            PolicyLifecycleConfig(
+                bundle_name="lc", required_instance_ids=("opa-a",), status_ttl_seconds=60
+            ),
         )
         # enforcement 未启用：enforcer/resolver 为 None
         runtime = Runtime(delivery, lifecycle, store, None, None)
@@ -263,6 +313,26 @@ class TestAuthentication:
 
 
 class TestPermissionMatrix:
+    def test_secrets_requires_platform_admin(self, tmp_path: Path) -> None:
+        client, _store, _runtime = _setup(tmp_path)
+
+        denied = client.get("/v1/admin/secrets", headers=_auth("auditor-a"))
+        allowed = client.get("/v1/admin/secrets", headers=_auth("admin"))
+
+        assert denied.status_code == 403
+        assert allowed.status_code == 200
+        assert allowed.json() == {
+            "secrets": [
+                {
+                    "ref": "platform-ref",
+                    "tenant_id": None,
+                    "backend": "memory",
+                    "has_value": True,
+                }
+            ]
+        }
+        assert "RBAC-CANARY" not in allowed.text
+
     def test_creator_create_and_list_own_tenant(self, tmp_path: Path) -> None:
         client, _store, _runtime = _setup(tmp_path)
         payload = _create_candidate(client, "creator-a")
@@ -333,9 +403,7 @@ class TestAdminAuditRbac:
         assert denial["required_permission"] == "policy.audit.read"
         assert denial["endpoint"] == "/v1/admin/audit"
 
-    def test_auditor_sees_only_same_tenant_for_every_query_path(
-        self, tmp_path: Path
-    ) -> None:
+    def test_auditor_sees_only_same_tenant_for_every_query_path(self, tmp_path: Path) -> None:
         client, _store, runtime = _setup(tmp_path)
         self._seed(runtime)
         queries = (
@@ -366,7 +434,7 @@ class TestAdminAuditRbac:
         )
 
         assert response.status_code == 200
-        assert response.json()["events"] == []
+        assert [event["event_id"] for event in response.json()["events"]] == ["event-a"]
 
     def test_non_platform_principal_without_tenant_fails_closed(self, tmp_path: Path) -> None:
         client, store, runtime = _setup(tmp_path)
@@ -489,7 +557,9 @@ class TestRbacAdminEndpoints:
             f"/v1/admin/rbac/bindings/{binding_id}/revoke", headers=_auth("admin")
         )
         assert revoked.status_code == 200
-        assert client.get("/v1/admin/rbac/bindings", headers=_auth("admin")).json()["bindings"] == []
+        assert (
+            client.get("/v1/admin/rbac/bindings", headers=_auth("admin")).json()["bindings"] == []
+        )
 
     def test_tenant_admin_scope_enforced(self, tmp_path: Path) -> None:
         client, store, _runtime = _setup(tmp_path)
@@ -513,7 +583,8 @@ class TestRbacAdminEndpoints:
         store.add_binding("creator-a", "tenant-a", Role.TENANT_ADMIN, "admin")
         for actor in ("creator-a", "eve"):
             denied = client.post(
-                "/v1/admin/rbac/bindings", headers=_auth("creator-a"),
+                "/v1/admin/rbac/bindings",
+                headers=_auth("creator-a"),
                 json={"principal": actor, "tenant_id": "tenant-a", "role": "platform_admin"},
             )
             assert denied.status_code == 403
@@ -527,7 +598,8 @@ class TestRbacAdminEndpoints:
             runtime.rbac_credential_resolver.resolve("creator-a", TOKENS["creator-a"])
         )
         admin = client.post(
-            "/v1/admin/rbac/bindings", headers=_auth("admin"),
+            "/v1/admin/rbac/bindings",
+            headers=_auth("admin"),
             json={"principal": "eve", "role": "platform_admin"},
         )
         assert admin.status_code == 201
@@ -535,49 +607,120 @@ class TestRbacAdminEndpoints:
     def test_admin_a2a_task_scope_and_delegation_source(self, tmp_path: Path) -> None:
         client, store, runtime = _setup(tmp_path)
         store.add_binding("creator-a", "tenant-a", Role.TENANT_ADMIN, "admin")
+
         class Bridge:
             canceled = False
             streamed = False
+            tasks: list[dict[str, str]] = []
+
+            async def list_tasks(self, *, root_only: bool = False) -> list[dict[str, str]]:
+                return self.tasks
+
             async def query_task(self, task_id: str) -> dict[str, str]:
-                return {"task_id": task_id, "tenant_id": "tenant-b" if task_id == "foreign" else "tenant-a"}
+                return {
+                    "task_id": task_id,
+                    "tenant_id": "tenant-b" if task_id == "foreign" else "tenant-a",
+                }
+
             async def cancel_task(self, task_id: str, reason: str = "") -> dict[str, str]:
                 self.canceled = True
                 return {"task_id": task_id}
+
             async def stream_task(self, task_id: str, *, cursor=None, include_sse=False):
                 assert cursor is None
                 assert include_sse is True
                 self.streamed = True
                 yield ({"task_id": task_id}, None, None)
+
         runtime.go_kernel_bridge = Bridge()
+        runtime.go_kernel_bridge.tasks = [
+            {"task_id": "own", "tenant_id": "tenant-a", "token": "secret"}
+        ]
+        listed = client.get("/v1/admin/a2a/tasks", headers=_auth("creator-a"))
+        assert listed.status_code == 200
+        assert listed.json() == {"tasks": [{"task_id": "own", "tenant_id": "tenant-a"}]}
+        runtime.go_kernel_bridge.tasks = [{"task_id": "foreign", "tenant_id": "tenant-b"}]
+        assert client.get("/v1/admin/a2a/tasks", headers=_auth("creator-a")).status_code == 403
+        runtime.go_kernel_bridge.tasks = [{"task_id": "missing-tenant"}]
+        assert client.get("/v1/admin/a2a/tasks", headers=_auth("creator-a")).status_code == 403
         for path in ("foreign", "own"):
             expected = 403 if path == "foreign" else 200
-            assert client.get(f"/v1/admin/a2a/tasks/{path}", headers=_auth("creator-a")).status_code == expected
-            assert client.get(f"/v1/admin/a2a/tasks/{path}/stream", headers=_auth("creator-a")).status_code == expected
-            assert client.post(f"/v1/admin/a2a/tasks/{path}/cancel", headers=_auth("creator-a")).status_code == expected
+            assert (
+                client.get(f"/v1/admin/a2a/tasks/{path}", headers=_auth("creator-a")).status_code
+                == expected
+            )
+            assert (
+                client.get(
+                    f"/v1/admin/a2a/tasks/{path}/stream", headers=_auth("creator-a")
+                ).status_code
+                == expected
+            )
+            assert (
+                client.post(
+                    f"/v1/admin/a2a/tasks/{path}/cancel", headers=_auth("creator-a")
+                ).status_code
+                == expected
+            )
         assert runtime.go_kernel_bridge.canceled
         runtime.go_kernel_bridge.canceled = False
         runtime.go_kernel_bridge.streamed = False
-        assert client.post("/v1/admin/a2a/tasks/foreign/cancel", headers=_auth("creator-a")).status_code == 403
+        assert (
+            client.post(
+                "/v1/admin/a2a/tasks/foreign/cancel", headers=_auth("creator-a")
+            ).status_code
+            == 403
+        )
         assert not runtime.go_kernel_bridge.canceled
-        assert client.get("/v1/admin/a2a/tasks/foreign/stream", headers=_auth("creator-a")).status_code == 403
+        assert (
+            client.get("/v1/admin/a2a/tasks/foreign/stream", headers=_auth("creator-a")).status_code
+            == 403
+        )
         assert not runtime.go_kernel_bridge.streamed
-        runtime.config = type("Config", (), {"rbac": _RbacConfig(), "agents": {
-            "source": type("Agent", (), {"tenant_id": "tenant-a", "owner_id": "other"})(),
-            "target": type("Agent", (), {"tenant_id": "tenant-b", "owner_id": "other"})(),
-        }})()
-        denied = client.post("/v1/admin/a2a/delegations", headers=_auth("creator-a"), json={
-            "source_agent_id": "source", "target_agent_id": "target", "tool_name": "echo",
-        })
+        runtime.config = type(
+            "Config",
+            (),
+            {
+                "rbac": _RbacConfig(),
+                "agents": {
+                    "source": type("Agent", (), {"tenant_id": "tenant-a", "owner_id": "other"})(),
+                    "target": type("Agent", (), {"tenant_id": "tenant-b", "owner_id": "other"})(),
+                },
+            },
+        )()
+        denied = client.post(
+            "/v1/admin/a2a/delegations",
+            headers=_auth("creator-a"),
+            json={
+                "source_agent_id": "source",
+                "target_agent_id": "target",
+                "tool_name": "echo",
+            },
+        )
         assert denied.status_code == 403
         runtime.config.agents["source"].owner_id = "creator-a"
-        assert client.post("/v1/admin/a2a/delegations", headers=_auth("creator-a"), json={
-            "source_agent_id": "source", "target_agent_id": "target", "tool_name": "echo",
-        }).status_code == 403
+        assert (
+            client.post(
+                "/v1/admin/a2a/delegations",
+                headers=_auth("creator-a"),
+                json={
+                    "source_agent_id": "source",
+                    "target_agent_id": "target",
+                    "tool_name": "echo",
+                },
+            ).status_code
+            == 403
+        )
 
     def test_rbac_rejects_unbound_api_key_session(self, tmp_path: Path) -> None:
         client, _store, _runtime = _setup(tmp_path)
-        assert client.post("/v1/admin/session/login", json={"api_key": "admin-secret"}).status_code == 403
-        assert client.get("/v1/admin/rbac/bindings", headers={"x-api-key": "admin-secret"}).status_code == 401
+        assert (
+            client.post("/v1/admin/session/login", json={"api_key": "admin-secret"}).status_code
+            == 403
+        )
+        assert (
+            client.get("/v1/admin/rbac/bindings", headers={"x-api-key": "admin-secret"}).status_code
+            == 401
+        )
 
     def test_grants_platform_admin_only(self, tmp_path: Path) -> None:
         client, _store, _runtime = _setup(tmp_path)
