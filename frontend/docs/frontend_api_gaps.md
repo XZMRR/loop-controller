@@ -536,15 +536,15 @@ has_value，不回显明文）。历史遗留事实：
 5. **SSE 硬化**：cursor/Last-Event-ID、指数退避重连、generation 防串扰。
 6. **A2A 任务树**：`TaskTree.vue` 通过 `A2ATaskDataSource` 接口消费数据，当前为
    Mock 实现（`api/a2a/mock.ts`），待后端提供任务树列表端点后切换 HTTP 实现，视图零改动。
-7. **治理页面**（Mock 数据源先行）：死信队列、RBAC 绑定、Policy 生命周期三页均按
-   `契约层 types.ts + Mock 数据源 + 视图 + vitest 用例` 模式交付，Mock 语义对齐
-   后端源码；契约冻结后新增 Http 实现替换单例即可，视图与测试零改动。
+7. **治理页面**：死信队列仍为 Mock 数据源（待内核联调环境）；RBAC 绑定与
+   Policy 生命周期已切换 Http 数据源（`HttpRbacBindingDataSource` /
+   `HttpRbacGrantDataSource` / `HttpPolicyDataSource`，Mock 保留供测试）。
 8. **SSE 基础设施**：`api/sse.ts createEventStream`（游标续传/退避重连/401 处理）
-   统一服务 A2A 任务流与审批推送；管理台审批推送端点未定，前端推送优先 +
-   15s 轮询兜底。
+   统一服务 A2A 任务流与审批推送；审批推送端点 v0.55 已落地，推送优先 +
+   轮询兜底保留。
 9. **三态规范**：全站列表数据区统一 Loading/Empty/Error（共享组件
    `ErrorState.vue` 持久错误块 + 重试）；操作反馈仍用 ElMessage。
-10. **测试资产**：vitest 55 用例 + Playwright E2E 15 用例（全部后端依赖
+10. **测试资产**：vitest 80 用例 + Playwright E2E 16 用例（全部后端依赖
     `page.route` stub，不依赖 Python/Go 进程）。
 
 ---

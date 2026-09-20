@@ -530,6 +530,28 @@ frontend/
 - **当前剩余队列**：RBAC/Policy/死信 Http 数据源替换（Mock 退役）；
   `/v1/admin/users` 用户视图；参数可视化编辑；可选增量同前。
 
+### 进度记录（第二十九轮：RBAC/Policy Http 数据源替换——Mock 退役）
+
+- **核对结论**：v0.55 后端 handler 与 R19/R20 契约逐字段一致
+  （_binding_payload/_grant_payload、validate 422 幂等、shadow 503 带
+  payload、publish/rollback 202）；两处契约修正——吊销路由为
+  `POST .../{id}/revoke`（非 DELETE）、rollback 为独立端点
+  `POST /v1/admin/policy/rollback`（types.ts 早已按此建模）。
+- **新增 Http 实现**：
+  - `api/rbac/http.ts`：`HttpRbacBindingDataSource` /
+    `HttpRbacGrantDataSource`（列表解包 + 吊销 /revoke 子路由 + ID 编码）；
+  - `api/policy/http.ts`：`HttpPolicyDataSource`（validate 422 / shadow 503
+    从 axios 错误响应提取 payload 不抛错，对齐 Mock 语义；
+    publish/rollback 缺省参数补 null）。
+- **单例切换**：`rbac/index.ts`、`policy/index.ts` 改用 Http 实现，
+  Mock 类保留在 ./mock 供既有单测使用；视图零改动。
+- **测试**：新增 `tests/rbac-http.test.ts`（6 用例）与
+  `tests/policy-http.test.ts`（13 用例），vi.hoisted mock pythonClient；
+  修复导航 E2E 空态文案歧义（限定 tab 角色）。vitest 80 passed；
+  typecheck + build 全绿；E2E 16 passed。
+- **当前剩余队列**：死信 Http 数据源（待内核联调环境）；
+  `/v1/admin/users` 用户视图；参数可视化编辑；可选增量同前。
+
 ---
 
 ## 5. 当前已完成工作
@@ -562,8 +584,9 @@ frontend/
 ### 6.2 待后端契约（前端已按未定契约或 Mock 就位）
 
 - [x] 管理台审批 SSE 端点（**v0.55 已交付**，见 R28；前端推送路径由暂定转正）
-- [ ] RBAC 绑定 / Policy 治理页 Http 数据源（Mock 语义已对齐
-      server.py:1928-2070/1699-1950，契约冻结后按 types.ts 直写实现）
+- [x] RBAC 绑定 / Policy 治理页 Http 数据源（**v0.55 已切换**，
+      `HttpRbacBindingDataSource` / `HttpRbacGrantDataSource` /
+      `HttpPolicyDataSource`，Mock 保留供测试，见 R29）
 - [ ] 死信队列治理页数据源（契约已对齐 Go 内核 models.TaskAssignment，
       待内核联调环境开放）
 - [x] 审计时间范围筛选（**v0.55 已交付**，`start_time`/`end_time`）

@@ -63,11 +63,12 @@ test.describe('主流程冒烟', () => {
 
     await page.getByRole('menuitem', { name: 'RBAC 绑定' }).click()
     await expect(page).toHaveURL(/\/rbac$/)
-    await expect(page.getByText('角色绑定')).toBeVisible()
+    // 限定到 Tab 角色：空态文案"暂无角色绑定"会造成歧义匹配
+    await expect(page.getByRole('tab', { name: '角色绑定' })).toBeVisible()
 
     await page.getByRole('menuitem', { name: '策略生命周期' }).click()
     await expect(page).toHaveURL(/\/policies$/)
-    await expect(page.getByText('策略候选')).toBeVisible()
+    await expect(page.getByRole('tab', { name: '策略候选' })).toBeVisible()
   })
 
   test('未认证直接访问受保护页被重定向', async ({ page }) => {
