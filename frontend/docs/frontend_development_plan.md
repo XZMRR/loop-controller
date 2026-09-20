@@ -499,6 +499,37 @@ frontend/
 - **当前剩余队列**：不变——随后端契约冻结替换 Mock 数据源（§6.2）；
   可选增量：RBAC/Policy 治理页操作流 E2E、Dashboard 增强区块断言。
 
+### 进度记录（第二十八轮：v0.55 后端缺口落地接入与联调修复）
+
+- **基线切换**：接入 `backend/v0.55-dev`（main 46f9078 + `17e1a12`，
+  单 commit 2457 行），本地建同名分支跟踪。
+- **v0.55 落地缺口（后端 + 前端接线已由该 commit 完成）**：
+  - Go 内核 `GET /a2a/v1/tasks`（tenant+initiator 隔离、root_only 严格校验、
+    空数组约定）+ Python 代理 `GET /v1/admin/a2a/tasks`（逐任务 RBAC +
+    载荷消毒）→ 前端 `HttpA2ATaskDataSource` 已切换，Mock 退役；
+  - `GET /v1/admin/approvals/stream` 管理台 SSE（HMAC 签名游标，
+    400/410/max_wait/心跳）→ 前端推送路径由暂定转正；
+  - 审批历史 durable 化（comment/principal/action_summary/
+    arguments_masked/call_id/task_id/tenant_id），待办列表改
+    session+RBAC 鉴权并按租户过滤；
+  - `GET /v1/admin/audit` 时间范围参数（ISO8601 aware 校验）+ 过滤下沉；
+  - `GET /v1/admin/secrets` 元数据视图（不回显明文）；
+  - 前端修复：审批提交 URL 不再硬编码 `/api/python` 前缀（buildPythonUrl）。
+- **联调修复（本仓库修复，v0.54 起遗留）**：
+  - `policy_validation.py`：OPA 1.x 在 Windows 将带盘符绝对路径误判为
+    URL scheme（`C:\...` → scheme `c`），check/test/eval 四处在 Windows 上
+    全部失败——改为相对路径 + `cwd` 传参（`OPACLIRunner.run` 新增 cwd）；
+    该 bug 影响 Windows 环境 Policy 校验生产路径；
+  - 测试配套：FakeRunner/empty_tests 兼容 cwd 参数；
+  - E2E：新增用例的 `el-radio-button` 原生 input 不可见，改点文本标签。
+- **回归（三栈全绿）**：Python 1204 passed / 8 skipped（修复前 1 failed）；
+  Go `go test ./...` 全 ok；前端 vitest 64 passed + typecheck + build；
+  Playwright E2E 16 passed（修复前 1 failed）。
+- **文档**：gaps 文档 §6 升版 v0.55、§7.2 四项标记已交付；
+  §6.2 队列表同步勾选。
+- **当前剩余队列**：RBAC/Policy/死信 Http 数据源替换（Mock 退役）；
+  `/v1/admin/users` 用户视图；参数可视化编辑；可选增量同前。
+
 ---
 
 ## 5. 当前已完成工作
@@ -530,14 +561,13 @@ frontend/
 
 ### 6.2 待后端契约（前端已按未定契约或 Mock 就位）
 
-- [ ] 管理台审批 SSE 端点（前端 `streamAdminApprovals` 已就绪，
-      推送优先 + 轮询兜底；后端落地 `GET /v1/admin/approvals/stream`
-      类端点后仅需对齐 url 与事件 payload）
+- [x] 管理台审批 SSE 端点（**v0.55 已交付**，见 R28；前端推送路径由暂定转正）
 - [ ] RBAC 绑定 / Policy 治理页 Http 数据源（Mock 语义已对齐
       server.py:1928-2070/1699-1950，契约冻结后按 types.ts 直写实现）
 - [ ] 死信队列治理页数据源（契约已对齐 Go 内核 models.TaskAssignment，
       待内核联调环境开放）
-- [ ] 审计时间范围筛选（`GET /v1/admin/audit` 扩展参数）
+- [x] 审计时间范围筛选（**v0.55 已交付**，`start_time`/`end_time`）
+- [x] A2A 任务树列表（**v0.55 已交付**，`HttpA2ATaskDataSource` 已切换）
 - [ ] `GET /v1/admin/users` 用户视图数据源（Agents 页合并展示用）
 
 ### 6.3 实施顺序

@@ -515,9 +515,14 @@ Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` �
 
 ---
 
-## 6. 前端当前实现状态（v0.54，develop 分支）
+## 6. 前端当前实现状态（v0.55，backend/v0.55-dev 分支）
 
-v0.54 前端已全面改为 API 直连，**YAML fallback 与 vite `/config/*` 中间件已移除**（Tools 页读取仍保留 YAML→在线 API 的单一回退）：
+v0.55 起治理台已与后端真实接口连通：A2A 任务树走 `GET /v1/admin/a2a/tasks`
+（Python 代理 + Go 内核 `GET /a2a/v1/tasks`，tenant+initiator 维度隔离）；
+审批推送走 `GET /v1/admin/approvals/stream`（HMAC 签名游标，400/410 语义与
+前端 `createEventStream` 对齐）；审计查询支持 `start_time`/`end_time`
+服务端过滤；Secret 元数据走 `GET /v1/admin/secrets`（仅 ref/tenant/backend/
+has_value，不回显明文）。历史遗留事实：
 
 1. **认证**：`Login.vue` 通过 `POST /v1/admin/session/login` 换取 Session；
    `client.ts` 请求拦截器统一携带 `Authorization: Bearer <session>`，401 自动登出跳登录；
@@ -572,8 +577,10 @@ stream/delegations，`b20a9b5`~`e1a6677`）、Session 认证（`1948248`）、RB
 | Agent CRUD | `POST/PUT/DELETE /v1/admin/agents[/{id}]` | Agent 管理在线增改 | 低 |
 | 审批转交 | `POST /v1/admin/approvals/{id}/reassign` | 审批人繁忙时转交 | 低 |
 | Identity/Entrypoints 热更新 | `PUT /v1/admin/identity` `PUT /v1/admin/entrypoints`（或统一 reload 目标） | 配置在线生效范围确认 | 低 |
-| 管理台审批 SSE 端点 | `GET /v1/admin/approvals/stream` 类（暂定形状） | 审批推送（前端 `streamAdminApprovals` 已就绪，推送优先+轮询兜底；`/v1/wait-for-approval/sse` 为 Agent 侧通道，管理台不可用——v0.54 代码核实） | 中 |
-| 审计时间范围参数 | `GET /v1/admin/audit` 扩展 `start_time`/`end_time` | 审计查询服务端时间过滤（当前为前端本地过滤，数据量大时不可扩展） | 中 |
+| ~~管理台审批 SSE 端点~~ | ~~`GET /v1/admin/approvals/stream`~~ | **v0.55 已落地**：HMAC 签名 Last-Event-ID 游标（400 invalid / 410 expired）、`max_wait` 0.1–300s、10s 心跳、`retry: 1000`；非平台管理员按租户过滤；事件名/负载由 `approval_store.list_events` 定义 | 已交付 |
+| ~~审计时间范围参数~~ | ~~`GET /v1/admin/audit` 扩展~~ | **v0.55 已落地**：`start_time`/`end_time`（ISO8601 带时区，400 校验含倒序拦截），tenant/agent_id/tool_name 过滤下沉到存储层 | 已交付 |
+| ~~A2A 任务树列表~~ | ~~`GET /a2a/v1/tasks` + 管理台代理~~ | **v0.55 已落地**：内核 `GET /a2a/v1/tasks`（tenant+initiator 隔离，`root_only` 严格 bool，空返回 `[]`），管理台代理 `GET /v1/admin/a2a/tasks`（逐任务 RBAC 校验 + 载荷消毒）；前端 `HttpA2ATaskDataSource` 已实现 | 已交付 |
+| Secret 元数据 | `GET /v1/admin/secrets` | **v0.55 已落地**：仅暴露 ref/tenant_id/backend/has_value，不 weakening credential boundaries | 已交付 |
 | 用户视图 | `GET /v1/admin/users` | Agents 页合并用户数据源（当前前端用 `users: []` 占位） | 低 |
 
 ### 7.3 已关闭的兼容方案（不再适用）

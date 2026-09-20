@@ -165,7 +165,8 @@ test.describe('审批操作流', () => {
     await stubApprovalBackend(page)
     await loginAndOpenApprovals(page)
 
-    await page.getByRole('radio', { name: '历史' }).click()
+    // el-radio-button 的原生 input 不可见，点击其文本标签
+    await page.getByText('历史', { exact: true }).click()
     await page.getByRole('button', { name: '详情' }).last().click()
 
     await expect(page.getByText('tenant-e2e')).toBeVisible()
