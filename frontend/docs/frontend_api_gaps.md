@@ -534,17 +534,19 @@ has_value，不回显明文）。历史遗留事实：
    「内核对账」页签已随 v0.54 内核审批端点变更删除。
 4. **审计**：`/v1/admin/audit`（含时间过滤）已接入。
 5. **SSE 硬化**：cursor/Last-Event-ID、指数退避重连、generation 防串扰。
-6. **A2A 任务树**：`TaskTree.vue` 通过 `A2ATaskDataSource` 接口消费数据，当前为
-   Mock 实现（`api/a2a/mock.ts`），待后端提供任务树列表端点后切换 HTTP 实现，视图零改动。
-7. **治理页面**：死信队列仍为 Mock 数据源（待内核联调环境）；RBAC 绑定与
-   Policy 生命周期已切换 Http 数据源（`HttpRbacBindingDataSource` /
-   `HttpRbacGrantDataSource` / `HttpPolicyDataSource`，Mock 保留供测试）。
+6. **A2A 任务树**：`TaskTree.vue` 通过 `A2ATaskDataSource` 接口消费数据，
+   当前为 Http 实现（`HttpA2ATaskDataSource`，v0.55 已切换）。
+7. **治理页面**：死信队列 / RBAC 绑定 / Policy 生命周期均已切换 Http 数据源
+   （`HttpDeadLetterDataSource` / `HttpRbacBindingDataSource` /
+   `HttpRbacGrantDataSource` / `HttpPolicyDataSource`，Mock 保留供测试）；
+   死信链路已完成真实栈冒烟（Python 代理 + Go 内核 + 浏览器全链路，
+   重放 revision 乐观校验与 409 幂等语义验证通过）。
 8. **SSE 基础设施**：`api/sse.ts createEventStream`（游标续传/退避重连/401 处理）
    统一服务 A2A 任务流与审批推送；审批推送端点 v0.55 已落地，推送优先 +
    轮询兜底保留。
 9. **三态规范**：全站列表数据区统一 Loading/Empty/Error（共享组件
    `ErrorState.vue` 持久错误块 + 重试）；操作反馈仍用 ElMessage。
-10. **测试资产**：vitest 80 用例 + Playwright E2E 16 用例（全部后端依赖
+10. **测试资产**：vitest 83 用例 + Playwright E2E 19 用例（全部后端依赖
     `page.route` stub，不依赖 Python/Go 进程）。
 
 ---
@@ -580,6 +582,7 @@ stream/delegations，`b20a9b5`~`e1a6677`）、Session 认证（`1948248`）、RB
 | ~~管理台审批 SSE 端点~~ | ~~`GET /v1/admin/approvals/stream`~~ | **v0.55 已落地**：HMAC 签名 Last-Event-ID 游标（400 invalid / 410 expired）、`max_wait` 0.1–300s、10s 心跳、`retry: 1000`；非平台管理员按租户过滤；事件名/负载由 `approval_store.list_events` 定义 | 已交付 |
 | ~~审计时间范围参数~~ | ~~`GET /v1/admin/audit` 扩展~~ | **v0.55 已落地**：`start_time`/`end_time`（ISO8601 带时区，400 校验含倒序拦截），tenant/agent_id/tool_name 过滤下沉到存储层 | 已交付 |
 | ~~A2A 任务树列表~~ | ~~`GET /a2a/v1/tasks` + 管理台代理~~ | **v0.55 已落地**：内核 `GET /a2a/v1/tasks`（tenant+initiator 隔离，`root_only` 严格 bool，空返回 `[]`），管理台代理 `GET /v1/admin/a2a/tasks`（逐任务 RBAC 校验 + 载荷消毒）；前端 `HttpA2ATaskDataSource` 已实现 | 已交付 |
+| ~~死信队列治理端点~~ | ~~`GET /a2a/v1/dead-letters` + `POST .../{id}/replay` + 管理台代理~~ | **v0.55 已落地并完成真实栈冒烟**：内核两端点补 `protocol_version` 包裹，管理台代理 `/v1/admin/a2a/dead-letters`（鉴权 + 消毒 + 404/409/502 映射），前端 `HttpDeadLetterDataSource` 已切换；重放 revision 乐观校验、二次重放 409、tasks 状态联动均验证通过 | 已交付 |
 | Secret 元数据 | `GET /v1/admin/secrets` | **v0.55 已落地**：仅暴露 ref/tenant_id/backend/has_value，不 weakening credential boundaries | 已交付 |
 | 用户视图 | `GET /v1/admin/users` | Agents 页合并用户数据源（当前前端用 `users: []` 占位） | 低 |
 

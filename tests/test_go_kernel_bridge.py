@@ -805,3 +805,73 @@ async def test_invalid_json_does_not_advance_cursor_and_aclose_stops_reconnect()
         await stream.aclose()
         await asyncio.sleep(0.005)
     assert len(headers) == 2
+
+
+def test_build_go_kernel_bridge_wires_env_tokens_and_mtls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """go_kernel.yaml 声明的 *_token_env 与 mTLS 文件必须装配进桥接客户端。"""
+    from types import SimpleNamespace
+
+    from loop_controller.runtime import _build_go_kernel_bridge
+
+    ca = tmp_path / "ca.pem"
+    cert = tmp_path / "client.pem"
+    key = tmp_path / "client-key.pem"
+    for path in (ca, cert, key):
+        path.write_text("pem", encoding="utf-8")
+    config = SimpleNamespace(
+        go_kernel_config={
+            "go_kernel": {
+                "enabled": True,
+                "base_url": "http://127.0.0.1:8080",
+                "timeout": 7.0,
+                "control_token_env": "LC_TEST_CONTROL_TOKEN",
+                "approver_token_env": "LC_TEST_APPROVER_TOKEN",
+                "mtls": {
+                    "ca_file": str(ca),
+                    "client_cert_file": str(cert),
+                    "client_key_file": str(key),
+                },
+            }
+        }
+    )
+    monkeypatch.setenv("LC_TEST_CONTROL_TOKEN", "ctl-token")
+    monkeypatch.setenv("LC_TEST_APPROVER_TOKEN", "apr-token")
+
+    bridge = _build_go_kernel_bridge(config)
+    assert bridge is not None
+    assert bridge._base_url == "http://127.0.0.1:8080"
+    assert bridge._timeout == 7.0
+    assert bridge._control_headers["Authorization"] == "Bearer ctl-token"
+    assert bridge._approver_headers["Authorization"] == "Bearer apr-token"
+    assert bridge._verify == str(ca)
+    assert bridge._cert == (str(cert), str(key))
+
+
+def test_build_go_kernel_bridge_disabled_or_partial_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from loop_controller.runtime import _build_go_kernel_bridge
+
+    disabled = SimpleNamespace(go_kernel_config={"go_kernel": {"enabled": False}})
+    assert _build_go_kernel_bridge(disabled) is None
+
+    monkeypatch.delenv("LC_TEST_MISSING_TOKEN", raising=False)
+    partial = SimpleNamespace(
+        go_kernel_config={
+            "go_kernel": {
+                "enabled": True,
+                "control_token_env": "LC_TEST_MISSING_TOKEN",
+                "mtls": {"client_cert_file": "client.pem"},
+            }
+        }
+    )
+    bridge = _build_go_kernel_bridge(partial)
+    assert bridge is not None
+    # 环境变量缺失时不注入 Authorization；不存在的 mTLS 占位路径不装配
+    assert "Authorization" not in bridge._control_headers
+    assert bridge._verify is True
+    assert bridge._cert is None

@@ -726,6 +726,37 @@ class GoKernelBridge:
             raise GoKernelProtocolError("tasks must be an array of objects")
         return tasks
 
+    async def list_dead_letters(self) -> list[dict[str, Any]]:
+        """列出当前 control tenant 内的死信 assignment。"""
+        data = await self._request_object("GET", f"{self._base_url}/a2a/v1/dead-letters")
+        items = data.get("assignments")
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise GoKernelProtocolError("assignments must be an array of objects")
+        return items
+
+    async def replay_dead_letter(
+        self,
+        assignment_id: str,
+        *,
+        tenant_id: str,
+        expected_revision: int,
+        not_before: str | None = None,
+    ) -> dict[str, Any]:
+        """死信重放（revision 乐观校验，内核 404/409 由调用方映射）。"""
+        body: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "expected_revision": expected_revision,
+        }
+        if not_before:
+            body["not_before"] = not_before
+        data = await self._request_object(
+            "POST",
+            f"{self._base_url}/a2a/v1/dead-letters/{assignment_id}/replay",
+            json=body,
+        )
+        assignment = data.get("assignment")
+        return assignment if isinstance(assignment, dict) else data
+
     async def query_task(self, task_id: str) -> dict[str, Any] | None:
         """查询任务状态。"""
         url = f"{self._base_url}/a2a/v1/tasks/{task_id}"

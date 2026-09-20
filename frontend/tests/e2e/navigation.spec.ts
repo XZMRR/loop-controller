@@ -1,37 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
-import { stubSessionLogin, stubJson, loginViaUI, expectLoggedIn } from './helpers'
-
-/** 仪表盘与各治理页所需的 python 端 stub（a2a 死信走 Mock 数据源无需 stub） */
-async function stubBackend(page: Page) {
-  await stubJson(page, 'v1/admin/health', {
-    status: 'ok',
-    opa_reachable: true,
-    gateway_ready: true,
-    evidence_status: 'ok',
-    anchor_status: 'ok',
-    persistence: {},
-    durability: 'enabled',
-    uptime_seconds: 3600,
-    harness_backends: [],
-  })
-  await stubJson(page, 'v1/admin/approvals/pending', { approvals: [] })
-  await stubJson(page, 'v1/admin/approvals', { approvals: [], total: 0 })
-  await stubJson(page, 'admin/revocation-list', { revocations: [], kill_switch: false })
-  await stubJson(page, 'v1/admin/agents', {
-    agents: [{ agent_id: 'e2e-agent', name: 'E2E Agent', profile_id: 'default' }],
-    users: [],
-  })
-  // 审批推送为未定契约端点：stub 404 触发前端轮询兜底
-  await stubJson(page, 'v1/admin/approvals/stream', { error: 'not_found' }, 404)
-  // /metrics 为文本响应
-  await page.route('**/metrics**', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'text/plain',
-      body: 'lc_requests_total 42\ngo_goroutines 18\n',
-    })
-  })
-}
+import { stubSessionLogin, stubBackend, loginViaUI, expectLoggedIn } from './helpers'
 
 async function loginWithStubs(page: Page) {
   await stubSessionLogin(page, true)

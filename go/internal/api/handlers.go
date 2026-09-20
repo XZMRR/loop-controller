@@ -461,7 +461,7 @@ func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "dead_letter_query_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"assignments": items})
+	writeJSON(w, http.StatusOK, map[string]any{"protocol_version": currentProtocolVersion, "assignments": items})
 }
 
 func (s *Server) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) {
@@ -493,7 +493,7 @@ func (s *Server) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) 
 		writeError(w, status, "dead_letter_replay_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, assignment)
+	writeJSON(w, http.StatusOK, map[string]any{"protocol_version": currentProtocolVersion, "assignment": assignment})
 }
 
 func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {

@@ -180,9 +180,16 @@ func TestDeadLetterRoutesRequireControlAuthAndReplayAudits(t *testing.T) {
 	}
 	body, _ := json.Marshal(map[string]any{"tenant_id": "tenant", "expected_revision": dead.Revision})
 	resp = do(http.MethodPost, "/a2a/v1/dead-letters/dead-assignment/replay", "control-secret", "corr-1", body)
-	var replay models.TaskAssignment
-	_ = json.NewDecoder(resp.Body).Decode(&replay)
+	var replayBody struct {
+		ProtocolVersion string                `json:"protocol_version"`
+		Assignment      models.TaskAssignment `json:"assignment"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&replayBody)
+	replay := replayBody.Assignment
 	resp.Body.Close()
+	if replayBody.ProtocolVersion == "" {
+		t.Fatalf("replay response missing protocol_version: %+v", replayBody)
+	}
 	if resp.StatusCode != http.StatusOK || replay.State != models.AssignmentStateQueued || replay.ExecutionFence != dead.ExecutionFence+1 || replay.Revision != dead.Revision+1 {
 		t.Fatalf("replay status=%d assignment=%+v dead=%+v", resp.StatusCode, replay, dead)
 	}

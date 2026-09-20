@@ -1,5 +1,11 @@
 import { pythonClient } from '@/api/client'
-import type { A2ATaskDataSource, A2ATaskNode } from './types'
+import type {
+  A2ADeadLetterDataSource,
+  A2ADeadLetterItem,
+  A2ADeadLetterReplayParams,
+  A2ATaskDataSource,
+  A2ATaskNode,
+} from './types'
 
 export interface KernelTask {
   task_id: string
@@ -40,6 +46,25 @@ export function normalizeTask(task: KernelTask): A2ATaskNode {
     error_code: task.error_code,
     created_at: task.created_at,
     updated_at: task.updated_at,
+  }
+}
+
+export class HttpA2ADeadLetterDataSource implements A2ADeadLetterDataSource {
+  async listDeadLetters(): Promise<A2ADeadLetterItem[]> {
+    const { data } = await pythonClient.get<{ assignments?: A2ADeadLetterItem[] }>(
+      '/v1/admin/a2a/dead-letters',
+    )
+    return data.assignments ?? []
+  }
+
+  async replayDeadLetter(
+    assignmentId: string,
+    params: A2ADeadLetterReplayParams,
+  ): Promise<void> {
+    await pythonClient.post(
+      `/v1/admin/a2a/dead-letters/${encodeURIComponent(assignmentId)}/replay`,
+      params,
+    )
   }
 }
 

@@ -552,6 +552,39 @@ frontend/
 - **当前剩余队列**：死信 Http 数据源（待内核联调环境）；
   `/v1/admin/users` 用户视图；参数可视化编辑；可选增量同前。
 
+### 进度记录（第三十轮：死信 Http 数据源替换 + 真实栈全链路冒烟）
+
+- **死信 E2E 修复**：三个用例补 `loginWithStubs(page)` 调用；因 auth store
+  为纯内存会话，跨 `page.goto` 直达受保护路由会被守卫弹回登录页，改用
+  登录态内点侧边栏"死信队列"导航；`stubDeadLetters` 由调用计数改为共享
+  `state.replayed` 标志，消除 15s 静默轮询对计数器的竞态；断言文案对齐
+  UI 实际（空态 `暂无死信——所有任务都在正常调度`、错误态 ElMessage 显示
+  axios message），`{ exact: true }` 与抽屉作用域断言消除 strict mode 歧义。
+- **E2E 结果**：全量 Playwright 16 → 19 passed。
+- **真实栈冒烟（Vue 前端 → Python 代理 → Go 内核）**：种入死信后全链路
+  打通——直连内核 list 200 → Python 代理 list 200（载荷消毒后字段完整）
+  → 浏览器登录进死信页 → 详情抽屉 → 确认重放（revision 3→4）→ 列表转空
+  → curl 二次重放 409 + `protocol_version` 正确返回。过程中发现并修复
+  4 个真实联调缺陷：
+  1. `_build_go_kernel_bridge` 从不装配凭据/mTLS → 控制面请求无
+     Authorization 被内核 401 → 代理 502。重写为按 `go_kernel.yaml`
+     声明的 `*_token_env` 读取静态快照，mTLS 三段文件齐全且
+     `os.path.exists` 通过才装配（样例占位路径不强制存在）；
+  2. Go 死信 list/replay 端点缺 `protocol_version` 包裹 → bridge
+     `_decode_object` 拒绝。两个 handler 补 `protocol_version`；
+  3. 重放响应由裸 assignment 改为 `{"assignment": ...}` 包裹 →
+     Python bridge 解包 + Go `api_test.go` 改结构化解码并断言
+     protocol_version 非空；
+  4. 新增 `tests/test_go_kernel_bridge.py` 两个装配用例（tmp_path 造真实
+     PEM 验证 token/mTLS 装配；disabled/缺凭据/占位路径不装配）。
+- **全量回归**：前端 vitest 83 / typecheck 0 / build 成功；Playwright 19
+  passed；Go `go test ./...` 全 ok；Python 全量 1209 passed + 8 skipped
+  （此前 test_go_kernel_integration 3 errors 为终端残留的
+  `LC_A2A_CONTROL_TOKEN` 环境污染内核启动，非代码缺陷，干净环境复跑通过）。
+- **收尾**：全部 `.smoke-*` / `.tmp-*` / `test-results` 临时产物已清理；
+  `config/go_kernel.yaml` 冒烟改动回退为样例默认（`enabled: false`）。
+- **当前剩余队列**：`/v1/admin/users` 用户视图；参数可视化编辑。
+
 ---
 
 ## 5. 当前已完成工作
@@ -587,8 +620,8 @@ frontend/
 - [x] RBAC 绑定 / Policy 治理页 Http 数据源（**v0.55 已切换**，
       `HttpRbacBindingDataSource` / `HttpRbacGrantDataSource` /
       `HttpPolicyDataSource`，Mock 保留供测试，见 R29）
-- [ ] 死信队列治理页数据源（契约已对齐 Go 内核 models.TaskAssignment，
-      待内核联调环境开放）
+- [x] 死信队列治理页数据源（**v0.55 已交付并完成真实栈冒烟**，
+      `HttpDeadLetterDataSource` 已切换，见 R30）
 - [x] 审计时间范围筛选（**v0.55 已交付**，`start_time`/`end_time`）
 - [x] A2A 任务树列表（**v0.55 已交付**，`HttpA2ATaskDataSource` 已切换）
 - [ ] `GET /v1/admin/users` 用户视图数据源（Agents 页合并展示用）

@@ -63,6 +63,8 @@ from loop_controller.go_kernel_bridge import (
     DelegationRequest,
     EventCursorExpiredError,
     EventCursorInvalidError,
+    GoKernelConflictError,
+    GoKernelNotFoundError,
 )
 from loop_controller.identity import (
     AgentIdentity,
@@ -2711,6 +2713,81 @@ class ToolGovernServer:
             return error
         return JSONResponse(self._sanitize_kernel_payload(task))
 
+    async def _handle_admin_a2a_dead_letters(self, request: Request) -> JSONResponse:
+        """GET /v1/admin/a2a/dead-letters：列出 control tenant 内死信 assignment。"""
+        principal, error = await self._authenticate_only(request)
+        if error is not None:
+            return error
+        assert principal is not None
+        bridge, _gk = self._go_kernel_view()
+        if bridge is None:
+            return JSONResponse({"error": "go kernel disabled"}, status_code=503)
+        try:
+            assignments = await bridge.list_dead_letters()
+        except Exception as exc:
+            logger.warning("Go kernel dead-letter list failed: %s", exc)
+            return JSONResponse(
+                {"error": "go kernel dead-letter list failed"}, status_code=502
+            )
+        visible: list[dict[str, Any]] = []
+        for assignment in assignments:
+            error = self._authorize_admin_a2a_task(request, principal, assignment)
+            if error is not None:
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            visible.append(self._sanitize_kernel_payload(assignment))
+        return JSONResponse({"assignments": visible})
+
+    async def _handle_admin_a2a_dead_letter_replay(self, request: Request) -> JSONResponse:
+        """POST /v1/admin/a2a/dead-letters/{id}/replay：死信重放（乐观 revision）。"""
+        principal, error = await self._authenticate_only(request)
+        if error is not None:
+            return error
+        assert principal is not None
+        bridge, _gk = self._go_kernel_view()
+        if bridge is None:
+            return JSONResponse({"error": "go kernel disabled"}, status_code=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "invalid_json"}, status_code=400)
+        tenant_id = str(body.get("tenant_id") or "")
+        if not tenant_id:
+            return JSONResponse({"error": "tenant_id required"}, status_code=400)
+        expected_revision = body.get("expected_revision")
+        if not isinstance(expected_revision, int) or expected_revision <= 0:
+            return JSONResponse(
+                {"error": "positive expected_revision is required"}, status_code=400
+            )
+        not_before = body.get("not_before")
+        if not_before is not None and not isinstance(not_before, str):
+            return JSONResponse({"error": "not_before must be a string"}, status_code=400)
+        if self._rbac_enforcer() is not None and not self._is_platform_admin(principal):
+            error = self._authorize(request, principal, PERM_RBAC_MANAGE, tenant_id)
+            if error is not None:
+                return error
+        assignment_id = request.path_params["assignment_id"]
+        try:
+            assignment = await bridge.replay_dead_letter(
+                assignment_id,
+                tenant_id=tenant_id,
+                expected_revision=expected_revision,
+                not_before=not_before,
+            )
+        except GoKernelNotFoundError:
+            return JSONResponse({"error": "dead letter not found"}, status_code=404)
+        except GoKernelConflictError as exc:
+            return JSONResponse(
+                {"error": str(exc) or "dead letter replay conflict"}, status_code=409
+            )
+        except Exception as exc:
+            logger.warning("Go kernel dead-letter replay failed: %s", exc)
+            return JSONResponse(
+                {"error": "go kernel dead-letter replay failed"}, status_code=502
+            )
+        return JSONResponse(self._sanitize_kernel_payload(assignment))
+
     async def _handle_admin_a2a_task_cancel(self, request: Request) -> JSONResponse:
         """POST /v1/admin/a2a/tasks/{task_id}/cancel：管理端取消委托任务。"""
         principal, error = await self._authenticate_only(request)
@@ -3294,6 +3371,16 @@ def build_app(
                 "/v1/admin/a2a/tasks/{task_id}/stream",
                 server._handle_admin_a2a_task_stream,
                 methods=["GET"],
+            ),
+            Route(
+                "/v1/admin/a2a/dead-letters",
+                server._handle_admin_a2a_dead_letters,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/admin/a2a/dead-letters/{assignment_id}/replay",
+                server._handle_admin_a2a_dead_letter_replay,
+                methods=["POST"],
             ),
             Route(
                 "/v1/admin/a2a/delegations",

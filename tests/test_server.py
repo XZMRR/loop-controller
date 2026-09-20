@@ -2121,6 +2121,45 @@ class _FakeGoKernelBridge:
             return None
         return {"task_id": task_id, "status": "canceled", "cancel_reason": reason}
 
+    async def list_dead_letters(self) -> list[dict[str, Any]]:
+        if not self.reachable:
+            return []
+        return [
+            {
+                "assignment_id": "a-1",
+                "tenant_id": "tenant-a",
+                "state": "dead_letter",
+                "failure_category": "remote_timeout",
+                "token": "secret",
+            }
+        ]
+
+    async def replay_dead_letter(
+        self,
+        assignment_id: str,
+        *,
+        tenant_id: str,
+        expected_revision: int,
+        not_before: str | None = None,
+    ) -> dict[str, Any]:
+        if not self.reachable:
+            raise RuntimeError("kernel unreachable")
+        self.replayed = (assignment_id, tenant_id, expected_revision, not_before)
+        if assignment_id == "missing":
+            from loop_controller.go_kernel_bridge import GoKernelNotFoundError
+
+            raise GoKernelNotFoundError("not found")
+        if assignment_id == "stale":
+            from loop_controller.go_kernel_bridge import GoKernelConflictError
+
+            raise GoKernelConflictError("revision mismatch")
+        return {
+            "assignment_id": assignment_id,
+            "tenant_id": tenant_id,
+            "state": "queued",
+            "replay_count": 1,
+        }
+
     async def stream_task(self, task_id: str, timeout: float = 30.0, *, cursor=None, include_sse=False):
         self.cursor = cursor
         for status, event_id in (("running", "opaque:one"), ("completed", "opaque:two")):
@@ -2184,6 +2223,72 @@ def test_admin_a2a_task_list_strict_root_only_and_sanitizes() -> None:
         "/v1/admin/a2a/tasks?root_only=true&root_only=false",
         headers={"X-API-Key": "test-key"},
     ).status_code == 400
+
+
+def test_admin_a2a_dead_letters_list_and_sanitize() -> None:
+    client, controller = _build_admin_client()
+    controller._runtime.go_kernel_bridge = _FakeGoKernelBridge(reachable=True)
+    resp = client.get("/v1/admin/a2a/dead-letters", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["assignments"][0]["assignment_id"] == "a-1"
+    assert "token" not in body["assignments"][0]
+
+
+def test_admin_a2a_dead_letters_without_bridge() -> None:
+    client, _controller = _build_admin_client()
+    resp = client.get("/v1/admin/a2a/dead-letters", headers={"X-API-Key": "test-key"})
+    assert resp.status_code == 503
+
+
+def test_admin_a2a_dead_letter_replay_flow() -> None:
+    client, controller = _build_admin_client()
+    bridge = _FakeGoKernelBridge(reachable=True)
+    controller._runtime.go_kernel_bridge = bridge
+
+    resp = client.post(
+        "/v1/admin/a2a/dead-letters/a-1/replay",
+        json={"tenant_id": "tenant-a", "expected_revision": 3},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "queued"
+    assert bridge.replayed == ("a-1", "tenant-a", 3, None)
+
+    resp = client.post(
+        "/v1/admin/a2a/dead-letters/a-1/replay",
+        json={"tenant_id": "tenant-a", "expected_revision": 3, "not_before": "2026-09-20T00:00:00Z"},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert resp.status_code == 200
+    assert bridge.replayed[3] == "2026-09-20T00:00:00Z"
+
+    for payload in (
+        {},
+        {"tenant_id": "tenant-a"},
+        {"tenant_id": "tenant-a", "expected_revision": 0},
+        {"tenant_id": "tenant-a", "expected_revision": "3"},
+    ):
+        resp = client.post(
+            "/v1/admin/a2a/dead-letters/a-1/replay",
+            json=payload,
+            headers={"X-API-Key": "test-key"},
+        )
+        assert resp.status_code == 400, payload
+
+    resp = client.post(
+        "/v1/admin/a2a/dead-letters/missing/replay",
+        json={"tenant_id": "tenant-a", "expected_revision": 3},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert resp.status_code == 404
+
+    resp = client.post(
+        "/v1/admin/a2a/dead-letters/stale/replay",
+        json={"tenant_id": "tenant-a", "expected_revision": 3},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert resp.status_code == 409
 
 
 def test_admin_a2a_task_query() -> None:
