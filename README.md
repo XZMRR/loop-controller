@@ -206,6 +206,31 @@ $env:PYTHONPATH="src"
 
 `research_agent.py` 不调用 Loop Controller 内部 API，仅以标准 MCP client 身份启动 `lc proxy`，因此可代表外部 Agent。它会真实读取文件、查询 sqlite、写入文件、尝试外发邮件，并被 R2 治理。
 
+### 框架适配器：LangChain / AutoGen / OpenAI Agents SDK（v0.15.0）
+
+三个主流 Agent 框架各有现成适配器（`examples/contrib/adapters/`），Agent 保持
+自己的主循环，每个 tool call 自动经过 R1/R2/R3 治理，Agent 无感知：
+
+```powershell
+# LangChain（GovernedTool 包装）
+uv pip install loop-controller langchain langchain-openai langgraph
+$env:OPENAI_API_KEY="sk-..."
+$env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="0123456789abcdef..."  # 64 位十六进制
+$env:PYTHONPATH="src"
+.venv\Scripts\python.exe examples\contrib\adapters\langchain_demo.py
+
+# AutoGen（govern_tool 装饰器）
+uv pip install loop-controller autogen-agentchat
+.venv\Scripts\python.exe examples\contrib\adapters\autogen_demo.py
+
+# OpenAI Agents SDK
+uv pip install loop-controller openai-agents openai
+.venv\Scripts\python.exe examples\contrib\adapters\openai_agents_demo.py
+```
+
+三个 demo 均需要 OPA 已在 `localhost:8181` 运行（见上文），并用真实 LLM
+（`OPENAI_API_KEY`）驱动 Agent 决策；工具执行被 Loop Controller 拦截治理。
+
 ### 启动治理台（v0.55.0）
 
 Loop Controller 附带 Vue 3 + Element Plus 管理治理台（`frontend/`），
