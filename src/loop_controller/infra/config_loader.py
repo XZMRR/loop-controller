@@ -403,6 +403,17 @@ class AppConfig:
 class ConfigLoader:
     """加载 config/ 目录并执行 7 条启动校验。"""
 
+    @staticmethod
+    def _with_local_override(path: Path) -> Path:
+        """本地覆盖：同目录同名 ``*.local.yaml`` 存在时优先（gitignore，不入库）。
+
+        仓库内的样例配置保持安全默认值；本地联调/演示的启用态
+        （如 go_kernel.enabled、policy_delivery.enabled）写入 *.local.yaml，
+        使任何机器克隆后路径与默认值都可复用。
+        """
+        local = path.with_name(f"{path.stem}.local{path.suffix}")
+        return local if local.exists() else path
+
     def load(self, config_dir: str | Path, opa_base_url: str | None = None) -> AppConfig:
         """加载并校验配置.
 
@@ -435,8 +446,12 @@ class ConfigLoader:
         llm_planner = self._load_llm_planner(config_dir / "llm_planner.yaml")
         identity_config = self._load_identity_config(config_dir / "identity.yaml")
         entrypoints_config = self._load_entrypoints_config(config_dir / "entrypoints.yaml")
-        go_kernel_config = self._load_optional_config(config_dir / "go_kernel.yaml")
-        policy_delivery = self._load_policy_delivery(config_dir / "policy_delivery.yaml", root)
+        go_kernel_config = self._load_optional_config(
+            self._with_local_override(config_dir / "go_kernel.yaml")
+        )
+        policy_delivery = self._load_policy_delivery(
+            self._with_local_override(config_dir / "policy_delivery.yaml"), root
+        )
         rbac = self._load_rbac(config_dir / "rbac.yaml")
         execution_security = self._load_execution_security(
             config_dir / "execution_security.yaml"
