@@ -23,6 +23,13 @@ from loop_controller.secrets import (
 from loop_controller.secrets.exceptions import SecretNotFoundError
 
 
+def _write_secret(path: Path, payload: dict) -> None:
+    """写入 secret 文件；Unix 上收紧为 0o600 以通过权限校验。"""
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    if os.name != "nt":
+        path.chmod(0o600)
+
+
 class TestMemorySecretBackend:
     """内存后端测试。"""
 
@@ -169,10 +176,7 @@ class TestFileSecretBackend:
         base = tmp_path / "secrets"
         global_dir = base / "global"
         global_dir.mkdir(parents=True)
-        (global_dir / "api_key.json").write_text(
-            json.dumps({"value": "global-secret", "version": "1"}),
-            encoding="utf-8",
-        )
+        _write_secret(global_dir / "api_key.json", {"value": "global-secret", "version": "1"})
         backend = FileSecretBackend(base)
         value = backend._get_global("api_key", None)  # 同步方法可直接测
         assert value is not None
@@ -186,12 +190,8 @@ class TestFileSecretBackend:
         tenant_dir = base / "tenants" / "tenant-a"
         global_dir.mkdir(parents=True)
         tenant_dir.mkdir(parents=True)
-        (global_dir / "global-ref.json").write_text(
-            json.dumps({"value": "global-canary"}), encoding="utf-8"
-        )
-        (tenant_dir / "tenant-ref.json").write_text(
-            json.dumps({"value": "tenant-canary"}), encoding="utf-8"
-        )
+        _write_secret(global_dir / "global-ref.json", {"value": "global-canary"})
+        _write_secret(tenant_dir / "tenant-ref.json", {"value": "tenant-canary"})
         backend = FileSecretBackend(base)
 
         async def fail_lookup(*args, **kwargs):
@@ -209,10 +209,7 @@ class TestFileSecretBackend:
         base = tmp_path / "secrets"
         global_dir = base / "global"
         global_dir.mkdir(parents=True)
-        (global_dir / "api_key.json").write_text(
-            json.dumps({"value": "global-secret"}),
-            encoding="utf-8",
-        )
+        _write_secret(global_dir / "api_key.json", {"value": "global-secret"})
         backend = FileSecretBackend(base)
         ref = SecretRef(name="api_key", tenant_id="acme")
         value = backend._get_from_tenant(ref)
@@ -225,14 +222,10 @@ class TestFileSecretBackend:
         base = tmp_path / "secrets"
         global_dir = base / "global"
         global_dir.mkdir(parents=True)
-        (global_dir / "api_key.json").write_text(
-            json.dumps({"value": "global-secret"}), encoding="utf-8"
-        )
+        _write_secret(global_dir / "api_key.json", {"value": "global-secret"})
         tenant_dir = base / "tenants" / "acme"
         tenant_dir.mkdir(parents=True)
-        (tenant_dir / "api_key.json").write_text(
-            json.dumps({"value": "tenant-secret"}), encoding="utf-8"
-        )
+        _write_secret(tenant_dir / "api_key.json", {"value": "tenant-secret"})
         backend = FileSecretBackend(base)
         ref = SecretRef(name="api_key", tenant_id="acme")
         value = backend._resolve_key(backend._get_from_tenant(ref), ref)
@@ -243,9 +236,9 @@ class TestFileSecretBackend:
         base = tmp_path / "secrets"
         global_dir = base / "global"
         global_dir.mkdir(parents=True)
-        (global_dir / "creds.json").write_text(
-            json.dumps({"value": {"username": "u", "password": "p"}}),
-            encoding="utf-8",
+        _write_secret(
+            global_dir / "creds.json",
+            {"value": {"username": "u", "password": "p"}},
         )
         backend = FileSecretBackend(base)
         value = backend._get_global("creds", "username")
@@ -257,9 +250,9 @@ class TestFileSecretBackend:
         global_dir = base / "global"
         global_dir.mkdir(parents=True)
         expired = (datetime.now(UTC) - timedelta(days=1)).isoformat()
-        (global_dir / "expired.json").write_text(
-            json.dumps({"value": "x", "expires_at": expired}),
-            encoding="utf-8",
+        _write_secret(
+            global_dir / "expired.json",
+            {"value": "x", "expires_at": expired},
         )
         backend = FileSecretBackend(base)
         assert "expired" not in backend._cache
@@ -271,7 +264,7 @@ class TestFileSecretBackend:
         global_dir = base / "global"
         global_dir.mkdir(parents=True)
         path = global_dir / "api_key.json"
-        path.write_text(json.dumps({"value": "x"}), encoding="utf-8")
+        _write_secret(path, {"value": "x"})
         current = path.stat().st_mode
         path.chmod(current | stat.S_IROTH)
 
@@ -284,14 +277,10 @@ class TestFileSecretBackend:
         base = tmp_path / "secrets"
         global_dir = base / "global"
         global_dir.mkdir(parents=True)
-        (global_dir / "api_key.json").write_text(
-            json.dumps({"value": "global", "version": "2"}), encoding="utf-8"
-        )
+        _write_secret(global_dir / "api_key.json", {"value": "global", "version": "2"})
         tenant_dir = base / "tenants" / "acme"
         tenant_dir.mkdir(parents=True)
-        (tenant_dir / "api_key.json").write_text(
-            json.dumps({"value": "tenant", "version": "1"}), encoding="utf-8"
-        )
+        _write_secret(tenant_dir / "api_key.json", {"value": "tenant", "version": "1"})
         backend = FileSecretBackend(base)
         ref = SecretRef(name="api_key", tenant_id="acme", version="2")
 
@@ -308,11 +297,11 @@ class TestFileSecretBackend:
         global_dir = base / "global"
         global_dir.mkdir(parents=True)
         path = global_dir / "api_key.json"
-        path.write_text(json.dumps({"value": "v1"}), encoding="utf-8")
+        _write_secret(path, {"value": "v1"})
 
         backend = FileSecretBackend(base)
         assert (await backend.get(SecretRef(name="api_key"))).value == "v1"
 
-        path.write_text(json.dumps({"value": "v2"}), encoding="utf-8")
+        _write_secret(path, {"value": "v2"})
         await backend.reload()
         assert (await backend.get(SecretRef(name="api_key"))).value == "v2"
