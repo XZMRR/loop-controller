@@ -51,6 +51,19 @@ def write_trusted_local_harness_config(
         lines.extend(f"    - {tool}" for tool in tools)
     (config_path / "harness_tools.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+
+def disable_policy_delivery_for_tests(config_dir: Path | str) -> None:
+    """复制仓库配置后显式关闭 policy_delivery。
+
+    仓库 config 可能启用 policy_delivery（P0 启动门禁要求 OPA 二进制存在且
+    admin/bundle/status 三个凭据环境变量均已设置）；测试工作目录不携带这些
+    运行时依赖，关闭后保持与引入该配置前一致的测试行为。门禁本身的校验由
+    config_loader 专项测试覆盖。
+    """
+    path = Path(config_dir) / "policy_delivery.yaml"
+    if path.exists():
+        path.write_text("policy_delivery:\n  enabled: false\n", encoding="utf-8")
+
 # P0 HMAC：为全部测试自动注入一个 32 字节测试 key，避免默认 hmac-sha256 模式启动失败。
 # 该 key 仅用于测试，不进入任何日志/审计内容。
 TEST_AUDIT_HMAC_KEY = "a" * 64  # 64 hex chars = 32 bytes

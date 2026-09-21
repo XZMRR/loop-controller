@@ -954,7 +954,7 @@ class ConfigLoader:
         for field_name in ("data_dir", "state_db_path", "opa_binary"):
             value = raw.get(field_name)
             if value and not Path(value).is_absolute():
-                raw[field_name] = str(root / value)
+                raw[field_name] = str((root / value).resolve())
         if "required_instance_ids" in raw:
             raw["required_instance_ids"] = tuple(raw["required_instance_ids"])
         try:

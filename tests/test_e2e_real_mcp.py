@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from loop_controller.models import ApprovalRecord
-from tests.conftest import write_trusted_local_harness_config
+from tests.conftest import disable_policy_delivery_for_tests, write_trusted_local_harness_config
 from tests.controller_helpers import controller_for
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +24,7 @@ def workdir(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     shutil.copytree(REPO_ROOT / "config", root / "config")
+    disable_policy_delivery_for_tests(root / "config")
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     (root / "data").mkdir()
     # 覆盖 mcp_servers.yaml：只保留本地 email_mock，移除需要 npx 的 filesystem server

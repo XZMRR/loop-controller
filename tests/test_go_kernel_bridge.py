@@ -136,6 +136,12 @@ def kernel_url(tmp_path_factory: pytest.TempPathFactory) -> Generator[str, None,
             "-allow-http",
             "-interaction-url",
             f"http://127.0.0.1:{interaction_port}",
+            "-control-token",
+            "test-control-token",
+            "-control-initiator",
+            "planner-agent",
+            "-control-tenant",
+            "test-tenant",
         ],
         cwd=go_root,
         stdout=subprocess.PIPE,
@@ -179,7 +185,7 @@ def kernel_url(tmp_path_factory: pytest.TempPathFactory) -> Generator[str, None,
 
 @pytest.fixture
 def bridge(kernel_url: str) -> GoKernelBridge:
-    return GoKernelBridge(base_url=kernel_url)
+    return GoKernelBridge(base_url=kernel_url, control_token="test-control-token")
 
 
 @pytest.mark.asyncio
@@ -420,6 +426,22 @@ async def test_request_delegation_surfaces_kernel_deny_reason() -> None:
 
     assert resp.allowed is False
     assert resp.reason == "delegation requires owner approval"
+
+
+@pytest.mark.asyncio
+async def test_ping_sends_control_token_headers() -> None:
+    captured: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers.get("Authorization", "")
+        assert request.url.path == "/a2a/v1/agents"
+        return httpx.Response(200, json={"protocol_version": CURRENT_PROTOCOL_VERSION, "agents": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bridge = GoKernelBridge(base_url="http://kernel", client=client, token="control-token")
+        assert await bridge.ping() is True
+
+    assert captured["auth"] == "Bearer control-token"
 
 
 @pytest.mark.asyncio
