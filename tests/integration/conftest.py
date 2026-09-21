@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,19 @@ from tests.controller_helpers import controller_for
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def _chmod_private_tree(root: Path) -> None:
+    """Unix 上递归收紧权限（目录 0o700 / 文件 0o600），避免 PersistenceProbe
+    判定 unsafe_permissions 导致 write_blocked。"""
+    if os.name == "nt":
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        for d in dirnames:
+            Path(dirpath, d).chmod(0o700)
+        for f in filenames:
+            Path(dirpath, f).chmod(0o600)
+    root.chmod(0o700)
+
+
 @pytest.fixture
 def integration_workdir(tmp_path: Path) -> Path:
     """复制 config/policies 到临时目录，返回项目根目录。"""
@@ -27,6 +41,7 @@ def integration_workdir(tmp_path: Path) -> Path:
     shutil.copytree(REPO_ROOT / "config", root / "config")
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     (root / "data").mkdir()
+    _chmod_private_tree(root)
     return root
 
 
