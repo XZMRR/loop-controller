@@ -7,14 +7,14 @@
 
 本仓库为单仓库三栈结构：
 
-| 目录 | 栈 | 说明 |
-|---|---|---|
-| `src/loop_controller/` | Python 3.12+ | 治理层核心（R1/R2/R3、三入口、执行器、IIGE、Go 内核桥接） |
-| `go/` | Go | A2A 交互治理内核（调度、委托、死信、SSE） |
-| `frontend/` | Vue 3 + TypeScript + Element Plus | 管理治理台 |
-| `config/` | YAML | 运行配置样例（含开发用占位凭据，生产必须替换） |
-| `tests/` | pytest | Python 单元与集成测试 |
-| `policies/` | Rego | OPA 策略 |
+| 目录                     | 栈                                 | 说明                                   |
+| ---------------------- | --------------------------------- | ------------------------------------ |
+| `src/loop_controller/` | Python 3.12+                      | 治理层核心（R1/R2/R3、三入口、执行器、IIGE、Go 内核桥接） |
+| `go/`                  | Go                                | A2A 交互治理内核（调度、委托、死信、SSE）             |
+| `frontend/`            | Vue 3 + TypeScript + Element Plus | 管理治理台                                |
+| `config/`              | YAML                              | 运行配置样例（含开发用占位凭据，生产必须替换）              |
+| `tests/`               | pytest                            | Python 单元与集成测试                       |
+| `policies/`            | Rego                              | OPA 策略                               |
 
 ## 环境搭建
 
@@ -74,13 +74,13 @@ npm run test:e2e      # E2E 19 用例（后端依赖全部 stub，无需启动 P
 
 Vue 前端（:5173）→ Python 代理（:8000）→ Go 内核（:8080）三进程联调，
 确认端到端链路后再提 PR。详见
-[frontend/docs/frontend_development_plan.md](frontend/docs/frontend_development_plan.md)。
+[frontend/docs/frontend\_development\_plan.md](frontend/docs/frontend_development_plan.md)。
 
 ## 提交规范
 
 - 提交信息使用英文 conventional 前缀：`feat:` / `fix:` / `docs:` /
   `test:` / `refactor:` / `chore:`，一行摘要说明动机。
-- 文档（含进度记录）不出现人员指称与日期，以轮次号或版本号锚定。
+- 文档（含进度记录）以轮次号或版本号锚定。
 - 不提交运行期产物：`data/*.db`、`*.jsonl`、`*.lock` 已被
   `.gitignore` 覆盖，请勿强行添加。
 - 不提交任何真实凭据；`config/` 中的 token/key 一律为开发占位值，
