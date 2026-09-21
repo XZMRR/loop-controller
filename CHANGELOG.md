@@ -4,7 +4,7 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased] — v0.55-dev（backend/v0.55-dev 分支）
+## [0.55.0] — 管理治理台全面接入真实后端
 
 ### Added
 
