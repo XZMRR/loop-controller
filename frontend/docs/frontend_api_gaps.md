@@ -476,15 +476,14 @@ Content-Type: application/json
 
 Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` 等接口，前端可直接使用。需要补齐的是：
 
-#### 缺口 9.1：Python 到 Go Kernel 的 control token 桥接
+#### 缺口 9.1：Python 到 Go Kernel 的 control token 桥接 —— ✅ 已关闭（R30）
 
-- **当前现状**：`GoKernelBridge` 调用 Go Kernel 时没有携带 control token（`src/loop_controller/go_kernel_bridge.py` 约 343–381 行）。
-- **影响**：生产模式（`development: false`）下，Go Kernel 强制要求 control token，导致 Python 委托链无法工作。
-- **建议修改**：
-  - 在 `go_kernel.yaml` 中配置 `control_token`。
-  - `GoKernelBridge` 发起请求时携带 `Authorization: Bearer <control_token>`。
-  - 若启用 control auth，还需配置 `initiator_agent_id`。
-- **复杂度**：低。
+- **关闭方式**：`_build_go_kernel_bridge` 重写为按 `go_kernel.yaml` 声明的
+  `control_token_env` / `approver_token_env` 在进程启动时读取静态快照并装配
+  Authorization；mTLS 三段文件齐全且 `os.path.exists` 通过才装配（样例占位路径
+  不强制存在）。真实栈冒烟验证：生产语义控制面请求经鉴权通过，未装配凭据时
+  内核 401 → 代理 502 的映射链路已覆盖。测试见
+  `tests/test_go_kernel_bridge.py` 装配用例。
 
 ---
 
@@ -499,7 +498,7 @@ Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` �
 | Identity/Entrypoints 只读 | `server.py` + `ConfigLoader` | 小 | 返回当前已加载配置（注意脱敏） |
 | 审批历史 | `approval_store.py` / `approval_manager.py` | 中 | 扩展查询方法 |
 | Govern 调试接口 | `server.py` + `checkpoint.py` | 小 | 调用 `evaluate()` 不 `forward()` |
-| Go Kernel control token | `go_kernel_bridge.py` + `go_kernel.yaml` | 小 | 增加 header |
+| ~~Go Kernel control token~~ | ~~`go_kernel_bridge.py` + `go_kernel.yaml`~~ | **已关闭（R30）**：bridge 按 env 装配 token/mTLS，见缺口 9.1 |
 
 ---
 

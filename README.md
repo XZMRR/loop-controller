@@ -136,7 +136,7 @@ $env:PYTHONPATH="src"
 .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
-当前已通过 **800+ 个单元与集成测试**（集成测试需有效 OPA 二进制），覆盖：
+当前已通过 **1200+ 个单元与集成测试**（集成测试需有效 OPA 二进制），覆盖：
 - 配置加载与 8 条启动校验
 - R1 `RuleBasedClassifier` 风险分类
 - R2 `Checkpoint` 判定流水线、审批、权限组合、预算、调用次数上限
