@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 
 import pytest
 
@@ -64,6 +65,78 @@ def test_correlation_fallback_expands_transitive_closure(tmp_path) -> None:
     store.append(_make_event().model_copy(update={"event_id": "e2", "decision_id": "d", "call_id": "c"}))
     store.append(_make_event().model_copy(update={"event_id": "e3", "call_id": "c", "receipt_id": "receipt"}))
     assert [event.event_id for event in store.query_by_correlation("receipt")] == ["e1", "e2", "e3"]
+
+
+@pytest.mark.parametrize("with_index", [False, True])
+def test_scoped_queries_filter_before_limit_and_include_boundaries(
+    tmp_path, with_index: bool
+) -> None:
+    store = JsonlAuditStore(
+        tmp_path / "audit.jsonl",
+        index_path=(tmp_path / "audit.index.db") if with_index else None,
+    )
+    base = datetime(2026, 9, 19, 9, tzinfo=UTC)
+    for seq, tenant_id, hour in (
+        (1, "tenant-a", 9),
+        (2, "tenant-b", 10),
+        (3, "tenant-a", 10),
+        (4, "tenant-a", 11),
+        (5, "tenant-b", 11),
+    ):
+        event = _make_event().model_copy(update={
+            "event_id": f"e{seq}", "tenant_id": tenant_id,
+            "timestamp": base.replace(hour=hour), "request_id": "corr",
+            "interaction_id": "interaction",
+            "metadata": {"interaction_id": "interaction", "source_agent_id": "agent",
+                         "verdict": "allow"},
+        })
+        store.append(event)
+    scope = {
+        "tenant_id": "tenant-a",
+        "start_time": base.replace(hour=10),
+        "end_time": base.replace(hour=11),
+    }
+    assert [e.tenant_id for e in store.query_by_session("t1", limit=2, **scope)] == [
+        "tenant-a", "tenant-a"
+    ]
+    assert len(store.query_by_task("t1", limit=2, **scope)) == 2
+    assert len(store.query_by_correlation("corr", limit=2, **scope)) == 2
+    assert len(store.query_interactions(interaction_id="interaction", limit=2, **scope)) == 2
+    assert len(store.list_recent(limit=2, **scope)) == 2
+
+
+@pytest.mark.parametrize("with_index", [False, True])
+def test_agent_tool_filters_apply_before_limit(tmp_path, with_index: bool) -> None:
+    store = JsonlAuditStore(
+        tmp_path / "audit.jsonl",
+        index_path=(tmp_path / "audit.index.db") if with_index else None,
+    )
+    store.append(_make_event().model_copy(update={
+        "event_id": "matching", "actor_id": "agent-a", "target": "send_email",
+    }))
+    store.append(_make_event().model_copy(update={
+        "event_id": "newer", "actor_id": "agent-b", "target": "web_search",
+    }))
+
+    assert [event.event_id for event in store.list_recent(
+        limit=1, agent_id="agent-a", tool_name="send_email"
+    )] == ["matching"]
+
+
+def test_correlation_builds_closure_before_scope_and_limit(tmp_path) -> None:
+    store = JsonlAuditStore(tmp_path / "audit.jsonl")
+    timestamp = datetime(2026, 9, 19, tzinfo=UTC)
+    store.append(_make_event().model_copy(update={
+        "event_id": "bridge", "tenant_id": "tenant-b", "timestamp": timestamp,
+        "request_id": "root", "decision_id": "decision",
+    }))
+    store.append(_make_event().model_copy(update={
+        "event_id": "visible", "tenant_id": "tenant-a", "timestamp": timestamp,
+        "decision_id": "decision",
+    }))
+    assert [event.event_id for event in store.query_by_correlation(
+        "root", tenant_id="tenant-a", limit=1
+    )] == ["visible"]
 
 
 def test_duplicate_lifecycle_event_id_is_idempotent(tmp_path) -> None:

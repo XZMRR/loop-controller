@@ -166,6 +166,21 @@ class AdminAgentsResponse(BaseModel):
     agents: list[AdminAgentItem] = Field(default_factory=list)
 
 
+class AdminSecretItem(BaseModel):
+    """GET /v1/admin/secrets 列表项。"""
+
+    ref: str
+    tenant_id: str | None = None
+    backend: str
+    has_value: bool
+
+
+class AdminSecretsResponse(BaseModel):
+    """GET /v1/admin/secrets 响应体。"""
+
+    secrets: list[AdminSecretItem] = Field(default_factory=list)
+
+
 class AdminAgentDetail(AdminAgentItem):
     """GET /v1/admin/agents/{agent_id} 详情。"""
 

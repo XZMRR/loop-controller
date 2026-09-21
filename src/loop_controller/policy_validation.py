@@ -90,7 +90,13 @@ class OPACLIRunner:
         self.max_output_bytes = max_output_bytes
         self.environment = dict(environment or {})
 
-    def run(self, stage: str, arguments: Sequence[str]) -> tuple[OPACommandResult, bytes]:
+    def run(
+        self,
+        stage: str,
+        arguments: Sequence[str],
+        *,
+        cwd: Path | None = None,
+    ) -> tuple[OPACommandResult, bytes]:
         started = time.monotonic()
         argv = [str(self.binary), *arguments]
         env = {"PATH": str(self.binary.parent), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
@@ -103,6 +109,7 @@ class OPACLIRunner:
                 stderr=subprocess.PIPE,
                 shell=False,
                 env=env,
+                cwd=str(cwd) if cwd is not None else None,
             )
         except OSError:
             return self._failed(stage, started, "opa_start_failed"), b""
@@ -215,13 +222,18 @@ class OPACandidateValidator:
             if not version_stage.ok:
                 failure_code = version_stage.failure_code
             else:
-                check_stage, _ = self._runner.run("check", ["check", "--strict", str(candidate)])
+                # OPA 1.x 在 Windows 会把带盘符的绝对路径（C:\...）误判为
+                # URL scheme，因此统一传相对路径并以临时目录为工作目录
+                temp_root = Path(temp_dir)
+                check_stage, _ = self._runner.run(
+                    "check", ["check", "--strict", candidate.name], cwd=temp_root
+                )
                 stages.append(check_stage)
                 if not check_stage.ok:
                     failure_code = check_stage.failure_code
                 else:
                     test_stage, test_output = self._runner.run(
-                        "test", ["test", "--format=json", str(candidate)]
+                        "test", ["test", "--format=json", candidate.name], cwd=temp_root
                     )
                     if test_stage.ok:
                         try:
@@ -277,7 +289,16 @@ class OPACandidateValidator:
             query = f"data.{package}.decision"
             stage, output = self._runner.run(
                 f"default_deny:{package}",
-                ["eval", "--format=json", "--data", str(snapshot), "--input", str(input_path), query],
+                [
+                    "eval",
+                    "--format=json",
+                    "--data",
+                    snapshot.name,
+                    "--input",
+                    input_path.name,
+                    query,
+                ],
+                cwd=temp_root,
             )
             if not stage.ok:
                 return stage, False

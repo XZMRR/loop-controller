@@ -4,7 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "loop-controller"
-version = "0.54.0"
+version = "0.55.0"
+description = "企业内部 Agent 工具调用治理基础设施：R0-R3 四层治理模型（审批/风险评估/策略判定/审计）+ A2A 交互治理内核 + Vue 管理治理台"
+readme = "README.md"
+license = { text = "Apache-2.0" }
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.0",
@@ -29,6 +32,10 @@ langchain = [
 
 [project.scripts]
 lc = "loop_controller.cli:main"
+
+[project.urls]
+Repository = "https://github.com/XZMRR/loop-controller"
+Changelog = "https://github.com/XZMRR/loop-controller/blob/backend/v0.55-dev/CHANGELOG.md"
 
 [dependency-groups]
 dev = [

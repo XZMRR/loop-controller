@@ -37,18 +37,13 @@
         :message="loadError"
         @retry="loadAudit"
       />
-      <el-table :data="filteredEvents" v-loading="loading" stripe>
+      <el-table :data="events" v-loading="loading" stripe>
         <el-table-column prop="timestamp" label="时间" width="180" />
         <el-table-column prop="action" label="动作" width="120" />
         <el-table-column prop="agent_id" label="Agent" width="140" />
         <el-table-column prop="tool_name" label="工具" width="140" />
         <el-table-column prop="verdict" label="结果" width="100" />
         <el-table-column prop="reason" label="原因" show-overflow-tooltip />
-        <el-table-column v-if="filteredEvents.length !== events.length" label="匹配" width="80">
-          <template #default>
-            <el-tag size="small" type="info">{{ filteredEvents.length }}/{{ events.length }}</el-tag>
-          </template>
-        </el-table-column>
         <template #empty>
           <el-empty description="暂无审计事件" />
         </template>
@@ -58,7 +53,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import { getAuditEvents } from '@/api/python'
 import ErrorState from '@/components/ErrorState.vue'
 import type { AuditEvent } from '@/api/python'
@@ -71,7 +66,6 @@ const filters = reactive({
   limit: 100,
 })
 
-// 时间范围筛选为前端过滤：后端 /v1/admin/audit 暂无时间参数，等接口补齐后可改为服务端筛选
 const timeRange = ref<[Date, Date] | null>(null)
 
 const events = ref<AuditEvent[]>([])
@@ -79,21 +73,14 @@ const loading = ref(false)
 // 加载失败的持久错误态（由 ErrorState 展示，含重试）
 const loadError = ref('')
 
-const filteredEvents = computed(() => {
-  if (!timeRange.value) return events.value
-  const [start, end] = timeRange.value
-  return events.value.filter((event) => {
-    const ts = new Date(event.timestamp).getTime()
-    return ts >= start.getTime() && ts <= end.getTime()
-  })
-})
-
 async function loadAudit() {
   loading.value = true
   try {
-    const params = Object.fromEntries(
-      Object.entries(filters).filter(([, v]) => v !== '')
-    )
+    const params = {
+      ...Object.fromEntries(Object.entries(filters).filter(([, v]) => v !== '')),
+      start_time: timeRange.value?.[0].toISOString(),
+      end_time: timeRange.value?.[1].toISOString(),
+    }
     events.value = await getAuditEvents(params)
     loadError.value = ''
   } catch (error: any) {

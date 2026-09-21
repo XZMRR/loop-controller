@@ -52,6 +52,35 @@ func TestTaskCreateAndGet(t *testing.T) {
 	}
 }
 
+func TestListTasksForTenantInitiator(t *testing.T) {
+	db := openTestDB(t)
+	ts := db.TaskStore()
+	now := time.Now().UTC()
+	tasks := []models.Task{
+		{TaskID: "root-own", SessionID: "s", TenantID: "tenant-a", InitiatorAgentID: "agent-a", TargetAgentID: "target", Status: "pending", CreatedAt: now, UpdatedAt: now},
+		{TaskID: "child-own", SessionID: "s", TenantID: "tenant-a", InitiatorAgentID: "agent-a", TargetAgentID: "target", ParentTaskID: "root-own", RootTaskID: "root-own", Status: "pending", CreatedAt: now.Add(time.Second), UpdatedAt: now.Add(time.Second)},
+		{TaskID: "other-initiator", SessionID: "s", TenantID: "tenant-a", InitiatorAgentID: "agent-x", TargetAgentID: "target", Status: "pending", CreatedAt: now, UpdatedAt: now},
+		{TaskID: "other-tenant", SessionID: "s", TenantID: "tenant-b", InitiatorAgentID: "agent-a", TargetAgentID: "target", Status: "pending", CreatedAt: now, UpdatedAt: now},
+	}
+	for _, task := range tasks {
+		if err := ts.Create(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, err := ts.ListForTenantInitiator(context.Background(), "tenant-a", "agent-a", false)
+	if err != nil || len(all) != 2 || all[0].TaskID != "child-own" || all[1].TaskID != "root-own" {
+		t.Fatalf("all=%+v err=%v", all, err)
+	}
+	roots, err := ts.ListForTenantInitiator(context.Background(), "tenant-a", "agent-a", true)
+	if err != nil || len(roots) != 1 || roots[0].TaskID != "root-own" {
+		t.Fatalf("roots=%+v err=%v", roots, err)
+	}
+	empty, err := ts.ListForTenantInitiator(context.Background(), "tenant-missing", "agent-a", false)
+	if err != nil || empty == nil || len(empty) != 0 {
+		t.Fatalf("empty=%+v err=%v", empty, err)
+	}
+}
+
 func TestListDescendantsScansCompleteTaskIdentity(t *testing.T) {
 	db := openTestDB(t)
 	ts := db.TaskStore()

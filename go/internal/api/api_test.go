@@ -180,9 +180,16 @@ func TestDeadLetterRoutesRequireControlAuthAndReplayAudits(t *testing.T) {
 	}
 	body, _ := json.Marshal(map[string]any{"tenant_id": "tenant", "expected_revision": dead.Revision})
 	resp = do(http.MethodPost, "/a2a/v1/dead-letters/dead-assignment/replay", "control-secret", "corr-1", body)
-	var replay models.TaskAssignment
-	_ = json.NewDecoder(resp.Body).Decode(&replay)
+	var replayBody struct {
+		ProtocolVersion string                `json:"protocol_version"`
+		Assignment      models.TaskAssignment `json:"assignment"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&replayBody)
+	replay := replayBody.Assignment
 	resp.Body.Close()
+	if replayBody.ProtocolVersion == "" {
+		t.Fatalf("replay response missing protocol_version: %+v", replayBody)
+	}
 	if resp.StatusCode != http.StatusOK || replay.State != models.AssignmentStateQueued || replay.ExecutionFence != dead.ExecutionFence+1 || replay.Revision != dead.Revision+1 {
 		t.Fatalf("replay status=%d assignment=%+v dead=%+v", resp.StatusCode, replay, dead)
 	}
@@ -555,6 +562,131 @@ func TestTaskStreamLastEventIDReplaysOnlyNewerEvents(t *testing.T) {
 	}
 	if eventTypes[0] != "task_accepted" || eventTypes[1] != "task_running" {
 		t.Fatalf("event types = %#v, want accepted then running", eventTypes)
+	}
+}
+
+func TestControlTenantCreateIsImmediatelyVisibleToGetAndList(t *testing.T) {
+	srv, server := newTestServer(t)
+	srv.SetControlAuthForTenant("control-secret", "agent-a", "tenant-a")
+	body := []byte(`{"protocol_version":"` + currentProtocolVersion + `","session_id":"s","initiator_agent_id":"agent-a","target_agent_id":"agent-b"}`)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/a2a/v1/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer control-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status=%d", resp.StatusCode)
+	}
+	var created models.Task
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created.TenantID != "tenant-a" {
+		t.Fatalf("tenant=%q, want trusted tenant", created.TenantID)
+	}
+
+	getReq, _ := http.NewRequest(http.MethodGet, server.URL+"/a2a/v1/tasks/"+created.TaskID, nil)
+	getReq.Header.Set("Authorization", "Bearer control-secret")
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("get status=%d", getResp.StatusCode)
+	}
+
+	listReq, _ := http.NewRequest(http.MethodGet, server.URL+"/a2a/v1/tasks", nil)
+	listReq.Header.Set("Authorization", "Bearer control-secret")
+	listResp, err := http.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listResp.Body.Close()
+	var listed struct {
+		Tasks []models.Task `json:"tasks"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if listResp.StatusCode != http.StatusOK || len(listed.Tasks) != 1 || listed.Tasks[0].TaskID != created.TaskID {
+		t.Fatalf("list status=%d tasks=%+v", listResp.StatusCode, listed.Tasks)
+	}
+}
+
+func TestListTasksUsesTrustedTenantAndInitiator(t *testing.T) {
+	srv, server := newTestServer(t)
+	srv.SetControlAuthForTenant("control-secret", "agent-a", "tenant-a")
+	now := time.Now().UTC()
+	for _, task := range []models.Task{
+		{TaskID: "root-own", SessionID: "s", TenantID: "tenant-a", InitiatorAgentID: "agent-a", TargetAgentID: "target", Status: "pending", CreatedAt: now, UpdatedAt: now},
+		{TaskID: "child-own", SessionID: "s", TenantID: "tenant-a", InitiatorAgentID: "agent-a", TargetAgentID: "target", ParentTaskID: "root-own", RootTaskID: "root-own", Status: "pending", CreatedAt: now.Add(time.Second), UpdatedAt: now.Add(time.Second)},
+		{TaskID: "foreign-tenant", SessionID: "s", TenantID: "tenant-b", InitiatorAgentID: "agent-a", TargetAgentID: "target", Status: "pending", CreatedAt: now, UpdatedAt: now},
+		{TaskID: "foreign-initiator", SessionID: "s", TenantID: "tenant-a", InitiatorAgentID: "agent-x", TargetAgentID: "target", Status: "pending", CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := srv.db.TaskStore().Create(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := func(path string) *http.Response {
+		req, _ := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer control-secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	resp := request("/a2a/v1/tasks?tenant_id=tenant-b&root_only=false")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var body struct {
+		ProtocolVersion string        `json:"protocol_version"`
+		Tasks           []models.Task `json:"tasks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ProtocolVersion != models.CurrentProtocolVersion || len(body.Tasks) != 2 {
+		t.Fatalf("body=%+v", body)
+	}
+	resp = request("/a2a/v1/tasks?root_only=true")
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Tasks) != 1 || body.Tasks[0].TaskID != "root-own" {
+		t.Fatalf("root tasks=%+v", body.Tasks)
+	}
+	for _, value := range []string{"1", "TRUE", "", "true&root_only=false"} {
+		resp = request("/a2a/v1/tasks?root_only=" + value)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("root_only=%q status=%d", value, resp.StatusCode)
+		}
+	}
+}
+
+func TestListTasksReturnsEmptyArray(t *testing.T) {
+	srv, server := newTestServer(t)
+	srv.SetControlAuthForTenant("control-secret", "agent-a", "tenant-a")
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/a2a/v1/tasks", nil)
+	req.Header.Set("Authorization", "Bearer control-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if string(body["tasks"]) != "[]" {
+		t.Fatalf("tasks=%s", body["tasks"])
 	}
 }
 

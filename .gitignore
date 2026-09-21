@@ -88,9 +88,11 @@ tools/
 # Runtime data (generated)
 data/*.jsonl
 data/output/
+data/*.db
 data/*.db-shm
 data/*.db-wal
 data/*.bak-*
+*.lock
 
 # Logs
 *.log

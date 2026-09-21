@@ -14,6 +14,14 @@ function resolveBaseUrl(storageKey: string, fallback: string): string {
 export const PYTHON_URL_STORAGE_KEY = 'lc_python_url'
 export const A2A_URL_STORAGE_KEY = 'lc_a2a_url'
 
+export function getPythonBaseUrl(): string {
+  return resolveBaseUrl(PYTHON_URL_STORAGE_KEY, DEFAULT_PYTHON_BASE_URL).replace(/\/$/, '')
+}
+
+export function buildPythonUrl(path: string): string {
+  return `${getPythonBaseUrl()}${path.startsWith('/') ? path : `/${path}`}`
+}
+
 export const pythonClient = axios.create({
   baseURL: resolveBaseUrl(PYTHON_URL_STORAGE_KEY, DEFAULT_PYTHON_BASE_URL),
   timeout: 30000,
@@ -37,14 +45,6 @@ export function applyCustomBaseUrls(): void {
 }
 
 pythonClient.interceptors.request.use((config) => {
-  const auth = useAuthStore()
-  if (auth.sessionValid) {
-    config.headers['Authorization'] = `Bearer ${auth.sessionToken}`
-  }
-  return config
-})
-
-a2aClient.interceptors.request.use((config) => {
   const auth = useAuthStore()
   if (auth.sessionValid) {
     config.headers['Authorization'] = `Bearer ${auth.sessionToken}`

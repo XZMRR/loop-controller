@@ -476,15 +476,14 @@ Content-Type: application/json
 
 Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` 等接口，前端可直接使用。需要补齐的是：
 
-#### 缺口 9.1：Python 到 Go Kernel 的 control token 桥接
+#### 缺口 9.1：Python 到 Go Kernel 的 control token 桥接 —— ✅ 已关闭（R30）
 
-- **当前现状**：`GoKernelBridge` 调用 Go Kernel 时没有携带 control token（`src/loop_controller/go_kernel_bridge.py` 约 343–381 行）。
-- **影响**：生产模式（`development: false`）下，Go Kernel 强制要求 control token，导致 Python 委托链无法工作。
-- **建议修改**：
-  - 在 `go_kernel.yaml` 中配置 `control_token`。
-  - `GoKernelBridge` 发起请求时携带 `Authorization: Bearer <control_token>`。
-  - 若启用 control auth，还需配置 `initiator_agent_id`。
-- **复杂度**：低。
+- **关闭方式**：`_build_go_kernel_bridge` 重写为按 `go_kernel.yaml` 声明的
+  `control_token_env` / `approver_token_env` 在进程启动时读取静态快照并装配
+  Authorization；mTLS 三段文件齐全且 `os.path.exists` 通过才装配（样例占位路径
+  不强制存在）。真实栈冒烟验证：生产语义控制面请求经鉴权通过，未装配凭据时
+  内核 401 → 代理 502 的映射链路已覆盖。测试见
+  `tests/test_go_kernel_bridge.py` 装配用例。
 
 ---
 
@@ -499,7 +498,7 @@ Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` �
 | Identity/Entrypoints 只读 | `server.py` + `ConfigLoader` | 小 | 返回当前已加载配置（注意脱敏） |
 | 审批历史 | `approval_store.py` / `approval_manager.py` | 中 | 扩展查询方法 |
 | Govern 调试接口 | `server.py` + `checkpoint.py` | 小 | 调用 `evaluate()` 不 `forward()` |
-| Go Kernel control token | `go_kernel_bridge.py` + `go_kernel.yaml` | 小 | 增加 header |
+| ~~Go Kernel control token~~ | ~~`go_kernel_bridge.py` + `go_kernel.yaml`~~ | **已关闭（R30）**：bridge 按 env 装配 token/mTLS，见缺口 9.1 |
 
 ---
 
@@ -515,9 +514,14 @@ Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` �
 
 ---
 
-## 6. 前端当前实现状态（v0.54，develop 分支）
+## 6. 前端当前实现状态（v0.55，backend/v0.55-dev 分支）
 
-v0.54 前端已全面改为 API 直连，**YAML fallback 与 vite `/config/*` 中间件已移除**（Tools 页读取仍保留 YAML→在线 API 的单一回退）：
+v0.55 起治理台已与后端真实接口连通：A2A 任务树走 `GET /v1/admin/a2a/tasks`
+（Python 代理 + Go 内核 `GET /a2a/v1/tasks`，tenant+initiator 维度隔离）；
+审批推送走 `GET /v1/admin/approvals/stream`（HMAC 签名游标，400/410 语义与
+前端 `createEventStream` 对齐）；审计查询支持 `start_time`/`end_time`
+服务端过滤；Secret 元数据走 `GET /v1/admin/secrets`（仅 ref/tenant/backend/
+has_value，不回显明文）。历史遗留事实：
 
 1. **认证**：`Login.vue` 通过 `POST /v1/admin/session/login` 换取 Session；
    `client.ts` 请求拦截器统一携带 `Authorization: Bearer <session>`，401 自动登出跳登录；
@@ -529,17 +533,19 @@ v0.54 前端已全面改为 API 直连，**YAML fallback 与 vite `/config/*` �
    「内核对账」页签已随 v0.54 内核审批端点变更删除。
 4. **审计**：`/v1/admin/audit`（含时间过滤）已接入。
 5. **SSE 硬化**：cursor/Last-Event-ID、指数退避重连、generation 防串扰。
-6. **A2A 任务树**：`TaskTree.vue` 通过 `A2ATaskDataSource` 接口消费数据，当前为
-   Mock 实现（`api/a2a/mock.ts`），待后端提供任务树列表端点后切换 HTTP 实现，视图零改动。
-7. **治理页面**（Mock 数据源先行）：死信队列、RBAC 绑定、Policy 生命周期三页均按
-   `契约层 types.ts + Mock 数据源 + 视图 + vitest 用例` 模式交付，Mock 语义对齐
-   后端源码；契约冻结后新增 Http 实现替换单例即可，视图与测试零改动。
+6. **A2A 任务树**：`TaskTree.vue` 通过 `A2ATaskDataSource` 接口消费数据，
+   当前为 Http 实现（`HttpA2ATaskDataSource`，v0.55 已切换）。
+7. **治理页面**：死信队列 / RBAC 绑定 / Policy 生命周期均已切换 Http 数据源
+   （`HttpDeadLetterDataSource` / `HttpRbacBindingDataSource` /
+   `HttpRbacGrantDataSource` / `HttpPolicyDataSource`，Mock 保留供测试）；
+   死信链路已完成真实栈冒烟（Python 代理 + Go 内核 + 浏览器全链路，
+   重放 revision 乐观校验与 409 幂等语义验证通过）。
 8. **SSE 基础设施**：`api/sse.ts createEventStream`（游标续传/退避重连/401 处理）
-   统一服务 A2A 任务流与审批推送；管理台审批推送端点未定，前端推送优先 +
-   15s 轮询兜底。
+   统一服务 A2A 任务流与审批推送；审批推送端点 v0.55 已落地，推送优先 +
+   轮询兜底保留。
 9. **三态规范**：全站列表数据区统一 Loading/Empty/Error（共享组件
    `ErrorState.vue` 持久错误块 + 重试）；操作反馈仍用 ElMessage。
-10. **测试资产**：vitest 55 用例 + Playwright E2E 15 用例（全部后端依赖
+10. **测试资产**：vitest 83 用例 + Playwright E2E 19 用例（全部后端依赖
     `page.route` stub，不依赖 Python/Go 进程）。
 
 ---
@@ -572,8 +578,11 @@ stream/delegations，`b20a9b5`~`e1a6677`）、Session 认证（`1948248`）、RB
 | Agent CRUD | `POST/PUT/DELETE /v1/admin/agents[/{id}]` | Agent 管理在线增改 | 低 |
 | 审批转交 | `POST /v1/admin/approvals/{id}/reassign` | 审批人繁忙时转交 | 低 |
 | Identity/Entrypoints 热更新 | `PUT /v1/admin/identity` `PUT /v1/admin/entrypoints`（或统一 reload 目标） | 配置在线生效范围确认 | 低 |
-| 管理台审批 SSE 端点 | `GET /v1/admin/approvals/stream` 类（暂定形状） | 审批推送（前端 `streamAdminApprovals` 已就绪，推送优先+轮询兜底；`/v1/wait-for-approval/sse` 为 Agent 侧通道，管理台不可用——v0.54 代码核实） | 中 |
-| 审计时间范围参数 | `GET /v1/admin/audit` 扩展 `start_time`/`end_time` | 审计查询服务端时间过滤（当前为前端本地过滤，数据量大时不可扩展） | 中 |
+| ~~管理台审批 SSE 端点~~ | ~~`GET /v1/admin/approvals/stream`~~ | **v0.55 已落地**：HMAC 签名 Last-Event-ID 游标（400 invalid / 410 expired）、`max_wait` 0.1–300s、10s 心跳、`retry: 1000`；非平台管理员按租户过滤；事件名/负载由 `approval_store.list_events` 定义 | 已交付 |
+| ~~审计时间范围参数~~ | ~~`GET /v1/admin/audit` 扩展~~ | **v0.55 已落地**：`start_time`/`end_time`（ISO8601 带时区，400 校验含倒序拦截），tenant/agent_id/tool_name 过滤下沉到存储层 | 已交付 |
+| ~~A2A 任务树列表~~ | ~~`GET /a2a/v1/tasks` + 管理台代理~~ | **v0.55 已落地**：内核 `GET /a2a/v1/tasks`（tenant+initiator 隔离，`root_only` 严格 bool，空返回 `[]`），管理台代理 `GET /v1/admin/a2a/tasks`（逐任务 RBAC 校验 + 载荷消毒）；前端 `HttpA2ATaskDataSource` 已实现 | 已交付 |
+| ~~死信队列治理端点~~ | ~~`GET /a2a/v1/dead-letters` + `POST .../{id}/replay` + 管理台代理~~ | **v0.55 已落地并完成真实栈冒烟**：内核两端点补 `protocol_version` 包裹，管理台代理 `/v1/admin/a2a/dead-letters`（鉴权 + 消毒 + 404/409/502 映射），前端 `HttpDeadLetterDataSource` 已切换；重放 revision 乐观校验、二次重放 409、tasks 状态联动均验证通过 | 已交付 |
+| Secret 元数据 | `GET /v1/admin/secrets` | **v0.55 已落地**：仅暴露 ref/tenant_id/backend/has_value，不 weakening credential boundaries | 已交付 |
 | 用户视图 | `GET /v1/admin/users` | Agents 页合并用户数据源（当前前端用 `users: []` 占位） | 低 |
 
 ### 7.3 已关闭的兼容方案（不再适用）

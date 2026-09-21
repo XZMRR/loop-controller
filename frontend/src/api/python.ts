@@ -1,4 +1,4 @@
-import { pythonClient } from './client'
+import { buildPythonUrl, pythonClient } from './client'
 import { createEventStream } from './sse'
 
 export interface HealthStatus {
@@ -83,14 +83,22 @@ export async function getMetrics(): Promise<string> {
 export interface ApprovalHistoryItem {
   request_id: string
   decision_id: string
+  call_id: string
+  task_id: string
+  tenant_id: string | null
   agent_id: string
   tool_name: string
   requester_id: string
   approver_id: string
+  arguments_masked: Record<string, any>
   reason: string
   status: string
-  created_at?: string | null
-  decided_at?: string | null
+  comment: string | null
+  principal: string | null
+  action_summary: string | null
+  original_decision: Record<string, any> | null
+  created_at: string | null
+  decided_at: string | null
 }
 
 export async function getApprovalHistory(params: {
@@ -118,7 +126,7 @@ async function submitApprovalDecision(
   credential: string,
 ): Promise<ApprovalActionResponse> {
   // 独立审批鉴权不能经过注入 Admin Session 的 pythonClient。
-  const response = await fetch(`/api/python/v1/admin/approvals/${encodeURIComponent(decisionId)}/${action}`, {
+  const response = await fetch(buildPythonUrl(`/v1/admin/approvals/${encodeURIComponent(decisionId)}/${action}`), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -156,6 +164,8 @@ export async function getAuditEvents(params: {
   agent_id?: string
   tool_name?: string
   verdict?: string
+  start_time?: string
+  end_time?: string
   limit?: number
 }): Promise<AuditEvent[]> {
   const { data } = await pythonClient.get('/v1/admin/audit', { params })
@@ -208,6 +218,18 @@ export async function getAdminAgentDetail(agentId: string): Promise<AdminAgentDe
 export async function getAdminProfiles(): Promise<Array<Record<string, any>>> {
   const { data } = await pythonClient.get('/v1/admin/profiles')
   return data.profiles || []
+}
+
+export interface AdminSecret {
+  ref: string
+  tenant_id: string | null
+  backend: string
+  has_value: boolean
+}
+
+export async function getAdminSecrets(): Promise<AdminSecret[]> {
+  const { data } = await pythonClient.get('/v1/admin/secrets')
+  return data.secrets || []
 }
 
 export interface ToolPermissionInput {
@@ -303,21 +325,14 @@ export function streamA2ATask(
   })
 }
 
-/**
- * 订阅审批台推送流；返回停止函数。
- * **未定契约**：后端尚无管理台 SSE 端点（/v1/wait-for-approval/sse 是 Agent 侧通道，
- * 按 request_id + agent 鉴权，管理台不可用）。本函数指向的
- * `GET /v1/admin/approvals/stream` 为前端暂定路径，事件形状暂定
- * `{type: 'pending'|'decided', ...}`；后端落地后仅需对齐 url 与 payload。
- * 当前环境连接将失败，调用方必须降级为轮询兜底。
- */
+/** 订阅管理台审批事件流；连接失败时由视图层保留轮询兜底。 */
 export function streamAdminApprovals(
   onEvent: (event: Record<string, any>) => void,
   onError?: (error: Error) => void,
   onEnd?: () => void,
 ): () => void {
   return createEventStream({
-    url: '/api/python/v1/admin/approvals/stream',
+    url: buildPythonUrl('/v1/admin/approvals/stream?max_wait=60'),
     onEvent,
     onError,
     onEnd,

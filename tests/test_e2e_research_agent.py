@@ -187,7 +187,11 @@ async def _run_and_resume(
             agent_id="researcher_001",
             user_id="alice",
             tool_name="send_email",
-            arguments={"to": "zhang@company.com", "subject": "AI 合规调研摘要", "body": "请查收附件"},
+            arguments={
+                "to": "zhang@company.com",
+                "subject": "AI 合规调研摘要",
+                "body": "请查收附件",
+            },
             task_context="调研 AI 合规并发送摘要邮件",
         )
         assert r4.status == "require_approval"
@@ -244,12 +248,10 @@ async def test_e2e_approval_expired_after_timeout(opa_server, workdir) -> None:
             )
         )
 
-        # 让审批请求中的原始 Decision 立即过期
-        expired_decision = request.original_decision.model_copy(
-            update={"expires_at": datetime.now(UTC) - timedelta(seconds=1)}
-        )
-        new_request = request.model_copy(update={"original_decision": expired_decision})
-        store.submit_request(new_request)
+        # 推进检查点时钟，使已持久化的原始 Decision 过期；审批请求不可被覆盖。
+        expires_at = request.original_decision.expires_at
+        assert expires_at is not None
+        controller._runtime.checkpoint._now = lambda: expires_at + timedelta(seconds=1)
 
         final = await controller.resume_after_approval(result.request_id)
         assert final.status in ("deny", "blocked")
@@ -257,8 +259,9 @@ async def test_e2e_approval_expired_after_timeout(opa_server, workdir) -> None:
 
         actions = [e.action for e in _events(workdir)]
         assert actions == [
-            "propose", "evaluate",          # send_email 被 require_approval 拦截
-            "approve",                    # 审批人已通过，但 Decision 已过期
+            "propose",
+            "evaluate",  # send_email 被 require_approval 拦截
+            "approve",  # 审批人已通过，但 Decision 已过期
         ]
     finally:
         await controller.aclose()
@@ -270,11 +273,24 @@ async def test_e2e_approve_path_event_sequence(opa_server, workdir) -> None:
 
     actions = [e.action for e in _events(workdir)]
     assert actions == [
-        "propose", "evaluate", "execution_authorized", "execution_completed",  # web_search
-        "propose", "evaluate", "execution_authorized", "execution_completed",  # read_file
-        "propose", "evaluate", "execution_authorized", "execution_completed",  # write_file
-        "propose", "evaluate",             # send_email 被 require_approval 拦截
-        "approve", "approval_consumed", "execution_authorized", "execution_completed",  # send_email 审批后执行
+        "propose",
+        "evaluate",
+        "execution_authorized",
+        "execution_completed",  # web_search
+        "propose",
+        "evaluate",
+        "execution_authorized",
+        "execution_completed",  # read_file
+        "propose",
+        "evaluate",
+        "execution_authorized",
+        "execution_completed",  # write_file
+        "propose",
+        "evaluate",  # send_email 被 require_approval 拦截
+        "approve",
+        "approval_consumed",
+        "execution_authorized",
+        "execution_completed",  # send_email 审批后执行
     ]
     assert controller._runtime.audit_store.verify_chain()
 

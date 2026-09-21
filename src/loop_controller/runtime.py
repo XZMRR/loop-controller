@@ -497,13 +497,39 @@ def _build_secret_broker(config: AppConfig) -> SecretBroker:
 
 
 def _build_go_kernel_bridge(config: AppConfig) -> GoKernelBridge | None:
-    """根据 config.go_kernel_config 构造 Go 内核桥接；未启用时返回 None。"""
+    """根据 config.go_kernel_config 构造 Go 内核桥接；未启用时返回 None。
+
+    凭据按 go_kernel.yaml 声明的 *_token_env 在进程启动时读取为静态快照；
+    mTLS 三段文件齐全时装配客户端证书，CA 文件存在时作为校验锚。
+    """
     gk = config.go_kernel_config.get("go_kernel", {})
     if not gk.get("enabled", False):
         return None
     base_url = gk.get("base_url", "http://127.0.0.1:8080")
     timeout = float(gk.get("timeout", 5.0))
-    return GoKernelBridge(base_url=base_url, timeout=timeout)
+    control_env = gk.get("control_token_env")
+    approver_env = gk.get("approver_token_env")
+    control_token = os.environ.get(str(control_env), "") if control_env else ""
+    approver_token = os.environ.get(str(approver_env), "") if approver_env else ""
+    mtls = gk.get("mtls") or {}
+    ca_file = mtls.get("ca_file")
+    cert_file = mtls.get("client_cert_file")
+    key_file = mtls.get("client_key_file")
+    # 样例配置中的占位路径不强制存在：mTLS 仅在文件齐全时装配
+    verify: Any = str(ca_file) if ca_file and os.path.exists(str(ca_file)) else True
+    cert: Any = None
+    if cert_file and key_file and os.path.exists(str(cert_file)) and os.path.exists(str(key_file)):
+        cert = (str(cert_file), str(key_file))
+    elif cert_file and os.path.exists(str(cert_file)):
+        cert = str(cert_file)
+    return GoKernelBridge(
+        base_url=base_url,
+        timeout=timeout,
+        control_token=control_token,
+        approver_token=approver_token,
+        verify=verify,
+        cert=cert,
+    )
 
 
 def _observe_runtime() -> tuple[str, dict[str, object]]:

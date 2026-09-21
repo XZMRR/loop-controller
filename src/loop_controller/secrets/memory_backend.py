@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import builtins
 from typing import Any
 
 from loop_controller.secrets.exceptions import SecretNotFoundError
-from loop_controller.secrets.models import SecretRef, SecretScope, SecretValue
+from loop_controller.secrets.models import SecretRef, SecretRefMetadata, SecretScope, SecretValue
 
 
 class MemorySecretBackend:
@@ -62,6 +63,18 @@ class MemorySecretBackend:
                 return []
             return sorted(self._tenant.get(tenant_id, {}).keys())
         return sorted(self._global.keys())
+
+    async def list_refs(self) -> builtins.list[SecretRefMetadata]:
+        refs = [
+            SecretRefMetadata(ref=name, has_value=True)
+            for name in self._global
+        ]
+        refs.extend(
+            SecretRefMetadata(ref=name, tenant_id=tenant_id, has_value=True)
+            for tenant_id, cache in self._tenant.items()
+            for name in cache
+        )
+        return sorted(refs, key=lambda item: (item.tenant_id or "", item.ref))
 
     async def reload(self) -> None:
         """内存后端无需从磁盘重载。"""

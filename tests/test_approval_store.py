@@ -127,6 +127,45 @@ def test_record_response_repairs_incomplete_tail_before_refresh_and_write(tmp_pa
     assert path.read_bytes().endswith(b"\n")
 
 
+@pytest.mark.parametrize("reload_before_conflict", [False, True])
+def test_submit_request_rejects_conflicting_decision_id(
+    tmp_path, reload_before_conflict: bool
+) -> None:
+    path = tmp_path / "approvals.jsonl"
+    original = _make_request("d1")
+    store = JsonlApprovalStore(path)
+    store.submit_request(original)
+    store.submit_request(original)
+    if reload_before_conflict:
+        store = JsonlApprovalStore(path)
+
+    conflicting = original.model_copy(update={"request_id": "r2", "tool_name": "other_tool"})
+    with pytest.raises(ApprovalStoreError, match="已绑定不同审批请求"):
+        store.submit_request(conflicting)
+
+    replayed = JsonlApprovalStore(path)
+    assert replayed.get_request("d1") == original
+    assert path.read_text(encoding="utf-8").count('"type":"request"') == 1
+
+
+def test_conflicting_request_cannot_rebind_existing_response_after_reload(tmp_path) -> None:
+    path = tmp_path / "approvals.jsonl"
+    original = _make_request("d1")
+    store = JsonlApprovalStore(path)
+    store.submit_request(original)
+    response = _make_record("d1", "approve")
+    store.record_response(response)
+
+    reloaded = JsonlApprovalStore(path)
+    conflicting = original.model_copy(update={"request_id": "r2", "tool_name": "other_tool"})
+    with pytest.raises(ApprovalStoreError, match="已绑定不同审批请求"):
+        reloaded.submit_request(conflicting)
+
+    final = JsonlApprovalStore(path)
+    assert final.get_request("d1") == original
+    assert final.get_record("d1") == response
+
+
 def test_record_response_rejects_overwrite(tmp_path) -> None:
     path = tmp_path / "approvals.jsonl"
     store = JsonlApprovalStore(path)
@@ -268,6 +307,25 @@ def test_jsonl_list_recent_includes_pending_and_terminal(tmp_path) -> None:
             "created_at": older.created_at.isoformat(),
         },
     ]
+
+
+def test_jsonl_history_and_events_are_stable_across_instances(tmp_path) -> None:
+    path = tmp_path / "approvals.jsonl"
+    writer = JsonlApprovalStore(path)
+    request = _make_request("d1").model_copy(update={"tenant_id": "tenant-a"})
+    writer.submit_request(request)
+    reader = JsonlApprovalStore(path)
+    first = reader.list_events(after_id=0, tenant_id="tenant-a", all_tenants=False)
+    assert [(event["event_id"], event["event_type"]) for event in first] == [(1, "pending")]
+
+    writer.record_response(_make_record("d1", "approve"))
+    replay = reader.list_events(after_id=1, tenant_id="tenant-a", all_tenants=False)
+    assert [(event["event_id"], event["event_type"]) for event in replay] == [(2, "decided")]
+    items, total = reader.list_history(
+        tenant_id="tenant-a", all_tenants=False, limit=1, offset=0
+    )
+    assert total == 1
+    assert items[0].status == "approve"
 
 
 def test_in_memory_store_refresh_noop() -> None:

@@ -1,7 +1,7 @@
 # Loop Controller — 企业内部 Agent 工具调用治理基础设施
 
-> **当前版本**：v0.54.0（可靠多 Agent 调度与执行编排基线）
-> **项目阶段**：可靠调度代码与代码级门禁已完成；真实双独立 OS 进程/容器崩溃接管，以及 Protected MCP 完整拓扑、Go→Python strict、Docker/Kubernetes CNI 与 Secret 隔离等支持环境发布门禁仍待执行。`compatibility` 为默认模式，`strict` 必须显式启用。
+> **当前版本**：v0.55.0（管理治理台全面接入真实后端）
+> **项目阶段**：核心治理层、A2A 调度内核与管理治理台均已完成代码级实现并通过全量自动化测试；真实双独立 OS 进程/容器崩溃接管，以及 Protected MCP 完整拓扑、Go→Python strict、Docker/Kubernetes CNI 与 Secret 隔离等支持环境发布门禁仍待执行。`compatibility` 为默认模式，`strict` 必须显式启用。
 > **首选语言**：Python（Agent 生态最丰富，社区传播友好）
 > **文档语言**：中文为主，代码与核心 API 文档以英文为主，便于国际化开源
 
@@ -74,11 +74,11 @@ Loop Controller 用同样的逻辑管理 Agent，抽象为 **R0-R3 四层治理�
 ```
 src/
 ├── loop_controller/        # Python 治理层源码（R1/R2/R3、三入口、执行器、IIGE、Go 内核桥接）
-├── Loop_Controller_MVP方案_纯工具调用_v1.1.md   # 当前权威实现依据
-├── Loop_Controller_MVP开发指南_v1.0.md
-├── development_log.md                          # 迭代开发记录
-├── KNOWN_LIMITATIONS.md                        # MVP 明确声明的能力边界
+├── KNOWN_LIMITATIONS.md                        # 明确声明的能力边界
 └── 发布检查清单_v0.1.0.md                      # 发布前手动 gate 与回归清单
+go/                         # Go A2A 交互治理内核（调度、委托、死信、SSE）
+frontend/                   # Vue 3 管理治理台（src/ + docs/ 前端设计文档）
+config/                     # 运行配置样例（开发占位凭据，生产必须替换）
 docs/
 ├── architecture/           # 架构文档
 │   ├── overview.md
@@ -90,7 +90,7 @@ docs/
 │   ├── 03_runtime_governance_landscape.md
 │   └── 内控最小岗位结构抽象_v0.1.md
 reports/                  # 汇报与研究报告
-tests/legacy/security_experiments/  # 早期实验（已归档，pytest 忽略）
+tests/                    # pytest 单元与集成测试
 ```
 
 ---
@@ -136,16 +136,7 @@ $env:PYTHONPATH="src"
 .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
-当前已通过 **800+ 个单元与集成测试**（集成测试需有效 OPA 二进制），覆盖：
-- 配置加载与 8 条启动校验
-- R1 `RuleBasedClassifier` 风险分类
-- R2 `Checkpoint` 判定流水线、审批、权限组合、预算、调用次数上限
-- R0-delegate 同步/异步审批打桩
-- R3 哈希链、分级掩码、审计埋点
-- OPA/Rego fail-closed 策略
-- 端到端 approve/deny 路径
-- `@governed` 主路线、MCP Proxy、HTTP REST API 安全路径与错误脱敏
-- SDK 并发安全（ContextVar、PrivateAttr、原子注册表替换）
+测试套件覆盖配置校验、R1 风险分类、R2 判定流水线（审批/权限组合/预算/调用次数上限）、R3 哈希链审计与分级掩码、OPA/Rego fail-closed 策略、端到端 approve/deny 路径，以及 SDK、MCP Proxy 与 HTTP REST API 三条接入主线的安全路径与错误脱敏。
 
 ### 运行端到端示例
 
@@ -215,6 +206,35 @@ $env:PYTHONPATH="src"
 
 `research_agent.py` 不调用 Loop Controller 内部 API，仅以标准 MCP client 身份启动 `lc proxy`，因此可代表外部 Agent。它会真实读取文件、查询 sqlite、写入文件、尝试外发邮件，并被 R2 治理。
 
+### 启动治理台（v0.55.0）
+
+Loop Controller 附带 Vue 3 + Element Plus 管理治理台（`frontend/`），
+覆盖仪表盘、审批台（SSE 推送优先）、Agent/Profile 管理、RBAC 绑定、
+Policy 生命周期（validate/shadow/publish/rollback）、A2A 任务树、
+死信队列（列表 + 重放）、审计查询与系统配置。全部页面均接入
+真实 Http 数据源（Mock 仅保留作测试替身）。
+
+```powershell
+# 1. 启动 OPA 与 Python Server（见上文）
+# 2. 启动 Go A2A 内核（可选，A2A 页面需要）
+cd go
+go run ./cmd/kernel -addr :8080 -secret test-secret -db ..\data\a2a.db -development -allow-http
+
+# 3. 启动前端开发服务器
+cd frontend
+npm install
+npm run dev   # http://127.0.0.1:5173
+```
+
+前端详细文档见
+[frontend/docs/frontend_development_plan.md](frontend/docs/frontend_development_plan.md)
+与[前端接口契约说明](frontend/docs/frontend_api_gaps.md)。
+
+> **配置安全说明**：`config/` 目录下的所有 token/key（如
+> `identity.yaml` 中的 `dev-token-*`）均为开发用占位凭据，仅用于本地
+> 演示与测试，**生产部署必须全部替换**并通过配置声明的 `*_token_env`
+> 环境变量注入。
+
 ### 真实 LLM Agent 验证（v0.9.1）
 
 v0.9.1 使用真实 LLM（DeepSeek）驱动 `LLMPlanner`，让 Agent 自主规划工具调用。API key 只通过环境变量 `LLM_API_KEY` 传入，不落盘：
@@ -258,7 +278,7 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 
 ---
 
-## 7. 当前阶段与路线图
+## 8. 当前阶段与路线图
 
 ### Phase 0：前期调研（已完成）
 
@@ -303,14 +323,18 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 - [x] v0.52.0：多租户、企业身份与 RBAC
 - [x] v0.53.0：workload/delegated identity、Secret 引用、受保护出口、ExecutionReceipt、能力协商与静态部署 conformance
 - [x] v0.54.0：可靠多 Agent 调度、durable assignment/lease/fence、retry/failover/dead-letter、有界静态 DAG、可靠 SSE、migration、readiness 与 metrics（支持环境门禁仍待执行）
+- [x] v0.55.0：管理治理台全面接入真实接口（A2A 任务树、RBAC/Policy、
+      死信队列重放、审批 SSE 推送）、管理台 A2A 代理端点、
+      Go 内核控制面凭据装配、前端 CI 门禁；
+      详见 [CHANGELOG.md](CHANGELOG.md)
 - [ ] T3.5（可选）：LLMPlanner JSON Schema 契约实现
 - [ ] 补充更多示例与文档
-- [ ] 建立完整 CI/CD、代码规范、贡献指南
-- [ ] 准备开源发布（CHANGELOG、贡献指南）
+- [x] 建立完整 CI/CD、代码规范、贡献指南
+- [x] 准备开源发布（CHANGELOG、贡献指南）
 
 ---
 
-## 8. 关键证据
+## 9. 关键证据
 
 - **T1 测试**：LLM 判定型 Guardrail 对信息提取型注入的拦截率在 20%-60% 之间波动，且多次触发 API 速率限制；无 Guardrail 时 Agent 100% 泄露敏感信息。
 - **T3 测试**：MCP 协议的 OAuth 2.1 授权为 OPTIONAL 且主要覆盖传输层，缺少工具级权限表达；Client Policy Gateway 是可行且必要的补充层。
@@ -320,13 +344,16 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 
 ---
 
-## 9. 贡献与联系
+## 10. 贡献与联系
 
-本项目目前进入 MVP 实现阶段，欢迎任何形式的反馈、建议和贡献。
+本项目已完成 MVP 并进入持续迭代阶段，欢迎任何形式的反馈、建议和贡献。
 
 - 如果你对企业内控有经验，请帮助我们验证 R0-R3 映射模型的合理性；
 - 如果你有 Agent 框架的开发经验，请帮助我们评估技术路线的可行性；
 - 如果你只是对 "把 Agent 当人看" 这个理念感兴趣，也欢迎加入讨论。
+
+参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md)，版本变更见
+[CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
