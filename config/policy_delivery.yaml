@@ -1,0 +1,28 @@
+# 策略生命周期/发布投递（candidate → validate → shadow → publish → rollback）。
+# 启用后 /v1/admin/policy/candidates 等管理端点可用（治理台"策略生命周期"页）。
+#
+# 本文件是入库样例，保持 enabled: false 的安全默认值。
+# 本地联调/演示需要启用时：复制为 config/policy_delivery.local.yaml
+# 并把 enabled 改为 true（*.local.yaml 已被 gitignore，loader 优先读取）。
+#
+# 启用时 P0 启动门禁要求（缺一不可，否则拒绝启动）：
+#   1. required_instance_ids 非空、status_ttl_seconds > 0
+#   2. opa_binary 指向存在的文件（相对路径按项目根解析，任何机器克隆后均可复用；
+#      OPA 二进制下载到 tools/ 下，该目录已 gitignore）
+#   3. admin/bundle/status 三个 token 环境变量均已设置且互不相同
+policy_delivery:
+  enabled: false
+  data_dir: "./data"
+  state_db_path: "./data/state.db"
+  opa_binary: "tools/opa.exe"
+  bundle_name: "loop-controller"
+  required_instance_ids:
+    - "opa-local-1"
+  status_ttl_seconds: 60
+  admin_token_env: "LOOP_CONTROLLER_API_KEY"
+  bundle_token_env: "LOOP_CONTROLLER_BUNDLE_TOKEN"
+  status_token_env: "LOOP_CONTROLLER_OPA_STATUS_TOKEN"
+  shadow_candidate_endpoint: ""
+  max_status_payload_bytes: 65536
+  shadow_max_samples: 1000
+  shadow_max_input_bytes: 65536

@@ -14,7 +14,7 @@ import pytest
 import yaml
 
 from loop_controller.controller import LoopController
-from tests.conftest import write_trusted_local_harness_config
+from tests.conftest import disable_policy_delivery_for_tests, write_trusted_local_harness_config
 from tests.controller_helpers import controller_for
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -39,6 +39,7 @@ def integration_workdir(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     shutil.copytree(REPO_ROOT / "config", root / "config")
+    disable_policy_delivery_for_tests(root / "config")
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     (root / "data").mkdir()
     _chmod_private_tree(root)

@@ -621,7 +621,7 @@ class GoKernelBridge:
         url = f"{self._base_url}/a2a/v1/agents"
         try:
             client = await self._client_context()
-            response = await client.get(url)
+            response = await client.get(url, headers=self._auth_headers())
             return response.status_code == 200
         except httpx.RequestError as exc:
             logger.warning("Go kernel ping unreachable: %s", exc)

@@ -51,6 +51,24 @@ def write_trusted_local_harness_config(
         lines.extend(f"    - {tool}" for tool in tools)
     (config_path / "harness_tools.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+
+def disable_policy_delivery_for_tests(config_dir: Path | str) -> None:
+    """复制仓库配置后将其恢复为"无本地覆盖"的测试基线。
+
+    1. 删除 ``*.local.yaml``：本地联调/演示覆盖（loader 优先读取）不进入测试
+       工作目录——部分集成测试会另起子进程加载同一份配置，conftest 的
+       monkeypatch 在子进程中不生效。
+    2. 显式关闭 policy_delivery：P0 启动门禁要求 OPA 二进制存在且
+       admin/bundle/status 三个凭据环境变量均已设置；测试工作目录不携带这些
+       运行时依赖。门禁本身的校验由 config_loader 专项测试覆盖。
+    """
+    config_path = Path(config_dir)
+    for local in config_path.glob("*.local.yaml"):
+        local.unlink()
+    path = config_path / "policy_delivery.yaml"
+    if path.exists():
+        path.write_text("policy_delivery:\n  enabled: false\n", encoding="utf-8")
+
 # P0 HMAC：为全部测试自动注入一个 32 字节测试 key，避免默认 hmac-sha256 模式启动失败。
 # 该 key 仅用于测试，不进入任何日志/审计内容。
 TEST_AUDIT_HMAC_KEY = "a" * 64  # 64 hex chars = 32 bytes
@@ -59,6 +77,21 @@ TEST_AUDIT_HMAC_KEY = "a" * 64  # 64 hex chars = 32 bytes
 @pytest.fixture(autouse=True)
 def _set_default_audit_hmac_key(monkeypatch):
     monkeypatch.setenv("LOOP_CONTROLLER_AUDIT_HMAC_KEY", TEST_AUDIT_HMAC_KEY)
+
+
+@pytest.fixture(autouse=True)
+def _ignore_config_local_overrides(monkeypatch):
+    """测试忽略 config/*.local.yaml 本地覆盖。
+
+    复制仓库 config/ 的 fixture 不应受本地联调/演示的 *.local.yaml 影响；
+    _with_local_override 本身的行为由 test_admin_console_availability 的
+    TestLocalOverride 直接覆盖。
+    """
+    from loop_controller.infra.config_loader import ConfigLoader
+
+    monkeypatch.setattr(
+        ConfigLoader, "_with_local_override", staticmethod(lambda path: path)
+    )
 
 
 def _terminate_proc(proc: subprocess.Popen[Any]) -> None:
