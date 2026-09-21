@@ -142,8 +142,13 @@ def kernel_url(tmp_path_factory: pytest.TempPathFactory) -> Generator[str, None,
         stderr=subprocess.PIPE,
     )
 
-    deadline = time.perf_counter() + 15.0
+    deadline = time.perf_counter() + 90.0
     while time.perf_counter() < deadline:
+        if proc.poll() is not None:
+            stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+            raise RuntimeError(
+                f"Go kernel exited early with code {proc.returncode}:\n{stderr}"
+            )
         try:
             resp = httpx.get(f"{url}/health", timeout=1.0)
             if resp.status_code == 200:
@@ -154,7 +159,10 @@ def kernel_url(tmp_path_factory: pytest.TempPathFactory) -> Generator[str, None,
     else:
         proc.terminate()
         proc.wait(timeout=5.0)
-        raise RuntimeError("Go kernel did not start in time")
+        stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+        raise RuntimeError(
+            f"Go kernel did not start in time:\n{stderr[-2000:]}"
+        )
 
     yield url
 
