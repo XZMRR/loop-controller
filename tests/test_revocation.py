@@ -26,7 +26,7 @@ from loop_controller.infra.durable_io import DurableIOError
 from loop_controller.infra.hot_reload import HotReloader
 from loop_controller.models import ApprovalRecord
 from loop_controller.server import build_app
-from tests.conftest import write_trusted_local_harness_config
+from tests.conftest import disable_policy_delivery_for_tests, write_trusted_local_harness_config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -340,6 +340,7 @@ def approval_workdir(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     shutil.copytree(REPO_ROOT / "config", root / "config")
+    disable_policy_delivery_for_tests(root / "config")
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     (root / "data").mkdir()
     (root / "config" / "profiles.yaml").write_text(

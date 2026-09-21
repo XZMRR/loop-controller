@@ -1014,8 +1014,13 @@ def build_runtime(
         bundle_reader_token = os.environ[delivery_config.bundle_token_env]
         status_writer_token = os.environ[delivery_config.status_token_env]
 
+    from loop_controller.rbac import SqliteRoleBindingStore
+
+    # 管理面存储与 enforcement 解耦：绑定/授权管理在 enforcement 关闭时也可用，
+    # 便于"先配置绑定、后开启 enforce"的运维流程；鉴权仍由 enforcement 门控。
+    rbac_db = _state_db_for(config.rbac.state_db_path)
+    rbac_store = SqliteRoleBindingStore(rbac_db)
     rbac_enforcer = None
-    rbac_store = None
     rbac_credential_resolver = None
     if config.rbac.enforce:
         from loop_controller.rbac import (
@@ -1023,13 +1028,9 @@ def build_runtime(
             RbacEnforcer,
             Role,
             RoleBinding,
-            SqliteRoleBindingStore,
             StaticCredential,
             StaticCredentialResolver,
         )
-
-        rbac_db = _state_db_for(config.rbac.state_db_path)
-        rbac_store = SqliteRoleBindingStore(rbac_db)
         # 静态凭证的 roles 列表可能含多个角色：逐角色展开为独立绑定。
         expanded: list[RoleBinding] = []
         for idx, binding in enumerate(config.rbac.bindings):

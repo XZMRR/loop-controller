@@ -25,6 +25,7 @@ from loop_controller.executors.base import (
 from loop_controller.infra.approval_store import JsonlApprovalStore
 from loop_controller.infra.config_loader import ConfigLoader
 from loop_controller.models import ActionProposal, ApprovalRecord, CapabilityProfile, ToolResult
+from tests.conftest import disable_policy_delivery_for_tests
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -83,6 +84,7 @@ def workdir(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     shutil.copytree(REPO_ROOT / "config", root / "config")
+    disable_policy_delivery_for_tests(root / "config")
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     (root / "data").mkdir()
     # 使用最小 profile，只保留 web_search，避免触发需要 npx 的工具

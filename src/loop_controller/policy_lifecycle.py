@@ -17,6 +17,7 @@ from loop_controller.infra.state_db import StateDatabase, StateDatabaseError
 from loop_controller.utils.canonical import canonical_json
 
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
+_NANO_RE = re.compile(r"(\.\d{6})\d+")
 _INSTANCE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _SECRET_RE = re.compile(r"(?i)(authorization|bearer|token|secret|password|api[-_]?key)\s*[:=]\s*\S+")
 
@@ -70,6 +71,12 @@ class PolicyLifecycleService:
                     ).fetchone()
                     if previous is not None:
                         if previous["report_sha256"] == digest:
+                            # 心跳：内容没变也刷新接收时间，实例保持 fresh。
+                            conn.execute(
+                                "UPDATE opa_instance_status SET received_at=? WHERE instance_id=?",
+                                (now.isoformat(), report["instance_id"]),
+                            )
+                            self._aggregate(conn, now)
                             return self.status(now=now)
                         old_seq, new_seq = previous["report_sequence"], report["report_sequence"]
                         old_time, new_time = previous["opa_reported_at"], report["opa_reported_at"]
@@ -77,7 +84,11 @@ class PolicyLifecycleService:
                             if new_seq <= old_seq:
                                 raise PolicyStatusError("status report replay")
                         elif old_time is not None and new_time is not None:
-                            if new_time <= old_time:
+                            # OPA 周期上报的激活时间不变（bundle 未更新），
+                            # 时间相等且版本未变视为心跳；只有回退才拒绝。
+                            if new_time < old_time:
+                                raise PolicyStatusError("status report replay")
+                            if new_time == old_time and report["revision"] != previous["revision"]:
                                 raise PolicyStatusError("status report replay")
                         else:
                             raise PolicyStatusError("status report 缺少可比较单调证据")
@@ -112,17 +123,41 @@ class PolicyLifecycleService:
             bundles = payload.get("bundles")
             if not isinstance(labels, dict) or not isinstance(bundles, dict):
                 raise PolicyStatusError("标准 status 缺少 labels/bundles")
-            instance_id = labels.get("id") or labels.get("instance_id") or payload.get("partition_name")
+            # 真实 OPA 会用实例 UUID 覆盖 labels.id，自定义 instance_id 优先。
+            instance_id = labels.get("instance_id") or labels.get("id") or payload.get("partition_name")
             bundle = bundles.get(self.config.bundle_name)
             if not isinstance(bundle, dict):
                 raise PolicyStatusForbiddenError("status 缺少目标 bundle")
             revision = bundle.get("active_revision") or bundle.get("revision")
             state = bundle.get("status") or bundle.get("state")
             error = bundle.get("errors") or bundle.get("error")
-            error_code = bundle.get("error_code")
-            reported = payload.get("timestamp")
+            # 真实 OPA 加载失败时的标准 status 没有 status 字段，
+            # 只有 code/download_code/errors，须识别为 error 态而非拒绝。
+            error_code = (
+                bundle.get("error_code")
+                or bundle.get("code")
+                or bundle.get("download_code")
+            )
+            if state is None:
+                # OPA 1.x 成功态同样没有 status 字段：有激活版本视为 loaded。
+                if error_code or error:
+                    state = "error"
+                elif revision:
+                    state = "loaded"
+            # OPA 1.x status 顶层没有 timestamp 字段，用 bundle 侧的
+            # 激活/下载时间作为上报时间（兼作防重放的单调证据）。
+            reported = (
+                payload.get("timestamp")
+                or bundle.get("last_successful_activation")
+                or bundle.get("last_successful_download")
+                or bundle.get("last_request")
+            )
             sequence = payload.get("sequence")
-            version = payload.get("version") or payload.get("opa_version")
+            version = (
+                payload.get("version")
+                or payload.get("opa_version")
+                or labels.get("version")
+            )
         elif schema_version == "loop-controller-status-v1":
             instance_id = payload.get("instance_id") or payload.get("labels", {}).get("id")
             if payload.get("bundle_name") != self.config.bundle_name:
@@ -139,6 +174,9 @@ class PolicyLifecycleService:
             raise PolicyStatusForbiddenError("未知 OPA instance")
         if revision is not None and (not isinstance(revision, str) or not _REVISION_RE.fullmatch(revision)):
             raise PolicyStatusError("revision 格式非法")
+        if isinstance(state, str):
+            # 真实 OPA 上报大写 "OK"，统一小写后归一化。
+            state = state.lower()
         if state in {"ok", "active", "loaded", "success"}:
             state = "loaded"
         elif state in {"error", "failed"}:
@@ -164,7 +202,10 @@ class PolicyLifecycleService:
             if not isinstance(reported, str):
                 raise PolicyStatusError("status timestamp 非法")
             try:
-                parsed = datetime.fromisoformat(reported.replace("Z", "+00:00"))
+                # 真实 OPA 的 RFC3339 时间戳带纳秒（7 位小数），
+                # datetime.fromisoformat 最多只接受 6 位微秒，先截断。
+                normalized = _NANO_RE.sub(r"\1", reported.replace("Z", "+00:00"))
+                parsed = datetime.fromisoformat(normalized)
                 if parsed.tzinfo is None:
                     raise ValueError
                 reported_at = parsed.astimezone(UTC).isoformat()

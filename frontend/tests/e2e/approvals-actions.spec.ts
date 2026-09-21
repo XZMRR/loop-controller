@@ -21,6 +21,12 @@ async function stubApprovalBackend(page: Page, approveStatus = 200) {
   let approvalDone = false
   const requests: Array<{ action: string; body: any; auth: string | null }> = []
 
+  // 兜底（最低优先级，先注册）：布局会附带请求 identity/entrypoints 等本用例
+  // 未关心的端点；本机联调后端在运行时这些请求会穿透到真实服务拿到 401，
+  // 把内存会话踢回登录页。后注册的具体 stub 优先匹配。
+  await page.route('**/admin/**', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
+  })
   // 注意：Playwright 路由后注册者优先匹配，审批相关端点用单一处理器按 URL 分发，
   // 避免宽泛的 '**/v1/admin/approvals**' 拦截 /pending 请求
   await page.route('**/v1/admin/approvals**', async (route: Route) => {
@@ -97,6 +103,15 @@ async function loginAndOpenApprovals(page: Page) {
   await stubJson(page, 'v1/admin/health', { status: 'ok' })
   await stubJson(page, 'admin/revocation-list', { revocations: [], kill_switch: false })
   await stubJson(page, 'v1/admin/agents', { agents: [], users: [] })
+  // /metrics 为文本端点；本机联调后端在运行时未 stub 会穿透并因假 token 返回 401，
+  // 触发全局 401 拦截器把会话踢回登录页。
+  await page.route('**/metrics**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/plain',
+      body: 'lc_requests_total 42\ngo_goroutines 18\n',
+    })
+  })
   await loginViaUI(page)
   await page.getByRole('menuitem', { name: '审批台' }).click()
   await expect(page.getByText('dec-e2e-001')).toBeVisible()
@@ -179,12 +194,26 @@ test.describe('审批操作流', () => {
 
 test.describe('吊销与 Kill Switch', () => {
   async function loginAndOpenSettings(page: Page) {
+    // 兜底（最低优先级，先注册）：系统配置页还会拉 harness/secrets/profiles
+    // 等本用例未关心的端点；本机联调后端在运行时穿透拿到 401 会把会话踢回
+    // 登录页。后注册的具体 stub 优先匹配。
+    await page.route('**/admin/**', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
+    })
     await stubSessionLogin(page, true)
     await stubJson(page, 'v1/admin/health', { status: 'ok' })
     await stubJson(page, 'v1/admin/entrypoints', { entrypoints: {} })
     await stubJson(page, 'v1/admin/identity', { config: {} })
     await stubJson(page, 'v1/admin/agents', { agents: [], users: [] })
     await stubJson(page, 'v1/admin/approvals/pending', { approvals: [] })
+    // 同 loginAndOpenApprovals：/metrics 未 stub 时本机后端会以 401 踢掉会话
+    await page.route('**/metrics**', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/plain',
+        body: 'lc_requests_total 42\ngo_goroutines 18\n',
+      })
+    })
     const calls: Array<{ url: string; body: any }> = []
     await page.route('**/admin/revoke', async (route) => {
       calls.push({ url: route.request().url(), body: route.request().postDataJSON() })

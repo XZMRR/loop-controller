@@ -85,6 +85,9 @@ mcp_servers_official/
 # Local OPA binary (58MB, downloaded into tools/)
 tools/
 
+# Local config overrides (local联调/演示状态，不入库；loader 优先读 *.local.yaml)
+config/*.local.yaml
+
 # Runtime data (generated)
 data/*.jsonl
 data/output/

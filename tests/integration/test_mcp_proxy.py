@@ -17,7 +17,7 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from tests.conftest import write_trusted_local_harness_config
+from tests.conftest import disable_policy_delivery_for_tests, write_trusted_local_harness_config
 from tests.controller_helpers import env_extra
 from tests.integration.conftest import _chmod_private_tree
 
@@ -40,6 +40,7 @@ def mcp_proxy_workdir(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     shutil.copytree(REPO_ROOT / "config", root / "config")
+    disable_policy_delivery_for_tests(root / "config")
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     shutil.copytree(REPO_ROOT / "src", root / "src")
     (root / "data").mkdir()
@@ -112,6 +113,7 @@ def mcp_proxy_approval_workdir(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     shutil.copytree(REPO_ROOT / "config", root / "config")
+    disable_policy_delivery_for_tests(root / "config")
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     shutil.copytree(REPO_ROOT / "src", root / "src")
     (root / "data").mkdir()

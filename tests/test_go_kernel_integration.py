@@ -154,6 +154,12 @@ def kernel_url(tmp_path_factory: pytest.TempPathFactory) -> str:
             "-allow-http",
             "-interaction-url",
             f"http://127.0.0.1:{interaction_port}",
+            "-control-token",
+            "test-control-token",
+            "-control-initiator",
+            "planner_001",
+            "-control-tenant",
+            "test-tenant",
         ],
         cwd=go_root,
         stdout=subprocess.PIPE,
@@ -251,7 +257,7 @@ def _build_controller_with_bridge(audit_path: Path, bridge: GoKernelBridge) -> L
 @pytest.mark.asyncio
 async def test_loop_controller_delegates_to_agent(kernel_url: str, tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    bridge = GoKernelBridge(base_url=kernel_url, timeout=5.0)
+    bridge = GoKernelBridge(base_url=kernel_url, timeout=5.0, control_token="test-control-token")
 
     # Register executor agent in Go kernel.
     ok = await bridge.register_agent(
@@ -285,7 +291,7 @@ async def test_loop_controller_delegates_to_agent(kernel_url: str, tmp_path: Pat
 @pytest.mark.asyncio
 async def test_loop_controller_rejects_unknown_target_agent(kernel_url: str, tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    bridge = GoKernelBridge(base_url=kernel_url, timeout=5.0)
+    bridge = GoKernelBridge(base_url=kernel_url, timeout=5.0, control_token="test-control-token")
     controller = _build_controller_with_bridge(audit_path, bridge)
     await controller.start()
     try:
@@ -303,7 +309,7 @@ async def test_loop_controller_rejects_unknown_target_agent(kernel_url: str, tmp
 
 @pytest.mark.asyncio
 async def test_stream_task_updates(kernel_url: str) -> None:
-    bridge = GoKernelBridge(base_url=kernel_url, timeout=5.0)
+    bridge = GoKernelBridge(base_url=kernel_url, timeout=5.0, control_token="test-control-token")
     await bridge.register_agent(
         AgentCard(
             agent_id="executor_002",
