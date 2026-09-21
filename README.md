@@ -215,6 +215,35 @@ $env:PYTHONPATH="src"
 
 `research_agent.py` 不调用 Loop Controller 内部 API，仅以标准 MCP client 身份启动 `lc proxy`，因此可代表外部 Agent。它会真实读取文件、查询 sqlite、写入文件、尝试外发邮件，并被 R2 治理。
 
+### 启动治理台（v0.55-dev）
+
+Loop Controller 附带 Vue 3 + Element Plus 管理治理台（`frontend/`），
+覆盖仪表盘、审批台（SSE 推送优先）、Agent/Profile 管理、RBAC 绑定、
+Policy 生命周期（validate/shadow/publish/rollback）、A2A 任务树、
+死信队列（列表 + 重放）、审计查询与系统配置。v0.55 起全部页面已接入
+真实 Http 数据源（Mock 仅保留作测试替身）。
+
+```powershell
+# 1. 启动 OPA 与 Python Server（见上文）
+# 2. 启动 Go A2A 内核（可选，A2A 页面需要）
+cd go
+go run ./cmd/kernel -addr :8080 -secret test-secret -db ..\data\a2a.db -development -allow-http
+
+# 3. 启动前端开发服务器
+cd frontend
+npm install
+npm run dev   # http://127.0.0.1:5173
+```
+
+前端详细文档见
+[frontend/docs/frontend_development_plan.md](frontend/docs/frontend_development_plan.md)
+与[接口缺口报告](frontend/docs/frontend_api_gaps.md)。
+
+> **配置安全说明**：`config/` 目录下的所有 token/key（如
+> `identity.yaml` 中的 `dev-token-*`）均为开发用占位凭据，仅用于本地
+> 演示与测试，**生产部署必须全部替换**并通过配置声明的 `*_token_env`
+> 环境变量注入。
+
 ### 真实 LLM Agent 验证（v0.9.1）
 
 v0.9.1 使用真实 LLM（DeepSeek）驱动 `LLMPlanner`，让 Agent 自主规划工具调用。API key 只通过环境变量 `LLM_API_KEY` 传入，不落盘：
@@ -258,7 +287,7 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 
 ---
 
-## 7. 当前阶段与路线图
+## 8. 当前阶段与路线图
 
 ### Phase 0：前期调研（已完成）
 
@@ -303,6 +332,10 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 - [x] v0.52.0：多租户、企业身份与 RBAC
 - [x] v0.53.0：workload/delegated identity、Secret 引用、受保护出口、ExecutionReceipt、能力协商与静态部署 conformance
 - [x] v0.54.0：可靠多 Agent 调度、durable assignment/lease/fence、retry/failover/dead-letter、有界静态 DAG、可靠 SSE、migration、readiness 与 metrics（支持环境门禁仍待执行）
+- [ ] v0.55.0（backend/v0.55-dev 开发中）：管理治理台全面接入真实接口
+      （A2A 任务树、RBAC/Policy、死信队列重放、审批 SSE 推送）、
+      管理台 A2A 代理端点、Go 内核控制面凭据装配、前端 CI 门禁；
+      详见 [CHANGELOG.md](CHANGELOG.md) Unreleased 一节
 - [ ] T3.5（可选）：LLMPlanner JSON Schema 契约实现
 - [ ] 补充更多示例与文档
 - [ ] 建立完整 CI/CD、代码规范、贡献指南
@@ -310,7 +343,7 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 
 ---
 
-## 8. 关键证据
+## 9. 关键证据
 
 - **T1 测试**：LLM 判定型 Guardrail 对信息提取型注入的拦截率在 20%-60% 之间波动，且多次触发 API 速率限制；无 Guardrail 时 Agent 100% 泄露敏感信息。
 - **T3 测试**：MCP 协议的 OAuth 2.1 授权为 OPTIONAL 且主要覆盖传输层，缺少工具级权限表达；Client Policy Gateway 是可行且必要的补充层。
@@ -320,13 +353,16 @@ $env:LOOP_CONTROLLER_AUDIT_HMAC_KEY="a"*64
 
 ---
 
-## 9. 贡献与联系
+## 10. 贡献与联系
 
 本项目目前进入 MVP 实现阶段，欢迎任何形式的反馈、建议和贡献。
 
 - 如果你对企业内控有经验，请帮助我们验证 R0-R3 映射模型的合理性；
 - 如果你有 Agent 框架的开发经验，请帮助我们评估技术路线的可行性；
 - 如果你只是对 "把 Agent 当人看" 这个理念感兴趣，也欢迎加入讨论。
+
+参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md)，版本变更见
+[CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
