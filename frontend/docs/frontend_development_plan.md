@@ -504,11 +504,108 @@ frontend/
 - main 此前停在 v0.48 基线（仅含两个历史 merge commit，无实质内容分叉）；
   本次 merge develop → main（合并提交 `46f9078`，262 文件，零冲突），
   已推送 origin 与 company 两库。
-- 后续协作约定：后端从 main 切分支开发（缺口清单见
-  `frontend_api_gaps.md` §7.2），前端从 main 切分支继续；
-  main 与 develop 当前内容一致，前端日常推进仍在 develop 上滚动。
 - 注意：本机两远端均为单分支 refspec（仅 fetch develop），操作 main 需用
   `git fetch <remote> main` + FETCH_HEAD 或显式 refspec。
+
+### 进度记录（第二十八轮：v0.55 后端缺口落地接入与联调修复）
+
+- **基线切换**：接入 `backend/v0.55-dev`（main 46f9078 + `17e1a12`，
+  单 commit 2457 行），本地建同名分支跟踪。
+- **v0.55 落地缺口（后端 + 前端接线已由该 commit 完成）**：
+  - Go 内核 `GET /a2a/v1/tasks`（tenant+initiator 隔离、root_only 严格校验、
+    空数组约定）+ Python 代理 `GET /v1/admin/a2a/tasks`（逐任务 RBAC +
+    载荷消毒）→ 前端 `HttpA2ATaskDataSource` 已切换，Mock 退役；
+  - `GET /v1/admin/approvals/stream` 管理台 SSE（HMAC 签名游标，
+    400/410/max_wait/心跳）→ 前端推送路径由暂定转正；
+  - 审批历史 durable 化（comment/principal/action_summary/
+    arguments_masked/call_id/task_id/tenant_id），待办列表改
+    session+RBAC 鉴权并按租户过滤；
+  - `GET /v1/admin/audit` 时间范围参数（ISO8601 aware 校验）+ 过滤下沉；
+  - `GET /v1/admin/secrets` 元数据视图（不回显明文）；
+  - 前端修复：审批提交 URL 不再硬编码 `/api/python` 前缀（buildPythonUrl）。
+- **联调修复（本仓库修复，v0.54 起遗留）**：
+  - `policy_validation.py`：OPA 1.x 在 Windows 将带盘符绝对路径误判为
+    URL scheme（`C:\...` → scheme `c`），check/test/eval 四处在 Windows 上
+    全部失败——改为相对路径 + `cwd` 传参（`OPACLIRunner.run` 新增 cwd）；
+    该 bug 影响 Windows 环境 Policy 校验生产路径；
+  - 测试配套：FakeRunner/empty_tests 兼容 cwd 参数；
+  - E2E：新增用例的 `el-radio-button` 原生 input 不可见，改点文本标签。
+- **回归（三栈全绿）**：Python 1204 passed / 8 skipped（修复前 1 failed）；
+  Go `go test ./...` 全 ok；前端 vitest 64 passed + typecheck + build；
+  Playwright E2E 16 passed（修复前 1 failed）。
+- **文档**：gaps 文档 §6 升版 v0.55、§7.2 四项标记已交付；
+  §6.2 队列表同步勾选。
+- **当前剩余队列**：RBAC/Policy/死信 Http 数据源替换（Mock 退役）；
+  `/v1/admin/users` 用户视图；参数可视化编辑；可选增量同前。
+
+### 进度记录（第二十九轮：RBAC/Policy Http 数据源替换——Mock 退役）
+
+- **核对结论**：v0.55 后端 handler 与 R19/R20 契约逐字段一致
+  （_binding_payload/_grant_payload、validate 422 幂等、shadow 503 带
+  payload、publish/rollback 202）；两处契约修正——吊销路由为
+  `POST .../{id}/revoke`（非 DELETE）、rollback 为独立端点
+  `POST /v1/admin/policy/rollback`（types.ts 早已按此建模）。
+- **新增 Http 实现**：
+  - `api/rbac/http.ts`：`HttpRbacBindingDataSource` /
+    `HttpRbacGrantDataSource`（列表解包 + 吊销 /revoke 子路由 + ID 编码）；
+  - `api/policy/http.ts`：`HttpPolicyDataSource`（validate 422 / shadow 503
+    从 axios 错误响应提取 payload 不抛错，对齐 Mock 语义；
+    publish/rollback 缺省参数补 null）。
+- **单例切换**：`rbac/index.ts`、`policy/index.ts` 改用 Http 实现，
+  Mock 类保留在 ./mock 供既有单测使用；视图零改动。
+- **测试**：新增 `tests/rbac-http.test.ts`（6 用例）与
+  `tests/policy-http.test.ts`（13 用例），vi.hoisted mock pythonClient；
+  修复导航 E2E 空态文案歧义（限定 tab 角色）。vitest 80 passed；
+  typecheck + build 全绿；E2E 16 passed。
+- **当前剩余队列**：死信 Http 数据源（待内核联调环境）；
+  `/v1/admin/users` 用户视图；参数可视化编辑；可选增量同前。
+
+### 进度记录（第三十轮：死信 Http 数据源替换 + 真实栈全链路冒烟）
+
+- **死信 E2E 修复**：三个用例补 `loginWithStubs(page)` 调用；因 auth store
+  为纯内存会话，跨 `page.goto` 直达受保护路由会被守卫弹回登录页，改用
+  登录态内点侧边栏"死信队列"导航；`stubDeadLetters` 由调用计数改为共享
+  `state.replayed` 标志，消除 15s 静默轮询对计数器的竞态；断言文案对齐
+  UI 实际（空态 `暂无死信——所有任务都在正常调度`、错误态 ElMessage 显示
+  axios message），`{ exact: true }` 与抽屉作用域断言消除 strict mode 歧义。
+- **E2E 结果**：全量 Playwright 16 → 19 passed。
+- **真实栈冒烟（Vue 前端 → Python 代理 → Go 内核）**：种入死信后全链路
+  打通——直连内核 list 200 → Python 代理 list 200（载荷消毒后字段完整）
+  → 浏览器登录进死信页 → 详情抽屉 → 确认重放（revision 3→4）→ 列表转空
+  → curl 二次重放 409 + `protocol_version` 正确返回。过程中发现并修复
+  4 个真实联调缺陷：
+  1. `_build_go_kernel_bridge` 从不装配凭据/mTLS → 控制面请求无
+     Authorization 被内核 401 → 代理 502。重写为按 `go_kernel.yaml`
+     声明的 `*_token_env` 读取静态快照，mTLS 三段文件齐全且
+     `os.path.exists` 通过才装配（样例占位路径不强制存在）；
+  2. Go 死信 list/replay 端点缺 `protocol_version` 包裹 → bridge
+     `_decode_object` 拒绝。两个 handler 补 `protocol_version`；
+  3. 重放响应由裸 assignment 改为 `{"assignment": ...}` 包裹 →
+     Python bridge 解包 + Go `api_test.go` 改结构化解码并断言
+     protocol_version 非空；
+  4. 新增 `tests/test_go_kernel_bridge.py` 两个装配用例（tmp_path 造真实
+     PEM 验证 token/mTLS 装配；disabled/缺凭据/占位路径不装配）。
+- **全量回归**：前端 vitest 83 / typecheck 0 / build 成功；Playwright 19
+  passed；Go `go test ./...` 全 ok；Python 全量 1209 passed + 8 skipped
+  （此前 test_go_kernel_integration 3 errors 为终端残留的
+  `LC_A2A_CONTROL_TOKEN` 环境污染内核启动，非代码缺陷，干净环境复跑通过）。
+- **收尾**：全部 `.smoke-*` / `.tmp-*` / `test-results` 临时产物已清理；
+  `config/go_kernel.yaml` 冒烟改动回退为样例默认（`enabled: false`）。
+- **当前剩余队列**：`/v1/admin/users` 用户视图；参数可视化编辑。
+
+### 进度记录（第三十一轮：开源就绪与 v0.55.0 发版）
+
+- **开源就绪轮**：新增 `CHANGELOG.md`（v0.55 明细 + v0.33–v0.54 历史回溯）
+  与 `CONTRIBUTING.md`（三栈环境搭建、提交前检查清单、提交规范、
+  凭据红线）；README 补治理台快速开始、v0.55 路线图勾选、dev 占位凭据
+  安全声明、章节编号修复；CI 新增前端 job（vitest / typecheck / build /
+  Playwright E2E）；pyproject 补 description / readme / license / urls
+  元数据（`uv build` 实测 wheel 元数据完整）。
+- **文档宣传化打磨**：README/src README 去除逐测试计数、修复失效文档
+  引用与归档链接、统一版本叙事至 v0.55.0。
+- **发版**：`backend/v0.55-dev` 合入 main（merge `95a03f4`），打 tag
+  `v0.55.0` 并推送 origin / company 双库；develop 同步 main。
+- **当前剩余队列**：`/v1/admin/users` 用户视图；参数可视化编辑。
 
 ---
 
@@ -541,14 +638,14 @@ frontend/
 
 ### 6.2 待后端契约（前端已按未定契约或 Mock 就位）
 
-- [ ] 管理台审批 SSE 端点（前端 `streamAdminApprovals` 已就绪，
-      推送优先 + 轮询兜底；后端落地 `GET /v1/admin/approvals/stream`
-      类端点后仅需对齐 url 与事件 payload）
-- [ ] RBAC 绑定 / Policy 治理页 Http 数据源（Mock 语义已对齐
-      server.py:1928-2070/1699-1950，契约冻结后按 types.ts 直写实现）
-- [ ] 死信队列治理页数据源（契约已对齐 Go 内核 models.TaskAssignment，
-      待内核联调环境开放）
-- [ ] 审计时间范围筛选（`GET /v1/admin/audit` 扩展参数）
+- [x] 管理台审批 SSE 端点（**v0.55 已交付**，见 R28；前端推送路径由暂定转正）
+- [x] RBAC 绑定 / Policy 治理页 Http 数据源（**v0.55 已切换**，
+      `HttpRbacBindingDataSource` / `HttpRbacGrantDataSource` /
+      `HttpPolicyDataSource`，Mock 保留供测试，见 R29）
+- [x] 死信队列治理页数据源（**v0.55 已交付并完成真实栈冒烟**，
+      `HttpDeadLetterDataSource` 已切换，见 R30）
+- [x] 审计时间范围筛选（**v0.55 已交付**，`start_time`/`end_time`）
+- [x] A2A 任务树列表（**v0.55 已交付**，`HttpA2ATaskDataSource` 已切换）
 - [ ] `GET /v1/admin/users` 用户视图数据源（Agents 页合并展示用）
 
 ### 6.3 实施顺序

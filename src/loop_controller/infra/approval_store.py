@@ -189,54 +189,77 @@ class ApprovalStore(Protocol):
     def record_response(self, record: ApprovalRecord) -> None: ...
     def get_record(self, decision_id: str) -> ApprovalRecord | None: ...
     def list_recent(self, limit: int = 100) -> list[dict[str, Any]]: ...
+    def list_history(
+        self, *, status: str | None = None, agent_id: str | None = None,
+        tool_name: str | None = None, requester_id: str | None = None,
+        approver_id: str | None = None, tenant_id: str | None = None,
+        all_tenants: bool = False, limit: int = 100, offset: int = 0,
+    ) -> tuple[list[ApprovalHistoryItem], int]: ...
+    def list_events(
+        self, *, after_id: int, tenant_id: str | None, all_tenants: bool,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]: ...
+    def event_bounds(
+        self, *, tenant_id: str | None, all_tenants: bool
+    ) -> tuple[int | None, int]: ...
     def refresh(self) -> None: ...
 
 
+def _safe_original_decision(request: ApprovalRequest) -> dict[str, Any] | None:
+    decision = request.original_decision
+    if decision is None:
+        return None
+    data = decision.model_dump(mode="json")
+    allowed = (
+        "verdict", "reason", "policy_hits", "policy_version", "profile_version",
+        "escalation_target", "expires_at",
+    )
+    return {key: data.get(key) for key in allowed}
+
+
+def _history_item(
+    request: ApprovalRequest, record: ApprovalRecord | None
+) -> ApprovalHistoryItem:
+    verdict = getattr(record.verdict, "value", record.verdict) if record else "pending"
+    return ApprovalHistoryItem(
+        request_id=request.request_id,
+        decision_id=request.decision_id,
+        call_id=request.call_id,
+        task_id=request.task_id,
+        tenant_id=request.tenant_id,
+        agent_id=request.agent_id,
+        tool_name=request.tool_name,
+        requester_id=request.requester_id,
+        approver_id=record.approver_id if record else request.approver_id,
+        arguments_masked=request.arguments_masked,
+        reason=request.reason,
+        status=verdict,
+        comment=record.comment if record else None,
+        principal=record.principal if record else None,
+        action_summary=record.action_summary if record else None,
+        original_decision=_safe_original_decision(request),
+        created_at=request.created_at,
+        decided_at=record.decided_at if record else None,
+    )
+
+
 def list_approval_history(
-    pending_requests: list[ApprovalRequest],
-    completed_records: list[tuple[ApprovalRequest, ApprovalRecord]],
+    requests: list[tuple[ApprovalRequest, ApprovalRecord | None]],
     *,
     status: str | None = None,
     agent_id: str | None = None,
     tool_name: str | None = None,
     requester_id: str | None = None,
     approver_id: str | None = None,
+    tenant_id: str | None = None,
+    all_tenants: bool = False,
     limit: int = 100,
     offset: int = 0,
-) -> list[ApprovalHistoryItem]:
-    """按统一契约返回审批历史（多 Agent / 多 Profile 场景预留）。"""
-
-    items: list[ApprovalHistoryItem] = []
-    for request in pending_requests:
-        items.append(
-            ApprovalHistoryItem(
-                request_id=request.request_id,
-                decision_id=request.decision_id,
-                agent_id=request.agent_id,
-                tool_name=request.tool_name,
-                requester_id=request.requester_id,
-                approver_id=request.approver_id,
-                reason=request.reason,
-                status="pending",
-                created_at=request.created_at,
-            )
-        )
-    for request, record in completed_records:
-        verdict = getattr(record.verdict, "value", record.verdict)
-        items.append(
-            ApprovalHistoryItem(
-                request_id=request.request_id,
-                decision_id=request.decision_id,
-                agent_id=request.agent_id,
-                tool_name=request.tool_name,
-                requester_id=request.requester_id,
-                approver_id=record.approver_id,
-                reason=request.reason,
-                status=verdict,
-                created_at=request.created_at,
-                decided_at=record.decided_at,
-            )
-        )
+) -> tuple[list[ApprovalHistoryItem], int]:
+    """为兼容存储提供统一、安全且先计数后分页的查询契约。"""
+    items = [_history_item(request, record) for request, record in requests]
+    if not all_tenants:
+        items = [item for item in items if item.tenant_id == tenant_id]
     if status not in (None, "all"):
         items = [item for item in items if item.status == status]
     if agent_id:
@@ -251,9 +274,8 @@ def list_approval_history(
         key=lambda item: item.created_at or item.decided_at or datetime.min.replace(tzinfo=UTC),
         reverse=True,
     )
-    if offset:
-        items = items[offset:]
-    return items[:limit]
+    total = len(items)
+    return items[offset : offset + limit], total
 
 
 class JsonlApprovalStore:
@@ -269,6 +291,7 @@ class JsonlApprovalStore:
         self._crypto = crypto
         self._requests: dict[str, ApprovalRequest] = {}
         self._responses: dict[str, ApprovalRecord] = {}
+        self._events: list[tuple[int, str, str]] = []
         self._lock = threading.RLock()
         self.refresh()
 
@@ -289,6 +312,7 @@ class JsonlApprovalStore:
     def _refresh_locked(self, transaction) -> None:
         requests: dict[str, ApprovalRequest] = {}
         responses: dict[str, ApprovalRecord] = {}
+        events: list[tuple[int, str, str]] = []
         transaction._stream.seek(0)
         content = transaction._stream.read()
         for raw in content.splitlines(keepends=True):
@@ -300,16 +324,20 @@ class JsonlApprovalStore:
                 record = json.loads(raw)
                 if record.get("type") == "request":
                     request = _deserialize_request(record, crypto=self._crypto)
+                    if request.decision_id not in requests:
+                        events.append((len(events) + 1, "pending", request.decision_id))
                     requests[request.decision_id] = request
                 elif record.get("type") == "response":
                     response = _deserialize_record(record)
+                    if response.decision_id not in responses:
+                        events.append((len(events) + 1, "decided", response.decision_id))
                     responses.setdefault(response.decision_id, response)
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 self._alert_for_bad_line(raw.decode("utf-8", errors="replace"), "invalid_json")
                 raise ApprovalStoreCorruptedError(
                     f"审批存储 {self._path} 存在损坏的完整记录"
                 ) from exc
-        self._requests, self._responses = requests, responses
+        self._requests, self._responses, self._events = requests, responses, events
 
     def refresh(self) -> None:
         with self._lock:
@@ -328,6 +356,10 @@ class JsonlApprovalStore:
                     existing = self._requests.get(request.decision_id)
                     if existing == request:
                         return
+                    if existing is not None:
+                        raise ApprovalStoreError(
+                            f"decision_id {request.decision_id} 已绑定不同审批请求"
+                        )
                     transaction.append_json(_serialize_request(request, crypto=self._crypto))
                     self._requests[request.decision_id] = request
             except DurableIOError as exc:
@@ -372,6 +404,45 @@ class JsonlApprovalStore:
         ]
         items.sort(key=lambda item: item["created_at"], reverse=True)
         return items[:limit]
+
+    def list_history(self, **filters: Any) -> tuple[list[ApprovalHistoryItem], int]:
+        self.refresh()
+        pairs = [
+            (request, self._responses.get(decision_id))
+            for decision_id, request in self._requests.items()
+        ]
+        return list_approval_history(pairs, **filters)
+
+    def list_events(
+        self, *, after_id: int, tenant_id: str | None, all_tenants: bool, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        self.refresh()
+        result: list[dict[str, Any]] = []
+        for event_id, event_type, decision_id in self._events:
+            request = self._requests.get(decision_id)
+            if event_id <= after_id or request is None:
+                continue
+            if not all_tenants and request.tenant_id != tenant_id:
+                continue
+            record = self._responses.get(decision_id) if event_type == "decided" else None
+            result.append({
+                "event_id": event_id,
+                "event_type": event_type,
+                "item": _history_item(request, record),
+            })
+            if len(result) >= limit:
+                break
+        return result
+
+    def event_bounds(
+        self, *, tenant_id: str | None, all_tenants: bool
+    ) -> tuple[int | None, int]:
+        self.refresh()
+        ids = [
+            event_id for event_id, _event_type, decision_id in self._events
+            if all_tenants or self._requests[decision_id].tenant_id == tenant_id
+        ]
+        return (min(ids) if ids else None, max(ids) if ids else 0)
 
 
 class SqliteApprovalStore:
@@ -527,6 +598,60 @@ class SqliteApprovalStore:
         except (StateDatabaseError, ApprovalStoreCorruptedError, ValueError) as exc:
             raise ApprovalStoreError(str(exc)) from exc
 
+    def list_history(self, **filters: Any) -> tuple[list[ApprovalHistoryItem], int]:
+        try:
+            rows = self._db.list_approval_history_json(
+                tenant_id=filters.get("tenant_id"),
+                all_tenants=bool(filters.get("all_tenants")),
+            )
+            pairs = [
+                (
+                    self._deserialize_request_json(row["request_json"] or ""),
+                    self._deserialize_response_json(row["response_json"])
+                    if row["response_json"] is not None else None,
+                )
+                for row in rows
+            ]
+            filters = dict(filters)
+            filters["all_tenants"] = True
+            return list_approval_history(pairs, **filters)
+        except (StateDatabaseError, ApprovalStoreCorruptedError, ValueError) as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def list_events(
+        self, *, after_id: int, tenant_id: str | None, all_tenants: bool, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        try:
+            rows = self._db.list_approval_events(
+                after_id=after_id, tenant_id=tenant_id, all_tenants=all_tenants, limit=limit
+            )
+            result = []
+            for row in rows:
+                request = self._deserialize_request_json(row["request_json"])
+                record = (
+                    self._deserialize_response_json(row["response_json"])
+                    if row["event_type"] == "decided" and row["response_json"] is not None
+                    else None
+                )
+                result.append({
+                    "event_id": row["event_id"],
+                    "event_type": row["event_type"],
+                    "item": _history_item(request, record),
+                })
+            return result
+        except (StateDatabaseError, ApprovalStoreCorruptedError, ValueError) as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
+    def event_bounds(
+        self, *, tenant_id: str | None, all_tenants: bool
+    ) -> tuple[int | None, int]:
+        try:
+            return self._db.approval_event_bounds(
+                tenant_id=tenant_id, all_tenants=all_tenants
+            )
+        except StateDatabaseError as exc:
+            raise ApprovalStoreError(str(exc)) from exc
+
     def refresh(self) -> None:
         pass
 
@@ -658,3 +783,40 @@ class InMemoryApprovalStore:
         ]
         items.sort(key=lambda item: item["created_at"], reverse=True)
         return items[:limit]
+
+    def list_history(self, **filters: Any) -> tuple[list[ApprovalHistoryItem], int]:
+        return list_approval_history(
+            [(request, self._responses.get(decision_id))
+             for decision_id, request in self._requests.items()],
+            **filters,
+        )
+
+    def list_events(
+        self, *, after_id: int, tenant_id: str | None, all_tenants: bool, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        event_id = 0
+        for decision_id, request in self._requests.items():
+            event_id += 1
+            if event_id > after_id and (all_tenants or request.tenant_id == tenant_id):
+                events.append({"event_id": event_id, "event_type": "pending",
+                               "item": _history_item(request, None)})
+            record = self._responses.get(decision_id)
+            if record is not None:
+                event_id += 1
+                if event_id > after_id and (all_tenants or request.tenant_id == tenant_id):
+                    events.append({"event_id": event_id, "event_type": "decided",
+                                   "item": _history_item(request, record)})
+            if len(events) >= limit:
+                break
+        return events
+
+    def event_bounds(
+        self, *, tenant_id: str | None, all_tenants: bool
+    ) -> tuple[int | None, int]:
+        events = self.list_events(
+            after_id=0, tenant_id=tenant_id, all_tenants=all_tenants,
+            limit=len(self._requests) + len(self._responses) or 1,
+        )
+        ids = [event["event_id"] for event in events]
+        return (min(ids) if ids else None, max(ids) if ids else 0)

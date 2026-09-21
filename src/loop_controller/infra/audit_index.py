@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from loop_controller.models import AuditEvent
@@ -28,6 +29,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
     trace_id TEXT,
     session_id TEXT,
     action TEXT,
+    actor_id TEXT,
+    target TEXT,
     json_payload TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -83,7 +86,7 @@ class AuditIndex:
             with self._connect() as conn:
                 conn.executescript(AUDIT_SCHEMA)
                 existing = {row[1] for row in conn.execute("PRAGMA table_info(audit_events)")}
-                for column in (*CORRELATION_COLUMNS, *EXTRA_COLUMNS):
+                for column in ("actor_id", "target", *CORRELATION_COLUMNS, *EXTRA_COLUMNS):
                     if column not in existing:
                         conn.execute(f"ALTER TABLE audit_events ADD COLUMN {column} TEXT")
                 for column in CORRELATION_COLUMNS:
@@ -92,6 +95,12 @@ class AuditIndex:
                     )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events(actor_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_events(target)"
                 )
         except (sqlite3.Error, AuditIndexError) as exc:
             raise AuditIndexError("audit_index_schema_unavailable") from exc
@@ -132,10 +141,11 @@ class AuditIndex:
             raise AuditIndexError("audit_index_write_failed") from exc
 
     def _insert_event(self, conn: sqlite3.Connection, event: AuditEvent, payload: str) -> None:
-        fields = ("seq", "event_id", "timestamp", "trace_id", "session_id", "action", "json_payload", "created_at", *CORRELATION_COLUMNS, *EXTRA_COLUMNS)
+        fields = ("seq", "event_id", "timestamp", "trace_id", "session_id", "action", "actor_id", "target", "json_payload", "created_at", *CORRELATION_COLUMNS, *EXTRA_COLUMNS)
         values = (
             event.seq, event.event_id, event.timestamp.timestamp(), event.trace_id or None,
-            event.session_id or None, event.action, payload, event.timestamp.isoformat(),
+            event.session_id or None, event.action, event.actor_id, event.target, payload,
+            event.timestamp.isoformat(),
             *(getattr(event, name) for name in CORRELATION_COLUMNS),
             *(getattr(event, name) for name in EXTRA_COLUMNS),
         )
@@ -159,29 +169,107 @@ class AuditIndex:
              json.dumps(metadata.get("target_entrypoint"), ensure_ascii=False)),
         )
 
-    def list_recent(self, limit: int = 100, before: float | None = None) -> list[AuditEvent]:
-        sql = "SELECT json_payload FROM audit_events"
-        params: tuple[object, ...]
-        if before is None:
-            params = (limit,)
-        else:
-            sql += " WHERE timestamp < ?"
-            params = (before, limit)
-        return self._query(sql + " ORDER BY seq DESC LIMIT ?", params)
+    @staticmethod
+    def _scope_filters(
+        *,
+        tenant_id: str | None,
+        start_time: datetime | None,
+        end_time: datetime | None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+        alias: str = "",
+    ) -> tuple[list[str], list[object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if tenant_id is not None:
+            clauses.append(f"{alias}tenant_id=?")
+            params.append(tenant_id)
+        if start_time is not None:
+            clauses.append(f"{alias}timestamp>=?")
+            params.append(start_time.timestamp())
+        if end_time is not None:
+            clauses.append(f"{alias}timestamp<=?")
+            params.append(end_time.timestamp())
+        if agent_id is not None:
+            clauses.append(f"{alias}actor_id=?")
+            params.append(agent_id)
+        if tool_name is not None:
+            clauses.append(f"{alias}target=?")
+            params.append(tool_name)
+        return clauses, params
+
+    def list_recent(
+        self,
+        limit: int = 100,
+        before: float | None = None,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+    ) -> list[AuditEvent]:
+        clauses, params = self._scope_filters(
+            tenant_id=tenant_id, start_time=start_time, end_time=end_time,
+            agent_id=agent_id, tool_name=tool_name,
+        )
+        if before is not None:
+            clauses.append("timestamp < ?")
+            params.append(before)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._query(
+            "SELECT json_payload FROM audit_events" + where + " ORDER BY seq DESC LIMIT ?",
+            (*params, limit),
+        )
 
     def query_by_trace(self, trace_id: str) -> list[AuditEvent]:
         return self._query_field("trace_id", trace_id)
 
-    def query_by_session(self, session_id: str) -> list[AuditEvent]:
-        return self._query_field("session_id", session_id)
-
-    def query_by_task(self, task_id: str) -> list[AuditEvent]:
-        return self._query(
-            "SELECT json_payload FROM audit_events WHERE task_id=? OR (task_id IS NULL AND trace_id=?) ORDER BY seq",
-            (task_id, task_id),
+    def query_by_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+    ) -> list[AuditEvent]:
+        return self._query_scoped(
+            "session_id=?", (session_id,), tenant_id=tenant_id,
+            start_time=start_time, end_time=end_time, agent_id=agent_id,
+            tool_name=tool_name, limit=limit,
         )
 
-    def query_by_correlation(self, correlation_id: str, limit: int = 100) -> list[AuditEvent]:
+    def query_by_task(
+        self,
+        task_id: str,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+    ) -> list[AuditEvent]:
+        return self._query_scoped(
+            "(task_id=? OR (task_id IS NULL AND trace_id=?))", (task_id, task_id),
+            tenant_id=tenant_id, start_time=start_time, end_time=end_time,
+            agent_id=agent_id, tool_name=tool_name, limit=limit,
+        )
+
+    def query_by_correlation(
+        self,
+        correlation_id: str,
+        limit: int = 100,
+        *,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+    ) -> list[AuditEvent]:
         events = self._query("SELECT json_payload FROM audit_events ORDER BY seq", ())
         identifiers = {correlation_id}
         selected: list[AuditEvent] = []
@@ -202,16 +290,65 @@ class AuditIndex:
                     identifiers.update(values)
                     changed = changed or len(identifiers) != before
         selected.sort(key=lambda event: event.seq)
+        selected = [
+            event for event in selected
+            if (tenant_id is None or event.tenant_id == tenant_id)
+            and (start_time is None or event.timestamp >= start_time)
+            and (end_time is None or event.timestamp <= end_time)
+            and (agent_id is None or event.actor_id == agent_id)
+            and (tool_name is None or event.target == tool_name)
+        ]
         return selected[:limit]
 
-    def query_interactions(self, *, interaction_id: str | None = None, source_agent_id: str | None = None, target_agent_id: str | None = None, verdict: str | None = None, limit: int = 100) -> list[AuditEvent]:
-        clauses, params = [], []
+    def query_interactions(
+        self,
+        *,
+        interaction_id: str | None = None,
+        source_agent_id: str | None = None,
+        target_agent_id: str | None = None,
+        verdict: str | None = None,
+        tenant_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+        limit: int = 100,
+    ) -> list[AuditEvent]:
+        clauses, params = self._scope_filters(
+            tenant_id=tenant_id, start_time=start_time, end_time=end_time,
+            agent_id=agent_id, tool_name=tool_name, alias="a.",
+        )
         for field, value in (("interaction_id", interaction_id), ("source_agent_id", source_agent_id), ("target_agent_id", target_agent_id), ("verdict", verdict)):
             if value is not None:
                 clauses.append(f"i.{field}=?")
                 params.append(value)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return self._query("SELECT a.json_payload FROM interaction_audit_events i JOIN audit_events a ON a.seq=i.seq" + where + " ORDER BY i.seq DESC LIMIT ?", (*params, limit))
+
+    def _query_scoped(
+        self,
+        clause: str,
+        params: tuple[object, ...],
+        *,
+        tenant_id: str | None,
+        start_time: datetime | None,
+        end_time: datetime | None,
+        agent_id: str | None,
+        tool_name: str | None,
+        limit: int | None,
+    ) -> list[AuditEvent]:
+        scope_clauses, scope_params = self._scope_filters(
+            tenant_id=tenant_id, start_time=start_time, end_time=end_time,
+            agent_id=agent_id, tool_name=tool_name,
+        )
+        clauses = [clause, *scope_clauses]
+        sql = f"SELECT json_payload FROM audit_events WHERE {' AND '.join(clauses)} ORDER BY seq"
+        all_params: tuple[object, ...] = (*params, *scope_params)
+        if limit is not None:
+            sql += " DESC LIMIT ?"
+            all_params = (*all_params, limit)
+            return list(reversed(self._query(sql, all_params)))
+        return self._query(sql, all_params)
 
     def _query_field(self, field: str, value: str) -> list[AuditEvent]:
         return self._query(f"SELECT json_payload FROM audit_events WHERE {field}=? ORDER BY seq", (value,))

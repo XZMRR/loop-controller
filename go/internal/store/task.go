@@ -35,6 +35,7 @@ type TaskStore interface {
 	CreateWithEvent(ctx context.Context, t models.Task) (models.TaskEvent, error)
 	Get(ctx context.Context, taskID string) (models.Task, error)
 	GetForTenant(ctx context.Context, tenantID, taskID string) (models.Task, error)
+	ListForTenantInitiator(ctx context.Context, tenantID, initiatorAgentID string, rootOnly bool) ([]models.Task, error)
 	UpdateStatus(ctx context.Context, taskID, expectedStatus, status string, outcome []byte, errorCode string) (models.Task, models.TaskEvent, error)
 	UpdateStatusWithConsumption(ctx context.Context, taskID, expectedStatus, status string, outcome []byte, errorCode string, consumed models.DelegationBudget) (models.Task, models.TaskEvent, error)
 	RecordLifecycle(ctx context.Context, task models.Task, event string) error
@@ -211,6 +212,31 @@ func (s *taskStore) Get(ctx context.Context, taskID string) (models.Task, error)
 
 func (s *taskStore) GetForTenant(ctx context.Context, tenantID, taskID string) (models.Task, error) {
 	return getTask(ctx, s.db, "tenant_id = ? AND task_id = ?", tenantID, taskID)
+}
+
+func (s *taskStore) ListForTenantInitiator(ctx context.Context, tenantID, initiatorAgentID string, rootOnly bool) ([]models.Task, error) {
+	rootClause := ""
+	if rootOnly {
+		rootClause = " AND parent_task_id = ''"
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT task_id, session_id, interaction_id, decision_id, root_interaction_id, parent_interaction_id, root_task_id, parent_task_id, delegation_depth, deadline, budget_token_count, budget_payment_amount, budget_currency, reserved_token_count, reserved_payment_amount, consumed_token_count, consumed_payment_amount, allowed_tools_json, allowed_capabilities_json, allow_redelegation, initiator_agent_id, target_agent_id, status, created_at, updated_at, completed_at, outcome, error_code, delegation_token, tenant_id, request_id, target_workload_id, target_instance_id
+		FROM tasks
+		WHERE tenant_id = ? AND initiator_agent_id = ?`+rootClause+`
+		ORDER BY created_at DESC
+	`, tenantID, initiatorAgentID)
+	if err != nil {
+		return nil, fmt.Errorf("list tasks for tenant initiator: %w", err)
+	}
+	defer rows.Close()
+	tasks, err := scanTasks(rows)
+	if err != nil {
+		return nil, err
+	}
+	if tasks == nil {
+		tasks = []models.Task{}
+	}
+	return tasks, nil
 }
 
 func getTask(ctx context.Context, q interface {

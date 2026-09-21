@@ -24,7 +24,7 @@ class FakeRunner:
         self.calls: list[tuple[str, list[str]]] = []
         self.failure = failure
 
-    def run(self, stage: str, arguments: list[str]):
+    def run(self, stage: str, arguments: list[str], *, cwd: Path | None = None):
         from loop_controller.policy_validation import OPACommandResult
 
         self.calls.append((stage, arguments))
@@ -74,9 +74,9 @@ def test_validator_rejects_no_tests_and_invalid_default_decision(tmp_path: Path)
     runner = FakeRunner()
     original = runner.run
 
-    def empty_tests(stage: str, arguments: list[str]):
-        result, output = original(stage, arguments)
-        return (result, b"[]") if stage == "test" else (result, output)
+    def empty_tests(stage: str, arguments: list[str], *, cwd: Path | None = None):
+            result, output = original(stage, arguments, cwd=cwd)
+            return (result, b"[]") if stage == "test" else (result, output)
 
     runner.run = empty_tests  # type: ignore[method-assign]
     result = OPACandidateValidator(runner).validate(_snapshot(tmp_path))  # type: ignore[arg-type]

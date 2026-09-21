@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import builtins
 from typing import Protocol
 
-from loop_controller.secrets.models import SecretRef, SecretScope, SecretValue
+from loop_controller.secrets.models import SecretRef, SecretRefMetadata, SecretScope, SecretValue
 
 
 class SecretBroker(Protocol):
@@ -24,6 +25,10 @@ class SecretBroker(Protocol):
         self, scope: SecretScope, tenant_id: str | None = None
     ) -> list[str]:
         """列出某作用域下的 secret 名称。"""
+        ...
+
+    async def list_refs(self) -> builtins.list[SecretRefMetadata]:
+        """列出所有 namespace 中当前已加载的引用元数据。"""
         ...
 
     async def reload(self) -> None:

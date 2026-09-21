@@ -49,6 +49,20 @@ def test_append_and_list_recent(tmp_path: Path) -> None:
     assert [e.seq for e in recent] == [5, 4, 3]
 
 
+def test_list_recent_filters_real_agent_and_tool_before_limit(tmp_path: Path) -> None:
+    index = AuditIndex(tmp_path / "audit.index.db")
+    index.append(_make_event(1).model_copy(update={
+        "actor_id": "agent-a", "target": "send_email",
+    }))
+    index.append(_make_event(2).model_copy(update={
+        "actor_id": "agent-b", "target": "web_search",
+    }))
+
+    assert [event.seq for event in index.list_recent(
+        limit=1, agent_id="agent-a", tool_name="send_email"
+    )] == [1]
+
+
 def test_query_by_trace(tmp_path: Path) -> None:
     index = AuditIndex(tmp_path / "audit.index.db")
     index.append(_make_event(1, trace_id="trace-a"))
@@ -191,6 +205,40 @@ def test_correlation_query_expands_transitive_closure(tmp_path: Path) -> None:
     index.append(_make_event(2).model_copy(update={"decision_id": "decision", "call_id": "call"}))
     index.append(_make_event(3).model_copy(update={"call_id": "call", "receipt_id": "receipt"}))
     assert [event.seq for event in index.query_by_correlation("receipt")] == [1, 2, 3]
+
+
+def test_scoped_queries_apply_tenant_time_before_limit(tmp_path: Path) -> None:
+    index = AuditIndex(tmp_path / "audit.index.db")
+    base = datetime(2026, 9, 19, 9, tzinfo=UTC)
+    for seq, tenant, hour in ((1, "a", 9), (2, "b", 10), (3, "a", 10), (4, "a", 11)):
+        index.append(_make_event(seq).model_copy(update={
+            "tenant_id": tenant,
+            "timestamp": base.replace(hour=hour),
+            "request_id": "corr",
+            "interaction_id": f"int-{seq}",
+            "metadata": {"interaction_id": f"int-{seq}", "source_agent_id": "agent",
+                         "verdict": "allow"},
+        }))
+    scope = {"tenant_id": "a", "start_time": base.replace(hour=10),
+             "end_time": base.replace(hour=11)}
+    assert [e.seq for e in index.list_recent(limit=2, **scope)] == [4, 3]
+    assert [e.seq for e in index.query_by_session("s1", limit=2, **scope)] == [3, 4]
+    assert [e.seq for e in index.query_by_task("trace-1", limit=2, **scope)] == [3, 4]
+    assert [e.seq for e in index.query_by_correlation("corr", limit=2, **scope)] == [3, 4]
+    assert [e.seq for e in index.query_interactions(source_agent_id="agent", limit=2, **scope)] == [4, 3]
+
+
+def test_correlation_scope_applies_after_transitive_closure(tmp_path: Path) -> None:
+    index = AuditIndex(tmp_path / "audit.index.db")
+    index.append(_make_event(1).model_copy(update={
+        "tenant_id": "b", "request_id": "root", "decision_id": "bridge"
+    }))
+    index.append(_make_event(2).model_copy(update={
+        "tenant_id": "a", "decision_id": "bridge"
+    }))
+    assert [e.seq for e in index.query_by_correlation(
+        "root", tenant_id="a", limit=1
+    )] == [2]
 
 
 def test_rebuild_twice_and_metadata_backfill(tmp_path: Path) -> None:

@@ -37,6 +37,15 @@ paths:
         '401': {$ref: '#/components/responses/Error401'}
         '404': {$ref: '#/components/responses/Error404'}
   /a2a/v1/tasks:
+    get:
+      operationId: listTasks
+      security: [{ControlBearer: []}]
+      parameters:
+        - {name: root_only, in: query, required: false, schema: {type: boolean, default: false}, description: When true only tasks without a parent_task_id are returned. Only literal true or false values are accepted.}
+      responses:
+        '200': {description: Tasks scoped to the authenticated control tenant and initiator, content: {application/json: {schema: {$ref: '#/components/schemas/TaskList'}}}}
+        '400': {$ref: '#/components/responses/Error400'}
+        '401': {$ref: '#/components/responses/Error401'}
     post:
       operationId: createTask
       security: [{ControlBearer: []}]
@@ -366,6 +375,13 @@ components:
       additionalProperties: false
       required: [protocol_version, session_id, initiator_agent_id, target_agent_id]
       properties: {protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}, session_id: {type: string}, initiator_agent_id: {type: string}, target_agent_id: {type: string}}
+    TaskList:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, tasks]
+      properties:
+        protocol_version: {$ref: '#/components/schemas/ProtocolVersion'}
+        tasks: {type: array, items: {$ref: '#/components/schemas/Task'}}
     Task:
       type: object
       additionalProperties: false

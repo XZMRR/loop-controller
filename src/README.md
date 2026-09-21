@@ -1,6 +1,8 @@
 # Loop Controller
 
-企业级 AI Agent 治理层（v0.54.0）。基于 R0-R3 分层治理模型，让 Agent 的工具调用和多 Agent 委托经过身份、策略、审批、可靠调度、授权执行与审计闭环。
+企业级 AI Agent 治理层（v0.55.0）。基于 R0-R3 分层治理模型，让 Agent 的工具调用和多 Agent 委托经过身份、策略、审批、可靠调度、授权执行与审计闭环。仓库另含 Go A2A 交互治理内核（`go/`）与 Vue 3 管理治理台（`frontend/`）。
+
+**v0.55.0 管理治理台**：Vue 3 + Element Plus 治理台全面接入真实后端——A2A 任务树、RBAC 绑定、Policy 生命周期（validate/shadow/publish/rollback）、死信队列列表与重放、审批 SSE 推送（HMAC 签名游标 + 轮询兜底）、管理台 A2A 代理端点（逐任务 RBAC 校验 + 载荷消毒），Go 内核控制面凭据装配（env token + mTLS）。
 
 **v0.54.0 可靠调度**：提供 Agent spec/status 与容量路由、durable assignment/outbox、lease/attempt/fence、retry/failover/dead-letter、有界静态 DAG、可恢复 SSE、SQLite migration、readiness 与 Prometheus metrics。dispatch 为 at-least-once；外部副作用不保证 exactly-once，下游必须按 `delivery_id`/幂等键去重并校验 attempt/fence；不确定发送结果进入 `outcome_unknown`。
 
@@ -8,7 +10,7 @@
 
 **v0.33.0 战略方向**：在 v0.32.0 接入方式收敛的基础上，本版本聚焦**Python 工具治理层的健壮性加固**：堵住 Agent SDK、MCP Proxy、HTTP REST API 与配置校验中当前最危险的安全、稳定与正确性漏洞，使 `@governed` 主路线和网络接入面达到可生产部署基线。HTTP REST API 与 MCP Proxy 继续作为**网关/强制约束层**保留，用于外部不可控 Agent 或跨语言接入；FastAPI 与 gRPC 接入已从核心包移除，LangChain 集成降级为 `examples/integrations/` 可选示例。
 
-v0.28.0 为审计/证据链引入外部可信锚点；v0.29.0 修复人工审批跨进程闭环失效与预算/决策状态泄漏；v0.32.0 重点完善 Agent 主动接入体验，并通过 22 个集成测试覆盖 `@governed`、hook 注册表、审批流、审批后自动重试、多步骤工作流、MCP Proxy、LangChain 等真实场景；v0.33.0 进一步补齐 SDK 并发安全、API 入口防御、错误响应脱敏、admin 权限隔离与 CI 分层验证。
+v0.28.0 为审计/证据链引入外部可信锚点；v0.29.0 修复人工审批跨进程闭环失效与预算/决策状态泄漏；v0.32.0 重点完善 Agent 主动接入体验并覆盖 `@governed`、hook 注册表、审批流、审批后自动重试、多步骤工作流、MCP Proxy、LangChain 等真实场景；v0.33.0 进一步补齐 SDK 并发安全、API 入口防御、错误响应脱敏、admin 权限隔离与 CI 分层验证；v0.35.0–v0.54.0 交付 A2A 交互治理层（Go 内核、委托生命周期、分布式可靠性、多租户 RBAC、Secret 引用与受保护出口）与可靠多 Agent 调度基线。
 
 **核心命题**：R1（Agent）不持有任何外部工具的执行通道；R2 Checkpoint 作为工具调用治理控制平面，是所有经治理工具调用的**唯一授权出口**。
 
@@ -156,7 +158,7 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 
 ## 已知局限
 
-**本项目当前为 v0.54.0（代码级可靠调度已完成，支持环境发布门禁待执行），存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：
+**本项目当前为 v0.55.0（治理台已接入真实后端，支持环境发布门禁待执行），存在明确声明的能力边界**，使用前必读 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。要点：
 
 - **交付语义**：durable dispatch 是 at-least-once，外部副作用不保证 exactly-once；下游必须按 delivery/idempotency 幂等并校验 fence，无法确认结果时保持 `outcome_unknown`。
 - **规模边界**：SQLite WAL 仅面向单区域、小到中等规模；无跨区域共识、无限水平扩展、federation 或动态 Agent 自助注册。
@@ -186,12 +188,11 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `loop_controller_v0.27.0_development.md`——v0.27.0 Harness 生产闭环
 - `loop_controller_v0.28.0_development.md`——v0.28.0 可信锚点与审计链外部闭环
 - `loop_controller_v0.29.0_development.md`——v0.29.0 审批与状态恢复闭环
-- `loop_controller_v0.31.0_development.md`——v0.31.0 外部工具执行沙箱（Harness）
 - `loop_controller_v0.32.0_development.md`——v0.32.0 Agent 接入体验优化与接入方式收敛
 - `loop_controller_v0.33.0_development.md`——v0.33.0 工具治理层健壮性加固：SDK 与 API 入口安全
 - `loop_controller_v0.54.0_development.md`——v0.54.0 可靠多 Agent 调度与发布门禁（当前版本依据）
 - `development_log.md`——开发记录与决策追溯
-- `KNOWN_LIMITATIONS.md`——MVP 明确声明的能力边界
+- `KNOWN_LIMITATIONS.md`——明确声明的能力边界
 - `answer.md`——MVP 审查分析与修复状态追踪
 
 ### 历史归档
@@ -203,7 +204,6 @@ python -c "import os; from loop_controller.infra.config_loader import ConfigLoad
 - `history/Loop_Controller方案_v1.2增补.md`——v1.2 能力增补方案
 - `history/LLMPlanner设计补充_v1.0.md`——v1.0 LLMPlanner 设计补充
 - `history/ask.md`——v0.3.0 前规划问题清单
-- `history/Loop_Controller_MVP_LangChain_Agent_示例_v1.0.md`——LangChain Agent 示例
 - `history/discussion_summary_for_planning_agent.md`——代码/规划 agent 讨论摘要
 
 ## 许可与边界

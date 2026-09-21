@@ -135,6 +135,66 @@ def test_request_and_outbox_are_atomic(tmp_path) -> None:
     assert store.list_notifications() == []
 
 
+def test_history_is_safe_filtered_and_total_precedes_pagination(tmp_path) -> None:
+    store = SqliteApprovalStore(tmp_path / "approvals.db", notification_destination=None)
+    first = _request("d1", "r1").model_copy(update={"tenant_id": "tenant-a"})
+    second = _request("d2", "r2").model_copy(update={"tenant_id": "tenant-b"})
+    store.submit_request(first)
+    store.submit_request(second)
+    store.record_response(_response("approve", "d1", "r1").model_copy(update={
+        "principal": "manager-a", "action_summary": "approval_approve"
+    }))
+
+    items, total = store.list_history(
+        tenant_id="tenant-a", all_tenants=False, status="approve", limit=1, offset=0
+    )
+    assert total == 1
+    assert len(items) == 1
+    payload = items[0].model_dump(mode="json")
+    assert payload["call_id"] == "c-d1"
+    assert payload["tenant_id"] == "tenant-a"
+    assert payload["principal"] == "manager-a"
+    assert payload["original_decision"]["policy_hits"] == ["sensitive-policy"]
+    assert "tool_arguments" not in payload
+    assert set(payload["original_decision"]) == {
+        "verdict", "reason", "policy_hits", "policy_version", "profile_version",
+        "escalation_target", "expires_at",
+    }
+
+
+def test_events_are_atomic_and_visible_across_store_instances(tmp_path) -> None:
+    path = tmp_path / "approvals.db"
+    writer = SqliteApprovalStore(path, notification_destination=None)
+    reader = SqliteApprovalStore(path, notification_destination=None)
+    request = _request().model_copy(update={"tenant_id": "tenant-a"})
+
+    writer.submit_request(request)
+    pending = reader.list_events(
+        after_id=0, tenant_id="tenant-a", all_tenants=False
+    )
+    assert [(event["event_type"], event["item"].status) for event in pending] == [
+        ("pending", "pending")
+    ]
+    writer.record_response(_response())
+    decided = reader.list_events(
+        after_id=pending[0]["event_id"], tenant_id="tenant-a", all_tenants=False
+    )
+    assert [(event["event_type"], event["item"].status) for event in decided] == [
+        ("decided", "approve")
+    ]
+    assert reader.list_events(after_id=0, tenant_id="tenant-b", all_tenants=False) == []
+
+
+def test_events_exist_when_webhook_is_disabled(tmp_path) -> None:
+    store = SqliteApprovalStore(tmp_path / "approvals.db", notification_destination=None)
+    store.submit_request(_request())
+    store.record_response(_response())
+    assert store.list_notifications() == []
+    assert [event["event_type"] for event in store.list_events(
+        after_id=0, tenant_id=None, all_tenants=True
+    )] == ["pending", "decided"]
+
+
 def test_claim_lease_attempts_retry_and_ack_fencing(tmp_path) -> None:
     store = SqliteApprovalStore(
         tmp_path / "approvals.sqlite", notification_destination="webhook"

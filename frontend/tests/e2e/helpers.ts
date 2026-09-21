@@ -36,6 +36,38 @@ export async function stubJson(page: Page, pathFragment: string, body: unknown, 
   })
 }
 
+/** 仪表盘与各治理页共用的 python 端 stub（健康/审批/吊销/Agents/审批流 404 兜底/metrics 文本） */
+export async function stubBackend(page: Page) {
+  await stubJson(page, 'v1/admin/health', {
+    status: 'ok',
+    opa_reachable: true,
+    gateway_ready: true,
+    evidence_status: 'ok',
+    anchor_status: 'ok',
+    persistence: {},
+    durability: 'enabled',
+    uptime_seconds: 3600,
+    harness_backends: [],
+  })
+  await stubJson(page, 'v1/admin/approvals/pending', { approvals: [] })
+  await stubJson(page, 'v1/admin/approvals', { approvals: [], total: 0 })
+  await stubJson(page, 'admin/revocation-list', { revocations: [], kill_switch: false })
+  await stubJson(page, 'v1/admin/agents', {
+    agents: [{ agent_id: 'e2e-agent', name: 'E2E Agent', profile_id: 'default' }],
+    users: [],
+  })
+  // 审批推送端点未就绪时：stub 404 触发前端轮询兜底
+  await stubJson(page, 'v1/admin/approvals/stream', { error: 'not_found' }, 404)
+  // /metrics 为文本响应
+  await page.route('**/metrics**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/plain',
+      body: 'lc_requests_total 42\ngo_goroutines 18\n',
+    })
+  })
+}
+
 /** 登录页填写 API Key 并提交 */
 export async function loginViaUI(page: Page, apiKey = 'e2e-key') {
   await page.goto('/login')
