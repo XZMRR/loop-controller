@@ -19,7 +19,7 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
-        run: uv sync --locked --dev
+        run: uv sync --locked --dev --extra server
 
       - name: Check whitespace errors
         run: git diff --check
