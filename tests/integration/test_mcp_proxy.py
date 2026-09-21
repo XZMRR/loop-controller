@@ -19,6 +19,7 @@ from mcp.client.stdio import stdio_client
 
 from tests.conftest import write_trusted_local_harness_config
 from tests.controller_helpers import env_extra
+from tests.integration.conftest import _chmod_private_tree
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -42,6 +43,7 @@ def mcp_proxy_workdir(tmp_path: Path) -> Path:
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     shutil.copytree(REPO_ROOT / "src", root / "src")
     (root / "data").mkdir()
+    _chmod_private_tree(root)
 
     (root / "config" / "mcp_servers.yaml").write_text(
         f"""
@@ -113,6 +115,7 @@ def mcp_proxy_approval_workdir(tmp_path: Path) -> Path:
     shutil.copytree(REPO_ROOT / "policies", root / "policies")
     shutil.copytree(REPO_ROOT / "src", root / "src")
     (root / "data").mkdir()
+    _chmod_private_tree(root)
 
     (root / "config" / "mcp_servers.yaml").write_text(
         f"""
