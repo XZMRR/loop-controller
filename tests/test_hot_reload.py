@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from pathlib import Path
 
@@ -43,9 +44,11 @@ def reload_setup(tmp_path: Path) -> tuple[Path, HTTPExecutor, FileSecretBackend,
         encoding="utf-8",
     )
 
-    # 初始 secret
+    # 初始 secret（Unix 上收紧权限以通过 FileSecretBackend 校验）
     secret_file = secrets_dir / "global" / "api_key.json"
     secret_file.write_text('{"value": "v1"}', encoding="utf-8")
+    if os.name != "nt":
+        secret_file.chmod(0o600)
 
     secrets_yaml = config_dir / "secrets.yaml"
     secrets_yaml.write_text(
@@ -125,6 +128,8 @@ async def test_hot_reload_reloads_secret(
 
         secret_file = Path(broker._base) / "global" / "api_key.json"
         secret_file.write_text('{"value": "v2"}', encoding="utf-8")
+        if os.name != "nt":
+            secret_file.chmod(0o600)
 
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline:
