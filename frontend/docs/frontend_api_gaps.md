@@ -506,11 +506,11 @@ Go Kernel 已提供 `/a2a/v1/agents`、`/a2a/v1/tasks`、`/a2a/v1/delegations` �
 
 | 缺口 | 工作量 | 风险 |
 |---|---|---|
-| 配置热重载 | 中~高 | 需保证运行中 task/approval 不受影响 |
-| Profile 策略更新并同步 OPA | 中 | 策略热重载一致性 |
-| Secret CRUD | 中 | 加密、权限、审计 |
-| 审批转交 | 中 | 状态机变更 |
-| Agent CRUD 持久化 | 中 | 配置备份与并发写入 |
+| 配置热重载（Identity/Entrypoints/Agents 等安全关键配置） | 中~高 | 需保证运行中 task/approval 不受影响；安全关键配置重启生效属合理设计，不追求全量热更新 |
+| ~~Profile 策略更新并同步 OPA~~ | ~~中~~ | **已交付且原表述过时**：LC 每次请求 OPA 都将最新 Profile 作为 `input.profile` 送入（`policy_engine.py` 构造 Rego input），Profile 在线编辑 + 热重载后下一次判定即用新策略；Rego 代码本身走 candidate→validate→shadow→publish→rollback 生命周期，两者无需强行同步机制 |
+| Secret CRUD | 中 | 加密、权限、审计；建议继续由 Vault/K8s Secret 管理，LC 不做 Secret Manager |
+| 审批转交 | 中 | 状态机变更；无多级审批需求则延后 |
+| Agent CRUD 持久化 | 中 | 配置备份与并发写入；配置文件注册更稳妥 |
 
 ---
 
@@ -572,8 +572,8 @@ stream/delegations，`b20a9b5`~`e1a6677`）、Session 认证（`1948248`）、RB
 | 缺口 | 建议接口 | 前端场景 | 优先级 |
 |---|---|---|---|
 | A2A 任务树列表 | `GET /v1/admin/a2a/tasks?root_only=true` 或 `/a2a/v1/tasks?list=roots` | TaskTree 页需要列出多跳委托链路（当前仅有 `tasks/{id}` 单查，Mock 无法上线） | 高 |
-| 审批详情字段 | 在 `GET /v1/admin/approvals` 响应中补充 escalation/租户/工具参数等全字段 | 审批详情抽屉完整展示 | 中 |
-| Secret 引用枚举 | `GET /v1/admin/secrets`（只列 ref/backend/has_value，不明文） | 系统配置页 Secret 管理 | 中 |
+| ~~审批详情字段~~ | ~~在 `GET /v1/admin/approvals` 响应中补充 escalation/租户/工具参数等全字段~~ | **已交付**：`ApprovalHistoryItem` 含 tenant_id/task_id/call_id/agent_id/tool_name/requester_id/approver_id、脱敏参数 `arguments_masked`、`action_summary`、`original_decision`、创建与决定时间；前端详情抽屉已接入。剩余小项：待审批列表仍为精简结构（体验增强，非发布门禁） | 已交付 |
+| ~~Secret 引用枚举~~ | ~~`GET /v1/admin/secrets`（只列 ref/backend/has_value，不明文）~~ | **已交付**（同下「Secret 元数据」行）：仅 ref/tenant_id/backend/has_value，不回显明文 | 已交付 |
 | Secret CRUD | `POST/PUT/DELETE /v1/admin/secrets[/{ref}]` | Secret 管理写入 | 低 |
 | Agent CRUD | `POST/PUT/DELETE /v1/admin/agents[/{id}]` | Agent 管理在线增改 | 低 |
 | 审批转交 | `POST /v1/admin/approvals/{id}/reassign` | 审批人繁忙时转交 | 低 |
@@ -592,3 +592,18 @@ stream/delegations，`b20a9b5`~`e1a6677`）、Session 认证（`1948248`）、RB
 - ~~审批请求体 `approver` 字段~~：已由独立审批凭证替代。
 - ~~「内核对账」页签~~：v0.54 内核审批端点已变更，该页签已删除。
 - ~~Go Kernel control token 桥接缺口~~：v0.54 已由 entrypoint token 体系覆盖。
+
+---
+
+## 8. 生产验证门禁（P0，非业务功能缺口）
+
+以下各项代码已实现并有单测/故障注入覆盖，但缺真实环境验证，是 strict 生产发布
+前的硬门禁（后端评审结论一致）：
+
+| 门禁 | 验证内容 | 状态 |
+|---|---|---|
+| 真实进程崩溃接管 | Worker A 真进程领任务→强杀→lease 到期→Worker B 接管→A 复活提交旧结果被 fencing token 拒绝 | 代码就绪（lease/fence/过期恢复），缺真实双进程演示 |
+| Protected MCP 完整拓扑 | Agent→LC strict→Protected MCP Proxy→真实 MCP Server；双向 mTLS、错误 CA/无证书/workload 不匹配/指纹不匹配/_meta 缺失均拒绝、ExecutionReceipt 回传 | 代码就绪，缺真实拓扑验证 |
+| Go→Python strict 全链 | 内核→/govern→workload identity→delegated subject→receipt 校验完成任务；interaction token 不能冒充 workload credential、租户/目标/correlation 错配拒绝 | 代码就绪，缺真实部署验证 |
+| K8s CNI/NetworkPolicy | Agent 不能直连真实 MCP/upstream、不能读云 metadata、不能读 LC/工具 Secret；默认拒绝 egress、非 root/只读 rootfs/drop capabilities/无 Docker socket/资源限制 | 有静态模板与 conformance 测试，未在真实 CNI 环境执行 |
+| DeploymentProof | 上述验证产出可复核证据 | 未开始 |
